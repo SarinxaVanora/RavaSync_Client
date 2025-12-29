@@ -195,7 +195,7 @@
     <Content Include="Fonts\VT323-Regular.ttf">
       <CopyToOutputDirectory>Always</CopyToOutputDirectory>
     </Content>
-    <Content Include="Resources\cards_atlas.png" />
+    <EmbeddedResource Include="Resources\cards_atlas.png" />
     <EmbeddedResource Include="Resources\card_back.png" />
     <Content Include="Themes\theme.darkforrest.json">
       <CopyToOutputDirectory>Always</CopyToOutputDirectory>
