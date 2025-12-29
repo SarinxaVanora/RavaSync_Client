@@ -64,42 +64,22 @@ public sealed class TokenProvider : IDisposable, IMediatorSubscriber
             {
                 _logger.LogDebug("GetNewToken: Requesting");
 
-                //if (!_serverManager.CurrentServer.UseOAuth2)
-                //{
-                //    tokenUri = MareAuth.AuthFullPath(new Uri(_serverManager.CurrentApiUrl
-                //        .Replace("wss://", "https://", StringComparison.OrdinalIgnoreCase)
-                //        .Replace("ws://", "http://", StringComparison.OrdinalIgnoreCase)));
-                //    var secretKey = _serverManager.GetSecretKey(out _)!;
-                //    var auth = secretKey.GetHash256();
-                //    _logger.LogInformation("Sending SecretKey Request to server with auth {auth}", string.Join("", identifier.SecretKeyOrOAuth.Take(10)));
-                //    result = await _httpClient.PostAsync(tokenUri, new FormUrlEncodedContent(
-                //    [
-                //            new KeyValuePair<string, string>("auth", auth),
-                //            new KeyValuePair<string, string>("charaIdent", await _dalamudUtil.GetPlayerNameHashedAsync().ConfigureAwait(false)),
-                //    ]), ct).ConfigureAwait(false);
-                //}
                 if (!_serverManager.CurrentServer.UseOAuth2)
                 {
-                    // Build the /auth/createWithIdent URL
                     tokenUri = MareAuth.AuthFullPath(new Uri(_serverManager.CurrentApiUrl
                         .Replace("wss://", "https://", StringComparison.OrdinalIgnoreCase)
                         .Replace("ws://", "http://", StringComparison.OrdinalIgnoreCase)));
 
-                    // 1) get secret if we have one; if not, auto-register to obtain and persist it
                     var secretKey = _serverManager.GetSecretKey(out _);
 
-                    // still no secret? bail in the usual way
                     if (string.IsNullOrEmpty(secretKey))
                     {
                         _logger.LogWarning("No secret key available for current character; cannot request token.");
-                        // let the POST fail naturally (or you can 'return' here if you prefer)
                     }
 
-                    // 2) normal path: auth = SHA256(secret)
                     var auth = (secretKey ?? string.Empty).GetHash256();
                     _logger.LogInformation("Sending SecretKey Request to server with auth {auth}", string.Join("", identifier.SecretKeyOrOAuth.Take(10)));
 
-                    // 3) call /auth/createWithIdent as before
                     result = await _httpClient.PostAsync(tokenUri, new FormUrlEncodedContent(
                     [
                         new KeyValuePair<string, string>("auth", auth),
