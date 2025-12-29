@@ -1,0 +1,26 @@
+{
+  "Id": "nyx",
+  "Name": "Nyx",
+  "Colors": {
+    "Primary": "#6C5CE7",
+    "Accent": "#A29BFE",
+    "Background": "#0A0A14",
+    "BackgroundAlt": "#0F1022",
+    "Surface": "#151837",
+    "Text": "#EDEBFF",
+    "MutedText": "#B9B4E6",
+    "Success": "#3ECF8E",
+    "Warning": "#FFD166",
+    "Danger": "#EF476F",
+    "Info": "#5AA9E6",
+    "Border": "#22254A",
+    "Highlight": "#2C2F6B"
+  },
+  "Typography": {
+    "DisplayFont": "EBGaramond-Regular",
+    "BaseSize": 20
+  },
+  "Effects": {
+    "RoundedUi": true
+  }
+}

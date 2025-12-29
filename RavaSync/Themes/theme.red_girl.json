@@ -1,0 +1,26 @@
+{
+  "Id": "red_girl",
+  "Name": "Red girl",
+  "Colors": {
+    "Primary": "#E11D48",
+    "Accent": "#FF334E",
+    "Background": "#140909",
+    "BackgroundAlt": "#1A0D0D",
+    "Surface": "#200F10",
+    "Text": "#FFECEC",
+    "MutedText": "#E3B3B3",
+    "Success": "#2ECC71",
+    "Warning": "#FFB347",
+    "Danger": "#FF4D4D",
+    "Info": "#F56A79",
+    "Border": "#2B1618",
+    "Highlight": "#3F1014"
+  },
+  "Typography": {
+    "DisplayFont": "Bebas Neue Regular",
+    "BaseSize": 17
+  },
+  "Effects": {
+    "RoundedUi": true
+  }
+}

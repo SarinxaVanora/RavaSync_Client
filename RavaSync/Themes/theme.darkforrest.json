@@ -1,0 +1,26 @@
+{
+  "Id": "darkforrest",
+  "Name": "Darkforrest",
+  "Colors": {
+    "Primary": "#8E1B3A",
+    "Accent": "#C92A42",
+    "Background": "#0E0A0A",
+    "BackgroundAlt": "#150E10",
+    "Surface": "#1C1216",
+    "Text": "#F3E8EA",
+    "MutedText": "#C9B4BA",
+    "Success": "#3ECF8E",
+    "Warning": "#FFB020",
+    "Danger": "#E63946",
+    "Info": "#7F9BB3",
+    "Border": "#2A191F",
+    "Highlight": "#3A1B26"
+  },
+  "Typography": {
+    "DisplayFont": "Marcellus-Regular",
+    "BaseSize": 16
+  },
+  "Effects": {
+    "RoundedUi": true
+  }
+}

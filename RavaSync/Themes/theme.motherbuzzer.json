@@ -1,0 +1,26 @@
+{
+  "Id": "motherbuzzer",
+  "Name": "MOTHERBUZZER",
+  "Colors": {
+    "Primary": "#FFC400",
+    "Accent": "#FFD54F",
+    "Background": "#0B0B0B",
+    "BackgroundAlt": "#121212",
+    "Surface": "#171717",
+    "Text": "#FFFBE6",
+    "MutedText": "#D1C892",
+    "Success": "#8BC34A",
+    "Warning": "#FFC400",
+    "Danger": "#FF5252",
+    "Info": "#64B5F6",
+    "Border": "#2A2A2A",
+    "Highlight": "#2B2B2B"
+  },
+  "Typography": {
+    "DisplayFont": "FugazOne-Regular",
+    "BaseSize": 18
+  },
+  "Effects": {
+    "RoundedUi": true
+  }
+}

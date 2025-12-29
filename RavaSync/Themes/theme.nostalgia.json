@@ -1,0 +1,26 @@
+{
+  "Id": "nostalgia",
+  "Name": "Nostalgia",
+  "Colors": {
+    "Primary": "#00E5FF",
+    "Accent": "#7A5CFF",
+    "Background": "#0A0F1F",
+    "BackgroundAlt": "#0F1733",
+    "Surface": "#111B40",
+    "Text": "#E6F2FF",
+    "MutedText": "#9FB8FF",
+    "Success": "#2EE6A6",
+    "Warning": "#FFC857",
+    "Danger": "#FF6B6B",
+    "Info": "#3EC1FF",
+    "Border": "#1C2A4D",
+    "Highlight": "#1A2B6B"
+  },
+  "Typography": {
+    "DisplayFont": "Audiowide Regular",
+    "BaseSize": 16
+  },
+  "Effects": {
+    "RoundedUi": true
+  }
+}

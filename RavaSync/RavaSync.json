@@ -1,0 +1,23 @@
+
+  {
+    "Author": "Ravalyn",
+    "Name": "RavaSync",
+    "InternalName": "RavaSync",
+    "AssemblyVersion": "1.14.4.09",
+    "Description": "You know what this is.",
+    "ApplicableVersion": "any",
+    "RepoUrl": "https://plugins.ravalyn.uk",
+    "Tags": [ "customization", "sync", "Ravalyn" ],
+    "DownloadLinkInstall": "https://plugins.ravalyn.uk/latest.zip",
+    "DownloadLinkUpdate": "https://plugins.ravalyn.uk/latest.zip",
+    "IconUrl": "https://plugins.ravalyn.uk/icon.png",
+    "DalamudApiLevel": 14,
+    "LoadRequiredState": 0,
+    "LoadSync": false,
+    "CanUnloadAsync": false,
+    "LoadPriority": 0,
+    "Punchline": "Lift the veil, see the world as it truly is.",
+    "AcceptsFeedback": true
+  }
+
+

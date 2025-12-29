@@ -1,0 +1,26 @@
+{
+  "Id": "wereroe",
+  "Name": "WereRoe",
+  "Colors": {
+    "Primary": "#2D6AA3",
+    "Accent": "#3D8AD6",
+    "Background": "#0B0F14",
+    "BackgroundAlt": "#101720",
+    "Surface": "#14202B",
+    "Text": "#E6EEF5",
+    "MutedText": "#B0C2D6",
+    "Success": "#2FBF71",
+    "Warning": "#E6B35C",
+    "Danger": "#E65C6B",
+    "Info": "#5AA9E6",
+    "Border": "#1B2733",
+    "Highlight": "#1C2F44"
+  },
+  "Typography": {
+    "DisplayFont": "oswald-semibold",
+    "BaseSize": 20
+  },
+  "Effects": {
+    "RoundedUi": true
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "Id": "avernus",
+  "Name": "Avernus",
+  "Colors": {
+    "Primary": "#6E46AE",
+    "Accent": "#9B6BFF",
+    "Background": "#0E0B16",
+    "BackgroundAlt": "#130F2A",
+    "Surface": "#1C1538",
+    "Text": "#EAE6FF",
+    "MutedText": "#B7AEE6",
+    "Success": "#3ECF8E",
+    "Warning": "#FFB020",
+    "Danger": "#E86A6A",
+    "Info": "#4DA3FF",
+    "Border": "#2A2145",
+    "Highlight": "#3B2D6B"
+  },
+  "Typography": {
+    "DisplayFont": "CormorantGaramond-Regular",
+    "BaseSize": 20
+  },
+  "Effects": {
+    "RoundedUi": true
+  }
+}

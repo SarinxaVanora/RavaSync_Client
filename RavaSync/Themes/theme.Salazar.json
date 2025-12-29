@@ -1,0 +1,39 @@
+{
+  "SchemaVersion": 1,
+  "Id": "salazar",
+  "Name": "Salazar",
+  "Inherits": null,
+  "Colors": {
+    "Primary": "#585858",
+    "Accent": "#3AAE9B",
+    "Background": "#232323",
+    "BackgroundAlt": "#232323",
+    "Surface": "#141A1A",
+    "Text": "#E6F2F0",
+    "MutedText": "#A6C0BC",
+    "Success": "#37D99A",
+    "Warning": "#D6B85A",
+    "Danger": "#E57373",
+    "Info": "#64D6ED",
+    "Border": "#1B2524",
+    "Highlight": "#1C2F2C"
+  },
+  "Typography": {
+    "UiFont": "Inter",
+    "DisplayFont": "spectral.regular",
+    "BaseSize": 22,
+    "Scale": 1
+  },
+  "Effects": {
+    "GlowIntensity": 0,
+    "NoiseOpacity": 0.05,
+    "Particles": false,
+    "ParticleStyle": "none",
+    "RoundedUi": true
+  },
+  "Assets": {
+    "BackgroundImage": null,
+    "Logo": null,
+    "Watermark": null
+  }
+}

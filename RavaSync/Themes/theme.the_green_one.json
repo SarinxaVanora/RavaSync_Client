@@ -1,0 +1,26 @@
+{
+  "Id": "the_green_one",
+  "Name": "The Green One",
+  "Colors": {
+    "Primary": "#1FA36B",
+    "Accent": "#2EC27E",
+    "Background": "#0B120C",
+    "BackgroundAlt": "#0F1A12",
+    "Surface": "#142016",
+    "Text": "#E7F5EC",
+    "MutedText": "#B5D2C1",
+    "Success": "#31D07D",
+    "Warning": "#E6C14F",
+    "Danger": "#E06363",
+    "Info": "#53C7D4",
+    "Border": "#1C2A22",
+    "Highlight": "#1B3A2A"
+  },
+  "Typography": {
+    "DisplayFont": "Montserrat SemiBold",
+    "BaseSize": 16
+  },
+  "Effects": {
+    "RoundedUi": true
+  }
+}
