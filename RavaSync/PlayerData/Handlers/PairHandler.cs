@@ -197,18 +197,6 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
 
         bool sameHash = string.Equals(newHash, _cachedData?.DataHash.Value ?? string.Empty, StringComparison.Ordinal);
 
-        //if (sameHash && !forceApplyCustomization)
-        //{
-        //    // don’t skip if any of the required cache files are missing.
-        //    if (!HasAnyMissingCacheFiles(applicationBase, characterData))
-        //    {
-        //        Logger.LogDebug("[BASE-{appbase}] Data hash unchanged and all required cache files present, skipping re-apply", applicationBase);
-        //        return;
-        //    }
-
-        //    Logger.LogInformation("[BASE-{appbase}] Data hash unchanged but some required cache files are missing; forcing re-download + re-apply",
-        //        applicationBase);
-        //}
 
         if (sameHash && !forceApplyCustomization)
         {
@@ -566,8 +554,6 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
         var updateModdedPaths = updatedData.Values.Any(v => v.Any(p => p == PlayerChanges.ModFiles));
         var updateManip = updatedData.Values.Any(v => v.Any(p => p == PlayerChanges.ModManip));
 
-        //_hasRetriedAfterMissingDownload = false;
-        //_hasRetriedAfterMissingAtApply = false;
 
         _downloadCancellationTokenSource = _downloadCancellationTokenSource?.CancelRecreate() ?? new CancellationTokenSource();
         var downloadToken = _downloadCancellationTokenSource.Token;
@@ -611,7 +597,7 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
 
                 if (attempts > 1)
                 {
-                    Logger.LogWarning("[BASE-{appBase}] Retry {attempt}/10 - still missing {count}: {missing}",
+                    Logger.LogDebug("[BASE-{appBase}] Retry {attempt}/10 - still missing {count}: {missing}",
                     applicationBase, attempts, toDownloadReplacements.Count, missingDetails);
                 }
 
@@ -626,20 +612,6 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
                 var toDownloadFiles = await _downloadManager
                     .InitiateDownloadList(_charaHandler!, toDownloadReplacements, downloadToken)
                     .ConfigureAwait(false);
-
-                //if (toDownloadFiles == null || toDownloadFiles.Count == 0)
-                //{
-                //    Logger.LogWarning(
-                //        "[BASE-{appBase}] Attempt {attempt}/10 queued 0 downloads, but {count} hashes still missing. Keeping existing appearance and waiting for next update.",
-                //        applicationBase, attempts, toDownloadReplacements.Count);
-
-                //    _downloadManager.ClearDownload();
-                //    _pairDownloadTask = null;
-
-                //    // Most commonly happens while the other client is still uploading and the server reports FileExists=false.
-                //    // We do NOT want to clear temp mods or force a vanilla flash – just wait for the next character data push.
-                //    return;
-                //}
                 
                 if (toDownloadFiles == null || toDownloadFiles.Count == 0)
                 {
@@ -669,16 +641,10 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
                     return;
                 }
 
-                //_pairDownloadTask = Task.Run(async () =>
-                //    await _downloadManager.DownloadFiles(_charaHandler!, toDownloadReplacements, downloadToken)
-                //        .ConfigureAwait(false));
-
-                //await _pairDownloadTask.ConfigureAwait(false);
                 _pairDownloadTask = _downloadManager.DownloadFiles(_charaHandler!, toDownloadReplacements, downloadToken);
 
                 await _pairDownloadTask.ConfigureAwait(false);
 
-                //await Task.Delay(200, downloadToken).ConfigureAwait(false);
                 if (downloadToken.IsCancellationRequested)
                 {
                     Logger.LogTrace("[BASE-{appBase}] Detected cancellation", applicationBase);
@@ -690,8 +656,6 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
 
                 if (toDownloadReplacements.Count == 0)
                     break;
-
-                //await Task.Delay(TimeSpan.FromSeconds(2), downloadToken).ConfigureAwait(false);
             }
 
 
@@ -764,191 +728,30 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
         var token = _applicationCancellationTokenSource.Token;
 
         _applicationTask = ApplyCharacterDataAsync(applicationBase, charaData, updatedData, updateModdedPaths, updateManip, moddedPaths, token);
+
+        _ = _applicationTask.ContinueWith(t =>
+        {
+            try
+            {
+                Logger.LogWarning(t.Exception, "[BASE-{appBase}] Application task faulted for {player}", applicationBase, PlayerName);
+            }
+            catch
+            {
+            }
+        }, TaskContinuationOptions.OnlyOnFaulted);
+
     }
-
-    #region old ApplyCharacterDataAsync
-    //private async Task ApplyCharacterDataAsync(Guid applicationBase, CharacterData charaData, Dictionary<ObjectKind, HashSet<PlayerChanges>> updatedData, bool updateModdedPaths, bool updateManip,
-    //    Dictionary<(string GamePath, string? Hash), string> moddedPaths, CancellationToken token)
-    //{
-    //    await GlobalApplySemaphore.WaitAsync(token).ConfigureAwait(false);
-    //    try
-    //    {
-    //        try
-    //        {
-    //            _applicationId = Guid.NewGuid();
-    //            Logger.LogDebug("[BASE-{applicationBase}] Starting application task for {this}: {appId}", applicationBase, this, _applicationId);
-    //            await Task.Delay(Random.Shared.Next(5, 30), token).ConfigureAwait(false);
-
-    //            Logger.LogDebug("[{applicationId}] Waiting for initial draw for {handler}", _applicationId, _charaHandler);
-    //            await _dalamudUtil
-    //                .WaitWhileCharacterIsDrawing(Logger, _charaHandler!, _applicationId, 30000, token)
-    //                .ConfigureAwait(false);
-
-    //            token.ThrowIfCancellationRequested();
-
-    //            if (updateModdedPaths)
-    //            {
-    //                // ensure collection is set
-    //                var objIndex = await _dalamudUtil
-    //                    .RunOnFrameworkThread(() => _charaHandler!.GetGameObject()!.ObjectIndex)
-    //                    .ConfigureAwait(false);
-
-    //                if (_lastAssignedObjectIndex != objIndex)
-    //                {
-    //                    await _ipcManager.Penumbra
-    //                        .AssignTemporaryCollectionAsync(Logger, _penumbraCollection, objIndex)
-    //                        .ConfigureAwait(false);
-
-    //                    _lastAssignedObjectIndex = objIndex;
-    //                }
-
-
-    //                var cacheRoot = _fileDbManager.CacheFolder;
-
-    //                var missingAtApply = moddedPaths
-    //                    .Where(kvp =>
-    //                    {
-    //                        var path = kvp.Value;
-    //                        var gamePath = kvp.Key.GamePath;
-
-    //                        if (string.IsNullOrEmpty(path))
-    //                            return true;
-
-    //                        if (ActivationPolicy.IsHardDelayed(path))
-    //                            return false;
-
-    //                        if (!path.StartsWith(cacheRoot, StringComparison.OrdinalIgnoreCase))
-    //                        {
-    //                            return false;
-    //                        }
-    //                        return !File.Exists(path);
-    //                    })
-    //                    .ToList();
-
-
-
-    //                if (missingAtApply.Count > 0)
-    //                {
-    //                    var details = string.Join(", ", missingAtApply.Select(x =>
-    //                        string.IsNullOrEmpty(x.Key.Hash)
-    //                            ? $"{x.Key.GamePath} {x.Value}"
-    //                            : $"{x.Key.Hash} ({x.Key.GamePath})"));
-
-    //                    Logger.LogWarning(
-    //                        "[{applicationId}] Aborting pair apply for {player}: {count} non-optional files missing at apply time. {details}",
-    //                        _applicationId,
-    //                        Pair.UserData.AliasOrUID,
-    //                        missingAtApply.Count,
-    //                        details);
-
-    //                    if (!_hasRetriedAfterMissingAtApply)
-    //                    {
-    //                        _hasRetriedAfterMissingAtApply = true;
-
-    //                        Logger.LogInformation(
-    //                            "[{applicationId}] Self-heal: re-running sync for {player} after apply-time missing files",
-    //                            _applicationId,
-    //                            Pair.UserData.AliasOrUID);
-
-    //                        // Fire a brand-new pipeline: recompute missing, re-download, re-apply.
-    //                        DownloadAndApplyCharacter(applicationBase, charaData.DeepClone(), updatedData);
-    //                    }
-
-    //                    // Do NOT apply a partial set in this run.
-    //                    return;
-    //                }
-
-
-    //                await _ipcManager.Penumbra
-    //                    .SetTemporaryModsAsync(
-    //                        Logger,
-    //                        _applicationId,
-    //                        _penumbraCollection,
-    //                        BuildPenumbraTempMods(moddedPaths))
-    //                    .ConfigureAwait(false);
-
-    //                LastAppliedDataBytes = -1;
-    //                foreach (var path in moddedPaths.Values
-    //                             .Distinct(StringComparer.OrdinalIgnoreCase)
-    //                             .Select(v => new FileInfo(v))
-    //                             .Where(p => p.Exists))
-    //                {
-    //                    if (LastAppliedDataBytes == -1) LastAppliedDataBytes = 0;
-    //                    LastAppliedDataBytes += path.Length;
-    //                }
-    //            }
-    //            var onlyModFilesChangedForThisKind = false;
-
-    //            if (updatedData.TryGetValue(_charaHandler.ObjectKind, out var changesForThisKind))
-    //            {
-    //                var hasModFiles = changesForThisKind.Contains(PlayerChanges.ModFiles);
-    //                var hasOtherChanges = changesForThisKind.Any(c => c != PlayerChanges.ModFiles);
-
-    //                onlyModFilesChangedForThisKind = hasModFiles && !hasOtherChanges;
-    //            }
-
-    //            if (onlyModFilesChangedForThisKind)
-    //            {
-    //                await _ipcManager.Penumbra
-    //                    .RedrawAsync(Logger, _charaHandler, _applicationId, token)
-    //                    .ConfigureAwait(false);
-    //            }
-    //            if (updateManip)
-    //            {
-    //                if (Pair.IsMetadataEnabled)
-    //                {
-    //                    await _ipcManager.Penumbra
-    //                        .SetManipulationDataAsync(Logger, _applicationId, _penumbraCollection, charaData.ManipulationData)
-    //                        .ConfigureAwait(false);
-    //                }
-    //                else
-    //                {
-    //                    await _ipcManager.Penumbra
-    //                        .ClearManipulationDataAsync(Logger, _applicationId, _penumbraCollection)
-    //                        .ConfigureAwait(false);
-    //                }
-    //            }
-
-    //            token.ThrowIfCancellationRequested();
-
-    //            foreach (var kind in updatedData)
-    //            {
-    //                await ApplyCustomizationDataAsync(_applicationId, kind, charaData, token).ConfigureAwait(false);
-    //                token.ThrowIfCancellationRequested();
-    //            }
-
-    //            _cachedData = charaData;
-
-    //            Logger.LogDebug("[{applicationId}] Application finished", _applicationId);
-    //        }
-    //        catch (Exception ex)
-    //        {
-    //            if (ex is AggregateException aggr && aggr.InnerExceptions.Any(e => e is ArgumentNullException))
-    //            {
-    //                IsVisible = false;
-    //                _forceApplyMods = true;
-    //                _cachedData = charaData;
-    //                Logger.LogDebug("[{applicationId}] Cancelled, player turned null during application", _applicationId);
-    //            }
-    //            else
-    //            {
-    //                Logger.LogWarning(ex, "[{applicationId}] Cancelled", _applicationId);
-    //            }
-    //        }
-    //    }
-    //    finally
-    //    {
-    //        GlobalApplySemaphore.Release();
-    //    }
-    //}
-    #endregion
 
     private async Task ApplyCharacterDataAsync(Guid applicationBase,CharacterData charaData,Dictionary<ObjectKind, HashSet<PlayerChanges>> updatedData,bool updateModdedPaths,
                                                bool updateManip,Dictionary<(string GamePath, string? Hash), string> moddedPaths,CancellationToken token)
     {
-        await GlobalApplySemaphore.WaitAsync(token).ConfigureAwait(false);
+        var acquired = false;
+
         try
         {
+            await GlobalApplySemaphore.WaitAsync(token).ConfigureAwait(false);
+            acquired = true;
+
             try
             {
                 _applicationId = Guid.NewGuid();
@@ -968,7 +771,6 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
 
                 token.ThrowIfCancellationRequested();
 
-                // One redraw
                 bool needsRedraw = false;
 
                 if (updateModdedPaths)
@@ -1116,6 +918,10 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
 
                 Logger.LogDebug("[{applicationId}] Application finished", _applicationId);
             }
+            catch (OperationCanceledException)
+            {
+                Logger.LogDebug("[{applicationId}] Application cancelled", _applicationId);
+            }
             catch (Exception ex)
             {
                 if (ex is AggregateException aggr && aggr.InnerExceptions.Any(e => e is ArgumentNullException))
@@ -1127,13 +933,24 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
                 }
                 else
                 {
-                    Logger.LogWarning(ex, "[{applicationId}] Cancelled", _applicationId);
+                    Logger.LogWarning(ex, "[{applicationId}] Error during application", _applicationId);
                 }
             }
         }
+        catch (OperationCanceledException)
+        {
+            Logger.LogDebug("[BASE-{applicationBase}] Application cancelled before semaphore acquired for {player}",
+                applicationBase, PlayerName);
+        }
+        catch (Exception ex)
+        {
+            Logger.LogWarning(ex, "[BASE-{applicationBase}] Unhandled error during apply for {player}",
+                applicationBase, PlayerName);
+        }
         finally
         {
-            GlobalApplySemaphore.Release();
+            if (acquired)
+                GlobalApplySemaphore.Release();
         }
     }
 
@@ -1141,9 +958,6 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
     {
         try
         {
-            //var replacementList = characterData.FileReplacements
-            //    .SelectMany(k => k.Value.Where(v => string.IsNullOrEmpty(v.FileSwapPath)))
-            //    .ToList();
 
             foreach (var item in characterData.FileReplacements.SelectMany(k => k.Value.Where(v => string.IsNullOrEmpty(v.FileSwapPath))))
             {
@@ -1179,8 +993,6 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
                 {
                     try
                     {
-                        //if (new FileInfo(fileCache.ResolvedFilepath).Length == 0)
-                        //    return true;
                         var fi = new FileInfo(fileCache.ResolvedFilepath);
                         if (fi.Length == 0)
                         {

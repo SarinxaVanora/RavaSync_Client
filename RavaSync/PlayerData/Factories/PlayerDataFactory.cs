@@ -1,5 +1,7 @@
 ﻿using FFXIVClientStructs.FFXIV.Client.Game.Character;
+using Microsoft.Extensions.Logging;
 using RavaSync.API.Data.Enum;
+using RavaSync.FileCache;
 using RavaSync.FileCache;
 using RavaSync.Interop.Ipc;
 using RavaSync.MareConfiguration.Models;
@@ -7,8 +9,7 @@ using RavaSync.PlayerData.Data;
 using RavaSync.PlayerData.Handlers;
 using RavaSync.Services;
 using RavaSync.Services.Mediator;
-using Microsoft.Extensions.Logging;
-using RavaSync.FileCache;
+using System.Linq;
 using CharacterData = RavaSync.PlayerData.Data.CharacterData;
 
 namespace RavaSync.PlayerData.Factories;
@@ -49,25 +50,31 @@ public class PlayerDataFactory
         if (playerRelatedObject == null) return null;
 
         bool pointerIsZero = true;
-        try
-        {
-            pointerIsZero = playerRelatedObject.Address == IntPtr.Zero;
-            try
-            {
-                pointerIsZero = await CheckForNullDrawObject(playerRelatedObject.Address).ConfigureAwait(false);
-            }
-            catch
-            {
-                pointerIsZero = true;
-                _logger.LogDebug("NullRef for {object}", playerRelatedObject);
-            }
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "Could not create data for {object}", playerRelatedObject);
-        }
+        //try
+        //{
+        //    pointerIsZero = playerRelatedObject.Address == IntPtr.Zero;
+        //    try
+        //    {
+        //        pointerIsZero = await CheckForNullDrawObject(playerRelatedObject.Address).ConfigureAwait(false);
+        //    }
+        //    catch
+        //    {
+        //        pointerIsZero = true;
+        //        _logger.LogDebug("NullRef for {object}", playerRelatedObject);
+        //    }
+        //}
+        //catch (Exception ex)
+        //{
+        //    _logger.LogWarning(ex, "Could not create data for {object}", playerRelatedObject);
+        //}
 
-        if (pointerIsZero)
+        //if (pointerIsZero)
+        //{
+        //    _logger.LogTrace("Pointer was zero for {objectKind}", playerRelatedObject.ObjectKind);
+        //    return null;
+        //}
+
+        if (playerRelatedObject.Address == IntPtr.Zero)
         {
             _logger.LogTrace("Pointer was zero for {objectKind}", playerRelatedObject.ObjectKind);
             return null;
@@ -93,15 +100,15 @@ public class PlayerDataFactory
         return null;
     }
 
-    private async Task<bool> CheckForNullDrawObject(IntPtr playerPointer)
-    {
-        return await _dalamudUtil.RunOnFrameworkThread(() => CheckForNullDrawObjectUnsafe(playerPointer)).ConfigureAwait(false);
-    }
+    //private async Task<bool> CheckForNullDrawObject(IntPtr playerPointer)
+    //{
+    //    return await _dalamudUtil.RunOnFrameworkThread(() => CheckForNullDrawObjectUnsafe(playerPointer)).ConfigureAwait(false);
+    //}
 
-    private unsafe bool CheckForNullDrawObjectUnsafe(IntPtr playerPointer)
-    {
-        return ((Character*)playerPointer)->GameObject.DrawObject == null;
-    }
+    //private unsafe bool CheckForNullDrawObjectUnsafe(IntPtr playerPointer)
+    //{
+    //    return ((Character*)playerPointer)->GameObject.DrawObject == null;
+    //}
 
     private async Task<CharacterDataFragment> CreateCharacterData(GameObjectHandler playerRelatedObject, CancellationToken ct)
     {
@@ -281,29 +288,73 @@ public class PlayerDataFactory
             ct.ThrowIfCancellationRequested();
 
             var skeletonIndices = await _dalamudUtil.RunOnFrameworkThread(() => _modelAnalyzer.GetBoneIndicesFromPap(file.Hash)).ConfigureAwait(false);
+
             bool validationFailed = false;
-            if (skeletonIndices != null)
+
+            if (skeletonIndices == null || skeletonIndices.Count == 0 || skeletonIndices.All(k => k.Value == null || k.Value.Count == 0))
             {
-                // 105 is the maximum vanilla skellington spoopy bone index
-                if (skeletonIndices.All(k => k.Value.Max() <= 105))
-                {
-                    _logger.LogTrace("All indices of {path} are <= 105, ignoring", file.ResolvedPath);
-                    continue;
-                }
+                _logger.LogDebug("Could not verify bone indices for {path} (unverifiable/empty). Allowing, but cannot guarantee safety.", file.ResolvedPath);
+                continue;
+            }
 
-                _logger.LogDebug("Verifying bone indices for {path}, found {x} skeletons", file.ResolvedPath, skeletonIndices.Count);
+            ushort maxPlayerIndex = 0;
+            foreach (var list in boneIndices.Values)
+            {
+                if (list == null || list.Count == 0) continue;
+                var localMax = list.Max();
+                if (localMax > maxPlayerIndex)
+                    maxPlayerIndex = localMax;
+            }
 
-                foreach (var boneCount in skeletonIndices.Select(k => k).ToList())
+            // 105 is the maximum vanilla skellington spoopy bone index
+            if (skeletonIndices.All(k => (k.Value.Count == 0 ? 0 : k.Value.Max()) <= 105))
+            {
+                _logger.LogTrace("All indices of {path} are <= 105, ignoring", file.ResolvedPath);
+                continue;
+            }
+
+            _logger.LogDebug("Verifying bone indices for {path}, found {x} skeletons", file.ResolvedPath, skeletonIndices.Count);
+
+            foreach (var kvp in skeletonIndices)
+            {
+                if (kvp.Value == null || kvp.Value.Count == 0) continue;
+
+                var maxAnimIndex = kvp.Value.Max();
+                if (maxAnimIndex > maxPlayerIndex)
                 {
-                    if (boneCount.Value.Max() > boneIndices.SelectMany(b => b.Value).Max())
-                    {
-                        _logger.LogWarning("Found more bone indices on the animation {path} skeleton {skl} (max indice {idx}) than on any player related skeleton (max indice {idx2})",
-                            file.ResolvedPath, boneCount.Key, boneCount.Value.Max(), boneIndices.SelectMany(b => b.Value).Max());
-                        validationFailed = true;
-                        break;
-                    }
+                    _logger.LogWarning(
+                        "Found more bone indices on the animation {path} skeleton {skl} (max indice {idx}) than on any player related skeleton (max indice {idx2})",
+                        file.ResolvedPath, kvp.Key, maxAnimIndex, maxPlayerIndex);
+
+                    validationFailed = true;
+                    break;
                 }
             }
+
+            //var skeletonIndices = await _dalamudUtil.RunOnFrameworkThread(() => _modelAnalyzer.GetBoneIndicesFromPap(file.Hash)).ConfigureAwait(false);
+            //bool validationFailed = false;
+            //if (skeletonIndices != null)
+            //{
+            //    // 105 is the maximum vanilla skellington spoopy bone index
+            //    if (skeletonIndices.All(k => k.Value.Max() <= 105))
+            //    {
+            //        _logger.LogTrace("All indices of {path} are <= 105, ignoring", file.ResolvedPath);
+            //        continue;
+            //    }
+
+            //    _logger.LogDebug("Verifying bone indices for {path}, found {x} skeletons", file.ResolvedPath, skeletonIndices.Count);
+
+            //    foreach (var boneCount in skeletonIndices.Select(k => k).ToList())
+            //    {
+            //        if (boneCount.Value.Max() > boneIndices.SelectMany(b => b.Value).Max())
+            //        {
+            //            _logger.LogWarning("Found more bone indices on the animation {path} skeleton {skl} (max indice {idx}) than on any player related skeleton (max indice {idx2})",
+            //                file.ResolvedPath, boneCount.Key, boneCount.Value.Max(), boneIndices.SelectMany(b => b.Value).Max());
+            //            validationFailed = true;
+            //            break;
+            //        }
+            //    }
+            //}
 
             if (validationFailed)
             {

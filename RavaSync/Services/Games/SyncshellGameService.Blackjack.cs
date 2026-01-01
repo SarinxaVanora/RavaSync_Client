@@ -1,38 +1,11 @@
-﻿using Dalamud.Game.ClientState;
-using Dalamud.Game.ClientState.Objects;
-using Dalamud.Game.ClientState.Objects.SubKinds;
-using Dalamud.Plugin.Services;
 using MessagePack;
 using Microsoft.Extensions.Logging;
-using RavaSync.API.Dto.Group;
-using RavaSync.Services.Discovery;
-using RavaSync.Services.Mediator;
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
 
 namespace RavaSync.Services;
-
-public enum SyncshellGameKind
-{
-    Blackjack = 0,
-    Poker = 1,
-    Bingo = 2
-}
-
-public enum SyncshellGameOp
-{
-    Invite = 0,
-    Join = 1,
-    Leave = 2,
-
-    BjPlaceBet = 10,
-    BjAction = 11,
-
-    BjStatePublic = 20,
-    BjStatePrivate = 21
-}
 
 public enum BjActionKind
 {
@@ -60,15 +33,6 @@ public enum BjOutcome
 public record BjResultPublic(string SessionId, string Name, int Bet, BjOutcome Outcome, int Payout);
 
 [MessagePackObject(keyAsPropertyName: true)]
-public record SyncshellGameEnvelope(Guid GameId, SyncshellGameKind Kind, SyncshellGameOp Op, byte[]? Payload = null);
-
-[MessagePackObject(keyAsPropertyName: true)]
-public record SyncshellInvitePayload(string HostSessionId, string HostName, SyncshellGameKind Kind);
-
-[MessagePackObject(keyAsPropertyName: true)]
-public record SyncshellJoinPayload(string PlayerSessionId, string PlayerName);
-
-[MessagePackObject(keyAsPropertyName: true)]
 public record BjBetPayload(string PlayerSessionId, int Bet);
 
 [MessagePackObject(keyAsPropertyName: true)]
@@ -85,41 +49,15 @@ public record BjStatePublic(Guid GameId, BjStage Stage, string HostSessionId, st
 public record BjStatePrivate(Guid GameId, BjStage Stage, bool IsYourTurn,
     byte DealerUpCard, byte? DealerHoleCardIfHost, List<byte> YourCards, int YourTotal, bool YourBust);
 
-public record SyncshellGameInvite(Guid GameId, string HostSessionId, string HostName, SyncshellGameKind Kind);
-
-public sealed class SyncshellGameService : DisposableMediatorSubscriberBase
+public sealed partial class SyncshellGameService
 {
-    private readonly ILogger<SyncshellGameService> _logger;
-    private readonly IRavaMesh _mesh;
-    private readonly DalamudUtilService _dalamudUtil;
-    private readonly IObjectTable _objects;
-    private readonly IClientState _clientState;
-
-    public ConcurrentDictionary<Guid, SyncshellGameInvite> Invites { get; } = new();
-
     private readonly ConcurrentDictionary<Guid, BlackjackHostGame> _hostedBlackjack = new();
     private readonly ConcurrentDictionary<Guid, BlackjackClientView> _clientBlackjack = new();
-
-    private string _cachedMySessionId = string.Empty;
-    private string _cachedMyName = "Player";
-
-    public SyncshellGameService(ILogger<SyncshellGameService> logger, MareMediator mediator,
-        IRavaMesh mesh, DalamudUtilService dalamudUtil, IObjectTable objects, IClientState clientState)
-        : base(logger, mediator)
-    {
-        _logger = logger;
-        _mesh = mesh;
-        _dalamudUtil = dalamudUtil;
-        _objects = objects;
-        _clientState = clientState;
-
-        Mediator.Subscribe<SyncshellGameMeshMessage>(this, OnGameMesh);
-    }
 
     public bool TryGetClientBlackjack(Guid gameId, out BlackjackClientView view) => _clientBlackjack.TryGetValue(gameId, out view!);
     public bool TryGetHostedBlackjack(Guid gameId, out BlackjackHostGame game) => _hostedBlackjack.TryGetValue(gameId, out game!);
 
-    public Guid HostBlackjack(GroupFullInfoDto group)
+    public Guid HostBlackjack(RavaSync.API.Dto.Group.GroupFullInfoDto group)
     {
         var hostSessionId = GetMySessionId();
         if (string.IsNullOrEmpty(hostSessionId)) return Guid.Empty;
@@ -139,37 +77,6 @@ public sealed class SyncshellGameService : DisposableMediatorSubscriberBase
 
         _logger.LogInformation("Hosted Blackjack {gameId}", gameId);
         return gameId;
-    }
-
-    public void Join(Guid gameId)
-    {
-        var mySessionId = GetMySessionId();
-        if (string.IsNullOrEmpty(mySessionId)) return;
-
-        var myName = _clientState.LocalPlayer?.Name.TextValue ?? "Player";
-        _cachedMySessionId = mySessionId;
-        _cachedMyName = myName;
-
-        if (_hostedBlackjack.TryGetValue(gameId, out var hostGame) &&
-            string.Equals(hostGame.HostSessionId, mySessionId, StringComparison.Ordinal))
-        {
-            _clientBlackjack[gameId] = BlackjackClientView.FromHost(hostGame);
-            PushBlackjackState(hostGame);
-            return;
-        }
-
-        if (!Invites.TryGetValue(gameId, out var inv))
-            return;
-
-        var join = new SyncshellJoinPayload(mySessionId, myName);
-
-        Send(mySessionId, inv.HostSessionId, new SyncshellGameEnvelope(
-            gameId, inv.Kind, SyncshellGameOp.Join,
-            MessagePackSerializer.Serialize(join)));
-
-        _clientBlackjack[gameId] = new BlackjackClientView(gameId, inv.HostSessionId, inv.HostName, mySessionId, myName, null, null);
-
-        Invites.TryRemove(gameId, out _);
     }
 
     public void LeaveBlackjack(Guid gameId)
@@ -232,10 +139,29 @@ public sealed class SyncshellGameService : DisposableMediatorSubscriberBase
     {
         if (_hostedBlackjack.TryGetValue(gameId, out var game))
         {
+            if (game.Stage != BjStage.Betting)
+                return;
+
+            if (game.Players.Values.Count == 0)
+                return;
+
+            if (game.Players.Values.Any(p => !p.BetConfirmed))
+                return;
+
             game.DealInitial();
             PushBlackjackState(game);
         }
     }
+
+    public void HostBlackjackDealerDraw(Guid gameId)
+    {
+        if (_hostedBlackjack.TryGetValue(gameId, out var game))
+        {
+            game.DealerDrawOne();
+            PushBlackjackState(game);
+        }
+    }
+
 
     public void HostBlackjackNextRound(Guid gameId)
     {
@@ -245,63 +171,6 @@ public sealed class SyncshellGameService : DisposableMediatorSubscriberBase
             game.ClearRound();
             PushBlackjackState(game);
         }
-    }
-
-    private void OnGameMesh(SyncshellGameMeshMessage msg)
-    {
-        SyncshellGameEnvelope env;
-        try
-        {
-            env = MessagePackSerializer.Deserialize<SyncshellGameEnvelope>(msg.Payload);
-        }
-        catch
-        {
-            return;
-        }
-
-        if (!string.IsNullOrEmpty(msg.LocalSessionId))
-            _cachedMySessionId = msg.LocalSessionId;
-
-        switch (env.Op)
-        {
-            case SyncshellGameOp.Invite:
-                HandleInvite(env);
-                break;
-
-            case SyncshellGameOp.Join:
-                HandleJoin(msg.FromSessionId, env);
-                break;
-
-            case SyncshellGameOp.Leave:
-                HandleLeave(msg.FromSessionId, env);
-                break;
-
-            case SyncshellGameOp.BjPlaceBet:
-                HandleBjBet(msg.FromSessionId, env);
-                break;
-
-            case SyncshellGameOp.BjAction:
-                HandleBjAction(msg.FromSessionId, env);
-                break;
-
-            case SyncshellGameOp.BjStatePublic:
-                HandleBjPublic(msg.LocalSessionId, env);
-                break;
-
-            case SyncshellGameOp.BjStatePrivate:
-                HandleBjPrivate(msg.LocalSessionId, env);
-                break;
-        }
-    }
-
-    private void HandleInvite(SyncshellGameEnvelope env)
-    {
-        if (env.Payload is null) return;
-
-        var payload = MessagePackSerializer.Deserialize<SyncshellInvitePayload>(env.Payload);
-        Invites[env.GameId] = new SyncshellGameInvite(env.GameId, payload.HostSessionId, payload.HostName, payload.Kind);
-        _logger.LogInformation("SyncshellGames: received invite {gameId} kind {kind} from {hostName} ({hostSessionId})",
-            env.GameId, payload.Kind, payload.HostName, payload.HostSessionId);
     }
 
     private void HandleJoin(string fromSessionId, SyncshellGameEnvelope env)
@@ -417,71 +286,6 @@ public sealed class SyncshellGameService : DisposableMediatorSubscriberBase
         _clientBlackjack[game.GameId] = BlackjackClientView.FromHost(game);
     }
 
-    private void BroadcastInviteNearby(Guid gameId, string hostSessionId, string hostName, SyncshellGameKind kind)
-    {
-        var payload = new SyncshellInvitePayload(hostSessionId, hostName, kind);
-        var env = new SyncshellGameEnvelope(gameId, kind, SyncshellGameOp.Invite, MessagePackSerializer.Serialize(payload));
-        var bytes = MessagePackSerializer.Serialize(env);
-
-        var players = _objects.OfType<IPlayerCharacter>()
-            .Where(p => p.Address != IntPtr.Zero && _clientState.LocalPlayer is not null && p.Address != _clientState.LocalPlayer.Address)
-            .ToArray();
-
-        _logger.LogInformation("SyncshellGames: broadcasting {kind} invite {gameId} from {host} to {count} nearby players",
-            kind, gameId, hostSessionId, players.Length);
-
-        foreach (var pc in players)
-        {
-            string ident;
-            try
-            {
-                ident = _dalamudUtil.GetIdentFromGameObject(pc) ?? string.Empty;
-            }
-            catch
-            {
-                continue;
-            }
-
-            if (string.IsNullOrEmpty(ident)) continue;
-
-            var sessionId = RavaSessionId.FromIdent(ident);
-            _ = _mesh.SendAsync(sessionId, new Services.Discovery.RavaGame(hostSessionId, bytes));
-        }
-    }
-
-    private void Send(string fromSessionId, string targetSessionId, SyncshellGameEnvelope env)
-    {
-        var bytes = MessagePackSerializer.Serialize(env);
-        _ = _mesh.SendAsync(targetSessionId, new Services.Discovery.RavaGame(fromSessionId, bytes));
-    }
-
-    private string? GetMySessionId()
-    {
-        if (!string.IsNullOrEmpty(_cachedMySessionId))
-            return _cachedMySessionId;
-
-        if (!_clientState.IsLoggedIn || _clientState.LocalPlayer is null) return null;
-
-        try
-        {
-            var ident = _dalamudUtil.GetIdentFromGameObject(_clientState.LocalPlayer);
-            if (string.IsNullOrEmpty(ident)) return null;
-
-            var sid = RavaSessionId.FromIdent(ident);
-            _cachedMySessionId = sid;
-
-            var name = _clientState.LocalPlayer?.Name.TextValue;
-            if (!string.IsNullOrEmpty(name))
-                _cachedMyName = name;
-
-            return sid;
-        }
-        catch
-        {
-            return null;
-        }
-    }
-
     public sealed record BlackjackPlayer(string SessionId, string Name)
     {
         public int Bet { get; set; }
@@ -495,6 +299,7 @@ public sealed class SyncshellGameService : DisposableMediatorSubscriberBase
     {
         private readonly Random _rng = new();
 
+        public bool DealerTurnInProgress { get; private set; }
         public Guid GameId { get; }
         public string HostSessionId { get; }
         public string HostName { get; }
@@ -557,6 +362,7 @@ public sealed class SyncshellGameService : DisposableMediatorSubscriberBase
             }
 
             Results.Clear();
+            DealerTurnInProgress = false;
         }
 
         public void DealInitial()
@@ -568,7 +374,7 @@ public sealed class SyncshellGameService : DisposableMediatorSubscriberBase
 
             DealerCards.Clear();
             DealerCards.Add(Draw());
-            DealerCards.Add(Draw());
+            DealerTurnInProgress = false;
 
             foreach (var p in Players.Values)
             {
@@ -598,8 +404,34 @@ public sealed class SyncshellGameService : DisposableMediatorSubscriberBase
                 .FirstOrDefault(p => !p.Done)?.SessionId ?? string.Empty;
 
             if (string.IsNullOrEmpty(CurrentTurnSessionId))
-                ResolveDealerAndResults();
+            {
+                CurrentTurnSessionId = string.Empty;
+                DealerTurnInProgress = true;
+            }
+
         }
+
+        public void DealerDrawOne()
+        {
+            if (Stage != BjStage.Playing) return;
+            if (!DealerTurnInProgress) return;
+
+            if (DealerCards.Count == 1)
+            {
+                DealerCards.Add(Draw());
+                return;
+            }
+
+            if (HandValue(DealerCards).Total < 17)
+            {
+                DealerCards.Add(Draw());
+                return;
+            }
+
+            ResolveDealerAndResults();
+            DealerTurnInProgress = false;
+        }
+
 
         public void ApplyAction(string sessionId, BjActionKind action)
         {
@@ -640,9 +472,15 @@ public sealed class SyncshellGameService : DisposableMediatorSubscriberBase
 
             if (ordered.Count == 0)
             {
-                ResolveDealerAndResults();
+                Stage = BjStage.Results;
+                CurrentTurnSessionId = string.Empty;
+                Results.Clear();
+                DealerTurnInProgress = false;
                 return;
             }
+
+            if (DealerTurnInProgress)
+                return; 
 
             if (string.IsNullOrEmpty(CurrentTurnSessionId) || !Players.TryGetValue(CurrentTurnSessionId, out var cur) || cur.Done)
             {
@@ -653,15 +491,14 @@ public sealed class SyncshellGameService : DisposableMediatorSubscriberBase
                     return;
                 }
 
-                ResolveDealerAndResults();
+                CurrentTurnSessionId = string.Empty;
+                DealerTurnInProgress = true;
             }
         }
 
+
         private void ResolveDealerAndResults()
         {
-            while (HandValue(DealerCards).Total < 17)
-                DealerCards.Add(Draw());
-
             var dealerValue = HandValue(DealerCards).Total;
             bool dealerBust = dealerValue > 21;
 
@@ -671,36 +508,36 @@ public sealed class SyncshellGameService : DisposableMediatorSubscriberBase
             {
                 var pv = HandValue(p.Cards).Total;
 
-                BjOutcome outcome;
+                BjOutcome outcum;
                 int payout;
 
                 if (pv > 21 || p.Bust)
                 {
-                    outcome = BjOutcome.Bust;
+                    outcum = BjOutcome.Bust;
                     payout = 0;
                 }
                 else if (dealerBust)
                 {
-                    outcome = BjOutcome.Win;
+                    outcum = BjOutcome.Win;
                     payout = p.Bet * 2;
                 }
                 else if (pv > dealerValue)
                 {
-                    outcome = BjOutcome.Win;
+                    outcum = BjOutcome.Win;
                     payout = p.Bet * 2;
                 }
                 else if (pv == dealerValue)
                 {
-                    outcome = BjOutcome.Push;
+                    outcum = BjOutcome.Push;
                     payout = p.Bet;
                 }
                 else
                 {
-                    outcome = BjOutcome.Lose;
+                    outcum = BjOutcome.Lose;
                     payout = 0;
                 }
 
-                Results[p.SessionId] = new BjResultPublic(p.SessionId, p.Name, p.Bet, outcome, payout);
+                Results[p.SessionId] = new BjResultPublic(p.SessionId, p.Name, p.Bet, outcum, payout);
             }
 
             Stage = BjStage.Results;
@@ -728,15 +565,22 @@ public sealed class SyncshellGameService : DisposableMediatorSubscriberBase
                     DealerCardsReveal: DealerCards.ToList(), DealerTotalReveal: dealerTotal, Results: results);
             }
 
+            if (DealerTurnInProgress)
+            {
+                return new BjStatePublic(GameId, Stage, HostSessionId, CurrentTurnSessionId, dealerUp, players,
+                    DealerCardsReveal: DealerCards.ToList());
+            }
+
             return new BjStatePublic(GameId, Stage, HostSessionId, CurrentTurnSessionId, dealerUp, players);
         }
+
 
         public BjStatePrivate BuildPrivateState(string sessionId)
         {
             var dealerUp = DealerCards.Count > 0 ? DealerCards[0] : (byte)0;
 
             bool isHost = string.Equals(sessionId, HostSessionId, StringComparison.Ordinal);
-            byte? hole = isHost && DealerCards.Count > 1 ? DealerCards[1] : null;
+            byte? hole = null;
 
             if (!Players.TryGetValue(sessionId, out var p))
                 return new BjStatePrivate(GameId, Stage, false, dealerUp, hole, [], 0, false);

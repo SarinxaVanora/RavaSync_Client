@@ -29,6 +29,9 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
     private readonly ServerConfigurationManager _serverManager;
     private readonly System.Collections.Concurrent.ConcurrentDictionary<string, DateTime> _verifiedUploadedHashes = new(StringComparer.Ordinal);
     private CancellationTokenSource? _uploadCancellationTokenSource = new();
+    private static readonly TimeSpan VerifiedHashTtl = TimeSpan.FromHours(12);
+    private const int MaxCdnExistenceChecks = 8;
+
 
     public FileUploadManager(ILogger<FileUploadManager> logger, MareMediator mediator,
         MareConfigService mareConfigService,
@@ -90,7 +93,6 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
 
         var fileSize = new FileInfo(filePath).Length;
 
-        // --- Prefer direct B2 upload via ticket (server will return 404 if unsupported/disabled) ---
         try
         {
             var ticketUri = MareFiles.ServerFilesUploadTicketFullPath(_orchestrator.UploadCdnUri!, fileHash);
@@ -105,18 +107,31 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
                 if (ticket != null && ticket.Mode == "DirectB2")
                 {
                     if (!ticket.UploadRequired)
-                        return;
+                    {
+                        if (await CdnHasFileAsync(fileHash, uploadToken).ConfigureAwait(false))
+                            return;
+
+                        Logger.LogWarning("[{hash}] Ticket says upload not required but CDN is missing it; forcing DirectB2 re-upload.", fileHash);
+
+                        var forcedTicketUri = new UriBuilder(ticketUri) { Query = "force=1" }.Uri;
+                        var forcedResp = await _orchestrator.SendRequestAsync(HttpMethod.Post, forcedTicketUri, ticketReq, uploadToken).ConfigureAwait(false);
+                        forcedResp.EnsureSuccessStatusCode();
+
+                        var forcedJson = await forcedResp.Content.ReadAsStringAsync(uploadToken).ConfigureAwait(false);
+                        ticket = JsonSerializer.Deserialize<UploadTicketResponseDto>(forcedJson, new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+
+                        if (ticket == null || ticket.Mode != "DirectB2" || !ticket.UploadRequired)
+                            throw new InvalidOperationException($"[{fileHash}] Forced ticket refused but CDN is missing the file.");
+                    }
+
 
                     Logger.LogDebug("[{hash}] Direct upload ticket acquired, compressing to temp (LZ4)", fileHash);
 
-                    // Phase 1: compress to a temp file (un-munged normalized upload)
                     var rawProgress = progress == null ? null : new Progress<long>(b => progress.Report(new UploadProgress(fileSize, b)));
                     await using var temp = await TempLz4UploadFile.CreateAsync(filePath, uploadToken, rawProgress).ConfigureAwait(false);
 
-                    // Ensure UI hits 100% on raw-read progress
                     progress?.Report(new UploadProgress(fileSize, fileSize));
 
-                    // Phase 2: PUT to B2 using presigned URL
                     await using var fs = new FileStream(temp.TempPath, FileMode.Open, FileAccess.Read, FileShare.Read,
                         bufferSize: 1024 * 1024, options: FileOptions.Asynchronous | FileOptions.SequentialScan);
 
@@ -134,7 +149,6 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
 
                     var etag = putResp.Headers.ETag?.Tag;
 
-                    // Phase 3: tell server we're done so it can update its DB
                     var completeUri = MareFiles.ServerFilesUploadCompleteFullPath(_orchestrator.UploadCdnUri!, fileHash);
                     var complete = new UploadCompleteDto(temp.RawSize, temp.CompressedSize, temp.Md5Base64, etag, true);
 
@@ -159,7 +173,6 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
             Logger.LogDebug(ex, "[{hash}] Direct upload path failed/unsupported, falling back to legacy upload", fileHash);
         }
 
-        // --- Legacy: upload to your file server, which will normalize and (now) mirror to B2 ---
         Logger.LogDebug("[{hash}] Legacy upload (streaming via file server)", fileHash);
 
         using var legacyContent = new Lz4FileContent(
@@ -207,22 +220,27 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
 
         _uploadCancellationTokenSource = new CancellationTokenSource();
         var uploadToken = _uploadCancellationTokenSource.Token;
-        Logger.LogDebug("Sending Character data {hash} to service {url}", data.DataHash.Value, _serverManager.CurrentApiUrl);
 
-        HashSet<string> unverifiedUploads = GetUnverifiedFiles(data);
-        if (unverifiedUploads.Any())
-        {
-            await UploadUnverifiedFiles(unverifiedUploads, visiblePlayers, uploadToken).ConfigureAwait(false);
-            Logger.LogInformation("Upload complete for {hash}", data.DataHash.Value);
-        }
+        Logger.LogDebug("Sending Character data {hash} to service {url}",
+            data.DataHash.Value, _serverManager.CurrentApiUrl);
 
         foreach (var kvp in data.FileReplacements)
         {
-            data.FileReplacements[kvp.Key].RemoveAll(i => _orchestrator.ForbiddenTransfers.Exists(f => string.Equals(f.Hash, i.Hash, StringComparison.OrdinalIgnoreCase)));
+            data.FileReplacements[kvp.Key].RemoveAll(i =>
+                _orchestrator.ForbiddenTransfers.Exists(f =>
+                    string.Equals(f.Hash, i.Hash, StringComparison.OrdinalIgnoreCase)));
+        }
+
+        var unverifiedUploads = GetUnverifiedFiles(data);
+        if (unverifiedUploads.Any())
+        {
+            await UploadUnverifiedFiles(unverifiedUploads, visiblePlayers, uploadToken).ConfigureAwait(false);
+            Logger.LogDebug("Verification complete for {hash}", data.DataHash.Value);
         }
 
         return data;
     }
+
 
     protected override void Dispose(bool disposing)
     {
@@ -248,22 +266,36 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
 
     private HashSet<string> GetUnverifiedFiles(CharacterData data)
     {
-        HashSet<string> unverifiedUploadHashes = new(StringComparer.Ordinal);
-        foreach (var item in data.FileReplacements.SelectMany(c => c.Value.Where(f => string.IsNullOrEmpty(f.FileSwapPath)).Select(v => v.Hash).Distinct(StringComparer.Ordinal)).Distinct(StringComparer.Ordinal).ToList())
-        {
-            if (!_verifiedUploadedHashes.TryGetValue(item, out var verifiedTime))
-            {
-                verifiedTime = DateTime.MinValue;
-            }
+        var now = DateTime.UtcNow;
+        var cutoff = now.Subtract(VerifiedHashTtl);
 
-            if (verifiedTime < DateTime.UtcNow.Subtract(TimeSpan.FromMinutes(10)))
+        HashSet<string> unverified = new(StringComparer.Ordinal);
+
+        foreach (var kvp in data.FileReplacements)
+        {
+            var list = kvp.Value;
+            for (int i = 0; i < list.Count; i++)
             {
-                Logger.LogTrace("Verifying {item}, last verified: {date}", item, verifiedTime);
-                unverifiedUploadHashes.Add(item);
+                var fr = list[i];
+
+                if (!string.IsNullOrEmpty(fr.FileSwapPath))
+                    continue;
+
+                var hash = fr.Hash;
+                if (string.IsNullOrEmpty(hash))
+                    continue;
+
+                if (_verifiedUploadedHashes.TryGetValue(hash, out var verifiedTime) && verifiedTime >= cutoff)
+                    continue;
+
+                unverified.Add(hash);
             }
         }
 
-        return unverifiedUploadHashes;
+        if (unverified.Count > 0)
+            Logger.LogDebug("Need verification for {count} hashes (ttl {ttl})", unverified.Count, VerifiedHashTtl);
+
+        return unverified;
     }
 
     private void Reset()
@@ -277,21 +309,18 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
 
     private async Task UploadUnverifiedFiles(HashSet<string> unverifiedUploadHashes, List<UserData> visiblePlayers, CancellationToken uploadToken)
     {
-        // Keep only locally present files
         unverifiedUploadHashes = unverifiedUploadHashes
             .Where(h => _fileDbManager.GetFileCacheByHash(h) != null)
             .ToHashSet(StringComparer.Ordinal);
 
         Logger.LogDebug("Verifying {count} files", unverifiedUploadHashes.Count);
 
-        // Authorize with server for the specific viewers
         var filesToUpload = await FilesSend(
             [.. unverifiedUploadHashes],
             visiblePlayers.Select(p => p.UID).ToList(),
             uploadToken
         ).ConfigureAwait(false);
 
-        // Record forbidden (server says don't upload) + bookkeeping
         foreach (var f in filesToUpload.Where(f => f.IsForbidden))
         {
             if (_orchestrator.ForbiddenTransfers.TrueForAll(x => !string.Equals(x.Hash, f.Hash, StringComparison.Ordinal)))
@@ -313,12 +342,12 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
 
         if (toPush.Count == 0) return;
 
-        // Delegate to the tuned core (PreAuthorized = no second FilesSend)
         var prog = new Progress<string>(msg => Logger.LogInformation(msg));
         var failed = await UploadFilesCore(toPush, prog, uploadToken, AuthMode.PreAuthorized).ConfigureAwait(false);
 
         if (failed.Any())
             Logger.LogInformation("Some uploads did not complete ({count}): {list}", failed.Count, string.Join(", ", failed));
+
     }
 
 
@@ -395,8 +424,6 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
             }
         }
 
-        // ---- Uploads: LIMIT CONCURRENCY ----
-        // Uploading too many files at once can saturate uplinks and starve the SignalR websocket keepalives. Rare, but something to keep in consideration.
         const int MaxUploadAttempts = 3;
 
         var maxParallelUploads = Math.Clamp(_mareConfigService.Current.ParallelUploads, 1, 10);
@@ -505,6 +532,19 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
 
         return failed;
     }
+    private async Task<bool> CdnHasFileAsync(string hash, CancellationToken ct)
+    {
+        if (_orchestrator.FilesCdnUri == null) return false;
+
+        var uri = new Uri(_orchestrator.FilesCdnUri, $"cdn/{hash}");
+
+        using var req = new HttpRequestMessage(HttpMethod.Head, uri);
+        req.Headers.CacheControl = new CacheControlHeaderValue { NoCache = true };
+        req.Headers.Pragma.ParseAdd("no-cache");
+
+        using var resp = await _directUploadClient.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
+        return resp.IsSuccessStatusCode;
+    }
 
     private static HttpClient CreateDirectUploadClient()
     {
@@ -513,9 +553,9 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
             MaxConnectionsPerServer = 64,
             PooledConnectionLifetime = TimeSpan.FromMinutes(10),
             PooledConnectionIdleTimeout = TimeSpan.FromMinutes(2),
-            KeepAlivePingDelay = TimeSpan.FromSeconds(30),
-            KeepAlivePingTimeout = TimeSpan.FromSeconds(15),
-            KeepAlivePingPolicy = HttpKeepAlivePingPolicy.Always,
+            KeepAlivePingDelay = TimeSpan.FromSeconds(60),
+            KeepAlivePingTimeout = TimeSpan.FromSeconds(30),
+            KeepAlivePingPolicy = HttpKeepAlivePingPolicy.WithActiveRequests,
             AutomaticDecompression = DecompressionMethods.None
         };
 

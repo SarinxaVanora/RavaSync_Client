@@ -45,6 +45,17 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
     // per-hash inflight dedupe (across pairs) so the same hash doesn't spawn duplicated bars
     private readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> _inflightHashes
         = new(StringComparer.OrdinalIgnoreCase);
+    
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, Cdn404State> _cdn404State
+        = new(StringComparer.OrdinalIgnoreCase);
+
+    private sealed class Cdn404State
+    {
+        public DateTime FirstSeenUtc;
+        public DateTime LastSeenUtc;
+        public int Count;
+        public DateTime LastSelfHealUtc;
+    }
 
     public FileDownloadManager(ILogger<FileDownloadManager> logger, MareMediator mediator,
         FileTransferOrchestrator orchestrator,
@@ -83,20 +94,107 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
             ConnectTimeout = TimeSpan.FromSeconds(10),
             MaxConnectionsPerServer = 64,
             EnableMultipleHttp2Connections = true,
-            KeepAlivePingDelay = TimeSpan.FromSeconds(20),
-            KeepAlivePingTimeout = TimeSpan.FromSeconds(10),
-            KeepAlivePingPolicy = HttpKeepAlivePingPolicy.Always,
         };
 
         var client = new HttpClient(handler, disposeHandler: true)
         {
             Timeout = Timeout.InfiniteTimeSpan,
-            DefaultRequestVersion = HttpVersion.Version30,
-            DefaultVersionPolicy = HttpVersionPolicy.RequestVersionOrLower,
+            DefaultRequestVersion = HttpVersion.Version20,
+            DefaultVersionPolicy = HttpVersionPolicy.RequestVersionOrHigher,
         };
 
         return client;
     }
+
+    private static string? TryGetHeaderValue(HttpResponseMessage response, string headerName)
+    {
+        if (response.Headers.TryGetValues(headerName, out var values))
+        {
+            foreach (var v in values)
+            {
+                if (!string.IsNullOrEmpty(v)) return v;
+            }
+        }
+
+        if (response.Content?.Headers != null && response.Content.Headers.TryGetValues(headerName, out var values2))
+        {
+            foreach (var v in values2)
+            {
+                if (!string.IsNullOrEmpty(v)) return v;
+            }
+        }
+
+        return null;
+    }
+
+    private static string AppendCacheBustQuery(string url)
+    {
+        var sep = url.IndexOf('?', StringComparison.Ordinal) >= 0 ? "&" : "?";
+        return url + sep + "rava_repair=" + Guid.NewGuid().ToString("N");
+    }
+
+    private bool TryPlanCdn404SelfHeal(string hash, string baseUrl, HttpResponseMessage response,out string cacheBustUrl, out string? cfCacheStatus, out string? age, out string? cfRay, out string reason)
+    {
+        cfCacheStatus = TryGetHeaderValue(response, "CF-Cache-Status");
+        age = TryGetHeaderValue(response, "Age");
+        cfRay = TryGetHeaderValue(response, "CF-RAY");
+
+        var cachey = false;
+        if (!string.IsNullOrEmpty(cfCacheStatus))
+        {
+            cachey =
+                !cfCacheStatus.Equals("MISS", StringComparison.OrdinalIgnoreCase) &&
+                !cfCacheStatus.Equals("BYPASS", StringComparison.OrdinalIgnoreCase) &&
+                !cfCacheStatus.Equals("DYNAMIC", StringComparison.OrdinalIgnoreCase);
+        }
+
+        if (!cachey && !string.IsNullOrEmpty(age))
+        {
+            cachey = true;
+        }
+
+        var now = DateTime.UtcNow;
+        var state = _cdn404State.GetOrAdd(hash, _ => new Cdn404State
+        {
+            FirstSeenUtc = now,
+            LastSeenUtc = now,
+            Count = 0,
+            LastSelfHealUtc = DateTime.MinValue
+        });
+
+        lock (state)
+        {
+            if ((now - state.LastSeenUtc) > TimeSpan.FromMinutes(10))
+            {
+                state.FirstSeenUtc = now;
+                state.Count = 0;
+                state.LastSelfHealUtc = DateTime.MinValue;
+            }
+
+            state.LastSeenUtc = now;
+            state.Count++;
+
+            if ((now - state.LastSelfHealUtc) < TimeSpan.FromMinutes(2))
+            {
+                cacheBustUrl = string.Empty;
+                reason = "self-heal recently attempted";
+                return false;
+            }
+
+            if (cachey || (state.Count >= 2 && (now - state.FirstSeenUtc) < TimeSpan.FromMinutes(5)))
+            {
+                state.LastSelfHealUtc = now;
+                cacheBustUrl = AppendCacheBustQuery(baseUrl);
+                reason = cachey ? "cached 404 suspected" : "repeat 404";
+                return true;
+            }
+        }
+
+        cacheBustUrl = string.Empty;
+        reason = "not eligible for self-heal";
+        return false;
+    }
+
 
 
     public List<DownloadFileTransfer> CurrentDownloads { get; private set; } = [];
@@ -407,7 +505,6 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
             catch (Exception ex)
             {
                 Logger.LogWarning(ex, "CDN fast-path: error, falling back to blk pipeline for group {group}", fileGroup.Key);
-                // fall through to blk path
             }
 
 
@@ -804,16 +901,42 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
         try
         {
             var attempts = 0;
+            string? plannedCdnUrl = null;
+
             while (attempts++ < MaxCdnAttemptsPerFile && !ct.IsCancellationRequested)
             {
-                var cdnUrl = MareFiles.CdnGetFullPath(_orchestrator.FilesCdnUri!, transfer.Hash.ToUpperInvariant());
+                var baseCdnUrl = MareFiles.CdnGetFullPath(_orchestrator.FilesCdnUri!, transfer.Hash.ToUpperInvariant()).ToString();
+                var isCacheBusted = plannedCdnUrl != null;
+                var cdnUrl = plannedCdnUrl ?? baseCdnUrl;
+                plannedCdnUrl = null;
+
                 Logger.LogDebug("CDN fast-path: downloading {hash} from {url} (attempt {attempt}/{max})",
                     transfer.Hash, cdnUrl, attempts, MaxCdnAttemptsPerFile);
 
                 try
                 {
                     using var response = await _cdnFastClient.GetAsync(cdnUrl, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
-                    response.EnsureSuccessStatusCode();
+
+                    if (!response.IsSuccessStatusCode)
+                    {
+                        if (response.StatusCode == System.Net.HttpStatusCode.NotFound && !isCacheBusted
+                            && TryPlanCdn404SelfHeal(transfer.Hash, baseCdnUrl, response, out var cacheBustUrl, out var cfCacheStatus, out var age, out var cfRay, out var reason))
+                        {
+                            plannedCdnUrl = cacheBustUrl;
+
+                            Logger.LogDebug(
+                                "CDN fast-path: 404 for {hash} ({cfCacheStatus}, age {age}); self-heal retry via cache-bust: {url} ({reason})",
+                                transfer.Hash,
+                                cfCacheStatus ?? "n/a",
+                                age ?? "n/a",
+                                cacheBustUrl,
+                                reason);
+
+                            continue;
+                        }
+
+                        response.EnsureSuccessStatusCode();
+                    }
 
                     await using var rawStream = await response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
 
@@ -873,7 +996,7 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
 
                         if (bytesWritten <= 0 || !string.Equals(computed, headerHash, StringComparison.OrdinalIgnoreCase))
                         {
-                            Logger.LogWarning(
+                            Logger.LogDebug(
                                 "CDN fast-path: downloaded file for {hash} failed validation (attempt {attempt}/{max})",
                                 headerHash, attempts, MaxCdnAttemptsPerFile);
 
@@ -898,7 +1021,7 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
 
                     if (!ExtraContentValidation(destPath, headerHash))
                     {
-                        Logger.LogWarning(
+                        Logger.LogDebug(
                             "CDN fast-path: extra validation failed for {hash} (attempt {attempt}/{max})",
                             headerHash, attempts, MaxCdnAttemptsPerFile);
 
@@ -912,6 +1035,9 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
 
                         continue;
                     }
+
+                    _cdn404State.TryRemove(headerHash, out _);
+                    _cdn404State.TryRemove(transfer.Hash, out _);
 
                     results.Add(new CdnDownloadedFile(headerHash, filePath, destPath, hard, soft));
 
@@ -945,6 +1071,8 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
                         if (File.Exists(finalPath2) && ValidateDownloadedFile(finalPath2, transfer.Hash, expectedRawSize: 0))
                         {
                             PersistFileToStorage(transfer.Hash, finalPath2);
+
+                            _cdn404State.TryRemove(transfer.Hash, out _);
 
                             if (_downloadStatus.TryGetValue(fileGroup.Key, out var st2))
                             {
@@ -1010,6 +1138,7 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
             concurrency.Release();
         }
     }
+
 
     private bool ExtraContentValidation(string filePath, string hash)
     {
