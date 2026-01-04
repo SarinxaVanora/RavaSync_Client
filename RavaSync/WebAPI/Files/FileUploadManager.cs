@@ -108,20 +108,22 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
                 {
                     if (!ticket.UploadRequired)
                     {
-                        if (await CdnHasFileAsync(fileHash, uploadToken).ConfigureAwait(false))
-                            return;
+                        return;
+                        //REMOVED DUE TO Added time to hit uploading. Server checks B2 instead now. D'oh
+                        //if (await CdnHasFileAsync(fileHash, uploadToken).ConfigureAwait(false))
+                        //    return;
 
-                        Logger.LogWarning("[{hash}] Ticket says upload not required but CDN is missing it; forcing DirectB2 re-upload.", fileHash);
+                        //Logger.LogWarning("[{hash}] Ticket says upload not required but CDN is missing it; forcing DirectB2 re-upload.", fileHash);
 
-                        var forcedTicketUri = new UriBuilder(ticketUri) { Query = "force=1" }.Uri;
-                        var forcedResp = await _orchestrator.SendRequestAsync(HttpMethod.Post, forcedTicketUri, ticketReq, uploadToken).ConfigureAwait(false);
-                        forcedResp.EnsureSuccessStatusCode();
+                        //var forcedTicketUri = new UriBuilder(ticketUri) { Query = "force=1" }.Uri;
+                        //var forcedResp = await _orchestrator.SendRequestAsync(HttpMethod.Post, forcedTicketUri, ticketReq, uploadToken).ConfigureAwait(false);
+                        //forcedResp.EnsureSuccessStatusCode();
 
-                        var forcedJson = await forcedResp.Content.ReadAsStringAsync(uploadToken).ConfigureAwait(false);
-                        ticket = JsonSerializer.Deserialize<UploadTicketResponseDto>(forcedJson, new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+                        //var forcedJson = await forcedResp.Content.ReadAsStringAsync(uploadToken).ConfigureAwait(false);
+                        //ticket = JsonSerializer.Deserialize<UploadTicketResponseDto>(forcedJson, new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
 
-                        if (ticket == null || ticket.Mode != "DirectB2" || !ticket.UploadRequired)
-                            throw new InvalidOperationException($"[{fileHash}] Forced ticket refused but CDN is missing the file.");
+                        //if (ticket == null || ticket.Mode != "DirectB2" || !ticket.UploadRequired)
+                        //    throw new InvalidOperationException($"[{fileHash}] Forced ticket refused but CDN is missing the file.");
                     }
 
 
@@ -221,25 +223,36 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
         _uploadCancellationTokenSource = new CancellationTokenSource();
         var uploadToken = _uploadCancellationTokenSource.Token;
 
-        Logger.LogDebug("Sending Character data {hash} to service {url}",
-            data.DataHash.Value, _serverManager.CurrentApiUrl);
-
-        foreach (var kvp in data.FileReplacements)
+        try
         {
-            data.FileReplacements[kvp.Key].RemoveAll(i =>
-                _orchestrator.ForbiddenTransfers.Exists(f =>
-                    string.Equals(f.Hash, i.Hash, StringComparison.OrdinalIgnoreCase)));
-        }
+            Logger.LogDebug("Sending Character data {hash} to service {url}",
+                data.DataHash.Value, _serverManager.CurrentApiUrl);
 
-        var unverifiedUploads = GetUnverifiedFiles(data);
-        if (unverifiedUploads.Any())
+            foreach (var kvp in data.FileReplacements)
+            {
+                data.FileReplacements[kvp.Key].RemoveAll(i =>
+                    _orchestrator.ForbiddenTransfers.Exists(f =>
+                        string.Equals(f.Hash, i.Hash, StringComparison.OrdinalIgnoreCase)));
+            }
+
+            var unverifiedUploads = GetUnverifiedFiles(data);
+            if (unverifiedUploads.Any())
+            {
+                await UploadUnverifiedFiles(unverifiedUploads, visiblePlayers, uploadToken).ConfigureAwait(false);
+                Logger.LogDebug("Verification complete for {hash}", data.DataHash.Value);
+            }
+
+            return data;
+        }
+        finally
         {
-            await UploadUnverifiedFiles(unverifiedUploads, visiblePlayers, uploadToken).ConfigureAwait(false);
-            Logger.LogDebug("Verification complete for {hash}", data.DataHash.Value);
-        }
+            try { _uploadCancellationTokenSource?.Dispose(); } catch { /* ignore */ }
+            _uploadCancellationTokenSource = null;
 
-        return data;
+            CurrentUploads.Clear();
+        }
     }
+
 
 
     protected override void Dispose(bool disposing)
@@ -532,19 +545,19 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
 
         return failed;
     }
-    private async Task<bool> CdnHasFileAsync(string hash, CancellationToken ct)
-    {
-        if (_orchestrator.FilesCdnUri == null) return false;
+    //private async Task<bool> CdnHasFileAsync(string hash, CancellationToken ct)
+    //{
+    //    if (_orchestrator.FilesCdnUri == null) return false;
 
-        var uri = new Uri(_orchestrator.FilesCdnUri, $"cdn/{hash}");
+    //    var uri = new Uri(_orchestrator.FilesCdnUri, $"cdn/{hash}");
 
-        using var req = new HttpRequestMessage(HttpMethod.Head, uri);
-        req.Headers.CacheControl = new CacheControlHeaderValue { NoCache = true };
-        req.Headers.Pragma.ParseAdd("no-cache");
+    //    using var req = new HttpRequestMessage(HttpMethod.Head, uri);
+    //    req.Headers.CacheControl = new CacheControlHeaderValue { NoCache = true };
+    //    req.Headers.Pragma.ParseAdd("no-cache");
 
-        using var resp = await _directUploadClient.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
-        return resp.IsSuccessStatusCode;
-    }
+    //    using var resp = await _directUploadClient.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
+    //    return resp.IsSuccessStatusCode;
+    //}
 
     private static HttpClient CreateDirectUploadClient()
     {

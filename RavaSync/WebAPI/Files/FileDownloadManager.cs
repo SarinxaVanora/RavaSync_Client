@@ -41,6 +41,8 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
     private readonly MareConfigService _mareConfigService;
     private readonly DelayedActivatorService _delayedActivator;
     private const int MaxCdnAttemptsPerFile = 3;
+    private static readonly TimeSpan CdnAttemptTimeout = TimeSpan.FromSeconds(30);
+
 
     // per-hash inflight dedupe (across pairs) so the same hash doesn't spawn duplicated bars
     private readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> _inflightHashes
@@ -915,7 +917,12 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
 
                 try
                 {
-                    using var response = await _cdnFastClient.GetAsync(cdnUrl, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
+                    using var attemptCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                    attemptCts.CancelAfter(CdnAttemptTimeout);
+                    var attemptToken = attemptCts.Token;
+
+                    using var response = await _cdnFastClient.GetAsync(cdnUrl, HttpCompletionOption.ResponseHeadersRead, attemptToken).ConfigureAwait(false);
+
 
                     if (!response.IsSuccessStatusCode)
                     {
@@ -938,7 +945,7 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
                         response.EnsureSuccessStatusCode();
                     }
 
-                    await using var rawStream = await response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
+                    await using var rawStream = await response.Content.ReadAsStreamAsync(attemptToken).ConfigureAwait(false);
 
                     var firstByteBuf = new byte[1];
                     var read0 = await rawStream.ReadAsync(firstByteBuf.AsMemory(0, 1), ct).ConfigureAwait(false);
@@ -992,7 +999,7 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
 
                     try
                     {
-                        var (computed, bytesWritten) = await DecompressLz4ToFileAndHashAsync(input, destPath, ct).ConfigureAwait(false);
+                        var (computed, bytesWritten) = await DecompressLz4ToFileAndHashAsync(input, destPath, attemptToken).ConfigureAwait(false);
 
                         if (bytesWritten <= 0 || !string.Equals(computed, headerHash, StringComparison.OrdinalIgnoreCase))
                         {
@@ -1052,11 +1059,26 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
 
                     return;
                 }
+                catch (OperationCanceledException oce) when (!ct.IsCancellationRequested)
+                {
+                    Logger.LogWarning(oce,
+                        "CDN fast-path: timed out for {hash} (attempt {attempt}/{max})",
+                        transfer.Hash, attempts, MaxCdnAttemptsPerFile);
+
+                    if (attempts >= MaxCdnAttemptsPerFile)
+                    {
+                        System.Threading.Interlocked.Exchange(ref anyFailure[0], 1);
+                        return;
+                    }
+
+                    continue;
+                }
                 catch (OperationCanceledException)
                 {
                     System.Threading.Interlocked.Exchange(ref anyFailure[0], 1);
                     throw;
                 }
+
                 catch (IOException ioEx)
                 {
                     Logger.LogDebug(ioEx,

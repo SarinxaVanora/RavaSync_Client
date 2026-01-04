@@ -25,6 +25,11 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
     private uint _lastClassJobId = uint.MaxValue;
     public bool IsTransientRecording { get; private set; } = false;
 
+    private readonly ConcurrentDictionary<ObjectKind, int> _transientSendScheduled = new();
+    private readonly ConcurrentDictionary<ObjectKind, int> _transientDirty = new();
+    private static readonly TimeSpan _transientSendDelay = TimeSpan.FromMilliseconds(750);
+
+
     public TransientResourceManager(ILogger<TransientResourceManager> logger, TransientConfigService configurationService,
             DalamudUtilService dalamudUtil, MareMediator mediator) : base(logger, mediator)
     {
@@ -383,23 +388,44 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
 
     private void SendTransients(nint gameObject, ObjectKind objectKind)
     {
+        _transientDirty[objectKind] = 1;
+
+        if (_transientSendScheduled.TryGetValue(objectKind, out var scheduled) && scheduled == 1)
+            return;
+
+        _transientSendScheduled[objectKind] = 1;
+
         _ = Task.Run(async () =>
         {
-            _sendTransientCts?.Cancel();
-            _sendTransientCts?.Dispose();
-            _sendTransientCts = new();
-            var token = _sendTransientCts.Token;
-            await Task.Delay(TimeSpan.FromSeconds(5), token).ConfigureAwait(false);
-            foreach (var kvp in TransientResources)
+            try
             {
-                if (TransientResources.TryGetValue(objectKind, out var values) && values.Any())
+                while (true)
                 {
-                    Logger.LogTrace("Sending Transients for {kind}", objectKind);
-                    Mediator.Publish(new TransientResourceChangedMessage(gameObject));
+                    _transientDirty[objectKind] = 0;
+
+                    await Task.Delay(_transientSendDelay).ConfigureAwait(false);
+
+                    if (TransientResources.TryGetValue(objectKind, out var values) && values.Any())
+                    {
+                        Logger.LogTrace("Sending Transients for {kind}", objectKind);
+                        Mediator.Publish(new TransientResourceChangedMessage(gameObject));
+                    }
+
+                    if (!_transientDirty.TryGetValue(objectKind, out var dirty) || dirty == 0)
+                        break;
                 }
+            }
+            catch (Exception ex)
+            {
+                Logger.LogWarning(ex, "Transient send task failed for {kind}", objectKind);
+            }
+            finally
+            {
+                _transientSendScheduled[objectKind] = 0;
             }
         });
     }
+
 
     public void StartRecording(CancellationToken token)
     {
@@ -461,7 +487,6 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
     public IReadOnlySet<TransientRecord> RecordedTransients => _recordedTransients;
 
     public ValueProgress<TimeSpan> RecordTimeRemaining { get; } = new();
-    private CancellationTokenSource _sendTransientCts = new();
 
     public record TransientRecord(GameObjectHandler Owner, string GamePath, string FilePath, bool AlreadyTransient)
     {

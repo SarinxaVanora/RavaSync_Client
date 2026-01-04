@@ -76,7 +76,8 @@ namespace RavaSync.WebAPI.Files
                 if (_gate == null) return;
 
                 var cfg = _cfgSvc.Current;
-                if (!cfg.DelayActivationEnabled) return;
+                if (!cfg.DelayActivationEnabled && _pending.IsEmpty && _touchedActors.IsEmpty)
+                    return;
 
                 if (!_gate.SafeNow(cfg.SafeIdleSeconds, cfg.ApplyOnlyOnZoneChange)) return;
 
@@ -207,7 +208,7 @@ namespace RavaSync.WebAPI.Files
                     return;
 
                 // Don’t spam redraws: only when queue is empty and cooldown passed.
-                if (!_pending.IsEmpty || DateTime.UtcNow < _nextAllowedRedrawUtc)
+                if (DateTime.UtcNow < _nextAllowedRedrawUtc)
                     return;
 
                 var local = _dalamudUtil.GetPlayerCharacter();
@@ -215,9 +216,9 @@ namespace RavaSync.WebAPI.Files
 
                 // Take a snapshot of all touched actors and clear for next cycle.
                 var touchedAddresses = _touchedActors.Keys.ToArray();
-                _touchedActors.Clear();
-
                 var set = new HashSet<nint>(touchedAddresses);
+                var redrawn = new List<nint>(touchedAddresses.Length);
+
 
                 foreach (var obj in _objectTable)
                 {
@@ -226,6 +227,12 @@ namespace RavaSync.WebAPI.Files
                     if (!set.Contains(pc.Address)) continue;
 
                     _mareMediator.Publish(new PenumbraRedrawCharacterMessage(pc));
+                    redrawn.Add(pc.Address);
+                }
+
+                foreach (var addr in redrawn)
+                {
+                    _touchedActors.TryRemove(addr, out _);
                 }
 
                 _nextAllowedRedrawUtc = DateTime.UtcNow.AddSeconds(1);
@@ -310,7 +317,6 @@ namespace RavaSync.WebAPI.Files
                     }
                     else
                     {
-                        // Legacy GUID-named quarantine file: recover by hashing contents
                         hash = currentPath.GetFileHash();
 
                         // Best effort rename so we never have to re-hash again

@@ -574,8 +574,17 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
             int attempts = 0;
 
             // Initial calculation
-            toDownloadReplacements =
-                TryCalculateModdedDictionary(applicationBase, charaData, out moddedPaths, downloadToken);
+            toDownloadReplacements = TryCalculateModdedDictionary(applicationBase, charaData, out moddedPaths, downloadToken);
+
+            if (toDownloadReplacements.Any(r =>
+                r.GamePaths != null && r.GamePaths.Any(p =>
+                p.EndsWith(".avfx", StringComparison.OrdinalIgnoreCase) ||
+                p.EndsWith(".atex", StringComparison.OrdinalIgnoreCase)))
+            )
+            {
+                _redrawOnNextApplication = true;
+            }
+
 
             for (attempts = 1;attempts <= 10 && toDownloadReplacements.Count > 0 && !downloadToken.IsCancellationRequested;attempts++)
             {
