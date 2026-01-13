@@ -14,7 +14,7 @@ using System.Numerics;
 
 namespace RavaSync.UI;
 
-public sealed partial class SyncshellGamesUi
+public sealed partial class ToyBoxUi
 {
     private int _betAmount = 1000;
 
@@ -52,9 +52,15 @@ private void DrawBlackjack()
 
             ImGui.SameLine();
 
-            if (_uiSharedService.IconTextButton(FontAwesomeIcon.SignOutAlt, "Leave", 120 * ImGuiHelpers.GlobalScale, true))
+            bool isHostLobby = pub != null && string.Equals(view.MySessionId, pub.HostSessionId, StringComparison.Ordinal);
+            var label = isHostLobby ? "Close Lobby" : "Leave";
+
+            if (_uiSharedService.IconTextButton(FontAwesomeIcon.SignOutAlt, label, 120 * ImGuiHelpers.GlobalScale, true))
             {
-                _games.LeaveBlackjack(_activeGameId);
+                if (isHostLobby) _games.CloseBJLobby(_activeGameId);
+                else _games.LeaveBlackjack(_activeGameId);
+
+                _activeGameId = Guid.Empty;
                 return;
             }
         }

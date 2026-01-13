@@ -82,25 +82,6 @@ public sealed class UiService : DisposableMediatorSubscriberBase
             _createdWindows.Remove(msg.Window);
             msg.Window.Dispose();
         });
-
-        Mediator.Subscribe<OpenSyncshellGamesPanel>(this, (msg) =>
-        {
-            var existing = _createdWindows
-                .OfType<SyncshellGamesUi>()
-                .FirstOrDefault(w => string.Equals(w.GroupFullInfo.GID, msg.GroupInfo.GID, StringComparison.Ordinal));
-
-            if (existing != null)
-            {
-                existing.IsOpen = true;
-                return;
-            }
-
-            var window = _uiFactory.CreateSyncshellGamesUi(msg.GroupInfo);
-            _createdWindows.Add(window);
-            _windowSystem.AddWindow(window);
-        });
-
-
     }
 
     public void ToggleMainUi()

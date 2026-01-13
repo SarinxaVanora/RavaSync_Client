@@ -48,6 +48,7 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
     private bool _hasRetriedAfterMissingAtApply = false;
     private int _manualRepairRunning = 0;
     private int? _lastAssignedObjectIndex = null;
+    private DateTime _lastAssignedCollectionAssignUtc = DateTime.MinValue;
     private static readonly SemaphoreSlim GlobalApplySemaphore = new(3, 3);
     private string? _lastAttemptedDataHash;
 
@@ -785,18 +786,46 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
                 if (updateModdedPaths)
                 {
                     // Ensure collection is set
-                    var objIndex = await _dalamudUtil
-                        .RunOnFrameworkThread(() => _charaHandler!.GetGameObject()!.ObjectIndex)
-                        .ConfigureAwait(false);
+                    //var objIndex = await _dalamudUtil
+                    //    .RunOnFrameworkThread(() => _charaHandler!.GetGameObject()!.ObjectIndex)
+                    //    .ConfigureAwait(false);
 
-                    if (_lastAssignedObjectIndex != objIndex)
+                    //if (_lastAssignedObjectIndex != objIndex)
+                    //{
+                    //    await _ipcManager.Penumbra
+                    //        .AssignTemporaryCollectionAsync(Logger, _penumbraCollection, objIndex)
+                    //        .ConfigureAwait(false);
+
+                    //    _lastAssignedObjectIndex = objIndex;
+                    //}
+
+                    var objIndex = await _dalamudUtil
+                                    .RunOnFrameworkThread(() => _charaHandler!.GetGameObject()!.ObjectIndex)
+                                    .ConfigureAwait(false);
+
+                    var nowUtc = DateTime.UtcNow;
+                    var needsAssign =
+                        _lastAssignedObjectIndex != objIndex
+                        || (nowUtc - _lastAssignedCollectionAssignUtc) > TimeSpan.FromSeconds(5);
+
+                    if (needsAssign)
                     {
-                        await _ipcManager.Penumbra
+                        _lastAssignedCollectionAssignUtc = nowUtc;
+
+                        var ok = await _ipcManager.Penumbra
                             .AssignTemporaryCollectionAsync(Logger, _penumbraCollection, objIndex)
                             .ConfigureAwait(false);
 
+                        if (!ok)
+                        {
+                            Logger.LogDebug("[{applicationId}] Could not claim Penumbra temp collection for idx {idx}; aborting apply to avoid partial state",
+                                _applicationId, objIndex);
+                            return;
+                        }
+
                         _lastAssignedObjectIndex = objIndex;
                     }
+
 
                     var cacheRoot = _fileDbManager.CacheFolder;
 
@@ -1117,7 +1146,13 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
             await _ipcManager.PetNames.SetPlayerData(PlayerCharacter, _cachedData.PetNamesData).ConfigureAwait(false);
         });
 
-        _ipcManager.Penumbra.AssignTemporaryCollectionAsync(Logger, _penumbraCollection, _charaHandler.GetGameObject()!.ObjectIndex).GetAwaiter().GetResult();
+        //_ipcManager.Penumbra.AssignTemporaryCollectionAsync(Logger, _penumbraCollection, _charaHandler.GetGameObject()!.ObjectIndex).GetAwaiter().GetResult();
+        
+        var ok = _ipcManager.Penumbra.AssignTemporaryCollectionAsync(Logger, _penumbraCollection, _charaHandler.GetGameObject()!.ObjectIndex).GetAwaiter().GetResult();
+
+        if (!ok)
+            Logger.LogDebug("[Penumbra] Initial temp collection assign failed for {name}", PlayerName);
+
     }
 
     private async Task RevertCustomizationDataAsync(ObjectKind objectKind, string name, Guid applicationId, CancellationToken cancelToken)

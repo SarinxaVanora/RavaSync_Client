@@ -23,6 +23,7 @@ using System.Net.Sockets;
 using System.Security.Cryptography;
 using System.Runtime.InteropServices;
 using System.Threading.Channels;
+using System.Collections.Concurrent;
 
 namespace RavaSync.WebAPI.Files;
 
@@ -94,7 +95,7 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
             PooledConnectionLifetime = TimeSpan.FromMinutes(10),
             PooledConnectionIdleTimeout = TimeSpan.FromMinutes(2),
             ConnectTimeout = TimeSpan.FromSeconds(10),
-            MaxConnectionsPerServer = 64,
+            MaxConnectionsPerServer = 256,
             EnableMultipleHttp2Connections = true,
         };
 
@@ -766,22 +767,49 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
         throw new InvalidDataException("CDN header too large or invalid");
     }
 
-    private void CleanupFailedCdnDownload(string destPath, string hash, MareConfig cfg, bool hard)
+    private void CleanupFailedCdnDownload(string pathToDelete, string? stagedHash = null)
     {
         try
         {
-            if (File.Exists(destPath)) File.Delete(destPath);
+            if (!string.IsNullOrWhiteSpace(pathToDelete) && File.Exists(pathToDelete))
+                File.Delete(pathToDelete);
         }
         catch { /* ignore */ }
 
-        if (cfg.DelayActivationEnabled && hard)
+        if (!string.IsNullOrWhiteSpace(stagedHash))
         {
-            try
-            {
-                _fileDbManager.UnstageFile(hash);
-            }
-            catch { /* ignore */ }
+            try { _fileDbManager.UnstageFile(stagedHash); } catch { /* ignore */ }
         }
+    }
+
+    private static string CreateTempDownloadPath(string finalPath)
+    {
+        var dir = Path.GetDirectoryName(finalPath);
+        if (string.IsNullOrEmpty(dir))
+            throw new InvalidOperationException($"Could not determine directory for {finalPath}");
+
+        var name = Path.GetFileName(finalPath);
+
+        // Keep temp in the same directory so the move is atomic on Windows.
+        var tmp = name + ".tmp." + Environment.ProcessId + "." + Guid.NewGuid().ToString("N");
+        return Path.Combine(dir, tmp);
+    }
+
+    private static bool IsFileInUse(Exception ex)
+    {
+        if (ex is UnauthorizedAccessException) return true;
+
+        if (ex is IOException ioEx)
+        {
+            if (OperatingSystem.IsWindows())
+            {
+                const int SharingViolation = unchecked((int)0x80070020);
+                const int LockViolation = unchecked((int)0x80070021);
+                return ioEx.HResult == SharingViolation || ioEx.HResult == LockViolation;
+            }
+            return true;
+        }
+        return false;
     }
 
 
@@ -825,11 +853,12 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
         }
     }
 
-    private async Task<bool> TryDownloadFilesFromCdnAsync(GameObjectHandler gameObjectHandler, IGrouping<string, DownloadFileTransfer> fileGroup, List<FileReplacementData> fileReplacement, CancellationToken ct)
+    private async Task<bool> TryDownloadFilesFromCdnAsync(GameObjectHandler gameObjectHandler,IGrouping<string, DownloadFileTransfer> fileGroup,List<FileReplacementData> fileReplacement,CancellationToken ct)
     {
         if (_orchestrator.FilesCdnUri == null) return false;
+        var transfers = fileGroup as IList<DownloadFileTransfer> ?? fileGroup.ToList();
+        if (transfers.Count == 0) return true;
 
-        // Hash -> extension map as in blk path
         var fileExtByHash = fileReplacement
             .Where(f => !string.IsNullOrEmpty(f.Hash) && f.GamePaths != null && f.GamePaths.Any())
             .GroupBy(f => f.Hash, StringComparer.OrdinalIgnoreCase)
@@ -839,23 +868,42 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
                 return gp.Contains('.') ? gp.Split(".")[^1] : "dat";
             }, StringComparer.OrdinalIgnoreCase);
 
-        // CDN pipeline is IO-bound, not CPU-bound — allow aggressive concurrency
-        var cdnParallel = Math.Clamp(_mareConfigService.Current.ParallelDownloads, 4, 12);
-        var concurrency = new SemaphoreSlim(cdnParallel, cdnParallel);
+        var configured = _mareConfigService.Current.ParallelDownloads;
 
-        var tasks = new List<Task>(fileGroup.Count());
+        var cdnParallel = Math.Clamp(configured, 4, 12);
+        cdnParallel = Math.Min(cdnParallel, transfers.Count);
+
         var anyFailure = new int[1];
-
         var results = new System.Collections.Concurrent.ConcurrentBag<CdnDownloadedFile>();
+        var groupKey = fileGroup.Key;
 
-        foreach (var transfer in fileGroup)
+        var index = -1;
+        var workers = new List<Task>(cdnParallel);
+
+        for (int i = 0; i < cdnParallel; i++)
         {
-            tasks.Add(DownloadOneFromCdnAsync(gameObjectHandler, fileGroup, fileExtByHash, results, concurrency, transfer, anyFailure, ct));
+            workers.Add(Task.Run(async () =>
+            {
+                while (!ct.IsCancellationRequested && System.Threading.Volatile.Read(ref anyFailure[0]) == 0)
+                {
+                    var j = System.Threading.Interlocked.Increment(ref index);
+                    if (j >= transfers.Count) break;
+
+                    await DownloadOneFromCdnAsync(
+                        gameObjectHandler,
+                        groupKey,
+                        fileExtByHash,
+                        results,
+                        transfers[j],
+                        anyFailure,
+                        ct).ConfigureAwait(false);
+                }
+            }, ct));
         }
 
         try
         {
-            await Task.WhenAll(tasks).ConfigureAwait(false);
+            await Task.WhenAll(workers).ConfigureAwait(false);
         }
         catch (OperationCanceledException)
         {
@@ -865,7 +913,7 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
 
         if (System.Threading.Volatile.Read(ref anyFailure[0]) != 0)
         {
-            Logger.LogDebug("CDN fast-path: at least one file failed, falling back to blk pipeline for group {group}", fileGroup.Key);
+            Logger.LogDebug("CDN fast-path: at least one file failed, falling back to blk pipeline for group {group}", groupKey);
             return false;
         }
 
@@ -888,18 +936,20 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
             }
         }
 
-        if (_downloadStatus.TryGetValue(fileGroup.Key, out var status))
+        if (_downloadStatus.TryGetValue(groupKey, out var status))
         {
             status.DownloadStatus = DownloadStatus.Decompressing;
         }
 
-        Logger.LogDebug("CDN fast-path: completed all files for group {group} via CDN", fileGroup.Key);
+        Logger.LogDebug("CDN fast-path: completed all files for group {group} via CDN", groupKey);
         return true;
     }
 
-    private async Task DownloadOneFromCdnAsync(GameObjectHandler gameObjectHandler, IGrouping<string, DownloadFileTransfer> fileGroup, Dictionary<string, string> fileExtByHash, System.Collections.Concurrent.ConcurrentBag<CdnDownloadedFile> results, SemaphoreSlim concurrency, DownloadFileTransfer transfer, int[] anyFailure, CancellationToken ct)
+
+
+
+    private async Task DownloadOneFromCdnAsync(GameObjectHandler gameObjectHandler,string groupKey,Dictionary<string, string> fileExtByHash,ConcurrentBag<CdnDownloadedFile> results,DownloadFileTransfer transfer,int[] anyFailure,CancellationToken ct)
     {
-        await concurrency.WaitAsync(ct).ConfigureAwait(false);
         try
         {
             var attempts = 0;
@@ -907,7 +957,10 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
 
             while (attempts++ < MaxCdnAttemptsPerFile && !ct.IsCancellationRequested)
             {
-                var baseCdnUrl = MareFiles.CdnGetFullPath(_orchestrator.FilesCdnUri!, transfer.Hash.ToUpperInvariant()).ToString();
+                var baseCdnUrl = MareFiles
+                    .CdnGetFullPath(_orchestrator.FilesCdnUri!, transfer.Hash.ToUpperInvariant())
+                    .ToString();
+
                 var isCacheBusted = plannedCdnUrl != null;
                 var cdnUrl = plannedCdnUrl ?? baseCdnUrl;
                 plannedCdnUrl = null;
@@ -921,13 +974,15 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
                     attemptCts.CancelAfter(CdnAttemptTimeout);
                     var attemptToken = attemptCts.Token;
 
-                    using var response = await _cdnFastClient.GetAsync(cdnUrl, HttpCompletionOption.ResponseHeadersRead, attemptToken).ConfigureAwait(false);
-
+                    using var response = await _cdnFastClient
+                        .GetAsync(cdnUrl, HttpCompletionOption.ResponseHeadersRead, attemptToken)
+                        .ConfigureAwait(false);
 
                     if (!response.IsSuccessStatusCode)
                     {
-                        if (response.StatusCode == System.Net.HttpStatusCode.NotFound && !isCacheBusted
-                            && TryPlanCdn404SelfHeal(transfer.Hash, baseCdnUrl, response, out var cacheBustUrl, out var cfCacheStatus, out var age, out var cfRay, out var reason))
+                        if (response.StatusCode == HttpStatusCode.NotFound && !isCacheBusted &&
+                            TryPlanCdn404SelfHeal(transfer.Hash, baseCdnUrl, response,
+                                out var cacheBustUrl, out var cfCacheStatus, out var age, out var cfRay, out var reason))
                         {
                             plannedCdnUrl = cacheBustUrl;
 
@@ -984,63 +1039,164 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
                     var hard = ActivationPolicy.IsHardDelayed(filePath);
                     var soft = !hard && ActivationPolicy.IsSoftDelayed(filePath);
 
-                    string destPath;
-                    if (cfg.DelayActivationEnabled && hard)
-                    {
-                        destPath = Path.Combine(_delayedActivator.QuarantineRoot, headerHash + Path.GetExtension(filePath));
-                        Directory.CreateDirectory(Path.GetDirectoryName(destPath)!);
-                        _fileDbManager.StageFile(headerHash, filePath);
-                    }
-                    else
-                    {
-                        destPath = filePath;
-                        Directory.CreateDirectory(Path.GetDirectoryName(destPath)!);
-                    }
+                    Directory.CreateDirectory(Path.GetDirectoryName(filePath)!);
+
+                    // CRITICAL: write to temp first so we never truncate/zero the live cache file.
+                    var tempPath = CreateTempDownloadPath(filePath);
+                    var destPath = filePath;
+
+                    string? stagedHash = null;
 
                     try
                     {
-                        var (computed, bytesWritten) = await DecompressLz4ToFileAndHashAsync(input, destPath, attemptToken).ConfigureAwait(false);
+                        var (computed, bytesWritten) =
+                            await DecompressLz4ToFileAndHashAsync(input, tempPath, attemptToken).ConfigureAwait(false);
 
                         if (bytesWritten <= 0 || !string.Equals(computed, headerHash, StringComparison.OrdinalIgnoreCase))
                         {
-                            Logger.LogDebug(
-                                "CDN fast-path: downloaded file for {hash} failed validation (attempt {attempt}/{max})",
-                                headerHash, attempts, MaxCdnAttemptsPerFile);
+                            Logger.LogWarning(
+                                "CDN fast-path: bad content for {hash} (computed={computed}, bytes={bytes}); cleaning temp and retrying",
+                                headerHash, computed, bytesWritten);
 
-                            CleanupFailedCdnDownload(destPath, headerHash, cfg, hard);
+                            CleanupFailedCdnDownload(tempPath, stagedHash);
 
                             if (attempts >= MaxCdnAttemptsPerFile)
                             {
-                                System.Threading.Interlocked.Exchange(ref anyFailure[0], 1);
+                                Interlocked.Exchange(ref anyFailure[0], 1);
                                 return;
                             }
 
                             continue;
                         }
                     }
-                    finally
+                    catch (OperationCanceledException oce) when (!ct.IsCancellationRequested)
                     {
-                        if (!ReferenceEquals(input, respStream))
-                        {
-                            try { input.Dispose(); } catch { /* ignore */ }
-                        }
-                    }
+                        // Per-attempt timeout: never leave partial files behind.
+                        CleanupFailedCdnDownload(tempPath, stagedHash);
 
-                    if (!ExtraContentValidation(destPath, headerHash))
-                    {
-                        Logger.LogDebug(
-                            "CDN fast-path: extra validation failed for {hash} (attempt {attempt}/{max})",
-                            headerHash, attempts, MaxCdnAttemptsPerFile);
-
-                        CleanupFailedCdnDownload(destPath, headerHash, cfg, hard);
+                        Logger.LogWarning(oce,
+                            "CDN fast-path: timeout while downloading {hash} from {url}, attempt {attempt}/{max}",
+                            transfer.Hash, cdnUrl, attempts, MaxCdnAttemptsPerFile);
 
                         if (attempts >= MaxCdnAttemptsPerFile)
                         {
-                            System.Threading.Interlocked.Exchange(ref anyFailure[0], 1);
+                            Interlocked.Exchange(ref anyFailure[0], 1);
                             return;
                         }
 
                         continue;
+                    }
+                    catch (Exception ex)
+                    {
+                        CleanupFailedCdnDownload(tempPath, stagedHash);
+
+                        Logger.LogWarning(ex,
+                            "CDN fast-path: error while downloading {hash} from {url}, attempt {attempt}/{max}",
+                            transfer.Hash, cdnUrl, attempts, MaxCdnAttemptsPerFile);
+
+                        if (attempts >= MaxCdnAttemptsPerFile)
+                        {
+                            Interlocked.Exchange(ref anyFailure[0], 1);
+                            return;
+                        }
+
+                        continue;
+                    }
+
+                    if (!ExtraContentValidation(tempPath, headerHash))
+                    {
+                        Logger.LogWarning("CDN fast-path: extra validation failed for {hash}, cleaning temp and retrying", headerHash);
+
+                        CleanupFailedCdnDownload(tempPath, stagedHash);
+
+                        if (attempts >= MaxCdnAttemptsPerFile)
+                        {
+                            Interlocked.Exchange(ref anyFailure[0], 1);
+                            return;
+                        }
+
+                        continue;
+                    }
+
+                    if (cfg.DelayActivationEnabled && hard)
+                    {
+                        destPath = Path.Combine(_delayedActivator.QuarantineRoot, headerHash + Path.GetExtension(filePath));
+                        Directory.CreateDirectory(Path.GetDirectoryName(destPath)!);
+
+                        stagedHash = headerHash;
+                        _fileDbManager.StageFile(headerHash, filePath);
+
+                        try
+                        {
+                            File.Move(tempPath, destPath, overwrite: true);
+                        }
+                        catch (Exception ex)
+                        {
+                            Logger.LogWarning(ex, "CDN fast-path: failed to move {hash} into quarantine {path}", headerHash, destPath);
+
+                            CleanupFailedCdnDownload(tempPath, stagedHash);
+                            CleanupFailedCdnDownload(destPath, stagedHash);
+
+                            if (attempts >= MaxCdnAttemptsPerFile)
+                            {
+                                Interlocked.Exchange(ref anyFailure[0], 1);
+                                return;
+                            }
+
+                            continue;
+                        }
+                    }
+                    else
+                    {
+                        try
+                        {
+                            File.Move(tempPath, filePath, overwrite: true);
+                        }
+                        catch (Exception ex) when (hard && IsFileInUse(ex))
+                        {
+                            var quarantinePath = Path.Combine(_delayedActivator.QuarantineRoot, headerHash + Path.GetExtension(filePath));
+                            Directory.CreateDirectory(Path.GetDirectoryName(quarantinePath)!);
+
+                            stagedHash = headerHash;
+                            _fileDbManager.StageFile(headerHash, filePath);
+
+                            try
+                            {
+                                File.Move(tempPath, quarantinePath, overwrite: true);
+                                destPath = quarantinePath;
+                            }
+                            catch (Exception ex2)
+                            {
+                                Logger.LogWarning(ex2,
+                                    "CDN fast-path: failed to move {hash} into quarantine fallback {path}",
+                                    headerHash, quarantinePath);
+
+                                CleanupFailedCdnDownload(tempPath, stagedHash);
+                                CleanupFailedCdnDownload(quarantinePath, stagedHash);
+
+                                if (attempts >= MaxCdnAttemptsPerFile)
+                                {
+                                    Interlocked.Exchange(ref anyFailure[0], 1);
+                                    return;
+                                }
+
+                                continue;
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            Logger.LogWarning(ex, "CDN fast-path: failed to finalize {hash} to {path}", headerHash, filePath);
+
+                            CleanupFailedCdnDownload(tempPath, stagedHash);
+
+                            if (attempts >= MaxCdnAttemptsPerFile)
+                            {
+                                Interlocked.Exchange(ref anyFailure[0], 1);
+                                return;
+                            }
+
+                            continue;
+                        }
                     }
 
                     _cdn404State.TryRemove(headerHash, out _);
@@ -1048,7 +1204,7 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
 
                     results.Add(new CdnDownloadedFile(headerHash, filePath, destPath, hard, soft));
 
-                    if (_downloadStatus.TryGetValue(fileGroup.Key, out var st))
+                    if (_downloadStatus.TryGetValue(groupKey, out var st))
                     {
                         lock (st)
                         {
@@ -1067,7 +1223,7 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
 
                     if (attempts >= MaxCdnAttemptsPerFile)
                     {
-                        System.Threading.Interlocked.Exchange(ref anyFailure[0], 1);
+                        Interlocked.Exchange(ref anyFailure[0], 1);
                         return;
                     }
 
@@ -1075,10 +1231,9 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
                 }
                 catch (OperationCanceledException)
                 {
-                    System.Threading.Interlocked.Exchange(ref anyFailure[0], 1);
+                    Interlocked.Exchange(ref anyFailure[0], 1);
                     throw;
                 }
-
                 catch (IOException ioEx)
                 {
                     Logger.LogDebug(ioEx,
@@ -1096,7 +1251,7 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
 
                             _cdn404State.TryRemove(transfer.Hash, out _);
 
-                            if (_downloadStatus.TryGetValue(fileGroup.Key, out var st2))
+                            if (_downloadStatus.TryGetValue(groupKey, out var st2))
                             {
                                 lock (st2)
                                 {
@@ -1119,7 +1274,7 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
 
                     if (attempts >= MaxCdnAttemptsPerFile)
                     {
-                        System.Threading.Interlocked.Exchange(ref anyFailure[0], 1);
+                        Interlocked.Exchange(ref anyFailure[0], 1);
 
                         try
                         {
@@ -1141,25 +1296,26 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
 
                     if (attempts >= MaxCdnAttemptsPerFile)
                     {
-                        System.Threading.Interlocked.Exchange(ref anyFailure[0], 1);
+                        Interlocked.Exchange(ref anyFailure[0], 1);
                         return;
                     }
                 }
             }
 
-            System.Threading.Interlocked.Exchange(ref anyFailure[0], 1);
+            Interlocked.Exchange(ref anyFailure[0], 1);
             Logger.LogWarning(
                 "CDN fast-path: all {max} attempts failed for {hash}, treating as failed for group {group}",
                 MaxCdnAttemptsPerFile,
                 transfer.Hash,
-                fileGroup.Key);
+                groupKey);
         }
         finally
         {
             _inflightHashes.TryRemove(transfer.Hash, out _);
-            concurrency.Release();
         }
     }
+
+
 
 
     private bool ExtraContentValidation(string filePath, string hash)

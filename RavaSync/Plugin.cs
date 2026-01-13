@@ -133,7 +133,7 @@ public sealed class Plugin : IDalamudPlugin
             collection.AddSingleton<IdDisplayHandler>();
             collection.AddSingleton<PlayerPerformanceService>();
             collection.AddSingleton<TransientResourceManager>();
-            collection.AddSingleton<SyncshellGameService>();
+            collection.AddSingleton<ToyBox>();
 
 
             collection.AddSingleton<CharaDataManager>();
@@ -350,6 +350,7 @@ public sealed class Plugin : IDalamudPlugin
             collection.AddScoped<WindowMediatorSubscriberBase, VenueJoinUi>();
             collection.AddScoped<WindowMediatorSubscriberBase, PairRequestUi>();
             collection.AddScoped<WindowMediatorSubscriberBase, ToolsHubUi>();
+            collection.AddScoped<WindowMediatorSubscriberBase, ToyBoxUi>();
             collection.AddScoped<WindowMediatorSubscriberBase, DiscoveryIntroUi>();
             collection.AddScoped<WindowMediatorSubscriberBase, VanityUi>();
             collection.AddScoped<WindowMediatorSubscriberBase, DiscoverySettingsUi>();
@@ -412,7 +413,7 @@ public sealed class Plugin : IDalamudPlugin
         _ = _host.Services.GetRequiredService<PairRequestService>();
         _ = _host.Services.GetRequiredService<PairRequestContextMenuService>();
         _ = _host.Services.GetRequiredService<FriendshapedMarkerService>();
-        _ = _host.Services.GetRequiredService<SyncshellGameService>();
+        _ = _host.Services.GetRequiredService<ToyBox>();
 
         _ = _host.Services.GetRequiredService<ScopeAutoPauseService>();
         var activator = _host.Services.GetRequiredService<DelayedActivatorService>();

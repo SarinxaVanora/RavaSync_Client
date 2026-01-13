@@ -47,7 +47,7 @@ public sealed class IpcCallerMoodles : IIpcCaller
     {
         try
         {
-            APIAvailable = _moodlesApiVersion.InvokeFunc() == 3;
+            APIAvailable = _moodlesApiVersion.InvokeFunc() >= 4;
         }
         catch
         {

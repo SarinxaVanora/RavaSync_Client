@@ -1,5 +1,6 @@
 using MessagePack;
 using Microsoft.Extensions.Logging;
+using RavaSync.API.Dto.Group;
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
@@ -49,7 +50,7 @@ public record BjStatePublic(Guid GameId, BjStage Stage, string HostSessionId, st
 public record BjStatePrivate(Guid GameId, BjStage Stage, bool IsYourTurn,
     byte DealerUpCard, byte? DealerHoleCardIfHost, List<byte> YourCards, int YourTotal, bool YourBust);
 
-public sealed partial class SyncshellGameService
+public sealed partial class ToyBox
 {
     private readonly ConcurrentDictionary<Guid, BlackjackHostGame> _hostedBlackjack = new();
     private readonly ConcurrentDictionary<Guid, BlackjackClientView> _clientBlackjack = new();
@@ -57,7 +58,7 @@ public sealed partial class SyncshellGameService
     public bool TryGetClientBlackjack(Guid gameId, out BlackjackClientView view) => _clientBlackjack.TryGetValue(gameId, out view!);
     public bool TryGetHostedBlackjack(Guid gameId, out BlackjackHostGame game) => _hostedBlackjack.TryGetValue(gameId, out game!);
 
-    public Guid HostBlackjack(RavaSync.API.Dto.Group.GroupFullInfoDto group)
+    public Guid HostBlackjack(string lobbyName = "", int maxPlayers = 0, string? password = null)
     {
         var hostSessionId = GetMySessionId();
         if (string.IsNullOrEmpty(hostSessionId)) return Guid.Empty;
@@ -68,16 +69,26 @@ public sealed partial class SyncshellGameService
 
         var gameId = Guid.NewGuid();
 
-        var game = new BlackjackHostGame(gameId, hostSessionId, hostName);
+        string salt = string.Empty;
+        string hash = string.Empty;
+        if (!string.IsNullOrWhiteSpace(password))
+        {
+            salt = Convert.ToBase64String(System.Security.Cryptography.RandomNumberGenerator.GetBytes(8));
+            hash = ToyBox.HashPassword(password, salt);
+        }
+
+        var game = new BlackjackHostGame(gameId, hostSessionId, hostName, lobbyName ?? string.Empty, Math.Max(0, maxPlayers), salt, hash);
         _hostedBlackjack[gameId] = game;
 
         _clientBlackjack[gameId] = BlackjackClientView.FromHost(game);
 
-        BroadcastInviteNearby(gameId, hostSessionId, hostName, SyncshellGameKind.Blackjack);
+        BroadcastInviteNearby(gameId, hostSessionId, hostName, SyncshellGameKind.Blackjack,
+            0, game.LobbyName, game.CurrentPlayers, game.MaxPlayers, game.PasswordProtected, game.PasswordSalt);
 
         _logger.LogInformation("Hosted Blackjack {gameId}", gameId);
         return gameId;
     }
+
 
     public void LeaveBlackjack(Guid gameId)
     {
@@ -181,13 +192,28 @@ public sealed partial class SyncshellGameService
 
         var join = MessagePackSerializer.Deserialize<SyncshellJoinPayload>(env.Payload);
 
-        if (string.Equals(join.PlayerSessionId, game.HostSessionId, StringComparison.Ordinal))
+        if (game.MaxPlayers > 0 && game.CurrentPlayers >= game.MaxPlayers)
+        {
+            SendJoinDenied(game.HostSessionId, join.PlayerSessionId, env.GameId, env.Kind, "Lobby is full.");
             return;
+        }
+
+        if (game.PasswordProtected)
+        {
+            var invitedOk = !string.IsNullOrEmpty(join.InviteToken) && game.ConsumeInviteToken(join.PlayerSessionId, join.InviteToken);
+            var passwordOk = string.Equals(join.PasswordHash ?? string.Empty, game.PasswordHash, StringComparison.Ordinal);
+
+            if (!invitedOk && !passwordOk)
+            {
+                SendJoinDenied(game.HostSessionId, join.PlayerSessionId, env.GameId, env.Kind, "Wrong password.");
+                return;
+            }
+        }
 
         game.AddPlayer(join.PlayerSessionId, join.PlayerName);
-
         PushBlackjackState(game);
     }
+
 
     private void HandleLeave(string fromSessionId, SyncshellGameEnvelope env)
     {
@@ -304,6 +330,15 @@ public sealed partial class SyncshellGameService
         public string HostSessionId { get; }
         public string HostName { get; }
 
+        public string LobbyName { get; }
+        public int MaxPlayers { get; }
+        public string PasswordSalt { get; }
+        public string PasswordHash { get; }
+        public bool PasswordProtected => !string.IsNullOrEmpty(PasswordHash);
+        public int CurrentPlayers => 1 + Players.Count;
+
+        private readonly ConcurrentDictionary<string, string> _inviteTokens = new(StringComparer.Ordinal);
+
         public BjStage Stage { get; set; } = BjStage.Lobby;
 
         public ConcurrentDictionary<string, BlackjackPlayer> Players { get; } = new(StringComparer.Ordinal);
@@ -314,11 +349,32 @@ public sealed partial class SyncshellGameService
         public List<byte> DealerCards { get; } = [];
         private readonly List<byte> _deck = [];
 
-        public BlackjackHostGame(Guid gameId, string hostSessionId, string hostName)
+        public BlackjackHostGame(Guid gameId, string hostSessionId, string hostName, string lobbyName, int maxPlayers, string passwordSalt, string passwordHash)
         {
             GameId = gameId;
             HostSessionId = hostSessionId;
             HostName = hostName;
+
+            LobbyName = lobbyName ?? string.Empty;
+            MaxPlayers = Math.Max(0, maxPlayers);
+            PasswordSalt = passwordSalt ?? string.Empty;
+            PasswordHash = passwordHash ?? string.Empty;
+        }
+
+        public string IssueInviteToken(string targetSessionId)
+        {
+            var token = Convert.ToBase64String(System.Security.Cryptography.RandomNumberGenerator.GetBytes(10));
+            _inviteTokens[targetSessionId] = token;
+            return token;
+        }
+
+        public bool ConsumeInviteToken(string targetSessionId, string token)
+        {
+            if (!_inviteTokens.TryGetValue(targetSessionId, out var stored)) return false;
+            if (!string.Equals(stored, token, StringComparison.Ordinal)) return false;
+
+            _inviteTokens.TryRemove(targetSessionId, out _);
+            return true;
         }
 
         public void AddPlayer(string sessionId, string name)
@@ -649,6 +705,34 @@ public sealed partial class SyncshellGameService
 
             bool soft = cards.Any(c => (c % 13) == 0) && total <= 21;
             return (total, soft);
+        }
+    }
+
+    public void CloseBJLobby(Guid gameId)
+    {
+        var mySessionId = GetMySessionId();
+        if (string.IsNullOrEmpty(mySessionId)) return;
+
+        if (!_hostedBingo.TryRemove(gameId, out var game) ||
+            !string.Equals(game.HostSessionId, mySessionId, StringComparison.Ordinal))
+        {
+            LeaveBlackjack(gameId);
+            Invites.TryRemove(gameId, out _);
+            DirectInvites.TryRemove(gameId, out _);
+            return;
+        }
+
+        _clientBingo.TryRemove(gameId, out _);
+        Invites.TryRemove(gameId, out _);
+        DirectInvites.TryRemove(gameId, out _);
+
+        BroadcastLobbyClosedNearby(gameId, mySessionId, SyncshellGameKind.Blackjack);
+
+        var env = new SyncshellGameEnvelope(gameId, SyncshellGameKind.Blackjack, SyncshellGameOp.LobbyClosed);
+        foreach (var sid in game.Players.Keys)
+        {
+            if (string.Equals(sid, mySessionId, StringComparison.Ordinal)) continue;
+            Send(mySessionId, sid, env);
         }
     }
 

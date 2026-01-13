@@ -112,8 +112,6 @@ public record PairRequestResultMessage(PairRequestResultDto Result) : MessageBas
 public record ContextMenuPairRequestMessage(string TargetIdent, string charName) : MessageBase;
 public record DirectPairRequestMessage(string TargetIdent, string TargetName) : MessageBase;
 public record SyncshellGameMeshMessage(string LocalSessionId, string FromSessionId, byte[] Payload) : MessageBase;
-public record OpenSyncshellGamesPanel(GroupFullInfoDto GroupInfo) : MessageBase;
-
 
 public record BlacklistUiMessage() : MessageBase;
 

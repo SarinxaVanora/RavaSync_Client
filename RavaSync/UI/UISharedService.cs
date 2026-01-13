@@ -78,6 +78,7 @@ public partial class UiSharedService : DisposableMediatorSubscriberBase
     private readonly IThemeManager _themeManager;
     private readonly IFontManager _fontManager;
     bool _didPrewarmFonts = false;
+    private const string RavaCacheSubdirName = "RavaFiles";
 
 
     public UiSharedService(ILogger<UiSharedService> logger, IpcManager ipcManager, ApiController apiController,
@@ -565,7 +566,7 @@ public partial class UiSharedService : DisposableMediatorSubscriberBase
 
     public void DrawCacheDirectorySetting()
     {
-        ColorTextWrapped("Note: The storage folder should be somewhere close to root (i.e. C:\\MareStorage) in a new empty folder. DO NOT point this to your game folder. DO NOT point this to your Penumbra folder.", ImGuiColors.DalamudYellow);
+        ColorTextWrapped("Note: The storage folder should be somewhere close to root (i.e. C:\\RavaStorage) in a new empty folder. DO NOT point this to your game folder. DO NOT point this to your Penumbra folder.", ImGuiColors.DalamudYellow);
         var cacheDirectory = _configService.Current.CacheFolder;
         ImGui.InputText("Storage Folder##cache", ref cacheDirectory, 255, ImGuiInputTextFlags.ReadOnly);
 
@@ -577,45 +578,78 @@ public partial class UiSharedService : DisposableMediatorSubscriberBase
                 FileDialogManager.OpenFolderDialog("Pick RavaSync Storage Folder", (success, path) =>
                 {
                     if (!success) return;
+                    if (string.IsNullOrWhiteSpace(path)) return;
 
-                    _isOneDrive = path.Contains("onedrive", StringComparison.OrdinalIgnoreCase);
-                    _isPenumbraDirectory = string.Equals(path.ToLowerInvariant(), _ipcManager.Penumbra.ModDirectory?.ToLowerInvariant(), StringComparison.Ordinal);
-                    var files = Directory.GetFiles(path, "*", SearchOption.AllDirectories);
+                    var cachePath = SetupSubDir(path);
+
+                    _isOneDrive =
+                        path.Contains("onedrive", StringComparison.OrdinalIgnoreCase) ||
+                        cachePath.Contains("onedrive", StringComparison.OrdinalIgnoreCase);
+
+                    _isPenumbraDirectory = string.Equals(
+                        Path.GetFullPath(path).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar),
+                        (_ipcManager.Penumbra.ModDirectory ?? string.Empty)
+                            .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar),
+                        StringComparison.OrdinalIgnoreCase);
+
+                    // Ensure our cache dir exists before validation
+                    try { Directory.CreateDirectory(cachePath); } catch { }
+
+                    // Validate ONLY the cachePath folder
                     _cacheDirectoryHasOtherFilesThanCache = false;
-                    foreach (var file in files)
+
+                    try
                     {
-                        var fileName = Path.GetFileNameWithoutExtension(file);
-                        if (fileName.Length != 40 && !string.Equals(fileName, "desktop", StringComparison.OrdinalIgnoreCase))
+                        var files = Directory.GetFiles(cachePath, "*", SearchOption.TopDirectoryOnly);
+                        foreach (var file in files)
+                        {
+                            var fileName = Path.GetFileNameWithoutExtension(file);
+
+                            if (fileName.Length != 40 && !string.Equals(fileName, "desktop", StringComparison.OrdinalIgnoreCase))
+                            {
+                                _cacheDirectoryHasOtherFilesThanCache = true;
+                                Logger.LogWarning("Found illegal file in {path}: {file}", cachePath, file);
+                                break;
+                            }
+                        }
+
+                        var dirs = Directory.GetDirectories(cachePath, "*", SearchOption.TopDirectoryOnly);
+                        if (dirs.Any())
                         {
                             _cacheDirectoryHasOtherFilesThanCache = true;
-                            Logger.LogWarning("Found illegal file in {path}: {file}", path, file);
-                            break;
+                            Logger.LogWarning("Found folders in {path} not belonging to RavaSync cache: {dirs}",
+                                cachePath, string.Join(", ", dirs));
                         }
                     }
-                    var dirs = Directory.GetDirectories(path);
-                    if (dirs.Any())
+                    catch (Exception ex)
                     {
+                        // If we can't enumerate, treat as invalid
+                        Logger.LogWarning(ex, "Could not validate cache directory contents at {path}", cachePath);
                         _cacheDirectoryHasOtherFilesThanCache = true;
-                        Logger.LogWarning("Found folders in {path} not belonging to Mare: {dirs}", path, string.Join(", ", dirs));
                     }
 
-                    _isDirectoryWritable = IsDirectoryWritable(path);
-                    _cacheDirectoryIsValidPath = PathRegex().IsMatch(path);
+                    _isDirectoryWritable = IsDirectoryWritable(cachePath);
+                    _cacheDirectoryIsValidPath = PathRegex().IsMatch(cachePath);
 
-                    if (!string.IsNullOrEmpty(path)
-                        && Directory.Exists(path)
+                    if (!string.IsNullOrEmpty(cachePath)
+                        && Directory.Exists(cachePath)
                         && _isDirectoryWritable
                         && !_isPenumbraDirectory
                         && !_isOneDrive
                         && !_cacheDirectoryHasOtherFilesThanCache
                         && _cacheDirectoryIsValidPath)
                     {
-                        _configService.Current.CacheFolder = path;
+                        _configService.Current.CacheFolder = cachePath;
+
+                        _configService.Current.CacheFolderSubdirMigrationDone = true;
+
                         _configService.Save();
-                        _cacheMonitor.StartMareWatcher(path);
+                        _cacheMonitor.StartMareWatcher(cachePath);
                         _cacheMonitor.InvokeScan();
                     }
+
                 }, _dalamudUtil.IsWine ? @"Z:\" : @"C:\");
+
             }
         }
         if (_cacheMonitor.MareWatcher != null)
@@ -1276,6 +1310,20 @@ public partial class UiSharedService : DisposableMediatorSubscriberBase
         }
     }
 
+    private static string SetupSubDir(string selectedFolder)
+    {
+        if (string.IsNullOrWhiteSpace(selectedFolder)) return string.Empty;
+
+        var full = Path.GetFullPath(selectedFolder);
+        full = Path.TrimEndingDirectorySeparator(full);
+
+        // If they already selected the subdir itself, keep it.
+        var leaf = Path.GetFileName(full);
+        if (leaf.Equals(RavaCacheSubdirName, StringComparison.OrdinalIgnoreCase))
+            return full;
+
+        return Path.Combine(full, RavaCacheSubdirName);
+    }
 
     public static string ColorStringFromVector4(Vector4 c, bool forceAlpha = false)
     {

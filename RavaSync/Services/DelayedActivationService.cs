@@ -8,7 +8,8 @@ using RavaSync.Services.Mediator;
 using Microsoft.Extensions.Logging;
 using System.Collections.Concurrent;
 using RavaSync.Utils;
-
+using System.Buffers;
+using System.Security.Cryptography;
 
 namespace RavaSync.WebAPI.Files
 {
@@ -23,6 +24,7 @@ namespace RavaSync.WebAPI.Files
         private readonly MareMediator _mareMediator;
         private readonly DalamudUtilService _dalamudUtil;
         private readonly IObjectTable _objectTable;
+
         private DateTime _nextAllowedRedrawUtc = DateTime.MinValue;
         private readonly ConcurrentDictionary<string, byte> _pendingHashes = new(StringComparer.OrdinalIgnoreCase);
         private readonly ConcurrentDictionary<nint, byte> _touchedActors = new();
@@ -69,6 +71,18 @@ namespace RavaSync.WebAPI.Files
             _gate = new SafetyGate(condition);
         }
 
+        public bool IsHashPending(string hash) => _pendingHashes.ContainsKey(hash);
+
+        public void Enqueue(PendingFile f)
+        {
+            // record pending hash first to prevent duplicate downloads
+            if (f is null) return;
+            if (string.IsNullOrWhiteSpace(f.FileHash)) return;
+
+            _pendingHashes.TryAdd(f.FileHash, 0);
+            _pending.Enqueue(f);
+        }
+
         private void OnFrameworkUpdate(IFramework framework)
         {
             try
@@ -81,8 +95,7 @@ namespace RavaSync.WebAPI.Files
 
                 if (!_gate.SafeNow(cfg.SafeIdleSeconds, cfg.ApplyOnlyOnZoneChange)) return;
 
-                // Process only a small batch per frame to avoid long stalls.
-                const int MaxFilesPerFrame = 4;
+                const int MaxFilesPerFrame = 2;
 
                 var drained = new List<PendingFile>(MaxFilesPerFrame);
                 while (drained.Count < MaxFilesPerFrame && _pending.TryDequeue(out var f))
@@ -93,7 +106,6 @@ namespace RavaSync.WebAPI.Files
 
                 if (drained.Count == 0)
                 {
-                    // No new files to process; maybe we’re ready to redraw.
                     TryDoRedrawPass();
                     return;
                 }
@@ -109,14 +121,12 @@ namespace RavaSync.WebAPI.Files
                     }
                     else
                     {
-                        // animations-only mode with soft-delayed file → requeue for later
                         _pending.Enqueue(f);
                     }
                 }
 
                 if (batch.Count == 0)
                 {
-                    // Nothing eligible in this frame; still may be more pending.
                     TryDoRedrawPass();
                     return;
                 }
@@ -127,25 +137,46 @@ namespace RavaSync.WebAPI.Files
                     {
                         if (!File.Exists(f.QuarantinePath))
                         {
+                            if (File.Exists(f.FinalPath) && DestinationIsExpectedHash(f.FinalPath, f.FileHash))
+                            {
+                                FinalizeSuccess(f, deleteQuarantine: false);
+                                continue;
+                            }
+
                             _logger.LogWarning("Quarantine missing: {file}", f.QuarantinePath);
                             _fileDbManager.UnstageFile(f.FileHash);
-
-                            // also clear pending flag
                             _pendingHashes.TryRemove(f.FileHash, out _);
                             continue;
                         }
 
-                        CopyFileBuffered(f.QuarantinePath, f.FinalPath);
+                        try
+                        {
+                            CopyFileBuffered(f.QuarantinePath, f.FinalPath);
+                        }
+                        catch (Exception ex) when (IsFileInUse(ex))
+                        {
+                            if (File.Exists(f.FinalPath) && DestinationIsExpectedHash(f.FinalPath, f.FileHash))
+                            {
+                                FinalizeSuccess(f, deleteQuarantine: true);
+                                continue;
+                            }
+
+                            _pending.Enqueue(f);
+                            continue;
+                        }
 
                         // match PersistFileToStorage timestamp behavior
-                        var fi = new FileInfo(f.FinalPath);
-                        DateTime start = new(1995, 1, 1, 1, 1, 1, DateTimeKind.Local);
-                        int range = (DateTime.Today - start).Days;
-                        fi.CreationTime = start.AddDays(_rng.Next(range));
-                        fi.LastAccessTime = DateTime.Today;
-                        fi.LastWriteTime = start.AddDays(_rng.Next(range));
+                        try
+                        {
+                            var fi = new FileInfo(f.FinalPath);
+                            DateTime start = new(1995, 1, 1, 1, 1, 1, DateTimeKind.Local);
+                            int range = (DateTime.Today - start).Days;
+                            fi.CreationTime = start.AddDays(_rng.Next(range));
+                            fi.LastAccessTime = DateTime.Today;
+                            fi.LastWriteTime = start.AddDays(_rng.Next(range));
+                        }
+                        catch { /* best effort */ }
 
-                        // register and validate expected hash
                         try
                         {
                             var entry = _fileDbManager.CreateCacheEntry(f.FinalPath);
@@ -165,22 +196,19 @@ namespace RavaSync.WebAPI.Files
                         }
                         catch (Exception ex)
                         {
+                            if (IsFileInUse(ex))
+                            {
+                                _pending.Enqueue(f);
+                                continue;
+                            }
+
                             _logger.LogWarning(ex, "Cache registration error for delayed file {path}", f.FinalPath);
                             _fileDbManager.UnstageFile(f.FileHash);
                             _pendingHashes.TryRemove(f.FileHash, out _);
                             continue;
                         }
 
-                        // success: remove quarantine blob and clear staged flag
-                        try { File.Delete(f.QuarantinePath); } catch { /* best effort */ }
-                        _fileDbManager.UnstageFile(f.FileHash);
-                        _pendingHashes.TryRemove(f.FileHash, out _);
-
-                        // Record actor as touched for a later redraw pass.
-                        if (f.ActorAddress is nint addr && addr != nint.Zero)
-                        {
-                            _touchedActors.TryAdd(addr, 0);
-                        }
+                        FinalizeSuccess(f, deleteQuarantine: true);
                     }
                     catch (Exception ex)
                     {
@@ -190,7 +218,6 @@ namespace RavaSync.WebAPI.Files
                     }
                 }
 
-                // After processing a batch, see if it’s time to redraw anyone.
                 TryDoRedrawPass();
             }
             catch (Exception ex)
@@ -199,26 +226,36 @@ namespace RavaSync.WebAPI.Files
             }
         }
 
+        private void FinalizeSuccess(PendingFile f, bool deleteQuarantine)
+        {
+            if (deleteQuarantine)
+            {
+                try { File.Delete(f.QuarantinePath); } catch { /* best effort */ }
+            }
+
+            _fileDbManager.UnstageFile(f.FileHash);
+            _pendingHashes.TryRemove(f.FileHash, out _);
+
+            if (f.ActorAddress is nint addr && addr != nint.Zero)
+                _touchedActors.TryAdd(addr, 0);
+        }
+
         private void TryDoRedrawPass()
         {
             try
             {
-                // Only redraw if we actually touched at least one actor
                 if (_touchedActors.IsEmpty)
                     return;
 
-                // Don’t spam redraws: only when queue is empty and cooldown passed.
                 if (DateTime.UtcNow < _nextAllowedRedrawUtc)
                     return;
 
                 var local = _dalamudUtil.GetPlayerCharacter();
                 var localAddr = local?.Address ?? nint.Zero;
 
-                // Take a snapshot of all touched actors and clear for next cycle.
                 var touchedAddresses = _touchedActors.Keys.ToArray();
                 var set = new HashSet<nint>(touchedAddresses);
                 var redrawn = new List<nint>(touchedAddresses.Length);
-
 
                 foreach (var obj in _objectTable)
                 {
@@ -231,9 +268,7 @@ namespace RavaSync.WebAPI.Files
                 }
 
                 foreach (var addr in redrawn)
-                {
                     _touchedActors.TryRemove(addr, out _);
-                }
 
                 _nextAllowedRedrawUtc = DateTime.UtcNow.AddSeconds(1);
             }
@@ -243,14 +278,11 @@ namespace RavaSync.WebAPI.Files
             }
         }
 
-
-
-        // Streamed copy to avoid LOH/GC hiccups from ReadAllBytes
         private static void CopyFileBuffered(string srcPath, string dstPath)
         {
             Directory.CreateDirectory(Path.GetDirectoryName(dstPath)!);
 
-            const int BufferSize = 1024 * 1024;
+            const int BufferSize = 256 * 1024;
 
             var srcOpts = new FileStreamOptions
             {
@@ -266,27 +298,65 @@ namespace RavaSync.WebAPI.Files
                 Access = FileAccess.Write,
                 Mode = FileMode.Create,
                 Share = FileShare.None,
-                Options = FileOptions.None,
+                Options = FileOptions.SequentialScan,
                 BufferSize = BufferSize,
             };
+
+            byte[]? buffer = null;
 
             using var src = new FileStream(srcPath, srcOpts);
             using var dst = new FileStream(dstPath, dstOpts);
 
-            var buffer = new byte[BufferSize];
-            int read;
-            while ((read = src.Read(buffer, 0, buffer.Length)) > 0)
-                dst.Write(buffer, 0, read);
+            try
+            {
+                buffer = ArrayPool<byte>.Shared.Rent(BufferSize);
+
+                int read;
+                while ((read = src.Read(buffer, 0, buffer.Length)) > 0)
+                    dst.Write(buffer, 0, read);
+
+                dst.Flush();
+            }
+            finally
+            {
+                if (buffer != null)
+                    ArrayPool<byte>.Shared.Return(buffer);
+            }
         }
 
-
-        public bool IsHashPending(string hash) => _pendingHashes.ContainsKey(hash);
-
-        public void Enqueue(PendingFile f)
+        private static bool DestinationIsExpectedHash(string path, string expectedHash)
         {
-            // record pending hash first to prevent duplicate downloads
-            _pendingHashes.TryAdd(f.FileHash, 0);
-            _pending.Enqueue(f);
+            try
+            {
+                using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+                using var sha1 = SHA1.Create();
+                var bytes = sha1.ComputeHash(fs);
+
+            #if NET5_0_OR_GREATER
+                var actual = Convert.ToHexString(bytes);
+            #else
+                var actual = BitConverter.ToString(bytes).Replace("-", "", StringComparison.Ordinal);
+            #endif
+                return string.Equals(actual, expectedHash, StringComparison.OrdinalIgnoreCase);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static bool IsFileInUse(Exception ex)
+        {
+            if (ex is UnauthorizedAccessException) return true;
+
+            if (ex is IOException ioEx && OperatingSystem.IsWindows())
+            {
+                const int SharingViolation = unchecked((int)0x80070020);
+                const int LockViolation = unchecked((int)0x80070021);
+                return ioEx.HResult == SharingViolation || ioEx.HResult == LockViolation;
+            }
+
+            return false;
         }
 
         private void RecoverQuarantineOrphans()
@@ -356,7 +426,6 @@ namespace RavaSync.WebAPI.Files
                 _logger.LogWarning(ex, "Failed to recover quarantine orphans");
             }
         }
-
 
         public void Dispose()
         {

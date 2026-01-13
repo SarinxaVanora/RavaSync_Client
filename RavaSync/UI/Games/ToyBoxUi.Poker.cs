@@ -14,7 +14,7 @@ using System.Numerics;
 
 namespace RavaSync.UI;
 
-public sealed partial class SyncshellGamesUi
+public sealed partial class ToyBoxUi
 {
     private int _pokerRaiseTo = 0;
 
@@ -89,11 +89,16 @@ public sealed partial class SyncshellGamesUi
             }
 
             ImGui.SameLine();
-            if (_uiSharedService.IconTextButton(FontAwesomeIcon.SignOutAlt, "Leave", 120 * scale, true))
+            var label = isHost ? "Close Lobby" : "Leave";
+            if (_uiSharedService.IconTextButton(FontAwesomeIcon.SignOutAlt, label, 120 * scale, true))
             {
-                _games.LeavePoker(_activeGameId);
+                if (isHost) _games.ClosePokerLobby(_activeGameId);
+                else _games.LeavePoker(_activeGameId);
+
+                _activeGameId = Guid.Empty;
                 return;
             }
+
         }
 
         ImGui.Separator();

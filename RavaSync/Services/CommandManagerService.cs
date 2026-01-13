@@ -53,7 +53,8 @@ public sealed class CommandManagerService : IDisposable
                 "\t /rava analyze - Opens the RavaSync Character Data Analysis window" + Environment.NewLine +
                 "\t /rava settings - Opens the RavaSync Settings window" + Environment.NewLine +
                 "\t /rava linktoshell - Opens the Venue Registration pane for the current interior (requires Indoor Furnishings)" + Environment.NewLine +
-                "\t /rava tools - Opens the Tools hub shortcuts window"
+                "\t /rava tools - Opens the Tools hub shortcuts window" + Environment.NewLine +
+                "\t /rava games - Opens the 'Toy Box games' window"
         });
     }
 
@@ -133,19 +134,20 @@ public sealed class CommandManagerService : IDisposable
         }
         else if (string.Equals(splitArgs[0], "linktoshell", StringComparison.OrdinalIgnoreCase))
         {
-            // Validate we’re in a registerable interior w/ Indoor Furnishings permission.
             if (!_dalamudUtil.TryGetRegisterableVenue(_gameGui, out var _, out var reason))
             {
                 _mediator.Publish(new NotificationMessage("Cannot register here", reason, NotificationType.Error));
                 return;
             }
-
-            // Open Venue Registration pane
             _mediator.Publish(new UiToggleMessage(typeof(VenueRegistrationUi)));
         }
         else if (string.Equals(splitArgs[0], "tools", StringComparison.OrdinalIgnoreCase))
         {
             _mediator.Publish(new UiToggleMessage(typeof(ToolsHubUi)));
+        }
+        else if (string.Equals(splitArgs[0], "games", StringComparison.OrdinalIgnoreCase))
+        {
+            _mediator.Publish(new UiToggleMessage(typeof(ToyBoxUi)));
         }
     }
 }

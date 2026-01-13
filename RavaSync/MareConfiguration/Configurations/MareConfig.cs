@@ -68,25 +68,18 @@ public class MareConfig : IMareConfiguration
     public float FontRasterizerMultiply { get; set; } = 1.0f;
     public int FontOversampleH { get; set; } = 2;
     public int FontOversampleV { get; set; } = 2;
-
     public bool DelayActivationEnabled { get; set; } = true;
-
     public bool DelayAnimationsOnly { get; set; } = true;
-
     public bool ApplyOnlyOnZoneChange { get; set; } = false;
-
     public int SafeIdleSeconds { get; set; } = 5;
-
     public HashSet<string> VenueAskSuppressKeys { get; set; } = new(StringComparer.OrdinalIgnoreCase);
-
-    public int ParallelApplyDegree { get; set; } = 0; // 0 = Auto, else explicit worker count
-
+    public int ParallelApplyDegree { get; set; } = 0;
     public bool ShowFriendshapedHeart { get; set; } = true;
-
     public bool EnableSendPairRequestContextMenu { get; set; } = true;
-
     public bool AutoDeclineIncomingPairRequests { get; set; } = false;
     public bool SeenDiscoveryIntro { get; set; } = false;
     public bool EnableRavaDiscoveryPresence { get; set; } = false;
+    public bool CacheFolderSubdirMigrationDone { get; set; } = false;
+
 
 }

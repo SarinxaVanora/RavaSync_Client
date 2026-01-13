@@ -5,6 +5,7 @@ using Dalamud.Interface.Utility.Raii;
 using Dalamud.Utility;
 using RavaSync.API.Data.Enum;
 using RavaSync.API.Data.Extensions;
+using RavaSync.API.Dto.Group;
 using RavaSync.PlayerData.Pairs;
 using RavaSync.Services.Mediator;
 using RavaSync.WebAPI;
@@ -72,7 +73,7 @@ public class TopTabMenu
     {
         var availableWidth = ImGui.GetWindowContentRegionMax().X - ImGui.GetWindowContentRegionMin().X;
         var spacing = ImGui.GetStyle().ItemSpacing;
-        var buttonCount = 3;
+        var buttonCount = 4;
         var buttonX = (availableWidth - spacing.X * (buttonCount - 1)) / buttonCount;
         var buttonY = _uiSharedService.GetIconButtonSize(FontAwesomeIcon.Pause).Y;
         var buttonSize = new Vector2(buttonX, buttonY);
@@ -115,6 +116,17 @@ public class TopTabMenu
                     underlineColor, 2);
         }
         UiSharedService.AttachToolTip("Syncshell Menu");
+
+        ImGui.SameLine();
+        using (ImRaii.PushFont(UiBuilder.IconFont))
+        {
+            if (ImGui.Button(FontAwesomeIcon.Gamepad.ToIconString(), buttonSize))
+            {
+                _mareMediator.Publish(new UiToggleMessage(typeof(ToyBoxUi)));
+            }
+        }
+        UiSharedService.AttachToolTip("Toy Box");
+
 
         ImGui.SameLine();
         using (ImRaii.PushFont(UiBuilder.IconFont))

@@ -1,17 +1,18 @@
 ﻿using Dalamud.Game.Gui.ContextMenu;
-using System;
-using System.Linq;
 using Dalamud.Game.Text.SeStringHandling;
+using Microsoft.Extensions.Logging;
 using RavaSync.API.Data;
 using RavaSync.API.Data.Enum;
 using RavaSync.API.Data.Extensions;
 using RavaSync.API.Dto.User;
 using RavaSync.PlayerData.Factories;
 using RavaSync.PlayerData.Handlers;
+using RavaSync.Services;
 using RavaSync.Services.Mediator;
 using RavaSync.Services.ServerConfiguration;
 using RavaSync.Utils;
-using Microsoft.Extensions.Logging;
+using System;
+using System.Linq;
 
 namespace RavaSync.PlayerData.Pairs;
 
@@ -22,6 +23,8 @@ public class Pair
     private readonly ILogger<Pair> _logger;
     private readonly MareMediator _mediator;
     private readonly ServerConfigurationManager _serverConfigurationManager;
+    private readonly ToyBox _toyBox;
+
     private CancellationTokenSource _applicationCts = new();
     private OnlineUserIdentDto? _onlineUserIdentDto = null;
     private long _lastUploadStatusTick = 0;
@@ -131,22 +134,11 @@ public class Pair
         });
     }
 
+
     public void ApplyData(OnlineUserCharaDataDto data)
     {
         _applicationCts = _applicationCts.CancelRecreate();
         var incoming = data.CharaData;
-
-        //if (IsUploadingRecently && incoming != null && LastReceivedCharacterData != null)
-        //{
-        //    bool incomingHasFiles = incoming.FileReplacements?.Any(k => k.Value?.Any() ?? false) ?? false;
-        //    bool previousHasFiles = LastReceivedCharacterData.FileReplacements?.Any(k => k.Value?.Any() ?? false) ?? false;
-
-        //    if (!incomingHasFiles && previousHasFiles)
-        //    {
-        //        _logger.LogDebug("Ignoring transient empty file list for {uid} while uploader is still uploading (keeping last appearance)", UserData.UID);
-        //        return;
-        //    }
-        //}
 
         if (incoming != null && LastReceivedCharacterData != null && IsUploadingRecently)
         {

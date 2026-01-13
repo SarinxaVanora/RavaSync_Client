@@ -97,13 +97,6 @@ public class DrawFolderGroup : DrawFolderBase
         UiSharedService.AttachToolTip("Copy Syncshell ID to Clipboard");
 
         ImGui.Separator();
-        ImGui.TextUnformatted("Syncshell Games");
-
-        if (_uiSharedService.IconTextButton(FontAwesomeIcon.Dice, "Open Syncshell Games", menuWidth, true))
-        {
-            ImGui.CloseCurrentPopup();
-            _mareMediator.Publish(new OpenSyncshellGamesPanel(_groupFullInfoDto));
-        }
 
         if (_uiSharedService.IconTextButton(FontAwesomeIcon.StickyNote, "Copy Notes", menuWidth, true))
         {

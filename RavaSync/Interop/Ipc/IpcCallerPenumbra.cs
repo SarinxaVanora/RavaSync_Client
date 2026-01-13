@@ -19,6 +19,15 @@ public sealed class IpcCallerPenumbra : DisposableMediatorSubscriberBase, IIpcCa
     private readonly RedrawManager _redrawManager;
     private bool _shownPenumbraUnavailable = false;
     private string? _penumbraModDirectory;
+
+    private sealed class RedrawGate
+    {
+        public int InFlight;
+        public int Pending;
+    }
+
+    private readonly ConcurrentDictionary<nint, RedrawGate> _redrawGates = new();
+
     public string? ModDirectory
     {
         get => _penumbraModDirectory;
@@ -31,6 +40,18 @@ public sealed class IpcCallerPenumbra : DisposableMediatorSubscriberBase, IIpcCa
             }
         }
     }
+
+    private readonly ConcurrentDictionary<int, TempCollectionAssignState> _tempCollectionAssignState = new();
+
+    private sealed class TempCollectionAssignState
+    {
+        public Guid LastCollection;
+        public int FailCount;
+        public DateTime NextAttemptUtc;
+        public DateTime LastWarnUtc;
+        public DateTime LastForceUtc;
+    }
+
 
     private readonly ConcurrentDictionary<IntPtr, bool> _penumbraRedrawRequests = new();
 
@@ -166,20 +187,89 @@ public sealed class IpcCallerPenumbra : DisposableMediatorSubscriberBase, IIpcCa
 
         _mareMediator.Publish(new PenumbraModSettingChangedMessage());
     }
-    public async Task AssignTemporaryCollectionAsync(ILogger logger, Guid collName, int idx)
+    //public async Task AssignTemporaryCollectionAsync(ILogger logger, Guid collName, int idx)
+    //{
+    //    if (!APIAvailable) return;
+
+    //    await SafeIpc.TryRun(Logger, "Penumbra.AssignTemporaryCollection", TimeSpan.FromSeconds(2), async ct =>
+    //    {
+    //        await _dalamudUtil.RunOnFrameworkThread(() =>
+    //        {
+    //            var retAssign = _penumbraAssignTemporaryCollection.Invoke(collName, idx, forceAssignment: true);
+    //            logger.LogTrace("Assigning Temp Collection {collName} to index {idx}, Success: {ret}", collName, idx, retAssign);
+    //            return collName;
+    //        }).ConfigureAwait(false);
+    //    }).ConfigureAwait(false);
+    //}
+
+    public async Task<bool> AssignTemporaryCollectionAsync(ILogger logger, Guid collName, int idx)
     {
-        if (!APIAvailable) return;
+        if (!APIAvailable) return false;
+
+        bool assigned = false;
 
         await SafeIpc.TryRun(Logger, "Penumbra.AssignTemporaryCollection", TimeSpan.FromSeconds(2), async ct =>
         {
-            await _dalamudUtil.RunOnFrameworkThread(() =>
+            assigned = await _dalamudUtil.RunOnFrameworkThread(() =>
             {
-                var retAssign = _penumbraAssignTemporaryCollection.Invoke(collName, idx, forceAssignment: true);
-                logger.LogTrace("Assigning Temp Collection {collName} to index {idx}, Success: {ret}", collName, idx, retAssign);
-                return collName;
+                var now = DateTime.UtcNow;
+                var state = _tempCollectionAssignState.GetOrAdd(idx, _ => new TempCollectionAssignState());
+
+                if (state.LastCollection != collName)
+                {
+                    state.LastCollection = collName;
+                    state.FailCount = 0;
+                    state.NextAttemptUtc = DateTime.MinValue;
+                    state.LastWarnUtc = DateTime.MinValue;
+                    state.LastForceUtc = DateTime.MinValue;
+                }
+
+                if (now < state.NextAttemptUtc)
+                    return false;
+
+                var ec = _penumbraAssignTemporaryCollection.Invoke(collName, idx, forceAssignment: false);
+                if (ec == PenumbraApiEc.Success)
+                {
+                    _tempCollectionAssignState.TryRemove(idx, out _);
+                    logger.LogTrace("[Penumbra] Assigned temp collection {collection} to idx {idx} (polite)", collName, idx);
+                    return true;
+                }
+
+                if ((now - state.LastForceUtc) >= TimeSpan.FromSeconds(3))
+                {
+                    state.LastForceUtc = now;
+
+                    var ecForce = _penumbraAssignTemporaryCollection.Invoke(collName, idx, forceAssignment: true);
+                    if (ecForce == PenumbraApiEc.Success)
+                    {
+                        _tempCollectionAssignState.TryRemove(idx, out _);
+                        logger.LogTrace("[Penumbra] Assigned temp collection {collection} to idx {idx} (forced)", collName, idx);
+                        return true;
+                    }
+
+                    ec = ecForce;
+                }
+
+                state.FailCount++;
+                var delayMs = (int)Math.Min(30_000, 500 * Math.Pow(2, Math.Min(state.FailCount, 10)));
+                state.NextAttemptUtc = now.AddMilliseconds(delayMs);
+
+                if (now - state.LastWarnUtc > TimeSpan.FromMinutes(1))
+                {
+                    state.LastWarnUtc = now;
+                    logger.LogWarning(
+                        "[Penumbra] Temp collection assign failed for idx {idx} (ec={ec}). Another plugin may be controlling this actor. Backing off for {delay}ms.",
+                        idx, ec, delayMs);
+                }
+
+                return false;
             }).ConfigureAwait(false);
         }).ConfigureAwait(false);
+
+        return assigned;
     }
+
+
 
     public async Task ConvertTextureFiles(ILogger logger, Dictionary<string, string[]> textures, IProgress<(string, int)> progress, CancellationToken token)
     {
@@ -286,72 +376,71 @@ public sealed class IpcCallerPenumbra : DisposableMediatorSubscriberBase, IIpcCa
         }
     }
 
-    //public async Task RedrawAsync(ILogger logger, GameObjectHandler handler, Guid applicationId, CancellationToken token)
-    //{
-    //    if (!APIAvailable || _dalamudUtil.IsZoning) return;
-    //    try
-    //    {
-    //        await _redrawManager.RedrawSemaphore.WaitAsync(token).ConfigureAwait(false);
-    //        await _redrawManager.PenumbraRedrawInternalAsync(logger, handler, applicationId, (chara) =>
-    //        {
-    //            logger.LogDebug("[{appid}] Calling on IPC: PenumbraRedraw", applicationId);
-    //            try
-    //            {
-    //                _penumbraRedraw!.Invoke(chara.ObjectIndex, setting: RedrawType.Redraw);
-    //            }
-    //            catch (Exception ex)
-    //            {
-    //                logger.LogError(ex, "Penumbra.Redraw threw.");
-    //            }
-
-    //        }, token).ConfigureAwait(false);
-    //    }
-    //    finally
-    //    {
-    //        _redrawManager.RedrawSemaphore.Release();
-    //    }
-    //}
-
     public async Task RedrawAsync(ILogger logger, GameObjectHandler handler, Guid applicationId, CancellationToken token)
     {
         if (!APIAvailable || _dalamudUtil.IsZoning) return;
 
-        var semaphore = _redrawManager.RedrawSemaphore;
-        var entered = false;
+        // Coalesce redraws per-actor:
+        var gate = _redrawGates.GetOrAdd(handler.Address, _ => new RedrawGate());
+
+        if (Interlocked.Exchange(ref gate.InFlight, 1) == 1)
+        {
+            Interlocked.Exchange(ref gate.Pending, 1);
+            logger.LogTrace("[{appid}] Redraw already in flight for {name}, marking pending", applicationId, handler.Name);
+            return;
+        }
 
         try
         {
-            await semaphore.WaitAsync(token).ConfigureAwait(false);
-            entered = true;
-
-            try
+            while (!token.IsCancellationRequested && !_dalamudUtil.IsZoning)
             {
-                await _redrawManager.PenumbraRedrawInternalAsync(logger, handler, applicationId, chara =>
+                // Clear pending for this run.
+                Interlocked.Exchange(ref gate.Pending, 0);
+
+                var semaphore = _redrawManager.RedrawSemaphore;
+                var entered = false;
+
+                try
                 {
-                    logger.LogDebug("[{appid}] Calling on IPC: PenumbraRedraw", applicationId);
+                    await semaphore.WaitAsync(token).ConfigureAwait(false);
+                    entered = true;
 
-                    try
+                    await _redrawManager.PenumbraRedrawInternalAsync(logger, handler, applicationId, chara =>
                     {
-                        _penumbraRedraw!.Invoke(chara.ObjectIndex, RedrawType.Redraw);
-                    }
-                    catch (Exception ex)
-                    {
-                        logger.LogError(ex, "Penumbra.Redraw threw");
-                    }
+                        logger.LogDebug("[{appid}] Calling on IPC: PenumbraRedraw", applicationId);
 
-                }, token).ConfigureAwait(false);
-            }
-            catch (OperationCanceledException)
-            {
-                logger.LogDebug("[{appid}] Penumbra redraw cancelled for {name}", applicationId, handler.Name);
+                        try
+                        {
+                            _penumbraRedraw!.Invoke(chara.ObjectIndex, RedrawType.Redraw);
+                        }
+                        catch (Exception ex)
+                        {
+                            logger.LogError(ex, "Penumbra.Redraw threw");
+                        }
+
+                    }, token).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    logger.LogDebug("[{appid}] Penumbra redraw cancelled for {name}", applicationId, handler.Name);
+                    break;
+                }
+                finally
+                {
+                    if (entered)
+                        semaphore.Release();
+                }
+
+                if (Interlocked.CompareExchange(ref gate.Pending, 0, 0) != 1)
+                    break;
             }
         }
         finally
         {
-            if (entered)
-                semaphore.Release();
+            Interlocked.Exchange(ref gate.InFlight, 0);
         }
     }
+
 
 
     public async Task RemoveTemporaryCollectionAsync(ILogger logger, Guid applicationId, Guid collId)
@@ -458,10 +547,10 @@ public sealed class IpcCallerPenumbra : DisposableMediatorSubscriberBase, IIpcCa
         ModDirectory = _penumbraResolveModDir.Invoke();
         _mareMediator.Publish(new PenumbraInitializedMessage());
 
-        _ = SafeIpc.TryRun(Logger, "Penumbra.Redraw.Init", TimeSpan.FromSeconds(2), ct =>
-        {
-            _penumbraRedraw!.Invoke(0, setting: RedrawType.Redraw);
-            return Task.CompletedTask;
-        });
+        //_ = SafeIpc.TryRun(Logger, "Penumbra.Redraw.Init", TimeSpan.FromSeconds(2), ct =>
+        //{
+        //    _penumbraRedraw!.Invoke(0, setting: RedrawType.Redraw);
+        //    return Task.CompletedTask;
+        //});
     }
 }
