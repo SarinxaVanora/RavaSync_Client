@@ -28,8 +28,8 @@ public class MareConfig : IMareConfiguration
     public double MaxLocalCacheInGiB { get; set; } = 20;
     public bool OpenGposeImportOnGposeStart { get; set; } = false;
     public bool OpenPopupOnAdd { get; set; } = true;
-    public int ParallelDownloads { get; set; } = 16;
-    public int ParallelUploads { get; set; } = 10;
+    public int ParallelDownloads { get; set; } = 0;
+    public int ParallelUploads { get; set; } = 0;
     public int DownloadSpeedLimitInBytes { get; set; } = 0;
     public DownloadSpeeds DownloadSpeedType { get; set; } = DownloadSpeeds.MBps;
     public bool PreferNotesOverNamesForVisible { get; set; } = false;
@@ -58,7 +58,7 @@ public class MareConfig : IMareConfiguration
     public bool UseCompactor { get; set; } = false;
     public bool DebugStopWhining { get; set; } = false;
     public bool AutoPopulateEmptyNotesFromCharaName { get; set; } = false;
-    public int Version { get; set; } = 1;
+    public int Version { get; set; } = 2;
     public NotificationLocation WarningNotification { get; set; } = NotificationLocation.Both;
     public bool UseFocusTarget { get; set; } = false;
     public bool SortPairsByVRAM { get; set; } = false;

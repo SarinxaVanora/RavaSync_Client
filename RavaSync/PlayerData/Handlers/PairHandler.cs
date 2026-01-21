@@ -346,105 +346,9 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
         }
     }
 
-    #region old ApplyCustomizationDataAsync
-    //private async Task ApplyCustomizationDataAsync(Guid applicationId, KeyValuePair<ObjectKind, HashSet<PlayerChanges>> changes, CharacterData charaData, CancellationToken token)
-    //{
-    //    if (PlayerCharacter == nint.Zero) return;
-    //    var ptr = PlayerCharacter;
-
-    //    var handler = changes.Key switch
-    //    {
-    //        ObjectKind.Player => _charaHandler!,
-    //        ObjectKind.Companion => await _gameObjectHandlerFactory.Create(changes.Key, () => _dalamudUtil.GetCompanionPtr(ptr), isWatched: false).ConfigureAwait(false),
-    //        ObjectKind.MinionOrMount => await _gameObjectHandlerFactory.Create(changes.Key, () => _dalamudUtil.GetMinionOrMountPtr(ptr), isWatched: false).ConfigureAwait(false),
-    //        ObjectKind.Pet => await _gameObjectHandlerFactory.Create(changes.Key, () => _dalamudUtil.GetPetPtr(ptr), isWatched: false).ConfigureAwait(false),
-    //        _ => throw new NotSupportedException("ObjectKind not supported: " + changes.Key)
-    //    };
-
-    //    try
-    //    {
-    //        if (handler.Address == nint.Zero)
-    //        {
-    //            return;
-    //        }
-
-    //        Logger.LogDebug("[{applicationId}] Applying Customization Data for {handler}", applicationId, handler);
-    //        await _dalamudUtil.WaitWhileCharacterIsDrawing(Logger, handler, applicationId, 30000, token).ConfigureAwait(false);
-    //        token.ThrowIfCancellationRequested();
-    //        foreach (var change in changes.Value.OrderBy(p => (int)p))
-    //        {
-    //            Logger.LogDebug("[{applicationId}] Processing {change} for {handler}", applicationId, change, handler);
-    //            switch (change)
-    //            {
-    //                case PlayerChanges.Customize:
-    //                    // Per-pair pause: if disabled, revert any previous C+ and skip applying new data
-    //                    if (!Pair.IsCustomizePlusEnabled)
-    //                    {
-    //                        if (_customizeIds.TryGetValue(changes.Key, out var appliedId) && appliedId.HasValue)
-    //                        {
-    //                            await _ipcManager.CustomizePlus.RevertByIdAsync(appliedId.Value).ConfigureAwait(false);
-    //                            _customizeIds.Remove(changes.Key);
-    //                        }
-    //                        break;
-    //                    }
-
-    //                    if (charaData.CustomizePlusData.TryGetValue(changes.Key, out var customizePlusData))
-    //                    {
-    //                        _customizeIds[changes.Key] = await _ipcManager.CustomizePlus
-    //                            .SetBodyScaleAsync(handler.Address, customizePlusData)
-    //                            .ConfigureAwait(false);
-    //                    }
-    //                    else if (_customizeIds.TryGetValue(changes.Key, out var customizeId) && customizeId.HasValue)
-    //                    {
-    //                        await _ipcManager.CustomizePlus.RevertByIdAsync(customizeId.Value).ConfigureAwait(false);
-    //                        _customizeIds.Remove(changes.Key);
-    //                    }
-    //                    break;
-
-
-    //                case PlayerChanges.Heels:
-    //                    await _ipcManager.Heels.SetOffsetForPlayerAsync(handler.Address, charaData.HeelsData).ConfigureAwait(false);
-    //                    break;
-
-    //                case PlayerChanges.Honorific:
-    //                    await _ipcManager.Honorific.SetTitleAsync(handler.Address, charaData.HonorificData).ConfigureAwait(false);
-    //                    break;
-
-    //                case PlayerChanges.Glamourer:
-    //                    if (charaData.GlamourerData.TryGetValue(changes.Key, out var glamourerData))
-    //                    {
-    //                        await _ipcManager.Glamourer.ApplyAllAsync(Logger, handler, glamourerData, applicationId, token).ConfigureAwait(false);
-    //                    }
-    //                    break;
-
-    //                case PlayerChanges.Moodles:
-    //                    await _ipcManager.Moodles.SetStatusAsync(handler.Address, charaData.MoodlesData).ConfigureAwait(false);
-    //                    break;
-
-    //                case PlayerChanges.PetNames:
-    //                    await _ipcManager.PetNames.SetPlayerData(handler.Address, charaData.PetNamesData).ConfigureAwait(false);
-    //                    break;
-
-    //                case PlayerChanges.ForcedRedraw:
-    //                    await _ipcManager.Penumbra.RedrawAsync(Logger, handler, applicationId, token).ConfigureAwait(false);
-    //                    break;
-
-    //                default:
-    //                    break;
-    //            }
-    //            token.ThrowIfCancellationRequested();
-    //        }
-    //    }
-    //    finally
-    //    {
-    //        if (handler != _charaHandler) handler.Dispose();
-    //    }
-    //}
-    #endregion
-
-    private async Task ApplyCustomizationDataAsync(Guid applicationId, KeyValuePair<ObjectKind, HashSet<PlayerChanges>> changes, CharacterData charaData, CancellationToken token)
+    private async Task<bool> ApplyCustomizationDataAsync(Guid applicationId, KeyValuePair<ObjectKind, HashSet<PlayerChanges>> changes, CharacterData charaData, CancellationToken token)
     {
-        if (PlayerCharacter == nint.Zero) return;
+        if (PlayerCharacter == nint.Zero) return false;
         var ptr = PlayerCharacter;
 
         var handler = changes.Key switch
@@ -458,11 +362,14 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
 
         try
         {
-            if (handler.Address == nint.Zero) return;
+            if (handler.Address == nint.Zero) return false;
 
             Logger.LogDebug("[{applicationId}] Applying Customization Data for {handler}", applicationId, handler);
-            await _dalamudUtil.WaitWhileCharacterIsDrawing(Logger, handler, applicationId, 30000, token).ConfigureAwait(false);
-            token.ThrowIfCancellationRequested();
+            if (changes.Key != ObjectKind.Player)
+            {
+                await _dalamudUtil.WaitWhileCharacterIsDrawing(Logger, handler, applicationId, 30000, token).ConfigureAwait(false);
+                token.ThrowIfCancellationRequested();
+            }
 
             // Coalesce redraws for this handler into a single call at the end.
             bool needsRedraw = false;
@@ -534,13 +441,38 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
 
             if (needsRedraw)
             {
+                if (changes.Key == ObjectKind.Player)
+                    return true;
+
                 await _ipcManager.Penumbra.RedrawAsync(Logger, handler, applicationId, token).ConfigureAwait(false);
             }
+
+            return false;
         }
         finally
         {
             if (handler != _charaHandler) handler.Dispose();
         }
+    }
+
+    private async Task TwoPassRedrawAsync(Guid applicationId, CancellationToken token)
+    {
+        if (_charaHandler == null || _charaHandler.Address == nint.Zero)
+            return;
+
+        await _ipcManager.Penumbra.RedrawAsync(Logger, _charaHandler, applicationId, token).ConfigureAwait(false);
+
+        token.ThrowIfCancellationRequested();
+
+        await Task.Delay(250, token).ConfigureAwait(false);
+
+        if (applicationId != _applicationId)
+            return;
+
+        if (_charaHandler == null || _charaHandler.Address == nint.Zero)
+            return;
+
+        await _ipcManager.Penumbra.RedrawAsync(Logger, _charaHandler, applicationId, token).ConfigureAwait(false);
     }
 
 
@@ -785,19 +717,6 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
 
                 if (updateModdedPaths)
                 {
-                    // Ensure collection is set
-                    //var objIndex = await _dalamudUtil
-                    //    .RunOnFrameworkThread(() => _charaHandler!.GetGameObject()!.ObjectIndex)
-                    //    .ConfigureAwait(false);
-
-                    //if (_lastAssignedObjectIndex != objIndex)
-                    //{
-                    //    await _ipcManager.Penumbra
-                    //        .AssignTemporaryCollectionAsync(Logger, _penumbraCollection, objIndex)
-                    //        .ConfigureAwait(false);
-
-                    //    _lastAssignedObjectIndex = objIndex;
-                    //}
 
                     var objIndex = await _dalamudUtil
                                     .RunOnFrameworkThread(() => _charaHandler!.GetGameObject()!.ObjectIndex)
@@ -887,6 +806,8 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
                             BuildPenumbraTempMods(moddedPaths))
                         .ConfigureAwait(false);
 
+                    needsRedraw = true;
+
                     long totalBytes = 0;
                     bool any = false;
 
@@ -910,15 +831,6 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
                     LastAppliedDataBytes = any ? totalBytes : -1;
                 }
 
-                if (_charaHandler != null && updatedData.TryGetValue(_charaHandler.ObjectKind, out var changesForThisKind))
-                {
-                    var hasModFiles = changesForThisKind.Contains(PlayerChanges.ModFiles);
-                    var hasOtherChanges = changesForThisKind.Any(c => c != PlayerChanges.ModFiles);
-
-                    if (hasModFiles && !hasOtherChanges)
-                        needsRedraw = true;
-                }
-
                 if (updateManip)
                 {
                     if (Pair.IsMetadataEnabled)
@@ -939,16 +851,14 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
 
                 foreach (var kind in updatedData)
                 {
-                    await ApplyCustomizationDataAsync(_applicationId, kind, charaData, token).ConfigureAwait(false);
+                    needsRedraw |= await ApplyCustomizationDataAsync(_applicationId, kind, charaData, token).ConfigureAwait(false);
                     token.ThrowIfCancellationRequested();
                 }
 
-                // Single redraw at end avoids redraw spikes mid-apply.
+                // Two-pass redraw: once immediately, then once shortly after to mitigate IVCS stretch/weirdness.
                 if (needsRedraw && _charaHandler != null && _charaHandler.Address != nint.Zero)
                 {
-                    await _ipcManager.Penumbra
-                        .RedrawAsync(Logger, _charaHandler, _applicationId, token)
-                        .ConfigureAwait(false);
+                    await TwoPassRedrawAsync(_applicationId, token).ConfigureAwait(false);
                 }
 
                 _cachedData = charaData;

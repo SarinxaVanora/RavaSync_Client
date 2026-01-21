@@ -195,6 +195,8 @@
     <Content Include="Fonts\VT323-Regular.ttf">
       <CopyToOutputDirectory>Always</CopyToOutputDirectory>
     </Content>
+    <EmbeddedResource Include="Resources\aether_fill_strip.png" />
+    <EmbeddedResource Include="Resources\aether_frame_bar.png" />
     <EmbeddedResource Include="Resources\cards_atlas.png" />
     <EmbeddedResource Include="Resources\card_back.png" />
     <Content Include="Themes\theme.darkforrest.json">

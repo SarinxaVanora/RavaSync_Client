@@ -13,6 +13,8 @@ public class TransientConfig : IMareConfiguration
         public List<string> GlobalPersistentCache { get; set; } = [];
         public Dictionary<uint, List<string>> JobSpecificCache { get; set; } = [];
         public Dictionary<uint, List<string>> JobSpecificPetCache { get; set; } = [];
+        public bool AutoRecordEmotes { get; set; } = true;
+        public List<string> AutoRecordedEmoteKeys { get; set; } = new();
 
         public TransientPlayerConfig()
         {

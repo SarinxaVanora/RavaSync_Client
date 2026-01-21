@@ -29,6 +29,27 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
     private readonly ConcurrentDictionary<ObjectKind, int> _transientDirty = new();
     private static readonly TimeSpan _transientSendDelay = TimeSpan.FromMilliseconds(750);
 
+    // -------------------- AUTO VFX EMOTE RECORDING --------------------
+    private int _autoRecordRunning = 0;
+    private bool _autoRecordWarnedDisabled = false;
+    private DateTime _autoRecordCooldownUntilUtc = DateTime.MinValue;
+
+    private static readonly TimeSpan _autoRecordDuration = TimeSpan.FromSeconds(20);
+    private static readonly TimeSpan _autoRecordCooldown = TimeSpan.FromSeconds(20);
+    private static readonly TimeSpan _autoRecordMinDuration = TimeSpan.FromSeconds(2);
+    private static readonly TimeSpan _autoRecordIdleStop = TimeSpan.FromMilliseconds(1500);
+
+
+    private long _autoRecordLastActivityTicks = 0;
+
+    private readonly object _autoRecordedKeyLock = new();
+    private HashSet<string>? _autoRecordedEmoteKeysCache;
+
+    public bool HasPendingTransients(ObjectKind kind)
+    {
+        return TransientResources.TryGetValue(kind, out var set) && set.Count > 0;
+    }
+
 
     public TransientResourceManager(ILogger<TransientResourceManager> logger, TransientConfigService configurationService,
             DalamudUtilService dalamudUtil, MareMediator mediator) : base(logger, mediator)
@@ -299,55 +320,65 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
 
     private void Manager_PenumbraResourceLoadEvent(PenumbraResourceLoadMessage msg)
     {
-        var gamePath = msg.GamePath.ToLowerInvariant();
+        var gamePathRaw = msg.GamePath ?? string.Empty;
         var gameObjectAddress = msg.GameObject;
-        var filePath = msg.FilePath;
+        var filePathRaw = msg.FilePath ?? string.Empty;
 
-        // ignore files already processed this frame
-        if (_cachedHandledPaths.Contains(gamePath)) return;
+        var replacedGamePath = NormalizePath(gamePathRaw);
 
+        // ignore files already processed this frame (thread-safe)
         lock (_cacheAdditionLock)
         {
-            _cachedHandledPaths.Add(gamePath);
+            if (_cachedHandledPaths.Contains(replacedGamePath)) return;
+            _cachedHandledPaths.Add(replacedGamePath);
         }
+
+        var filePath = filePathRaw;
 
         // replace individual mtrl stuff
-        if (filePath.StartsWith("|", StringComparison.OrdinalIgnoreCase))
+        if (!string.IsNullOrEmpty(filePath) && filePath.StartsWith("|", StringComparison.OrdinalIgnoreCase))
         {
-            filePath = filePath.Split("|")[2];
+            var parts = filePath.Split("|");
+            if (parts.Length >= 3) filePath = parts[2];
         }
-        // replace filepath
-        filePath = filePath.ToLowerInvariant().Replace("\\", "/", StringComparison.OrdinalIgnoreCase);
+
+        filePath = NormalizePath(filePath);
 
         // ignore files that are the same
-        var replacedGamePath = gamePath.ToLowerInvariant().Replace("\\", "/", StringComparison.OrdinalIgnoreCase);
         if (string.Equals(filePath, replacedGamePath, StringComparison.OrdinalIgnoreCase))
-        {
             return;
-        }
 
         // ignore files to not handle
-        var handledTypes = IsTransientRecording ? _handledRecordingFileTypes.Concat(_handledFileTypes) : _handledFileTypes;
-        if (!handledTypes.Any(type => gamePath.EndsWith(type, StringComparison.OrdinalIgnoreCase)))
-        {
-            lock (_cacheAdditionLock)
-            {
-                _cachedHandledPaths.Add(gamePath);
-            }
+        var handledTypes = IsTransientRecording
+            ? _handledRecordingFileTypes.Concat(_handledFileTypes)
+            : _handledFileTypes;
+
+        if (!handledTypes.Any(type => replacedGamePath.EndsWith(type, StringComparison.OrdinalIgnoreCase)))
             return;
-        }
 
         // ignore files not belonging to anything player related
         if (!_cachedFrameAddresses.TryGetValue(gameObjectAddress, out var objectKind))
-        {
-            lock (_cacheAdditionLock)
-            {
-                _cachedHandledPaths.Add(gamePath);
-            }
             return;
+
+        // -------------------- AUTO RECORD TRIGGER --------------------
+        if (!IsTransientRecording
+            && objectKind == ObjectKind.Player
+            && !_dalamudUtil.IsInCombatOrPerforming
+            && ShouldAutoRecordVfxOnly(replacedGamePath))
+        {
+            var key = IsEmoteKeyPath(replacedGamePath) ? replacedGamePath : null;
+            TryStartAutoRecordSession(key, replacedGamePath);
         }
 
-        // ^ all of the code above is just to sanitize the data
+        // If we are recording, ONLY capture VFX/prop/emote-related items
+        if (IsTransientRecording)
+        {
+            if (!ShouldAutoRecordVfxOnly(replacedGamePath))
+                return;
+
+            // activity pulse for idle-stop
+            Interlocked.Exchange(ref _autoRecordLastActivityTicks, DateTime.UtcNow.Ticks);
+        }
 
         if (!TransientResources.TryGetValue(objectKind, out HashSet<string>? transientResources))
         {
@@ -359,12 +390,16 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
         bool alreadyTransient = false;
 
         bool transientContains = transientResources.Contains(replacedGamePath);
-        bool semiTransientContains = SemiTransientResources.SelectMany(k => k.Value).Any(f => string.Equals(f, gamePath, StringComparison.OrdinalIgnoreCase));
+
+        bool semiTransientContains = SemiTransientResources.SelectMany(k => k.Value)
+            .Any(f => string.Equals(f, replacedGamePath, StringComparison.OrdinalIgnoreCase));
+
         if (transientContains || semiTransientContains)
         {
             if (!IsTransientRecording)
-                Logger.LogTrace("Not adding {replacedPath} => {filePath}, Reason: Transient: {contains}, SemiTransient: {contains2}", replacedGamePath, filePath,
-                    transientContains, semiTransientContains);
+                Logger.LogTrace("Not adding {replacedPath} => {filePath}, Reason: Transient: {contains}, SemiTransient: {contains2}",
+                    replacedGamePath, filePath, transientContains, semiTransientContains);
+
             alreadyTransient = true;
         }
         else
@@ -374,7 +409,11 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
                 bool isAdded = transientResources.Add(replacedGamePath);
                 if (isAdded)
                 {
-                    Logger.LogDebug("Adding {replacedGamePath} for {gameObject} ({filePath})", replacedGamePath, owner?.ToString() ?? gameObjectAddress.ToString("X"), filePath);
+                    Logger.LogDebug("Adding {replacedGamePath} for {gameObject} ({filePath})",
+                        replacedGamePath,
+                        owner?.ToString() ?? gameObjectAddress.ToString("X"),
+                        filePath);
+
                     SendTransients(gameObjectAddress, objectKind);
                 }
             }
@@ -382,9 +421,14 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
 
         if (owner != null && IsTransientRecording)
         {
-            _recordedTransients.Add(new TransientRecord(owner, replacedGamePath, filePath, alreadyTransient) { AddTransient = !alreadyTransient });
+            _recordedTransients.Add(new TransientRecord(owner, replacedGamePath, filePath, alreadyTransient)
+            {
+                AddTransient = !alreadyTransient
+            });
         }
     }
+
+
 
     private void SendTransients(nint gameObject, ObjectKind objectKind)
     {
@@ -482,6 +526,183 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
             Mediator.Publish(new TransientResourceChangedMessage(item));
         }
     }
+
+
+    // -------------------- PATH HELPERS --------------------
+
+    private static string NormalizePath(string p)
+    {
+        if (string.IsNullOrWhiteSpace(p)) return string.Empty;
+        return p.ToLowerInvariant().Replace("\\", "/", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsEmoteKeyPath(string gamePath)
+    {
+        if (string.IsNullOrWhiteSpace(gamePath)) return false;
+
+        return gamePath.StartsWith("emote/", StringComparison.OrdinalIgnoreCase)
+            || gamePath.Contains("/emote/", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsVfxRelatedResourcePath(string gamePath)
+    {
+        if (string.IsNullOrWhiteSpace(gamePath)) return false;
+
+        return gamePath.StartsWith("vfx/", StringComparison.OrdinalIgnoreCase)
+            || gamePath.Contains("/vfx/", StringComparison.OrdinalIgnoreCase)
+            || gamePath.StartsWith("bgcommon/vfx/", StringComparison.OrdinalIgnoreCase)
+            || gamePath.Contains("/bgcommon/vfx/", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsPropRelatedResourcePath(string gamePath)
+    {
+        if (string.IsNullOrWhiteSpace(gamePath)) return false;
+
+        return gamePath.StartsWith("chara/weapon/", StringComparison.OrdinalIgnoreCase)
+            || gamePath.StartsWith("chara/accessory/", StringComparison.OrdinalIgnoreCase)
+            || gamePath.StartsWith("chara/minion/", StringComparison.OrdinalIgnoreCase)
+            || gamePath.StartsWith("chara/monster/", StringComparison.OrdinalIgnoreCase)
+            || gamePath.StartsWith("chara/demihuman/", StringComparison.OrdinalIgnoreCase)
+            || gamePath.StartsWith("bgcommon/vfx/", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsClothesOrBodyPath(string gamePath)
+    {
+        if (string.IsNullOrWhiteSpace(gamePath)) return false;
+
+        return gamePath.StartsWith("chara/equipment/", StringComparison.OrdinalIgnoreCase)
+            || gamePath.StartsWith("chara/human/", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private bool ShouldAutoRecordVfxOnly(string normalizedGamePath)
+    {
+        if (string.IsNullOrWhiteSpace(normalizedGamePath)) return false;
+        if (IsClothesOrBodyPath(normalizedGamePath)) return false;
+
+        if (normalizedGamePath.Contains("/emote/", StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        return IsVfxRelatedResourcePath(normalizedGamePath)
+            || IsPropRelatedResourcePath(normalizedGamePath);
+    }
+
+    private HashSet<string> GetAutoRecordedEmoteKeySet()
+    {
+        lock (_autoRecordedKeyLock)
+        {
+            if (_autoRecordedEmoteKeysCache != null) return _autoRecordedEmoteKeysCache;
+
+            _autoRecordedEmoteKeysCache = new HashSet<string>(
+                PlayerConfig.AutoRecordedEmoteKeys.Select(NormalizePath),
+                StringComparer.OrdinalIgnoreCase);
+
+            return _autoRecordedEmoteKeysCache;
+        }
+    }
+
+    private void AddAutoRecordedEmoteKey(string keyNormalized)
+    {
+        lock (_autoRecordedKeyLock)
+        {
+            PlayerConfig.AutoRecordedEmoteKeys.Add(keyNormalized);
+            _autoRecordedEmoteKeysCache ??= new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            _autoRecordedEmoteKeysCache.Add(keyNormalized);
+        }
+    }
+
+    private void TryStartAutoRecordSession(string? emoteKeyNormalized, string triggerPathNormalized)
+    {
+        if (!PlayerConfig.AutoRecordEmotes)
+        {
+            if (!_autoRecordWarnedDisabled)
+            {
+                _autoRecordWarnedDisabled = true;
+                Logger.LogWarning("Auto-record emotes is disabled in transient config.");
+            }
+            return;
+        }
+
+        if (DateTime.UtcNow < _autoRecordCooldownUntilUtc)
+            return;
+
+        var normalizedKey = string.IsNullOrWhiteSpace(emoteKeyNormalized) ? null : NormalizePath(emoteKeyNormalized);
+        if (!string.IsNullOrEmpty(normalizedKey))
+        {
+            var done = GetAutoRecordedEmoteKeySet();
+            if (done.Contains(normalizedKey))
+                return;
+        }
+
+        if (Interlocked.CompareExchange(ref _autoRecordRunning, 1, 0) != 0)
+            return;
+
+        _autoRecordCooldownUntilUtc = DateTime.UtcNow + _autoRecordCooldown;
+        Interlocked.Exchange(ref _autoRecordLastActivityTicks, DateTime.UtcNow.Ticks);
+
+        Logger.LogInformation("Auto-record starting (key={key}, trigger={trigger})", normalizedKey ?? "<none>", triggerPathNormalized);
+
+        var cts = new CancellationTokenSource(_autoRecordDuration);
+        StartRecording(cts.Token);
+
+        _ = Task.Run(async () =>
+        {
+            using (cts)
+            {
+                try
+                {
+                    var startedUtc = DateTime.UtcNow;
+
+                    while (!cts.IsCancellationRequested)
+                    {
+                        await Task.Delay(150).ConfigureAwait(false);
+
+                        var elapsed = DateTime.UtcNow - startedUtc;
+                        if (elapsed < _autoRecordMinDuration)
+                            continue;
+
+                        var lastTicks = Interlocked.Read(ref _autoRecordLastActivityTicks);
+                        if (lastTicks == 0)
+                            continue;
+
+                        var lastUtc = new DateTime(lastTicks, DateTimeKind.Utc);
+                        if (DateTime.UtcNow - lastUtc >= _autoRecordIdleStop)
+                        {
+                            cts.Cancel();
+                            break;
+                        }
+                    }
+
+                    try { cts.Cancel(); } catch { /* ignore */ }
+                    await WaitForRecording(CancellationToken.None).ConfigureAwait(false);
+
+                    var recorded = RecordedTransients.Count;
+                    SaveRecording();
+                    PersistTransientResources(ObjectKind.Player);
+
+                    if (!string.IsNullOrEmpty(normalizedKey))
+                    {
+                        AddAutoRecordedEmoteKey(normalizedKey);
+                        _configurationService.Save();
+                    }
+
+                    Logger.LogInformation("Auto-record finished (key={key}, recorded={count})", normalizedKey ?? "<none>", recorded);
+                }
+                catch (OperationCanceledException)
+                {
+                    // expected
+                }
+                catch (Exception ex)
+                {
+                    Logger.LogWarning(ex, "Auto-record emote task failed (key={key}, trigger={trigger})", normalizedKey ?? "<none>", triggerPathNormalized);
+                }
+                finally
+                {
+                    Interlocked.Exchange(ref _autoRecordRunning, 0);
+                }
+            }
+        });
+    }
+
 
     private readonly HashSet<TransientRecord> _recordedTransients = [];
     public IReadOnlySet<TransientRecord> RecordedTransients => _recordedTransients;

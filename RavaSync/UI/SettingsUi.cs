@@ -270,17 +270,26 @@ public class SettingsUi : WindowMediatorSubscriberBase
         ImGui.AlignTextToFramePadding();
         ImGui.TextUnformatted("0 = No limit/infinite");
 
-        if (ImGui.SliderInt("Maximum Parallel Downloads", ref maxParallelDownloads, 1, 10))
+        if (ImGui.SliderInt("Maximum Parallel Downloads", ref maxParallelDownloads, 0, 12))
         {
             _configService.Current.ParallelDownloads = maxParallelDownloads;
             _configService.Save();
         }
 
-        if (ImGui.SliderInt("Maximum Parallel Uploads", ref maxParallelUploads, 1, 10))
+        ImGui.SameLine();
+        ImGui.AlignTextToFramePadding();
+        ImGui.TextDisabled("(0 = Auto)");
+
+        if (ImGui.SliderInt("Maximum Parallel Uploads", ref maxParallelUploads, 0, 12))
         {
             _configService.Current.ParallelUploads = maxParallelUploads;
             _configService.Save();
         }
+
+        ImGui.SameLine();
+        ImGui.AlignTextToFramePadding();
+        ImGui.TextDisabled("(0 = Auto)");
+
 
         if (ImGui.Checkbox("Use Alternative Upload Method", ref useAlternativeUpload))
         {

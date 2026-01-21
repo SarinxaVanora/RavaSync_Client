@@ -42,8 +42,57 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
     private readonly MareConfigService _mareConfigService;
     private readonly DelayedActivatorService _delayedActivator;
     private const int MaxCdnAttemptsPerFile = 3;
-    private static readonly TimeSpan CdnAttemptTimeout = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan CdnAttemptTimeout = TimeSpan.FromSeconds(60);
 
+    private const int AutoCdnMinParallel = 2;
+    private const int AutoCdnMaxParallel = 12;
+
+    private const long AutoCdnSlowBpsThreshold = 768 * 1024;
+
+    private int _autoCdnParallel = 4;
+
+
+    private int GetCdnParallelTarget(int configuredParallel, int filesInGroup)
+    {
+        if (configuredParallel > 0)
+            return Math.Clamp(configuredParallel, 1, Math.Min(AutoCdnMaxParallel, Math.Max(1, filesInGroup)));
+
+        var p = Volatile.Read(ref _autoCdnParallel);
+        p = Math.Clamp(p, AutoCdnMinParallel, AutoCdnMaxParallel);
+        return Math.Clamp(p, 1, Math.Max(1, filesInGroup));
+    }
+
+    private void UpdateAutoCdnParallel(int usedParallel, bool success, bool hadTimeoutOrBackoff, bool hadSlow)
+    {
+        // Only adjust when config is Auto (0)
+        if (_mareConfigService.Current.ParallelDownloads > 0) return;
+
+        var cur = Volatile.Read(ref _autoCdnParallel);
+        var next = cur;
+
+        if (!success)
+            next = Math.Max(AutoCdnMinParallel, cur - 2);
+        else if (hadTimeoutOrBackoff)
+            next = Math.Max(AutoCdnMinParallel, cur - 1);
+        else if (hadSlow)
+            next = Math.Max(AutoCdnMinParallel, cur - 1);
+        else
+        {
+            if (usedParallel >= cur)
+            {
+                var step = cur < 6 ? 2 : 1;
+                next = Math.Min(AutoCdnMaxParallel, cur + step);
+            }
+
+        }
+
+        if (next != cur)
+        {
+            Volatile.Write(ref _autoCdnParallel, next);
+            Logger.LogDebug("CDN auto parallel: {cur} => {next} (success={success}, timeout/backoff={timeout}, slow={slow}, used={used})",
+                cur, next, success, hadTimeoutOrBackoff, hadSlow, usedParallel);
+        }
+    }
 
     // per-hash inflight dedupe (across pairs) so the same hash doesn't spawn duplicated bars
     private readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> _inflightHashes
@@ -216,6 +265,7 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
 
     public void ClearDownload()
     {
+        ReleaseInflight(CurrentDownloads);
         CurrentDownloads.Clear();
         _downloadStatus.Clear();
     }
@@ -467,7 +517,9 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
 
     private async Task DownloadFilesInternal(GameObjectHandler gameObjectHandler, List<FileReplacementData> fileReplacement, CancellationToken ct)
     {
-        var downloadGroups = CurrentDownloads.GroupBy(f => f.DownloadUri.Host + ":" + f.DownloadUri.Port, StringComparer.Ordinal);
+       var downloadGroups = CurrentDownloads
+            .GroupBy(f => f.DownloadUri.Host + ":" + f.DownloadUri.Port, StringComparer.Ordinal)
+            .ToList();
 
         foreach (var downloadGroup in downloadGroups)
         {
@@ -485,8 +537,7 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
 
         await Parallel.ForEachAsync(downloadGroups, new ParallelOptions()
         {
-
-            MaxDegreeOfParallelism = Math.Clamp(_mareConfigService.Current.ParallelDownloads, 2, Math.Min(Environment.ProcessorCount, 6)),
+            MaxDegreeOfParallelism = GetDownloadGroupParallelism(downloadGroups.Count),
             CancellationToken = ct,
         },
         async (fileGroup, token) =>
@@ -738,19 +789,19 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
         return false;
     }
 
-    private static (string fileHash, long fileLengthBytes, bool munged) ReadCdnHeader(Stream stream)
+    private static async Task<(string fileHash, long fileLengthBytes, bool munged)> ReadCdnHeaderAsync(Stream stream, CancellationToken ct)
     {
         var headerBytes = new List<byte>(128);
+        var one = new byte[1];
 
-        // We read byte-by-byte until we have enough to successfully parse "#hash:length#",
-        // trying both unmunged and munged interpretations.
+        // Read byte-by-byte (header is tiny, max 256) but in an async + cancellable way.
         while (headerBytes.Count < 256)
         {
-            int b = stream.ReadByte();
-            if (b == -1) throw new EndOfStreamException("Unexpected end of stream while reading CDN header");
-            headerBytes.Add((byte)b);
+            var n = await stream.ReadAsync(one.AsMemory(0, 1), ct).ConfigureAwait(false);
+            if (n <= 0) throw new EndOfStreamException("Unexpected end of stream while reading CDN header");
+            headerBytes.Add(one[0]);
 
-            // Optimization: only try parse when last interpreted char could be '#'
+            // Only try parse when last interpreted char could be '#'
             byte last = headerBytes[^1];
             bool couldBeTerminator = (char)last == '#' || (char)(last ^ 42) == '#';
             if (!couldBeTerminator) continue;
@@ -813,7 +864,7 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
     }
 
 
-    private static async Task<(string HashUpper, long BytesWritten)> DecompressLz4ToFileAndHashAsync(Stream input, string destPath, CancellationToken ct)
+    private static async Task<(string HashUpper, long BytesWritten)> DecompressLz4ToFileAndHashAsync(Stream input,string destPath,long expectedRawSize,CancellationToken ct)
     {
         using var sha1 = IncrementalHash.CreateHash(HashAlgorithmName.SHA1);
 
@@ -841,9 +892,17 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
                 sha1.AppendData(buffer, 0, read);
                 await outFs.WriteAsync(buffer.AsMemory(0, read), ct).ConfigureAwait(false);
                 total += read;
+
+                // Safety: if server told us the raw size, never allow overflow expansions.
+                if (expectedRawSize > 0 && total > expectedRawSize)
+                    throw new InvalidDataException($"Decompressed bytes exceeded expected size (expected {expectedRawSize}, got {total})");
             }
 
             await outFs.FlushAsync(ct).ConfigureAwait(false);
+
+            // Safety: if we know the exact size, enforce it.
+            if (expectedRawSize > 0 && total != expectedRawSize)
+                throw new InvalidDataException($"Decompressed bytes did not match expected size (expected {expectedRawSize}, got {total})");
 
             return (Convert.ToHexString(sha1.GetHashAndReset()), total);
         }
@@ -853,102 +912,130 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
         }
     }
 
+
     private async Task<bool> TryDownloadFilesFromCdnAsync(GameObjectHandler gameObjectHandler,IGrouping<string, DownloadFileTransfer> fileGroup,List<FileReplacementData> fileReplacement,CancellationToken ct)
     {
-        if (_orchestrator.FilesCdnUri == null) return false;
-        var transfers = fileGroup as IList<DownloadFileTransfer> ?? fileGroup.ToList();
-        if (transfers.Count == 0) return true;
 
-        var fileExtByHash = fileReplacement
-            .Where(f => !string.IsNullOrEmpty(f.Hash) && f.GamePaths != null && f.GamePaths.Any())
-            .GroupBy(f => f.Hash, StringComparer.OrdinalIgnoreCase)
-            .ToDictionary(g => g.Key, g =>
-            {
-                var gp = g.First().GamePaths[0];
-                return gp.Contains('.') ? gp.Split(".")[^1] : "dat";
-            }, StringComparer.OrdinalIgnoreCase);
-
-        var configured = _mareConfigService.Current.ParallelDownloads;
-
-        var cdnParallel = Math.Clamp(configured, 4, 12);
-        cdnParallel = Math.Min(cdnParallel, transfers.Count);
-
-        var anyFailure = new int[1];
-        var results = new System.Collections.Concurrent.ConcurrentBag<CdnDownloadedFile>();
-        var groupKey = fileGroup.Key;
-
-        var index = -1;
-        var workers = new List<Task>(cdnParallel);
-
-        for (int i = 0; i < cdnParallel; i++)
-        {
-            workers.Add(Task.Run(async () =>
-            {
-                while (!ct.IsCancellationRequested && System.Threading.Volatile.Read(ref anyFailure[0]) == 0)
-                {
-                    var j = System.Threading.Interlocked.Increment(ref index);
-                    if (j >= transfers.Count) break;
-
-                    await DownloadOneFromCdnAsync(
-                        gameObjectHandler,
-                        groupKey,
-                        fileExtByHash,
-                        results,
-                        transfers[j],
-                        anyFailure,
-                        ct).ConfigureAwait(false);
-                }
-            }, ct));
-        }
+        var success = false;
+        List<DownloadFileTransfer>? transfers = null;
 
         try
         {
-            await Task.WhenAll(workers).ConfigureAwait(false);
-        }
-        catch (OperationCanceledException)
-        {
-            System.Threading.Interlocked.Exchange(ref anyFailure[0], 1);
-            throw;
-        }
+            if (_orchestrator.FilesCdnUri == null) return false;
 
-        if (System.Threading.Volatile.Read(ref anyFailure[0]) != 0)
-        {
-            Logger.LogDebug("CDN fast-path: at least one file failed, falling back to blk pipeline for group {group}", groupKey);
-            return false;
-        }
+            transfers = fileGroup.ToList();
+            if (transfers.Count == 0) return true;
 
-        foreach (var r in results)
-        {
-            if (r.DestPath == r.FinalPath)
+            var fileExtByHash = fileReplacement
+                .Where(f => !string.IsNullOrEmpty(f.Hash) && f.GamePaths != null && f.GamePaths.Any())
+                .GroupBy(f => f.Hash, StringComparer.OrdinalIgnoreCase)
+                .ToDictionary(g => g.Key, g =>
+                {
+                    var gp = g.First().GamePaths[0];
+                    return gp.Contains('.') ? gp.Split(".")[^1] : "dat";
+                }, StringComparer.OrdinalIgnoreCase);
+
+            var configured = _mareConfigService.Current.ParallelDownloads;
+
+            // 0 => Auto (adaptive)
+            var cdnParallel = GetCdnParallelTarget(configured, transfers.Count);
+            cdnParallel = Math.Min(cdnParallel, transfers.Count);
+
+            var anyFailure = new int[1];
+            var anyTimeoutOrBackoff = new int[1];
+            var anySlow = new int[1];
+
+            var results = new ConcurrentBag<CdnDownloadedFile>();
+            var groupKey = fileGroup.Key;
+
+            var index = -1;
+            var workers = new List<Task>(cdnParallel);
+
+            for (int i = 0; i < cdnParallel; i++)
             {
-                PersistFileToStorage(r.Hash, r.FinalPath);
+                workers.Add(Task.Run(async () =>
+                {
+                    while (!ct.IsCancellationRequested && Volatile.Read(ref anyFailure[0]) == 0)
+                    {
+                        var j = Interlocked.Increment(ref index);
+                        if (j >= transfers.Count) break;
+
+                        await DownloadOneFromCdnAsync(
+                            gameObjectHandler,
+                            groupKey,
+                            fileExtByHash,
+                            results,
+                            transfers[j],
+                            anyFailure,
+                            anyTimeoutOrBackoff,
+                            anySlow,
+                            ct).ConfigureAwait(false);
+                    }
+                }, ct));
             }
-            else
+
+            try
             {
-                _delayedActivator.Enqueue(new PendingFile(
-                    r.DestPath,
-                    r.FinalPath,
-                    r.Hash,
-                    r.Hard,
-                    r.Soft,
-                    gameObjectHandler?.Address
-                ));
+                await Task.WhenAll(workers).ConfigureAwait(false);
             }
-        }
+            catch (OperationCanceledException)
+            {
+                Interlocked.Exchange(ref anyFailure[0], 1);
+                throw;
+            }
 
-        if (_downloadStatus.TryGetValue(groupKey, out var status))
+            var hadTimeout = Volatile.Read(ref anyTimeoutOrBackoff[0]) != 0;
+            var hadSlowLink = Volatile.Read(ref anySlow[0]) != 0;
+
+            if (Volatile.Read(ref anyFailure[0]) != 0)
+            {
+                Logger.LogDebug("CDN fast-path: at least one file failed, falling back to blk pipeline for group {group}", groupKey);
+                UpdateAutoCdnParallel(cdnParallel, success: false, hadTimeoutOrBackoff: hadTimeout, hadSlow: hadSlowLink);
+                return false;
+            }
+
+            foreach (var r in results)
+            {
+                if (r.DestPath == r.FinalPath)
+                {
+                    PersistFileToStorage(r.Hash, r.FinalPath);
+                }
+                else
+                {
+                    _delayedActivator.Enqueue(new PendingFile(
+                        r.DestPath,
+                        r.FinalPath,
+                        r.Hash,
+                        r.Hard,
+                        r.Soft,
+                        gameObjectHandler?.Address
+                    ));
+                }
+            }
+
+            if (_downloadStatus.TryGetValue(groupKey, out var status))
+            {
+                status.DownloadStatus = DownloadStatus.Decompressing;
+            }
+
+            Logger.LogDebug("CDN fast-path: completed all files for group {group} via CDN", groupKey);
+            success = true;
+
+            UpdateAutoCdnParallel(cdnParallel, success: true, hadTimeoutOrBackoff: hadTimeout, hadSlow: hadSlowLink);
+            return true;
+        }
+        finally
         {
-            status.DownloadStatus = DownloadStatus.Decompressing;
+            if (!success && transfers != null)
+                ReleaseInflight(transfers);
         }
 
-        Logger.LogDebug("CDN fast-path: completed all files for group {group} via CDN", groupKey);
-        return true;
     }
 
 
 
 
-    private async Task DownloadOneFromCdnAsync(GameObjectHandler gameObjectHandler,string groupKey,Dictionary<string, string> fileExtByHash,ConcurrentBag<CdnDownloadedFile> results,DownloadFileTransfer transfer,int[] anyFailure,CancellationToken ct)
+    private async Task DownloadOneFromCdnAsync(GameObjectHandler gameObjectHandler,string groupKey,Dictionary<string, string> fileExtByHash,ConcurrentBag<CdnDownloadedFile> results,DownloadFileTransfer transfer,int[] anyFailure,int[] anyTimeoutOrBackoff,int[] anySlow,CancellationToken ct)
     {
         try
         {
@@ -974,10 +1061,11 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
                     attemptCts.CancelAfter(CdnAttemptTimeout);
                     var attemptToken = attemptCts.Token;
 
+                    var sw = Stopwatch.StartNew();
+
                     using var response = await _cdnFastClient
                         .GetAsync(cdnUrl, HttpCompletionOption.ResponseHeadersRead, attemptToken)
                         .ConfigureAwait(false);
-
                     if (!response.IsSuccessStatusCode)
                     {
                         if (response.StatusCode == HttpStatusCode.NotFound && !isCacheBusted &&
@@ -997,13 +1085,32 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
                             continue;
                         }
 
+                        if ((int)response.StatusCode == 429)
+                        {
+                            Interlocked.Exchange(ref anyTimeoutOrBackoff[0], 1);
+
+                            var delayMs = Math.Min(2000, 250 * attempts);
+                            await Task.Delay(delayMs, attemptToken).ConfigureAwait(false);
+                            continue;
+                        }
+
+                        if (response.StatusCode == HttpStatusCode.RequestTimeout ||
+                            response.StatusCode == HttpStatusCode.BadGateway ||
+                            response.StatusCode == HttpStatusCode.ServiceUnavailable ||
+                            response.StatusCode == HttpStatusCode.GatewayTimeout)
+                        {
+                            Interlocked.Exchange(ref anyTimeoutOrBackoff[0], 1);
+                            continue;
+                        }
+
                         response.EnsureSuccessStatusCode();
                     }
+
 
                     await using var rawStream = await response.Content.ReadAsStreamAsync(attemptToken).ConfigureAwait(false);
 
                     var firstByteBuf = new byte[1];
-                    var read0 = await rawStream.ReadAsync(firstByteBuf.AsMemory(0, 1), ct).ConfigureAwait(false);
+                    var read0 = await rawStream.ReadAsync(firstByteBuf.AsMemory(0, 1), attemptToken).ConfigureAwait(false);
                     if (read0 <= 0) throw new InvalidDataException("CDN response stream was empty");
 
                     using var respStream = new PrefixedReadStream(rawStream, firstByteBuf, read0);
@@ -1017,7 +1124,7 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
                     Stream input;
                     if (looksHeadered)
                     {
-                        (headerHash, payloadLen, munged) = ReadCdnHeader(respStream);
+                        (headerHash, payloadLen, munged) = await ReadCdnHeaderAsync(respStream, attemptToken).ConfigureAwait(false);
 
                         if (!string.Equals(headerHash, transfer.Hash, StringComparison.OrdinalIgnoreCase))
                             throw new InvalidDataException($"CDN fast-path: header hash mismatch for {transfer.Hash}, got {headerHash}");
@@ -1050,7 +1157,16 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
                     try
                     {
                         var (computed, bytesWritten) =
-                            await DecompressLz4ToFileAndHashAsync(input, tempPath, attemptToken).ConfigureAwait(false);
+                            await DecompressLz4ToFileAndHashAsync(input, tempPath, transfer.TotalRaw, attemptToken).ConfigureAwait(false);
+
+                        sw.Stop();
+
+                        if (bytesWritten >= (2 * 1024 * 1024) && sw.Elapsed.TotalSeconds >= 1.0)
+                        {
+                            var bps = (long)(bytesWritten / sw.Elapsed.TotalSeconds);
+                            if (bps < AutoCdnSlowBpsThreshold)
+                                Interlocked.Exchange(ref anySlow[0], 1);
+                        }
 
                         if (bytesWritten <= 0 || !string.Equals(computed, headerHash, StringComparison.OrdinalIgnoreCase))
                         {
@@ -1072,6 +1188,7 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
                     catch (OperationCanceledException oce) when (!ct.IsCancellationRequested)
                     {
                         // Per-attempt timeout: never leave partial files behind.
+                        Interlocked.Exchange(ref anyTimeoutOrBackoff[0], 1);
                         CleanupFailedCdnDownload(tempPath, stagedHash);
 
                         Logger.LogWarning(oce,
@@ -1217,6 +1334,8 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
                 }
                 catch (OperationCanceledException oce) when (!ct.IsCancellationRequested)
                 {
+                    Interlocked.Exchange(ref anyTimeoutOrBackoff[0], 1);
+
                     Logger.LogWarning(oce,
                         "CDN fast-path: timed out for {hash} (attempt {attempt}/{max})",
                         transfer.Hash, attempts, MaxCdnAttemptsPerFile);
@@ -1368,6 +1487,8 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
 
     private bool ValidateDownloadedFile(string fullPath, string fileHash, long expectedRawSize)
     {
+        // Conservative: IO errors should not silently "pass" validation, because that allows partial/corrupt files
+        // to persist and potentially crash-loop on apply.
         try
         {
             var fi = new FileInfo(fullPath);
@@ -1396,8 +1517,23 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
                 return false;
             }
 
-            // Strong check: recompute hash and compare to server hash
-            var computed = Crypto.GetFileHash(fi.FullName);
+            string computed;
+            const int MaxIoRetries = 2;
+            for (int attempt = 0; ; attempt++)
+            {
+                try
+                {
+                    computed = Crypto.GetFileHash(fi.FullName);
+                    break;
+                }
+                catch (IOException ioEx) when (attempt < MaxIoRetries)
+                {
+                    Logger.LogDebug(ioEx, "IO error while hashing {path} (attempt {attempt}/{max})", fullPath, attempt + 1, MaxIoRetries + 1);
+                    Thread.Sleep(50 * (attempt + 1));
+                    continue;
+                }
+            }
+
             if (!string.Equals(computed, fileHash, StringComparison.OrdinalIgnoreCase))
             {
                 Logger.LogWarning(
@@ -1405,25 +1541,53 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
                     fileHash, computed, fullPath);
                 return false;
             }
+
             return true;
         }
         catch (IOException ioEx)
         {
-            Logger.LogDebug(
+            Logger.LogWarning(
                 ioEx,
-                "IO error during validation of {hash} at {path}; treating as valid and keeping file",
+                "IO error during validation of {hash} at {path}; treating as invalid to force clean re-download",
                 fileHash, fullPath);
-
-            return true;
+            return false;
         }
         catch (Exception ex)
         {
-            // Anything else is genuinely suspicious – allow the caller to delete + retry.
             Logger.LogWarning(ex, "Validation threw for {hash} at {path}", fileHash, fullPath);
             return false;
         }
     }
 
+
+    private int GetDownloadGroupParallelism(int groupCount)
+    {
+        var max = Math.Min(Environment.ProcessorCount, 6);
+        var configured = _mareConfigService.Current.ParallelDownloads;
+
+        if (configured > 0)
+            return Math.Clamp(Math.Min(configured, groupCount), 2, max);
+
+        var cpu = Environment.ProcessorCount;
+        var auto =
+            cpu <= 4 ? 2 :
+            cpu <= 8 ? 3 :
+            cpu <= 16 ? 4 :
+                        6;
+
+        return Math.Clamp(Math.Min(auto, groupCount), 2, max);
+    }
+
+
+
+    private void ReleaseInflight(IEnumerable<DownloadFileTransfer> transfers)
+    {
+        foreach (var t in transfers)
+        {
+            try { _inflightHashes.TryRemove(t.Hash, out _); }
+            catch { /* ignore */ }
+        }
+    }
 
 
     private sealed record CdnDownloadedFile(string Hash, string FinalPath, string DestPath, bool Hard, bool Soft);

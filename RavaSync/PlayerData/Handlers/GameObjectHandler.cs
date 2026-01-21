@@ -91,6 +91,7 @@ public sealed class GameObjectHandler : DisposableMediatorSubscriberBase, IHighP
     }
 
     public IntPtr Address { get; private set; }
+    public IntPtr DrawObject => DrawObjectAddress;
     public DrawCondition CurrentDrawCondition { get; set; } = DrawCondition.None;
     public byte Gender { get; private set; }
     public string Name { get; private set; }

@@ -38,7 +38,7 @@ public class FileTransferOrchestrator : DisposableMediatorSubscriberBase
         var ver = Assembly.GetExecutingAssembly().GetName().Version;
         _httpClient.DefaultRequestHeaders.UserAgent.Add(new ProductInfoHeaderValue("RavaSync", ver!.Major + "." + ver!.Minor + "." + ver!.Build));
 
-        _availableDownloadSlots = mareConfig.Current.ParallelDownloads;
+        _availableDownloadSlots = GetEffectiveParallelDownloads();
         _downloadSemaphore = new(_availableDownloadSlots, _availableDownloadSlots);
 
         Mediator.Subscribe<ConnectedMessage>(this, (msg) =>
@@ -126,16 +126,38 @@ public class FileTransferOrchestrator : DisposableMediatorSubscriberBase
     {
         lock (_semaphoreModificationLock)
         {
-            if (_availableDownloadSlots != _mareConfig.Current.ParallelDownloads && _availableDownloadSlots == _downloadSemaphore.CurrentCount)
+            var desired = GetEffectiveParallelDownloads();
+
+            if (_availableDownloadSlots != desired && _downloadSemaphore.CurrentCount == _availableDownloadSlots)
             {
-                _availableDownloadSlots = _mareConfig.Current.ParallelDownloads;
-                _downloadSemaphore = new(_availableDownloadSlots, _availableDownloadSlots);
+                _availableDownloadSlots = desired;
+                _downloadSemaphore = new SemaphoreSlim(_availableDownloadSlots, _availableDownloadSlots);
             }
         }
 
         await _downloadSemaphore.WaitAsync(token).ConfigureAwait(false);
         Mediator.Publish(new DownloadLimitChangedMessage());
     }
+
+    private int GetEffectiveParallelDownloads()
+    {
+        var configured = _mareConfig.Current.ParallelDownloads;
+
+        if (configured > 0)
+            return Math.Clamp(configured, 1, 12);
+
+        var cpu = Environment.ProcessorCount;
+
+        var auto =
+            cpu <= 4 ? 2 :
+            cpu <= 8 ? 3 :
+            cpu <= 16 ? 4 :
+                        6;
+
+        return Math.Clamp(auto, 1, 12);
+    }
+
+
 
     public long DownloadLimitPerSlot()
     {
@@ -166,7 +188,6 @@ public class FileTransferOrchestrator : DisposableMediatorSubscriberBase
       CancellationToken? ct = null,
       HttpCompletionOption httpCompletionOption = HttpCompletionOption.ResponseHeadersRead)
     {
-        // Build a fresh request per attempt (or one-shot for streaming)
         async Task<HttpRequestMessage> BuildRequestAsync()
         {
             var clone = new HttpRequestMessage(originalRequestMessage.Method, originalRequestMessage.RequestUri);
@@ -178,10 +199,8 @@ public class FileTransferOrchestrator : DisposableMediatorSubscriberBase
             {
                 if (content is StreamContent || content is Lz4FileContent)
                 {
-                    // non-replayable: one-shot only
                     clone.Content = content;
 
-                    // This prevents redirect/resend issues with streaming content.
                     if (clone.Method == HttpMethod.Post || clone.Method == HttpMethod.Put)
                         clone.Headers.ExpectContinue = false;
                 }
@@ -204,7 +223,6 @@ public class FileTransferOrchestrator : DisposableMediatorSubscriberBase
         bool nonReplayable = originalRequestMessage.Content is StreamContent
                              || originalRequestMessage.Content is Lz4FileContent;
 
-        // SAFE logging — never read streaming content
         if (originalRequestMessage.Content is null)
         {
             Logger.LogDebug("HTTP {method} {uri}", originalRequestMessage.Method, originalRequestMessage.RequestUri);

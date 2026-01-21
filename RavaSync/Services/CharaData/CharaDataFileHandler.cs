@@ -73,36 +73,56 @@ public sealed class CharaDataFileHandler : IDisposable
             modPaths[swap.GamePath] = swap.HashOrFileSwap;
         }
     }
-
     public async Task<CharacterData?> CreatePlayerData()
     {
         var chara = await _dalamudUtilService.GetPlayerCharacterAsync().ConfigureAwait(false);
         if (_dalamudUtilService.IsInGpose)
         {
-            chara = (IPlayerCharacter?)(await _dalamudUtilService.GetGposeCharacterFromObjectTableByNameAsync(chara.Name.TextValue, _dalamudUtilService.IsInGpose).ConfigureAwait(false));
+            chara = (IPlayerCharacter?)(await _dalamudUtilService
+                .GetGposeCharacterFromObjectTableByNameAsync(chara.Name.TextValue, _dalamudUtilService.IsInGpose)
+                .ConfigureAwait(false));
         }
 
         if (chara == null)
             return null;
 
         using var tempHandler = await _gameObjectHandlerFactory.Create(ObjectKind.Player,
-                        () => _dalamudUtilService.GetCharacterFromObjectTableByIndex(chara.ObjectIndex)?.Address ?? IntPtr.Zero, isWatched: false).ConfigureAwait(false);
+                        () => _dalamudUtilService.GetCharacterFromObjectTableByIndex(chara.ObjectIndex)?.Address ?? IntPtr.Zero,
+                        isWatched: false).ConfigureAwait(false);
+
         PlayerData.Data.CharacterData newCdata = new();
         var fragment = await _playerDataFactory.BuildCharacterData(tempHandler, CancellationToken.None).ConfigureAwait(false);
         newCdata.SetFragment(ObjectKind.Player, fragment);
+
+        static bool IsVfxPath(string p)
+        {
+            if (string.IsNullOrWhiteSpace(p)) return false;
+
+            // Normalize slashes for safety (Penumbra usually gives / already)
+            p = p.Replace("\\", "/", StringComparison.OrdinalIgnoreCase);
+
+            return p.StartsWith("vfx/", StringComparison.OrdinalIgnoreCase)
+                || p.Contains("/vfx/", StringComparison.OrdinalIgnoreCase)
+                || p.StartsWith("bgcommon/vfx/", StringComparison.OrdinalIgnoreCase)
+                || p.Contains("/bgcommon/vfx/", StringComparison.OrdinalIgnoreCase);
+        }
+
         if (newCdata.FileReplacements.TryGetValue(ObjectKind.Player, out var playerData) && playerData != null)
         {
             foreach (var data in playerData.Select(g => g.GamePaths))
             {
-                data.RemoveWhere(g => g.EndsWith(".pap", StringComparison.OrdinalIgnoreCase)
-                    || g.EndsWith(".tmb", StringComparison.OrdinalIgnoreCase)
-                    || g.EndsWith(".scd", StringComparison.OrdinalIgnoreCase)
+                data.RemoveWhere(g =>
+                    g.EndsWith(".scd", StringComparison.OrdinalIgnoreCase)
                     || (g.EndsWith(".avfx", StringComparison.OrdinalIgnoreCase)
-                        && !g.Contains("/weapon/", StringComparison.OrdinalIgnoreCase)
-                        && !g.Contains("/equipment/", StringComparison.OrdinalIgnoreCase))
+                        && !(IsVfxPath(g)
+                            || g.Contains("/weapon/", StringComparison.OrdinalIgnoreCase)
+                            || g.Contains("/equipment/", StringComparison.OrdinalIgnoreCase)))
+
                     || (g.EndsWith(".atex", StringComparison.OrdinalIgnoreCase)
-                        && !g.Contains("/weapon/", StringComparison.OrdinalIgnoreCase)
-                        && !g.Contains("/equipment/", StringComparison.OrdinalIgnoreCase)));
+                        && !(IsVfxPath(g)
+                            || g.Contains("/weapon/", StringComparison.OrdinalIgnoreCase)
+                            || g.Contains("/equipment/", StringComparison.OrdinalIgnoreCase)))
+                );
             }
 
             playerData.RemoveWhere(g => g.GamePaths.Count == 0);
@@ -110,6 +130,7 @@ public sealed class CharaDataFileHandler : IDisposable
 
         return newCdata.ToAPI();
     }
+
 
     public void Dispose()
     {

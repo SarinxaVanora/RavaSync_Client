@@ -82,6 +82,12 @@ namespace RavaSync.WebAPI.Files
             _pendingHashes.TryAdd(f.FileHash, 0);
             _pending.Enqueue(f);
         }
+        public void NotifyActorTouched(nint? actorAddress)
+        {
+            if (actorAddress is nint addr && addr != nint.Zero)
+                _touchedActors.TryAdd(addr, 0);
+        }
+
 
         private void OnFrameworkUpdate(IFramework framework)
         {
@@ -151,6 +157,19 @@ namespace RavaSync.WebAPI.Files
 
                         try
                         {
+                            if (!DestinationIsExpectedHash(f.QuarantinePath, f.FileHash))
+                            {
+                                _logger.LogError(
+                                    "Quarantine failed hash validation; expected {expected} → {path}",
+                                    f.FileHash,
+                                    f.QuarantinePath);
+
+                                try { File.Delete(f.QuarantinePath); } catch { /* best effort */ }
+                                _fileDbManager.UnstageFile(f.FileHash);
+                                _pendingHashes.TryRemove(f.FileHash, out _);
+                                continue;
+                            }
+
                             CopyFileBuffered(f.QuarantinePath, f.FinalPath);
                         }
                         catch (Exception ex) when (IsFileInUse(ex))
@@ -284,6 +303,8 @@ namespace RavaSync.WebAPI.Files
 
             const int BufferSize = 256 * 1024;
 
+            var tmpPath = dstPath + ".tmp." + Environment.ProcessId + "." + Guid.NewGuid().ToString("N");
+
             var srcOpts = new FileStreamOptions
             {
                 Access = FileAccess.Read,
@@ -296,7 +317,7 @@ namespace RavaSync.WebAPI.Files
             var dstOpts = new FileStreamOptions
             {
                 Access = FileAccess.Write,
-                Mode = FileMode.Create,
+                Mode = FileMode.CreateNew,
                 Share = FileShare.None,
                 Options = FileOptions.SequentialScan,
                 BufferSize = BufferSize,
@@ -304,18 +325,25 @@ namespace RavaSync.WebAPI.Files
 
             byte[]? buffer = null;
 
-            using var src = new FileStream(srcPath, srcOpts);
-            using var dst = new FileStream(dstPath, dstOpts);
-
             try
             {
                 buffer = ArrayPool<byte>.Shared.Rent(BufferSize);
 
-                int read;
-                while ((read = src.Read(buffer, 0, buffer.Length)) > 0)
-                    dst.Write(buffer, 0, read);
+                using (var src = new FileStream(srcPath, srcOpts))
+                using (var dst = new FileStream(tmpPath, dstOpts))
+                {
+                    int read;
+                    while ((read = src.Read(buffer, 0, buffer.Length)) > 0)
+                        dst.Write(buffer, 0, read);
+                    dst.Flush(true);
+                }
 
-                dst.Flush();
+                File.Move(tmpPath, dstPath, overwrite: true);
+            }
+            catch
+            {
+                try { if (File.Exists(tmpPath)) File.Delete(tmpPath); } catch { /* best effort */ }
+                throw;
             }
             finally
             {
@@ -323,6 +351,7 @@ namespace RavaSync.WebAPI.Files
                     ArrayPool<byte>.Shared.Return(buffer);
             }
         }
+
 
         private static bool DestinationIsExpectedHash(string path, string expectedHash)
         {

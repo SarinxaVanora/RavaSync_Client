@@ -9,6 +9,7 @@ using RavaSync.PlayerData.Data;
 using RavaSync.PlayerData.Handlers;
 using RavaSync.Services;
 using RavaSync.Services.Mediator;
+using System.Collections.Concurrent;
 using System.Linq;
 using CharacterData = RavaSync.PlayerData.Data.CharacterData;
 
@@ -24,6 +25,7 @@ public class PlayerDataFactory
     private readonly XivDataAnalyzer _modelAnalyzer;
     private readonly MareMediator _mareMediator;
     private readonly TransientResourceManager _transientResourceManager;
+    private readonly ConcurrentDictionary<string, bool> _papBoneValidationCache = new(StringComparer.Ordinal);
 
     public PlayerDataFactory(ILogger<PlayerDataFactory> logger, DalamudUtilService dalamudUtil, IpcManager ipcManager,
         TransientResourceManager transientResourceManager, FileCacheManager fileReplacementFactory,
@@ -50,29 +52,6 @@ public class PlayerDataFactory
         if (playerRelatedObject == null) return null;
 
         bool pointerIsZero = true;
-        //try
-        //{
-        //    pointerIsZero = playerRelatedObject.Address == IntPtr.Zero;
-        //    try
-        //    {
-        //        pointerIsZero = await CheckForNullDrawObject(playerRelatedObject.Address).ConfigureAwait(false);
-        //    }
-        //    catch
-        //    {
-        //        pointerIsZero = true;
-        //        _logger.LogDebug("NullRef for {object}", playerRelatedObject);
-        //    }
-        //}
-        //catch (Exception ex)
-        //{
-        //    _logger.LogWarning(ex, "Could not create data for {object}", playerRelatedObject);
-        //}
-
-        //if (pointerIsZero)
-        //{
-        //    _logger.LogTrace("Pointer was zero for {objectKind}", playerRelatedObject.ObjectKind);
-        //    return null;
-        //}
 
         if (playerRelatedObject.Address == IntPtr.Zero)
         {
@@ -100,16 +79,6 @@ public class PlayerDataFactory
         return null;
     }
 
-    //private async Task<bool> CheckForNullDrawObject(IntPtr playerPointer)
-    //{
-    //    return await _dalamudUtil.RunOnFrameworkThread(() => CheckForNullDrawObjectUnsafe(playerPointer)).ConfigureAwait(false);
-    //}
-
-    //private unsafe bool CheckForNullDrawObjectUnsafe(IntPtr playerPointer)
-    //{
-    //    return ((Character*)playerPointer)->GameObject.DrawObject == null;
-    //}
-
     private async Task<CharacterDataFragment> CreateCharacterData(GameObjectHandler playerRelatedObject, CancellationToken ct)
     {
         var objectKind = playerRelatedObject.ObjectKind;
@@ -117,17 +86,50 @@ public class PlayerDataFactory
 
         _logger.LogDebug("Building character data for {obj}", playerRelatedObject);
 
-        // wait until chara is not drawing and present so nothing spontaneously explodes
         await _dalamudUtil.WaitWhileCharacterIsDrawing(_logger, playerRelatedObject, Guid.NewGuid(), 30000, ct: ct).ConfigureAwait(false);
         int totalWaitTime = 10000;
-        while (!await _dalamudUtil.IsObjectPresentAsync(await _dalamudUtil.CreateGameObjectAsync(playerRelatedObject.Address).ConfigureAwait(false)).ConfigureAwait(false) && totalWaitTime > 0)
+
+        var gameObj = await _dalamudUtil.CreateGameObjectAsync(playerRelatedObject.Address).ConfigureAwait(false);
+
+        while (totalWaitTime > 0)
         {
-            _logger.LogTrace("Character is null but it shouldn't be, waiting");
+            ct.ThrowIfCancellationRequested();
+
+            bool present = false;
+
+            try
+            {
+
+                gameObj ??= await _dalamudUtil.CreateGameObjectAsync(playerRelatedObject.Address).ConfigureAwait(false);
+
+                if (gameObj != null)
+                    present = await _dalamudUtil.IsObjectPresentAsync(gameObj).ConfigureAwait(false);
+            }
+            catch
+            {
+                gameObj = null;
+                present = false;
+            }
+
+            if (present)
+                break;
+
+            if ((totalWaitTime % 500) == 0)
+                _logger.LogTrace("Character is null but it shouldn't be, waiting");
             await Task.Delay(50, ct).ConfigureAwait(false);
             totalWaitTime -= 50;
         }
 
+
         ct.ThrowIfCancellationRequested();
+
+        // Start IPC tasks early so they overlap with resolving + hashing
+        Task<string> getHeelsOffset = _ipcManager.Heels.GetOffsetAsync();
+        Task<string> getGlamourerData = _ipcManager.Glamourer.GetCharacterCustomizationAsync(playerRelatedObject.Address);
+        Task<string?> getCustomizeData = _ipcManager.CustomizePlus.GetScaleAsync(playerRelatedObject.Address);
+        Task<string> getHonorificTitle = _ipcManager.Honorific.GetTitle();
+
+        Task<string?> getMoodles = objectKind == ObjectKind.Player ? _ipcManager.Moodles.GetStatusAsync(playerRelatedObject.Address) : Task.FromResult<string?>(null);
 
         Dictionary<string, List<ushort>>? boneIndices =
             objectKind != ObjectKind.Player
@@ -151,12 +153,18 @@ public class PlayerDataFactory
 
         ct.ThrowIfCancellationRequested();
 
-        _logger.LogDebug("== Static Replacements ==");
-        foreach (var replacement in fragment.FileReplacements.Where(i => i.HasFileReplacement).OrderBy(i => i.GamePaths.First(), StringComparer.OrdinalIgnoreCase))
+        if (_logger.IsEnabled(LogLevel.Debug))
         {
-            _logger.LogDebug("=> {repl}", replacement);
-            ct.ThrowIfCancellationRequested();
+            _logger.LogDebug("== Static Replacements ==");
+            foreach (var replacement in fragment.FileReplacements
+                         .Where(i => i.HasFileReplacement)
+                         .OrderBy(i => i.GamePaths.First(), StringComparer.OrdinalIgnoreCase))
+            {
+                _logger.LogDebug("=> {repl}", replacement);
+                ct.ThrowIfCancellationRequested();
+            }
         }
+
 
         await _transientResourceManager.WaitForRecording(ct).ConfigureAwait(false);
 
@@ -187,12 +195,23 @@ public class PlayerDataFactory
         var transientPaths = ManageSemiTransientData(objectKind);
         var resolvedTransientPaths = await GetFileReplacementsFromPaths(transientPaths, new HashSet<string>(StringComparer.Ordinal)).ConfigureAwait(false);
 
-        _logger.LogDebug("== Transient Replacements ==");
-        foreach (var replacement in resolvedTransientPaths.Select(c => new FileReplacement([.. c.Value], c.Key)).OrderBy(f => f.ResolvedPath, StringComparer.Ordinal))
+        if (_logger.IsEnabled(LogLevel.Debug))
         {
-            _logger.LogDebug("=> {repl}", replacement);
-            fragment.FileReplacements.Add(replacement);
+            _logger.LogDebug("== Transient Replacements ==");
+            foreach (var replacement in resolvedTransientPaths
+                         .Select(c => new FileReplacement([.. c.Value], c.Key))
+                         .OrderBy(f => f.ResolvedPath, StringComparer.Ordinal))
+            {
+                _logger.LogDebug("=> {repl}", replacement);
+                fragment.FileReplacements.Add(replacement);
+            }
         }
+        else
+        {
+            foreach (var replacement in resolvedTransientPaths.Select(c => new FileReplacement([.. c.Value], c.Key)))
+                fragment.FileReplacements.Add(replacement);
+        }
+
 
         // clean up all semi transient resources that don't have any file replacement (aka null resolve)
         _transientResourceManager.CleanUpSemiTransientResources(objectKind, [.. fragment.FileReplacements]);
@@ -203,12 +222,9 @@ public class PlayerDataFactory
         fragment.FileReplacements = new HashSet<FileReplacement>(fragment.FileReplacements.Where(v => v.HasFileReplacement).OrderBy(v => v.ResolvedPath, StringComparer.Ordinal), FileReplacementComparer.Instance);
 
         // gather up data from ipc
-        Task<string> getHeelsOffset = _ipcManager.Heels.GetOffsetAsync();
-        Task<string> getGlamourerData = _ipcManager.Glamourer.GetCharacterCustomizationAsync(playerRelatedObject.Address);
-        Task<string?> getCustomizeData = _ipcManager.CustomizePlus.GetScaleAsync(playerRelatedObject.Address);
-        Task<string> getHonorificTitle = _ipcManager.Honorific.GetTitle();
         fragment.GlamourerString = await getGlamourerData.ConfigureAwait(false);
         _logger.LogDebug("Glamourer is now: {data}", fragment.GlamourerString);
+
         var customizeScale = await getCustomizeData.ConfigureAwait(false);
         fragment.CustomizePlusScale = customizeScale ?? string.Empty;
         _logger.LogDebug("Customize is now: {data}", fragment.CustomizePlusScale);
@@ -224,12 +240,13 @@ public class PlayerDataFactory
             playerFragment!.HeelsData = await getHeelsOffset.ConfigureAwait(false);
             _logger.LogDebug("Heels is now: {heels}", playerFragment!.HeelsData);
 
-            playerFragment!.MoodlesData = await _ipcManager.Moodles.GetStatusAsync(playerRelatedObject.Address).ConfigureAwait(false) ?? string.Empty;
+            playerFragment!.MoodlesData = await getMoodles.ConfigureAwait(false) ?? string.Empty;
             _logger.LogDebug("Moodles is now: {moodles}", playerFragment!.MoodlesData);
 
             playerFragment!.PetNamesData = _ipcManager.PetNames.GetLocalNames();
             _logger.LogDebug("Pet Nicknames is now: {petnames}", playerFragment!.PetNamesData);
         }
+
 
         ct.ThrowIfCancellationRequested();
 
@@ -275,9 +292,15 @@ public class PlayerDataFactory
     {
         if (boneIndices == null) return;
 
-        foreach (var kvp in boneIndices)
+        if (_logger.IsEnabled(LogLevel.Debug))
         {
-            _logger.LogDebug("Found {skellyname} ({idx} bone indices) on player: {bones}", kvp.Key, kvp.Value.Any() ? kvp.Value.Max() : 0, string.Join(',', kvp.Value));
+            foreach (var kvp in boneIndices)
+            {
+                _logger.LogDebug("Found {skellyname} ({idx} bone indices) on player: {bones}",
+                    kvp.Key,
+                    kvp.Value.Any() ? kvp.Value.Max() : 0,
+                    string.Join(',', kvp.Value));
+            }
         }
 
         if (boneIndices.All(u => u.Value.Count == 0)) return;
@@ -287,6 +310,23 @@ public class PlayerDataFactory
         {
             ct.ThrowIfCancellationRequested();
 
+            // If we've already validated this exact file hash before, reuse the result.
+            if (!string.IsNullOrEmpty(file.Hash) && _papBoneValidationCache.TryGetValue(file.Hash, out var cachedOk))
+            {
+                if (!cachedOk)
+                {
+                    noValidationFailed++;
+                    _logger.LogDebug("Removing {file} from sent file replacements and transient data (cached invalid)", file.ResolvedPath);
+                    fragment.FileReplacements.Remove(file);
+                    foreach (var gamePath in file.GamePaths)
+                    {
+                        _transientResourceManager.RemoveTransientResource(ObjectKind.Player, gamePath);
+                    }
+                }
+
+                continue;
+            }
+
             var skeletonIndices = await _dalamudUtil.RunOnFrameworkThread(() => _modelAnalyzer.GetBoneIndicesFromPap(file.Hash)).ConfigureAwait(false);
 
             bool validationFailed = false;
@@ -294,6 +334,10 @@ public class PlayerDataFactory
             if (skeletonIndices == null || skeletonIndices.Count == 0 || skeletonIndices.All(k => k.Value == null || k.Value.Count == 0))
             {
                 _logger.LogDebug("Could not verify bone indices for {path} (unverifiable/empty). Allowing, but cannot guarantee safety.", file.ResolvedPath);
+
+                if (!string.IsNullOrEmpty(file.Hash))
+                    _papBoneValidationCache[file.Hash] = true;
+
                 continue;
             }
 
@@ -310,6 +354,10 @@ public class PlayerDataFactory
             if (skeletonIndices.All(k => (k.Value.Count == 0 ? 0 : k.Value.Max()) <= 105))
             {
                 _logger.LogTrace("All indices of {path} are <= 105, ignoring", file.ResolvedPath);
+
+                if (!string.IsNullOrEmpty(file.Hash))
+                    _papBoneValidationCache[file.Hash] = true;
+
                 continue;
             }
 
@@ -331,31 +379,6 @@ public class PlayerDataFactory
                 }
             }
 
-            //var skeletonIndices = await _dalamudUtil.RunOnFrameworkThread(() => _modelAnalyzer.GetBoneIndicesFromPap(file.Hash)).ConfigureAwait(false);
-            //bool validationFailed = false;
-            //if (skeletonIndices != null)
-            //{
-            //    // 105 is the maximum vanilla skellington spoopy bone index
-            //    if (skeletonIndices.All(k => k.Value.Max() <= 105))
-            //    {
-            //        _logger.LogTrace("All indices of {path} are <= 105, ignoring", file.ResolvedPath);
-            //        continue;
-            //    }
-
-            //    _logger.LogDebug("Verifying bone indices for {path}, found {x} skeletons", file.ResolvedPath, skeletonIndices.Count);
-
-            //    foreach (var boneCount in skeletonIndices.Select(k => k).ToList())
-            //    {
-            //        if (boneCount.Value.Max() > boneIndices.SelectMany(b => b.Value).Max())
-            //        {
-            //            _logger.LogWarning("Found more bone indices on the animation {path} skeleton {skl} (max indice {idx}) than on any player related skeleton (max indice {idx2})",
-            //                file.ResolvedPath, boneCount.Key, boneCount.Value.Max(), boneIndices.SelectMany(b => b.Value).Max());
-            //            validationFailed = true;
-            //            break;
-            //        }
-            //    }
-            //}
-
             if (validationFailed)
             {
                 noValidationFailed++;
@@ -367,6 +390,8 @@ public class PlayerDataFactory
                 }
             }
 
+            if (!string.IsNullOrEmpty(file.Hash))
+                _papBoneValidationCache[file.Hash] = !validationFailed;
         }
 
         if (noValidationFailed > 0)
@@ -382,47 +407,66 @@ public class PlayerDataFactory
     {
         var forwardPaths = forwardResolve.ToArray();
         var reversePaths = reverseResolve.ToArray();
-        Dictionary<string, List<string>> resolvedPaths = new(StringComparer.Ordinal);
+
+        Dictionary<string, List<string>> resolvedPaths = new(StringComparer.OrdinalIgnoreCase);
+
         var (forward, reverse) = await _ipcManager.Penumbra.ResolvePathsAsync(forwardPaths, reversePaths).ConfigureAwait(false);
+
         for (int i = 0; i < forwardPaths.Length; i++)
         {
-            var filePath = forward[i].ToLowerInvariant();
-            if (resolvedPaths.TryGetValue(filePath, out var list))
-            {
-                list.Add(forwardPaths[i].ToLowerInvariant());
-            }
-            else
-            {
-                resolvedPaths[filePath] = [forwardPaths[i].ToLowerInvariant()];
-            }
+            var filePath = forward[i];
+            if (string.IsNullOrEmpty(filePath)) continue;
+
+            filePath = filePath.ToLowerInvariant();
+            var gp = forwardPaths[i].ToLowerInvariant();
+
+            if (!resolvedPaths.TryGetValue(filePath, out var list))
+                resolvedPaths[filePath] = list = new List<string>(1);
+
+            list.Add(gp);
         }
 
         for (int i = 0; i < reversePaths.Length; i++)
         {
-            var filePath = reversePaths[i].ToLowerInvariant();
-            if (resolvedPaths.TryGetValue(filePath, out var list))
+            var filePath = reversePaths[i];
+            if (string.IsNullOrEmpty(filePath)) continue;
+
+            filePath = filePath.ToLowerInvariant();
+
+            if (!resolvedPaths.TryGetValue(filePath, out var list))
+                resolvedPaths[filePath] = list = new List<string>(reverse[i].Length);
+
+            foreach (var g in reverse[i])
             {
-                list.AddRange(reverse[i].Select(c => c.ToLowerInvariant()));
-            }
-            else
-            {
-                resolvedPaths[filePath] = new List<string>(reverse[i].Select(c => c.ToLowerInvariant()).ToList());
+                if (!string.IsNullOrEmpty(g))
+                    list.Add(g.ToLowerInvariant());
             }
         }
 
-        return resolvedPaths.ToDictionary(k => k.Key, k => k.Value.ToArray(), StringComparer.OrdinalIgnoreCase).AsReadOnly();
+        // Build final dictionary without extra LINQ allocations
+        Dictionary<string, string[]> output = new(StringComparer.OrdinalIgnoreCase);
+        foreach (var kvp in resolvedPaths)
+            output[kvp.Key] = kvp.Value.ToArray();
+
+        return output.AsReadOnly();
     }
+
 
     private HashSet<string> ManageSemiTransientData(ObjectKind objectKind)
     {
-        _transientResourceManager.PersistTransientResources(objectKind);
+        if (_transientResourceManager.HasPendingTransients(objectKind))
+        {
+            _transientResourceManager.PersistTransientResources(objectKind);
+        }
 
         HashSet<string> pathsToResolve = new(StringComparer.Ordinal);
-        foreach (var path in _transientResourceManager.GetSemiTransientResources(objectKind).Where(path => !string.IsNullOrEmpty(path)))
+        foreach (var path in _transientResourceManager.GetSemiTransientResources(objectKind))
         {
-            pathsToResolve.Add(path);
+            if (!string.IsNullOrEmpty(path))
+                pathsToResolve.Add(path);
         }
 
         return pathsToResolve;
+
     }
 }

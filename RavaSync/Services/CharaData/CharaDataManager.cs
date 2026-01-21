@@ -932,23 +932,42 @@ public sealed partial class CharaDataManager : DisposableMediatorSubscriberBase
                 .SetManipulationDataAsync(Logger, applicationId, penumbraCollection, manipData ?? string.Empty)
                 .ConfigureAwait(false);
 
-            Logger.LogTrace("[{appId}] Applying Glamourer data and Redrawing", applicationId);
-            DataApplicationProgress = "Applying Glamourer and redrawing Character";
+            var needsRedraw = !string.IsNullOrEmpty(manipData)
+                || modPaths.Keys.Any(static gp =>
+                {
+                    var ext = System.IO.Path.GetExtension(gp).TrimStart('.');
+                    if (string.IsNullOrEmpty(ext)) return false;
+
+                    return ext.Equals("tmb", StringComparison.OrdinalIgnoreCase)
+                        || ext.Equals("pap", StringComparison.OrdinalIgnoreCase)
+                        || ext.Equals("avfx", StringComparison.OrdinalIgnoreCase)
+                        || ext.Equals("atex", StringComparison.OrdinalIgnoreCase)
+                        || ext.Equals("sklb", StringComparison.OrdinalIgnoreCase)
+                        || ext.Equals("eid", StringComparison.OrdinalIgnoreCase)
+                        || ext.Equals("phyb", StringComparison.OrdinalIgnoreCase)
+                        || ext.Equals("scd", StringComparison.OrdinalIgnoreCase)
+                        || ext.Equals("skp", StringComparison.OrdinalIgnoreCase)
+                        || ext.Equals("shpk", StringComparison.OrdinalIgnoreCase);
+                });
+
+            Logger.LogTrace("[{appId}] Applying Glamourer data{redraw}", applicationId, needsRedraw ? " and redrawing" : string.Empty);
+            DataApplicationProgress = needsRedraw ? "Applying Glamourer and redrawing Character" : "Applying Glamourer";
 
             await _ipcManager.Glamourer
                 .ApplyAllAsync(Logger, tempHandler, glamourerData, applicationId, token)
                 .ConfigureAwait(false);
 
-            await _ipcManager.Penumbra
-                .RedrawAsync(Logger, tempHandler, applicationId, token)
-                .ConfigureAwait(false);
+            if (needsRedraw)
+            {
+                await _ipcManager.Penumbra
+                    .RedrawAsync(Logger, tempHandler, applicationId, token)
+                    .ConfigureAwait(false);
+            }
 
             await _dalamudUtilService
                 .WaitWhileCharacterIsDrawing(Logger, tempHandler, applicationId, ct: token)
                 .ConfigureAwait(false);
 
-            // 🔧 KEY CHANGE: only remove the temp Penumbra collection when autoRevert is true.
-            // For MCDF (autoRevert == false), we KEEP the collection alive so the file swaps persist.
             if (autoRevert)
             {
                 Logger.LogTrace("[{appId}] Removing collection (autoRevert)", applicationId);

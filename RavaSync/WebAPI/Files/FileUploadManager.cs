@@ -439,7 +439,7 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
 
         const int MaxUploadAttempts = 3;
 
-        var maxParallelUploads = Math.Clamp(_mareConfigService.Current.ParallelUploads, 1, 10);
+        var maxParallelUploads = GetEffectiveParallelUploads();
         using var sem = new System.Threading.SemaphoreSlim(maxParallelUploads, maxParallelUploads);
 
         var tasks = new List<Task>(allowedHashes.Count);
@@ -545,19 +545,26 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
 
         return failed;
     }
-    //private async Task<bool> CdnHasFileAsync(string hash, CancellationToken ct)
-    //{
-    //    if (_orchestrator.FilesCdnUri == null) return false;
 
-    //    var uri = new Uri(_orchestrator.FilesCdnUri, $"cdn/{hash}");
+    private int GetEffectiveParallelUploads()
+    {
+        var configured = _mareConfigService.Current.ParallelUploads;
 
-    //    using var req = new HttpRequestMessage(HttpMethod.Head, uri);
-    //    req.Headers.CacheControl = new CacheControlHeaderValue { NoCache = true };
-    //    req.Headers.Pragma.ParseAdd("no-cache");
+        if (configured > 0)
+            return Math.Clamp(configured, 1, 10);
 
-    //    using var resp = await _directUploadClient.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
-    //    return resp.IsSuccessStatusCode;
-    //}
+        // 0 = Auto
+        var cpu = Environment.ProcessorCount;
+
+        var auto =
+            cpu <= 4 ? 2 :
+            cpu <= 8 ? 3 :
+            cpu <= 16 ? 4 :
+                        6;
+
+        return Math.Clamp(auto, 1, 10);
+    }
+
 
     private static HttpClient CreateDirectUploadClient()
     {

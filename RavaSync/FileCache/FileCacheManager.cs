@@ -20,6 +20,7 @@ public sealed partial class FileCacheManager : IHostedService
     private readonly MareMediator _mareMediator;
     private readonly string _csvPath;
     private readonly ConcurrentDictionary<string, List<FileCacheEntity>> _fileCaches = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, FileCacheEntity> _prefixedPathIndex = new(StringComparer.OrdinalIgnoreCase);
     private readonly SemaphoreSlim _getCachesByPathsSemaphore = new(1, 1);
     private readonly object _fileWriteLock = new();
     private readonly IpcManager _ipcManager;
@@ -197,19 +198,9 @@ public sealed partial class FileCacheManager : IHostedService
             (int)new FileInfo(fileCache).Length));
     }
 
-    //public FileCacheEntity? GetFileCacheByHash(string hash)
-    //{
-    //    if (_fileCaches.TryGetValue(hash, out var hashes))
-    //    {
-    //        var item = hashes.OrderBy(p => p.PrefixedFilePath.Contains(PenumbraPrefix) ? 0 : 1).FirstOrDefault();
-    //        if (item != null) return GetValidatedFileCache(item);
-    //    }
-    //    return null;
-    //}
 
     public FileCacheEntity? GetFileCacheByHash(string hash)
     {
-        // 1) Normal path: use in-memory index first
         if (_fileCaches.TryGetValue(hash, out var hashes))
         {
             foreach (var candidate in hashes
@@ -221,13 +212,11 @@ public sealed partial class FileCacheManager : IHostedService
             }
         }
 
-        // 2) Fallback: probe the cache folder on disk (filesystem as truth)
         try
         {
             var cacheFolder = _configService.Current.CacheFolder;
             if (!string.IsNullOrEmpty(cacheFolder) && Directory.Exists(cacheFolder))
             {
-                // 🔧 recursive search, in case files live in subfolders
                 var matches = Directory.GetFiles(cacheFolder, hash + ".*", SearchOption.AllDirectories);
                 var first = matches.FirstOrDefault();
                 if (!string.IsNullOrEmpty(first))
@@ -349,37 +338,9 @@ public sealed partial class FileCacheManager : IHostedService
 
             Dictionary<string, FileCacheEntity?> result = new(StringComparer.OrdinalIgnoreCase);
 
-            //build a map of PrefixedFilePath → FileCacheEntity
-            // and gracefully handle duplicate PrefixedFilePath entries.
-            var prefixedPathMap = new Dictionary<string, FileCacheEntity>(StringComparer.OrdinalIgnoreCase);
-
-            foreach (var entity in _fileCaches.SelectMany(f => f.Value))
-            {
-                if (entity == null || string.IsNullOrEmpty(entity.PrefixedFilePath))
-                    continue;
-
-                // If we already have an entry for this path, prefer the "newer" one by LastModifiedDateTicks
-                if (prefixedPathMap.TryGetValue(entity.PrefixedFilePath, out var existing))
-                {
-                    if (long.TryParse(existing.LastModifiedDateTicks, out var existingTicks)
-                        && long.TryParse(entity.LastModifiedDateTicks, out var newTicks)
-                        && newTicks <= existingTicks)
-                    {
-                        // Existing is newer or equal – keep it
-                        continue;
-                    }
-
-                    // Otherwise, entity is newer – overwrite
-                }
-
-                prefixedPathMap[entity.PrefixedFilePath] = entity;
-            }
-
             foreach (var entry in cleanedPaths)
             {
-                // _logger.LogDebug("Checking {path}", entry.Value);
-
-                if (prefixedPathMap.TryGetValue(entry.Value, out var entity))
+                if (_prefixedPathIndex.TryGetValue(entry.Value, out var entity))
                 {
                     var validatedCache = GetValidatedFileCache(entity);
                     result.Add(entry.Key, validatedCache);
@@ -406,19 +367,27 @@ public sealed partial class FileCacheManager : IHostedService
     }
 
 
+
     public void RemoveHashedFile(string hash, string prefixedFilePath)
     {
         if (_fileCaches.TryGetValue(hash, out var caches))
         {
-            var removedCount = caches?.RemoveAll(c => string.Equals(c.PrefixedFilePath, prefixedFilePath, StringComparison.Ordinal));
+            var removedCount = caches.RemoveAll(c => string.Equals(c.PrefixedFilePath, prefixedFilePath, StringComparison.OrdinalIgnoreCase));
             _logger.LogTrace("Removed from DB: {count} file(s) with hash {hash} and file cache {path}", removedCount, hash, prefixedFilePath);
 
-            if (caches?.Count == 0)
+            if (caches.Count == 0)
             {
-                _fileCaches.Remove(hash, out var entity);
+                _fileCaches.TryRemove(hash, out _);
+            }
+
+            if (_prefixedPathIndex.TryGetValue(prefixedFilePath, out var indexed) &&
+                string.Equals(indexed.Hash, hash, StringComparison.OrdinalIgnoreCase))
+            {
+                RebuildPrefixedPathIndexForPath(prefixedFilePath);
             }
         }
     }
+
 
     public void UpdateHashedFile(FileCacheEntity fileCache, bool computeProperties = true)
     {
@@ -451,6 +420,55 @@ public sealed partial class FileCacheManager : IHostedService
 
         RemoveHashedFile(oldHash, prefixedPath);
         AddHashedFile(fileCache);
+    }
+
+
+    private void UpdatePrefixedPathIndex(FileCacheEntity entity)
+    {
+        if (entity == null || string.IsNullOrEmpty(entity.PrefixedFilePath))
+            return;
+
+        _prefixedPathIndex.AddOrUpdate(entity.PrefixedFilePath, entity, (_, existing) =>
+        {
+            if (existing == null) return entity;
+
+            if (long.TryParse(existing.LastModifiedDateTicks, NumberStyles.Integer, CultureInfo.InvariantCulture, out var exTicks) &&
+                long.TryParse(entity.LastModifiedDateTicks, NumberStyles.Integer, CultureInfo.InvariantCulture, out var newTicks))
+            {
+                return newTicks >= exTicks ? entity : existing;
+            }
+
+            // If ticks are weird/missing, prefer the newer arrival.
+            return entity;
+        });
+    }
+
+    private void RebuildPrefixedPathIndexForPath(string prefixedPath)
+    {
+        if (string.IsNullOrWhiteSpace(prefixedPath))
+            return;
+
+        FileCacheEntity? best = null;
+        long bestTicks = long.MinValue;
+
+        foreach (var e in _fileCaches.SelectMany(k => k.Value))
+        {
+            if (e == null) continue;
+            if (!string.Equals(e.PrefixedFilePath, prefixedPath, StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            if (!long.TryParse(e.LastModifiedDateTicks, NumberStyles.Integer, CultureInfo.InvariantCulture, out var ticks))
+                ticks = 0;
+
+            if (best == null || ticks >= bestTicks)
+            {
+                best = e;
+                bestTicks = ticks;
+            }
+        }
+
+        if (best != null) _prefixedPathIndex[prefixedPath] = best;
+        else _prefixedPathIndex.TryRemove(prefixedPath, out _);
     }
 
 
@@ -527,25 +545,11 @@ public sealed partial class FileCacheManager : IHostedService
 
         if (!entries.Exists(u => string.Equals(u.PrefixedFilePath, fileCache.PrefixedFilePath, StringComparison.OrdinalIgnoreCase)))
         {
-            //_logger.LogTrace("Adding to DB: {hash} => {path}", fileCache.Hash, fileCache.PrefixedFilePath);
             entries.Add(fileCache);
+            UpdatePrefixedPathIndex(fileCache);
         }
     }
 
-    //private FileCacheEntity? CreateFileCacheEntity(FileInfo fileInfo, string prefixedPath, string? hash = null)
-    //{
-    //    hash ??= Crypto.GetFileHash(fileInfo.FullName);
-    //    var entity = new FileCacheEntity(hash, prefixedPath, fileInfo.LastWriteTimeUtc.Ticks.ToString(CultureInfo.InvariantCulture), fileInfo.Length);
-    //    entity = ReplacePathPrefixes(entity);
-    //    AddHashedFile(entity);
-    //    lock (_fileWriteLock)
-    //    {
-    //        File.AppendAllLines(_csvPath, new[] { entity.CsvEntry });
-    //    }
-    //    var result = GetFileCacheByPath(fileInfo.FullName);
-    //    _logger.LogTrace("Creating cache entity for {name} success: {success}", fileInfo.FullName, (result != null));
-    //    return result;
-    //}
 
     private FileCacheEntity? CreateFileCacheEntity(FileInfo fileInfo, string prefixedPath, string? hash = null)
     {

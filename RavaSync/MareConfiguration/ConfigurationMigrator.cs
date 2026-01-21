@@ -17,6 +17,16 @@ public class ConfigurationMigrator(ILogger<ConfigurationMigrator> logger,Transie
     {
         MigrateCacheFolderToSubdir(mareConfigService, mediator);
 
+        if (mareConfigService.Current.Version < 2)
+        {
+            _logger.LogInformation("Migrating Rava Config V{old} => V2 (ParallelDownloads => Auto)", mareConfigService.Current.Version);
+
+            mareConfigService.Current.ParallelDownloads = 0;
+            mareConfigService.Current.ParallelUploads = 0;
+            mareConfigService.Current.Version = 2;
+            mareConfigService.Save();
+        }
+
         if (transientConfigService.Current.Version == 0)
         {
             _logger.LogInformation("Migrating Transient Config V0 => V1");
@@ -29,7 +39,7 @@ public class ConfigurationMigrator(ILogger<ConfigurationMigrator> logger,Transie
         {
             _logger.LogInformation("Migrating Server Config V1 => V2");
             var centralServer = serverConfigService.Current.ServerStorage.Find(f =>
-                f.ServerName.Equals("Lunae Crescere Incipientis (Central Server EU)", StringComparison.Ordinal));
+                f.ServerName.Equals("Ravalyn's Domain", StringComparison.Ordinal));
             if (centralServer != null)
             {
                 centralServer.ServerName = ApiController.MainServer;
@@ -38,6 +48,7 @@ public class ConfigurationMigrator(ILogger<ConfigurationMigrator> logger,Transie
             serverConfigService.Save();
         }
     }
+
 
     private const string CacheSubdirName = "RavaFiles";
 
