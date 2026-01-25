@@ -37,12 +37,14 @@ public sealed partial class ToyBoxUi : WindowMediatorSubscriberBase
     private Guid _pendingJoinGameId = Guid.Empty;
     private string _pendingJoinPassword = string.Empty;
     private bool _openJoinPasswordPopup = false;
+    private TournamentRole _pendingTournamentRole = TournamentRole.Spectator;
 
     private bool _selectLobbiesTab = false;
     private bool _selectHostTab = false;
     private bool _selectBlackjackTab = false;
     private bool _selectPokerTab = false;
     private bool _selectBingoTab = false;
+    private bool _selectTournamentTab = false;
 
 
     protected override IDisposable? BeginThemeScope() => _uiSharedService.BeginThemed();
@@ -120,6 +122,12 @@ public sealed partial class ToyBoxUi : WindowMediatorSubscriberBase
             if (bingoTab)
                 DrawBingo();
         }
+        var tFlags = _selectTournamentTab ? ImGuiTabItemFlags.SetSelected : ImGuiTabItemFlags.None;
+        using (var tournamentTab = ImRaii.TabItem("Tournament", tFlags))
+        {
+            if (tournamentTab)
+                DrawTournament();
+        }
 
 
         _selectPokerTab = false;
@@ -127,11 +135,12 @@ public sealed partial class ToyBoxUi : WindowMediatorSubscriberBase
         _selectHostTab = false;
         _selectBlackjackTab = false;
         _selectBingoTab = false;
+        _selectTournamentTab = false;
     }
 
     private void DrawHost()
     {
-        string[] kinds = ["Blackjack", "Poker (Texas Hold 'em)", "Bingo"];
+        string[] kinds = ["Blackjack", "Poker (Texas Hold 'em)", "Bingo", "Combat Tournament"];
         ImGui.SetNextItemWidth(250 * ImGuiHelpers.GlobalScale);
         ImGui.Combo("Game Type", ref _hostGameKind, kinds, kinds.Length);
 
@@ -210,6 +219,19 @@ public sealed partial class ToyBoxUi : WindowMediatorSubscriberBase
                 ImGui.TextColored(ImGuiColors.DalamudRed, "Buy-in must be set before hosting Poker.");
         }
 
+        bool tournamentSelected = _hostGameKind == 3;
+        if (tournamentSelected)
+        {
+            ImGuiHelpers.ScaledDummy(6);
+
+            ImGui.AlignTextToFramePadding();
+            ImGui.TextUnformatted("Max HP");
+            ImGui.SameLine();
+            ImGui.SetNextItemWidth(110 * ImGuiHelpers.GlobalScale);
+            ImGui.InputInt("##toybox_tour_maxhp", ref _tournamentHostMaxHp);
+            if (_tournamentHostMaxHp < 1) _tournamentHostMaxHp = 1;
+        }
+
 
         bool disableHost = pokerSelected && !pokerBuyInValid;
 
@@ -235,6 +257,12 @@ public sealed partial class ToyBoxUi : WindowMediatorSubscriberBase
                 _activeGameId = _games.HostBingo(_hostLobbyName, _hostMaxPlayers, pw);
                 if (_activeGameId != Guid.Empty) _selectBingoTab = true;
             }
+            else if (_hostGameKind == 3)
+            {
+                _activeGameId = _games.HostTournament(_hostLobbyName, _tournamentHostMaxHp, _hostMaxPlayers, pw);
+                if (_activeGameId != Guid.Empty) _selectTournamentTab = true;
+            }
+
         }
         ImGui.EndDisabled();
     }
@@ -257,14 +285,31 @@ public sealed partial class ToyBoxUi : WindowMediatorSubscriberBase
                     : $"{inv.LobbyName} ({inv.Kind}) from {inv.HostName}";
 
                 ImGui.TextUnformatted(title);
+                if (inv.Kind == SyncshellGameKind.Tournament)
+                {
+                    if (_uiSharedService.IconTextButton(FontAwesomeIcon.UserNinja, "Join as Fighter", 170 * ImGuiHelpers.GlobalScale, true))
+                    {
+                        _activeGameId = inv.GameId;
+                        _games.JoinTournament(inv.GameId, TournamentRole.Fighter, null, fromDirectInvite: true);
+                        _selectTournamentTab = true;
+                    }
 
-                if (_uiSharedService.IconTextButton(FontAwesomeIcon.Check, "Accept invite", 170 * ImGuiHelpers.GlobalScale, true))
+                    ImGui.SameLine();
+
+                    if (_uiSharedService.IconTextButton(FontAwesomeIcon.Eye, "Join as Spectator", 170 * ImGuiHelpers.GlobalScale, true))
+                    {
+                        _activeGameId = inv.GameId;
+                        _games.JoinTournament(inv.GameId, TournamentRole.Spectator, null, fromDirectInvite: true);
+                        _selectTournamentTab = true;
+                    }
+                }
+                else if (_uiSharedService.IconTextButton(FontAwesomeIcon.Check, "Accept invite", 170 * ImGuiHelpers.GlobalScale, true))
                 {
                     _activeGameId = inv.GameId;
+
                     if (inv.Kind == SyncshellGameKind.Bingo)
                     {
                         _games.JoinBingo(inv.GameId, 0, PackArgb(_bingoMarkerColor), null, fromDirectInvite: true);
-
                         _selectBingoTab = true;
                     }
                     else
@@ -317,6 +362,48 @@ public sealed partial class ToyBoxUi : WindowMediatorSubscriberBase
                 ImGui.SameLine();
                 ImGui.TextColored(ImGuiColors.DalamudGrey, $"  Buy-in: {inv.TableBuyIn}");
             }
+            if (inv.Kind == SyncshellGameKind.Tournament)
+            {
+                if (_uiSharedService.IconTextButton(FontAwesomeIcon.UserNinja, inv.PasswordProtected ? "Fighter (pw)" : "Join Fighter", 170 * ImGuiHelpers.GlobalScale, true))
+                {
+                    if (inv.PasswordProtected)
+                    {
+                        _pendingJoinGameId = inv.GameId;
+                        _pendingJoinPassword = string.Empty;
+                        _pendingTournamentRole = TournamentRole.Fighter;
+                        _openJoinPasswordPopup = true;
+                    }
+                    else
+                    {
+                        _activeGameId = inv.GameId;
+                        _games.JoinTournament(inv.GameId, TournamentRole.Fighter);
+                        _selectTournamentTab = true;
+                    }
+                }
+
+                ImGui.SameLine();
+
+                if (_uiSharedService.IconTextButton(FontAwesomeIcon.Eye, inv.PasswordProtected ? "Spectator (pw)" : "Join Spectator", 170 * ImGuiHelpers.GlobalScale, true))
+                {
+                    if (inv.PasswordProtected)
+                    {
+                        _pendingJoinGameId = inv.GameId;
+                        _pendingJoinPassword = string.Empty;
+                        _pendingTournamentRole = TournamentRole.Spectator;
+                        _openJoinPasswordPopup = true;
+                    }
+                    else
+                    {
+                        _activeGameId = inv.GameId;
+                        _games.JoinTournament(inv.GameId, TournamentRole.Spectator);
+                        _selectTournamentTab = true;
+                    }
+                }
+
+                ImGui.Separator();
+                continue;
+            }
+
             if (_uiSharedService.IconTextButton(FontAwesomeIcon.SignInAlt, inv.PasswordProtected ? "Join (password)" : "Join", 170 * ImGuiHelpers.GlobalScale, true))
             {
                 if (inv.PasswordProtected)
@@ -380,6 +467,11 @@ public sealed partial class ToyBoxUi : WindowMediatorSubscriberBase
                     _games.JoinBingo(inv.GameId, 0, PackArgb(_bingoMarkerColor), _pendingJoinPassword);
                     _selectBingoTab = true;
                 }
+                else if (inv.Kind == SyncshellGameKind.Tournament)
+                {
+                    _games.JoinTournament(inv.GameId, _pendingTournamentRole, _pendingJoinPassword);
+                    _selectTournamentTab = true;
+                }
                 else
                 {
                     _games.Join(inv.GameId, inv.Kind == SyncshellGameKind.Poker ? inv.TableBuyIn : 0, _pendingJoinPassword);
@@ -391,6 +483,7 @@ public sealed partial class ToyBoxUi : WindowMediatorSubscriberBase
 
             _pendingJoinPassword = string.Empty;
             _pendingJoinGameId = Guid.Empty;
+            _pendingTournamentRole = TournamentRole.Spectator;
             ImGui.CloseCurrentPopup();
         }
 

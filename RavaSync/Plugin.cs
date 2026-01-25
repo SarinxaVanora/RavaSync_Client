@@ -184,6 +184,7 @@ public sealed class Plugin : IDalamudPlugin
             collection.AddSingleton((s) => new NotificationService(s.GetRequiredService<ILogger<NotificationService>>(),
                 s.GetRequiredService<MareMediator>(), s.GetRequiredService<DalamudUtilService>(),
                 notificationManager, chatGui, s.GetRequiredService<MareConfigService>()));
+            collection.AddSingleton<CrashRecoveryService>();
             collection.AddSingleton(s => new PcpExportGuard(s.GetRequiredService<ILogger<PcpExportGuard>>(),pluginInterface,
                 s.GetRequiredService<PairManager>(),s.GetRequiredService<IpcCallerPenumbra>(),s.GetRequiredService<DalamudUtilService>(), s.GetRequiredService<MareMediator>()));
             collection.AddSingleton((s) => new PairRequestService(
@@ -340,6 +341,7 @@ public sealed class Plugin : IDalamudPlugin
             collection.AddScoped<WindowMediatorSubscriberBase, CompactUi>();
             collection.AddScoped<WindowMediatorSubscriberBase, IntroUi>();
             collection.AddScoped<WindowMediatorSubscriberBase, DownloadUi>();
+            collection.AddScoped<WindowMediatorSubscriberBase, TournamentHpUi>();
             collection.AddScoped<WindowMediatorSubscriberBase, PopoutProfileUi>();
             collection.AddScoped<WindowMediatorSubscriberBase, DataAnalysisUi>();
             collection.AddScoped<WindowMediatorSubscriberBase, JoinSyncshellUI>();
@@ -393,6 +395,7 @@ public sealed class Plugin : IDalamudPlugin
             collection.AddHostedService(p => p.GetRequiredService<ConfigurationSaveService>());
             collection.AddHostedService(p => p.GetRequiredService<MareMediator>());
             collection.AddHostedService(p => p.GetRequiredService<NotificationService>());
+            collection.AddHostedService(p => p.GetRequiredService<CrashRecoveryService>());
             collection.AddHostedService(p => p.GetRequiredService<FileCacheManager>());
             collection.AddHostedService(p => p.GetRequiredService<ConfigurationMigrator>());
             collection.AddHostedService(p => p.GetRequiredService<DalamudUtilService>());
@@ -402,6 +405,7 @@ public sealed class Plugin : IDalamudPlugin
             collection.AddHostedService(p => p.GetRequiredService<IpcProvider>());
             collection.AddHostedService(p => p.GetRequiredService<RavaPlugin>());
             collection.AddHostedService(p => p.GetRequiredService<RavaDiscoveryService>());
+            collection.AddHostedService(p => p.GetRequiredService<ToyBox>());
 
 
         })
@@ -413,7 +417,6 @@ public sealed class Plugin : IDalamudPlugin
         _ = _host.Services.GetRequiredService<PairRequestService>();
         _ = _host.Services.GetRequiredService<PairRequestContextMenuService>();
         _ = _host.Services.GetRequiredService<FriendshapedMarkerService>();
-        _ = _host.Services.GetRequiredService<ToyBox>();
 
         _ = _host.Services.GetRequiredService<ScopeAutoPauseService>();
         var activator = _host.Services.GetRequiredService<DelayedActivatorService>();

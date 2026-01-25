@@ -535,6 +535,9 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
 
         Mediator.Publish(new DownloadStartedMessage(gameObjectHandler, _downloadStatus));
 
+        var anyGroupFailure = 0;
+        var failedGroups = new ConcurrentBag<string>();
+
         await Parallel.ForEachAsync(downloadGroups, new ParallelOptions()
         {
             MaxDegreeOfParallelism = GetDownloadGroupParallelism(downloadGroups.Count),
@@ -542,7 +545,6 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
         },
         async (fileGroup, token) =>
         {
-
             try
             {
                 var cdnOk = await TryDownloadFilesFromCdnAsync(gameObjectHandler, fileGroup, fileReplacement, token).ConfigureAwait(false);
@@ -551,6 +553,12 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
                     Logger.LogDebug("CDN fast-path: group {group} fully satisfied via CDN, skipping blk pipeline", fileGroup.Key);
                     return;
                 }
+
+                Interlocked.Exchange(ref anyGroupFailure, 1);
+                failedGroups.Add(fileGroup.Key);
+
+                Logger.LogWarning("CDN fast-path: group {group} could not be fully satisfied via CDN; will fail overall after other groups finish",
+                    fileGroup.Key);
             }
             catch (OperationCanceledException)
             {
@@ -558,13 +566,21 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
             }
             catch (Exception ex)
             {
-                Logger.LogWarning(ex, "CDN fast-path: error, falling back to blk pipeline for group {group}", fileGroup.Key);
+                Interlocked.Exchange(ref anyGroupFailure, 1);
+                failedGroups.Add(fileGroup.Key);
+
+                Logger.LogWarning(ex, "CDN fast-path: error for group {group}; will fail overall after other groups finish",
+                    fileGroup.Key);
             }
-
-
-            Logger.LogError("CDN fast-path: group {group} could not be fully satisfied. CDN-only mode is enabled; aborting download group.", fileGroup.Key);
-            throw new HttpRequestException("CDN fast-path failed for group " + fileGroup.Key);
         }).ConfigureAwait(false);
+
+        if (Volatile.Read(ref anyGroupFailure) != 0)
+        {
+            Logger.LogError("CDN fast-path: one or more groups failed. Aborting download. Failed groups: {groups}",
+                string.Join(", ", failedGroups.Distinct(StringComparer.Ordinal)));
+
+            throw new HttpRequestException("CDN fast-path failed for groups: " + string.Join(", ", failedGroups.Distinct(StringComparer.Ordinal)));
+        }
 
         Logger.LogDebug("Download end: {id}", gameObjectHandler);
 
@@ -845,7 +861,44 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
         var tmp = name + ".tmp." + Environment.ProcessId + "." + Guid.NewGuid().ToString("N");
         return Path.Combine(dir, tmp);
     }
+    public bool TryResolveHardDelayedPath(string hash, string finalCachePath, out string resolvedPath)
+    {
+        resolvedPath = finalCachePath;
 
+        if (string.IsNullOrWhiteSpace(hash)) return false;
+        if (string.IsNullOrWhiteSpace(finalCachePath)) return false;
+
+        if (!ActivationPolicy.IsHardDelayed(finalCachePath))
+            return false;
+
+        if (File.Exists(finalCachePath))
+            return true;
+
+        var ext = Path.GetExtension(finalCachePath);
+        var quarantinePath = Path.Combine(_delayedActivator.QuarantineRoot, hash.ToUpperInvariant() + ext);
+
+        if (File.Exists(quarantinePath))
+        {
+            try
+            {
+                if (new FileInfo(quarantinePath).Length < 16)
+                {
+                    Logger.LogWarning("Quarantine file is zero-byte, deleting and forcing redownload: {file}", quarantinePath);
+                    try { File.Delete(quarantinePath); } catch { }
+                    return false;
+                }
+            }
+            catch
+            {
+                return false;
+            }
+
+            resolvedPath = quarantinePath;
+            return true;
+        }
+
+        return false;
+    }
     private static bool IsFileInUse(Exception ex)
     {
         if (ex is UnauthorizedAccessException) return true;

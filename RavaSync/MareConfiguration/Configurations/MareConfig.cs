@@ -1,6 +1,7 @@
 ﻿using RavaSync.MareConfiguration.Models;
 using RavaSync.UI;
 using Microsoft.Extensions.Logging;
+using FFXIVClientStructs.FFXIV.Common.Math;
 
 namespace RavaSync.MareConfiguration.Configurations;
 
@@ -45,7 +46,9 @@ public class MareConfig : IMareConfiguration
     public bool ShowOnlineNotifications { get; set; } = false;
     public bool ShowOnlineNotificationsOnlyForIndividualPairs { get; set; } = true;
     public bool ShowOnlineNotificationsOnlyForNamedPairs { get; set; } = false;
-    public bool ShowTransferBars { get; set; } = true;
+    public bool ShowTransferBars { get; set; } = false;
+    public bool ShowGlobalTransferBars { get; set; } = true;
+    public bool ShowUploadProgress { get; set; } = true;
     public bool ShowTransferWindow { get; set; } = false;
     public bool ShowUploading { get; set; } = true;
     public bool ShowUploadingBigText { get; set; } = true;
@@ -80,6 +83,15 @@ public class MareConfig : IMareConfiguration
     public bool SeenDiscoveryIntro { get; set; } = false;
     public bool EnableRavaDiscoveryPresence { get; set; } = false;
     public bool CacheFolderSubdirMigrationDone { get; set; } = false;
+
+    public bool EditGlobalTransferOverlay { get; set; } = false;
+
+    public float GlobalTransferOverlayX { get; set; } = float.NaN;
+    public float GlobalTransferOverlayY { get; set; } = float.NaN;
+
+    public float GlobalTransferOverlayScale { get; set; } = 1.0f;
+
+    public bool GlobalTransferOverlayRowLayout { get; set; } = false;
 
 
 }

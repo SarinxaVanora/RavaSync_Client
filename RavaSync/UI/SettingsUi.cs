@@ -290,14 +290,6 @@ public class SettingsUi : WindowMediatorSubscriberBase
         ImGui.AlignTextToFramePadding();
         ImGui.TextDisabled("(0 = Auto)");
 
-
-        if (ImGui.Checkbox("Use Alternative Upload Method", ref useAlternativeUpload))
-        {
-            _configService.Current.UseAlternativeFileUpload = useAlternativeUpload;
-            _configService.Save();
-        }
-        _uiShared.DrawHelpText("This will attempt to upload files in one go instead of a stream. Typically not necessary to enable. Use if you have upload issues.");
-
         ImGui.Separator();
         _uiShared.BigText("Transfer UI");
 
@@ -322,6 +314,35 @@ public class SettingsUi : WindowMediatorSubscriberBase
         ImGui.Unindent();
         if (!_configService.Current.ShowTransferWindow) ImGui.EndDisabled();
 
+        bool showGlobalTransferBars = _configService.Current.ShowGlobalTransferBars;
+        if (ImGui.Checkbox("Show global transfer bars", ref showGlobalTransferBars))
+        {
+            _configService.Current.ShowGlobalTransferBars = showGlobalTransferBars;
+            _configService.Save();
+        }
+
+        ImGui.SameLine();
+
+        var isEditingGlobal = _configService.Current.EditGlobalTransferOverlay;
+        var editLabel = isEditingGlobal ? "Done editing global bars##editGlobalTransfers" : "Edit global bars location##editGlobalTransfers";
+        if (ImGui.SmallButton(editLabel))
+        {
+            _configService.Current.EditGlobalTransferOverlay = !isEditingGlobal;
+            _configService.Save();
+        }
+
+        _uiShared.DrawHelpText("Shows a single download bar and a single upload bar when transfers are active.");
+
+        bool showUploadProgress = _configService.Current.ShowUploadProgress;
+        if (ImGui.Checkbox("Show upload progress bar", ref showUploadProgress))
+        {
+            _configService.Current.ShowUploadProgress = showUploadProgress;
+            _configService.Save();
+        }
+        _uiShared.DrawHelpText($"Shows a global upload bar when uploads are active.{Environment.NewLine}" + 
+            "Use this if you want individual download bars but still want to see your own upload progress");
+
+
         bool showTransferBars = _configService.Current.ShowTransferBars;
         if (ImGui.Checkbox("Show transfer bars rendered below players", ref showTransferBars))
         {
@@ -331,6 +352,8 @@ public class SettingsUi : WindowMediatorSubscriberBase
         _uiShared.DrawHelpText("This will render a progress bar during the download at the feet of the player you are downloading from.");
 
         if (!showTransferBars) ImGui.BeginDisabled();
+
+
         ImGui.Indent();
         bool transferBarShowText = _configService.Current.TransferBarsShowText;
         if (ImGui.Checkbox("Show Download Text", ref transferBarShowText))

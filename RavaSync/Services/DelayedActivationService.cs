@@ -25,9 +25,19 @@ namespace RavaSync.WebAPI.Files
         private readonly DalamudUtilService _dalamudUtil;
         private readonly IObjectTable _objectTable;
 
-        private DateTime _nextAllowedRedrawUtc = DateTime.MinValue;
         private readonly ConcurrentDictionary<string, byte> _pendingHashes = new(StringComparer.OrdinalIgnoreCase);
-        private readonly ConcurrentDictionary<nint, byte> _touchedActors = new();
+
+        private sealed class ActorRedrawState
+        {
+            public readonly object Gate = new();
+            public DateTime FirstTouchUtc;
+            public DateTime LastTouchUtc;
+            public DateTime NextRedrawUtc;
+            public bool FirstRedrawDone;
+        }
+
+        private readonly ConcurrentDictionary<nint, ActorRedrawState> _actorRedrawStates = new();
+
 
         private readonly Random _rng = new();
 
@@ -82,11 +92,36 @@ namespace RavaSync.WebAPI.Files
             _pendingHashes.TryAdd(f.FileHash, 0);
             _pending.Enqueue(f);
         }
+        private void TouchActor(nint addr)
+        {
+            if (addr == nint.Zero) return;
+
+            var now = DateTime.UtcNow;
+
+            _actorRedrawStates.AddOrUpdate(addr,
+                _ => new ActorRedrawState
+                {
+                    FirstTouchUtc = now,
+                    LastTouchUtc = now,
+                    NextRedrawUtc = DateTime.MinValue,
+                    FirstRedrawDone = false
+                },
+                (_, state) =>
+                {
+                    lock (state.Gate)
+                    {
+                        state.LastTouchUtc = now;
+                    }
+                    return state;
+                });
+        }
+
         public void NotifyActorTouched(nint? actorAddress)
         {
             if (actorAddress is nint addr && addr != nint.Zero)
-                _touchedActors.TryAdd(addr, 0);
+                TouchActor(addr);
         }
+
 
 
         private void OnFrameworkUpdate(IFramework framework)
@@ -96,7 +131,7 @@ namespace RavaSync.WebAPI.Files
                 if (_gate == null) return;
 
                 var cfg = _cfgSvc.Current;
-                if (!cfg.DelayActivationEnabled && _pending.IsEmpty && _touchedActors.IsEmpty)
+                if (!cfg.DelayActivationEnabled && _pending.IsEmpty && _actorRedrawStates.IsEmpty)
                     return;
 
                 if (!_gate.SafeNow(cfg.SafeIdleSeconds, cfg.ApplyOnlyOnZoneChange)) return;
@@ -254,48 +289,91 @@ namespace RavaSync.WebAPI.Files
 
             _fileDbManager.UnstageFile(f.FileHash);
             _pendingHashes.TryRemove(f.FileHash, out _);
-
+            
             if (f.ActorAddress is nint addr && addr != nint.Zero)
-                _touchedActors.TryAdd(addr, 0);
+                TouchActor(addr);
         }
 
         private void TryDoRedrawPass()
         {
             try
             {
-                if (_touchedActors.IsEmpty)
+                if (_actorRedrawStates.IsEmpty)
                     return;
 
-                if (DateTime.UtcNow < _nextAllowedRedrawUtc)
+                var now = DateTime.UtcNow;
+
+                foreach (var kvp in _actorRedrawStates)
+                {
+                    var state = kvp.Value;
+                    DateTime lastTouch;
+                    lock (state.Gate) lastTouch = state.LastTouchUtc;
+
+                    if ((now - lastTouch) > TimeSpan.FromSeconds(30))
+                        _actorRedrawStates.TryRemove(kvp.Key, out _);
+                }
+
+                if (_actorRedrawStates.IsEmpty)
                     return;
 
                 var local = _dalamudUtil.GetPlayerCharacter();
                 var localAddr = local?.Address ?? nint.Zero;
 
-                var touchedAddresses = _touchedActors.Keys.ToArray();
-                var set = new HashSet<nint>(touchedAddresses);
-                var redrawn = new List<nint>(touchedAddresses.Length);
+                var touched = _actorRedrawStates.Keys.ToArray();
+                var set = new HashSet<nint>(touched);
+                var toRemove = new List<nint>(touched.Length);
 
                 foreach (var obj in _objectTable)
                 {
                     if (obj is not IPlayerCharacter pc) continue;
                     if (pc.Address == localAddr) continue; // skip self
                     if (!set.Contains(pc.Address)) continue;
+                    if (!_actorRedrawStates.TryGetValue(pc.Address, out var state)) continue;
 
-                    _mareMediator.Publish(new PenumbraRedrawCharacterMessage(pc));
-                    redrawn.Add(pc.Address);
+                    var doRedraw = false;
+                    var remove = false;
+
+                    lock (state.Gate)
+                    {
+                        if (now < state.NextRedrawUtc)
+                        {
+                            // still within cooldown
+                        }
+                        else if (!state.FirstRedrawDone)
+                        {
+                            if ((now - state.FirstTouchUtc) >= TimeSpan.FromMilliseconds(250))
+                            {
+                                doRedraw = true;
+                                state.FirstRedrawDone = true;
+                                state.NextRedrawUtc = now.AddMilliseconds(900);
+                            }
+                        }
+                        else
+                        {
+                            if ((now - state.LastTouchUtc) >= TimeSpan.FromMilliseconds(1200))
+                            {
+                                doRedraw = true;
+                                remove = true;
+                            }
+                        }
+                    }
+
+                    if (doRedraw)
+                        _mareMediator.Publish(new PenumbraRedrawCharacterMessage(pc));
+
+                    if (remove)
+                        toRemove.Add(pc.Address);
                 }
 
-                foreach (var addr in redrawn)
-                    _touchedActors.TryRemove(addr, out _);
-
-                _nextAllowedRedrawUtc = DateTime.UtcNow.AddSeconds(1);
+                foreach (var addr in toRemove)
+                    _actorRedrawStates.TryRemove(addr, out _);
             }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Error during delayed redraw pass");
             }
         }
+
 
         private static void CopyFileBuffered(string srcPath, string dstPath)
         {
@@ -395,6 +473,19 @@ namespace RavaSync.WebAPI.Files
                 foreach (var originalPath in Directory.EnumerateFiles(QuarantineRoot))
                 {
                     var currentPath = originalPath;
+
+                    try
+                    {
+                        if (new FileInfo(currentPath).Length < 16)
+                        {
+                            try { File.Delete(currentPath); } catch { }
+                            continue;
+                        }
+                    }
+                    catch
+                    {
+                        continue;
+                    }
 
                     var ext = Path.GetExtension(currentPath);
                     if (string.IsNullOrWhiteSpace(ext))

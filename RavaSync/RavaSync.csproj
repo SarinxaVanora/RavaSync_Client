@@ -2,7 +2,7 @@
 <Project Sdk="Dalamud.NET.Sdk/14.0.1">
   <PropertyGroup>
 	  <AssemblyName>RavaSync</AssemblyName>
-    <Version>1.14.5</Version>
+    <Version>1.14.6</Version>
   </PropertyGroup>
 
   <PropertyGroup>
@@ -195,6 +195,8 @@
     <Content Include="Fonts\VT323-Regular.ttf">
       <CopyToOutputDirectory>Always</CopyToOutputDirectory>
     </Content>
+    <EmbeddedResource Include="Resources\aether_fill_blue.png" />
+    <EmbeddedResource Include="Resources\aether_fill_green.png" />
     <EmbeddedResource Include="Resources\aether_fill_strip.png" />
     <EmbeddedResource Include="Resources\aether_frame_bar.png" />
     <EmbeddedResource Include="Resources\cards_atlas.png" />

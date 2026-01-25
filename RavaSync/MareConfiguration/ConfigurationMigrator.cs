@@ -17,13 +17,14 @@ public class ConfigurationMigrator(ILogger<ConfigurationMigrator> logger,Transie
     {
         MigrateCacheFolderToSubdir(mareConfigService, mediator);
 
-        if (mareConfigService.Current.Version < 2)
+        if (mareConfigService.Current.Version < 3)
         {
-            _logger.LogInformation("Migrating Rava Config V{old} => V2 (ParallelDownloads => Auto)", mareConfigService.Current.Version);
+            _logger.LogInformation("Migrating Rava Config V{old} => V3", mareConfigService.Current.Version);
 
             mareConfigService.Current.ParallelDownloads = 0;
             mareConfigService.Current.ParallelUploads = 0;
-            mareConfigService.Current.Version = 2;
+            mareConfigService.Current.ShowTransferBars = false;
+            mareConfigService.Current.Version = 3;
             mareConfigService.Save();
         }
 

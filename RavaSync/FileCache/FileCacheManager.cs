@@ -132,6 +132,23 @@ public sealed partial class FileCacheManager : IHostedService
                 continue;
             }
 
+            long length = -1;
+            try
+            {
+                length = new FileInfo(fileCache.ResolvedFilepath).Length;
+            }
+            catch
+            {
+                // if we can't stat it, let hashing path decide
+            }
+
+            if (length >= 0 && length < 16)
+            {
+                _logger.LogInformation("File too small to be valid ({len} bytes): {file}", length, fileCache.ResolvedFilepath);
+                brokenEntities.Add(fileCache);
+                continue;
+            }
+
             try
             {
                 var computedHash = Crypto.GetFileHash(fileCache.ResolvedFilepath);
@@ -146,13 +163,18 @@ public sealed partial class FileCacheManager : IHostedService
             }
             catch (IOException ioEx)
             {
-                // MOST IMPORTANT CHANGE:
-                // IO problems here are almost always "file in use" / transient.
-                // We log them but DO NOT treat the file as broken and DO NOT delete it.
-                _logger.LogWarning(
-                    ioEx,
-                    "IO error during validation of {file}; treating as temporarily unavailable and keeping cache entry",
-                    fileCache.ResolvedFilepath);
+                if (length == 0)
+                {
+                    _logger.LogWarning(ioEx, "IO error during validation of {file} but length is 0; marking as broken", fileCache.ResolvedFilepath);
+                    brokenEntities.Add(fileCache);
+                }
+                else
+                {
+                    _logger.LogWarning(
+                        ioEx,
+                        "IO error during validation of {file}; treating as temporarily unavailable and keeping cache entry",
+                        fileCache.ResolvedFilepath);
+                }
 
                 continue;
             }

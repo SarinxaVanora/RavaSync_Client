@@ -1,6 +1,8 @@
 ﻿using Dalamud.Game.ClientState;
 using Dalamud.Game.ClientState.Objects;
 using Dalamud.Game.ClientState.Objects.SubKinds;
+using Dalamud.Game.Text;
+using Dalamud.Game.Text.SeStringHandling;
 using Dalamud.Plugin.Services;
 using MessagePack;
 using Microsoft.Extensions.Hosting;
@@ -18,7 +20,8 @@ public enum SyncshellGameKind
 {
     Blackjack = 0,
     Poker = 1,
-    Bingo = 2
+    Bingo = 2,
+    Tournament = 3
 }
 
 public enum SyncshellGameOp
@@ -49,7 +52,12 @@ public enum SyncshellGameOp
     BingoClaimResult = 51,
 
     BingoStatePublic = 60,
-    BingoStatePrivate = 61
+    BingoStatePrivate = 61,
+
+    TournamentRoll = 71,
+    TournamentStatePublic = 80,
+    TournamentStatePrivate = 81
+
 }
 
 
@@ -136,6 +144,8 @@ public sealed partial class ToyBox : DisposableMediatorSubscriberBase, IHostedSe
     private readonly IObjectTable _objects;
     private readonly IClientState _clientState;
     private readonly IFramework _framework;
+    private readonly IChatGui _chatGui;
+
 
     public ConcurrentDictionary<Guid, SyncshellGameInvite> Invites { get; } = new(); // (UI calls these "Lobbies")
     public ConcurrentDictionary<Guid, SyncshellDirectInvite> DirectInvites { get; } = new();
@@ -150,10 +160,8 @@ public sealed partial class ToyBox : DisposableMediatorSubscriberBase, IHostedSe
     private string _cachedMySessionId = string.Empty;
     private string _cachedMyName = "Player";
 
-    public ToyBox(ILogger<ToyBox> logger, MareMediator mediator,
-        IRavaMesh mesh, DalamudUtilService dalamudUtil, IObjectTable objects, IClientState clientState,
-        IFramework framework)
-        : base(logger, mediator)
+    public ToyBox(ILogger<ToyBox> logger, MareMediator mediator, IRavaMesh mesh, DalamudUtilService dalamudUtil, IObjectTable objects, IClientState clientState, IFramework framework, IChatGui chatGui)
+            : base(logger, mediator)
     {
         _logger = logger;
         _mesh = mesh;
@@ -161,6 +169,7 @@ public sealed partial class ToyBox : DisposableMediatorSubscriberBase, IHostedSe
         _objects = objects;
         _clientState = clientState;
         _framework = framework;
+        _chatGui = chatGui;
 
         Mediator.Subscribe<SyncshellGameMeshMessage>(this, OnGameMesh);
     }
@@ -168,12 +177,14 @@ public sealed partial class ToyBox : DisposableMediatorSubscriberBase, IHostedSe
     public Task StartAsync(CancellationToken cancellationToken)
     {
         _framework.Update += FrameworkOnUpdate;
+        _chatGui.ChatMessage += ChatGuiOnChatMessage;
         return Task.CompletedTask;
     }
 
     public Task StopAsync(CancellationToken cancellationToken)
     {
         _framework.Update -= FrameworkOnUpdate;
+        _chatGui.ChatMessage -= ChatGuiOnChatMessage;
         return Task.CompletedTask;
     }
 
@@ -189,6 +200,18 @@ public sealed partial class ToyBox : DisposableMediatorSubscriberBase, IHostedSe
         }
         catch
         {
+        }
+    }
+    private void ChatGuiOnChatMessage(XivChatType type, int timestamp, ref SeString sender, ref SeString message, ref bool isHandled)
+    {
+        try
+        {
+            TryHandleTournamentRoll(type, sender, message);
+        }
+        catch (Exception ex)
+        {
+            Logger.LogWarning(ex, "ToyBox chat handler failed. type={type} sender={sender} msg={msg}",
+                type, sender.TextValue ?? "<null>", message.TextValue ?? "<null>");
         }
     }
 
@@ -303,12 +326,14 @@ public sealed partial class ToyBox : DisposableMediatorSubscriberBase, IHostedSe
                 if (env.Kind == SyncshellGameKind.Blackjack) HandleJoin(msg.FromSessionId, env);
                 else if (env.Kind == SyncshellGameKind.Poker) HandlePokerJoin(msg.FromSessionId, env);
                 else if (env.Kind == SyncshellGameKind.Bingo) HandleBingoJoin(msg.FromSessionId, env);
+                else if (env.Kind == SyncshellGameKind.Tournament) HandleTournamentJoin(msg.FromSessionId, env);
                 break;
 
             case SyncshellGameOp.Leave:
                 if (env.Kind == SyncshellGameKind.Blackjack) HandleLeave(msg.FromSessionId, env);
                 else if (env.Kind == SyncshellGameKind.Poker) HandlePokerLeave(msg.FromSessionId, env);
                 else if (env.Kind == SyncshellGameKind.Bingo) HandleBingoLeave(msg.FromSessionId, env);
+                else if (env.Kind == SyncshellGameKind.Tournament) HandleTournamentLeave(msg.FromSessionId, env);
                 break;
 
             case SyncshellGameOp.BjPlaceBet:
@@ -357,6 +382,17 @@ public sealed partial class ToyBox : DisposableMediatorSubscriberBase, IHostedSe
 
             case SyncshellGameOp.BingoStatePrivate:
                 HandleBingoPrivate(msg.LocalSessionId, msg.FromSessionId, env);
+                break;
+
+            case SyncshellGameOp.TournamentStatePublic:
+                HandleTournamentPublic(msg.LocalSessionId, env);
+                break;
+
+            case SyncshellGameOp.TournamentStatePrivate:
+                HandleTournamentPrivate(msg.LocalSessionId, env);
+                break;
+            case SyncshellGameOp.TournamentRoll:
+                HandleTournamentRoll(msg.FromSessionId, env);
                 break;
             case SyncshellGameOp.LobbyClosed:
                 HandleLobbyClosed(env);
@@ -505,6 +541,18 @@ public sealed partial class ToyBox : DisposableMediatorSubscriberBase, IHostedSe
                 g.MaxPlayers,
                 g.PasswordProtected));
         }
+        foreach (var kv in _hostedTournament)
+        {
+            var g = kv.Value;
+            list.Add(new ToyBoxHostedLobbySummary(
+                g.GameId,
+                SyncshellGameKind.Tournament,
+                g.LobbyName,
+                0,
+                g.CurrentPlayers,
+                g.MaxPlayers,
+                g.PasswordProtected));
+        }
 
         return list;
     }
@@ -562,6 +610,21 @@ public sealed partial class ToyBox : DisposableMediatorSubscriberBase, IHostedSe
 
             Send(bg.HostSessionId, targetSessionId, env);
         }
+
+        if (_hostedTournament.TryGetValue(gameId, out var tg))
+        {
+            var token = tg.IssueInviteToken(targetSessionId);
+
+            var payload = new SyncshellDirectInvitePayload(
+                tg.HostSessionId, tg.HostName, SyncshellGameKind.Tournament, tg.GameId,
+                0, tg.LobbyName, token);
+
+            var env = new SyncshellGameEnvelope(tg.GameId, SyncshellGameKind.Tournament, SyncshellGameOp.DirectInvite,
+                MessagePackSerializer.Serialize(payload));
+
+            Send(tg.HostSessionId, targetSessionId, env);
+        }
+
     }
 
     public void AcceptDirectInvite(Guid gameId)
@@ -572,6 +635,12 @@ public sealed partial class ToyBox : DisposableMediatorSubscriberBase, IHostedSe
         if (inv.Kind == SyncshellGameKind.Bingo)
         {
             JoinBingo(gameId, cardCount: 0, markerColorArgb: 0, passwordPlaintext: null, fromDirectInvite: true);
+            return;
+        }
+
+        if (inv.Kind == SyncshellGameKind.Tournament)
+        {
+            JoinTournament(gameId, TournamentRole.Spectator, null, fromDirectInvite: true);
             return;
         }
 
@@ -620,6 +689,8 @@ public sealed partial class ToyBox : DisposableMediatorSubscriberBase, IHostedSe
             _clientPoker.TryRemove(env.GameId, out _);
         else if (env.Kind == SyncshellGameKind.Bingo)
             _clientBingo.TryRemove(env.GameId, out _);
+        else if (env.Kind == SyncshellGameKind.Tournament)
+            _clientTournament.TryRemove(env.GameId, out _);
 
         Mediator.Publish(new NotificationMessage(
             "Toy Box",
@@ -649,6 +720,8 @@ public sealed partial class ToyBox : DisposableMediatorSubscriberBase, IHostedSe
             _clientPoker.TryRemove(env.GameId, out _);
         else if (env.Kind == SyncshellGameKind.Bingo)
             _clientBingo.TryRemove(env.GameId, out _);
+        else if (env.Kind == SyncshellGameKind.Tournament)
+            _clientTournament.TryRemove(env.GameId, out _);
     }
     private void BroadcastLobbyClosedNearby(Guid gameId, string hostSessionId, SyncshellGameKind kind)
     {
@@ -750,6 +823,23 @@ public sealed partial class ToyBox : DisposableMediatorSubscriberBase, IHostedSe
                 g.PasswordProtected,
                 g.PasswordSalt);
         }
+        foreach (var kv in _hostedTournament)
+        {
+            var g = kv.Value;
+
+            BroadcastInviteNearby(
+                g.GameId,
+                g.HostSessionId,
+                g.HostName,
+                SyncshellGameKind.Tournament,
+                0,
+                g.LobbyName,
+                g.CurrentPlayers,
+                g.MaxPlayers,
+                g.PasswordProtected,
+                g.PasswordSalt);
+        }
+
     }
 
     private string? GetMySessionId()

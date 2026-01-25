@@ -7,23 +7,23 @@ using Dalamud.Utility;
 using FFXIVClientStructs.FFXIV.Client.Game;
 using FFXIVClientStructs.FFXIV.Client.Game.Character;
 using FFXIVClientStructs.FFXIV.Client.Game.Control;
+using FFXIVClientStructs.FFXIV.Client.Game.Object;
 using FFXIVClientStructs.FFXIV.Client.Graphics.Scene;
 using FFXIVClientStructs.FFXIV.Client.UI.Agent;
 using FFXIVClientStructs.FFXIV.Component.GUI;
 using Lumina.Excel.Sheets;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
 using RavaSync.API.Dto.CharaData;
 using RavaSync.Interop;
 using RavaSync.MareConfiguration;
 using RavaSync.PlayerData.Handlers;
 using RavaSync.Services.Mediator;
 using RavaSync.Utils;
-using Microsoft.Extensions.Hosting;
-using Microsoft.Extensions.Logging;
 using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Text;
 using GameObject = FFXIVClientStructs.FFXIV.Client.Game.Object.GameObject;
-using FFXIVClientStructs.FFXIV.Client.Game.Object;
 
 
 namespace RavaSync.Services;
@@ -680,8 +680,34 @@ public class DalamudUtilService : IHostedService, IMediatorSubscriber
     public Vector2 WorldToScreen(IGameObject? obj)
     {
         if (obj == null) return Vector2.Zero;
-        return _gameGui.WorldToScreen(obj.Position, out var screenPos) ? screenPos : Vector2.Zero;
+
+        try
+        {
+            var addr = obj.Address;
+            if (addr == IntPtr.Zero) return Vector2.Zero;
+
+            var idx = obj.ObjectIndex;
+            if (idx >= 0 && idx < _objectTable.Length)
+            {
+                var fresh = _objectTable[idx];
+                if (fresh == null || fresh.Address == IntPtr.Zero)
+                    return Vector2.Zero;
+
+                obj = fresh;
+            }
+
+            return _gameGui.WorldToScreen(obj.Position, out var screenPos) ? screenPos : Vector2.Zero;
+        }
+        catch (AccessViolationException)
+        {
+            return Vector2.Zero;
+        }
+        catch
+        {
+            return Vector2.Zero;
+        }
     }
+
 
     internal (string Name, nint Address) FindPlayerByNameHash(string ident)
     {
@@ -994,6 +1020,30 @@ public class DalamudUtilService : IHostedService, IMediatorSubscriber
         {
             if (kvp.Value.Address == addr)
                 return kvp.Key; // ident
+        }
+
+        return null;
+    }
+
+    public IGameObject? GetGameObjectBySessionId(string sessionId)
+    {
+        if (string.IsNullOrEmpty(sessionId)) return null;
+
+        foreach (var obj in _objectTable)
+        {
+            try
+            {
+                var ident = GetIdentFromGameObject(obj);
+                if (string.IsNullOrEmpty(ident)) continue;
+
+                var sid = RavaSync.Services.Discovery.RavaSessionId.FromIdent(ident);
+                if (string.Equals(sid, sessionId, StringComparison.Ordinal))
+                    return obj;
+            }
+            catch
+            {
+                //*ignore*
+            }
         }
 
         return null;
