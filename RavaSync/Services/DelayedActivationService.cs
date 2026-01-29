@@ -24,6 +24,7 @@ namespace RavaSync.WebAPI.Files
         private readonly MareMediator _mareMediator;
         private readonly DalamudUtilService _dalamudUtil;
         private readonly IObjectTable _objectTable;
+        private int _globalRedrawRequested = 0;
 
         private readonly ConcurrentDictionary<string, byte> _pendingHashes = new(StringComparer.OrdinalIgnoreCase);
 
@@ -32,8 +33,8 @@ namespace RavaSync.WebAPI.Files
             public readonly object Gate = new();
             public DateTime FirstTouchUtc;
             public DateTime LastTouchUtc;
-            public DateTime NextRedrawUtc;
-            public bool FirstRedrawDone;
+            public DateTime DueUtc;
+            public DateTime LastRedrawUtc;
         }
 
         private readonly ConcurrentDictionary<nint, ActorRedrawState> _actorRedrawStates = new();
@@ -75,7 +76,6 @@ namespace RavaSync.WebAPI.Files
             _framework.Update += OnFrameworkUpdate;
         }
 
-        // fed from Plugin ctor (Dalamud's ICondition)
         public void Initialize(ICondition condition)
         {
             _gate = new SafetyGate(condition);
@@ -85,13 +85,16 @@ namespace RavaSync.WebAPI.Files
 
         public void Enqueue(PendingFile f)
         {
-            // record pending hash first to prevent duplicate downloads
             if (f is null) return;
             if (string.IsNullOrWhiteSpace(f.FileHash)) return;
 
             _pendingHashes.TryAdd(f.FileHash, 0);
             _pending.Enqueue(f);
         }
+        private const int ActorCoalesceDelayMs = 150;
+        private const int ActorMaxHoldMs = 1500;  
+        private const int ActorMinRedrawIntervalMs = 750; 
+
         private void TouchActor(nint addr)
         {
             if (addr == nint.Zero) return;
@@ -103,14 +106,19 @@ namespace RavaSync.WebAPI.Files
                 {
                     FirstTouchUtc = now,
                     LastTouchUtc = now,
-                    NextRedrawUtc = DateTime.MinValue,
-                    FirstRedrawDone = false
+                    DueUtc = now.AddMilliseconds(ActorCoalesceDelayMs),
+                    LastRedrawUtc = DateTime.MinValue
                 },
                 (_, state) =>
                 {
                     lock (state.Gate)
                     {
                         state.LastTouchUtc = now;
+
+                        // Push the due time out, but cap by max-hold so we still redraw even under constant churn.
+                        var pushed = now.AddMilliseconds(ActorCoalesceDelayMs);
+                        var capped = state.FirstTouchUtc.AddMilliseconds(ActorMaxHoldMs);
+                        state.DueUtc = pushed <= capped ? pushed : capped;
                     }
                     return state;
                 });
@@ -136,7 +144,7 @@ namespace RavaSync.WebAPI.Files
 
                 if (!_gate.SafeNow(cfg.SafeIdleSeconds, cfg.ApplyOnlyOnZoneChange)) return;
 
-                const int MaxFilesPerFrame = 2;
+                const int MaxFilesPerFrame = 6;
 
                 var drained = new List<PendingFile>(MaxFilesPerFrame);
                 while (drained.Count < MaxFilesPerFrame && _pending.TryDequeue(out var f))
@@ -219,7 +227,6 @@ namespace RavaSync.WebAPI.Files
                             continue;
                         }
 
-                        // match PersistFileToStorage timestamp behavior
                         try
                         {
                             var fi = new FileInfo(f.FinalPath);
@@ -289,16 +296,25 @@ namespace RavaSync.WebAPI.Files
 
             _fileDbManager.UnstageFile(f.FileHash);
             _pendingHashes.TryRemove(f.FileHash, out _);
-            
-            if (f.ActorAddress is nint addr && addr != nint.Zero)
-                TouchActor(addr);
+
+            if (IsRedrawCriticalFinalPath(f.FinalPath))
+            {
+                if (f.ActorAddress is nint addr && addr != nint.Zero)
+                    TouchActor(addr);
+                else
+                    Interlocked.Exchange(ref _globalRedrawRequested, 1);
+            }
         }
+
+        private DateTime _globalDueUtc = DateTime.MinValue;
+        private const int GlobalCoalesceDelayMs = 350;
+        private const int GlobalMinIntervalMs = 1000;
 
         private void TryDoRedrawPass()
         {
             try
             {
-                if (_actorRedrawStates.IsEmpty)
+                if (_actorRedrawStates.IsEmpty && Volatile.Read(ref _globalRedrawRequested) == 0)
                     return;
 
                 var now = DateTime.UtcNow;
@@ -313,56 +329,59 @@ namespace RavaSync.WebAPI.Files
                         _actorRedrawStates.TryRemove(kvp.Key, out _);
                 }
 
-                if (_actorRedrawStates.IsEmpty)
-                    return;
-
                 var local = _dalamudUtil.GetPlayerCharacter();
                 var localAddr = local?.Address ?? nint.Zero;
 
-                var touched = _actorRedrawStates.Keys.ToArray();
-                var set = new HashSet<nint>(touched);
-                var toRemove = new List<nint>(touched.Length);
+                if (Interlocked.Exchange(ref _globalRedrawRequested, 0) == 1)
+                {
+                    var pushed = now.AddMilliseconds(GlobalCoalesceDelayMs);
+                    if (_globalDueUtc < pushed) _globalDueUtc = pushed;
+                }
+
+                if (_globalDueUtc != DateTime.MinValue && now >= _globalDueUtc)
+                {
+                    _globalDueUtc = now.AddMilliseconds(GlobalMinIntervalMs);
+
+                    foreach (var obj in _objectTable)
+                    {
+                        if (obj is not IPlayerCharacter pc) continue;
+                        if (pc.Address == localAddr) continue;
+                        _mareMediator.Publish(new PenumbraRedrawCharacterMessage(pc));
+                    }
+                }
+
+                if (_actorRedrawStates.IsEmpty)
+                    return;
+
+                var toRemove = new List<nint>();
 
                 foreach (var obj in _objectTable)
                 {
                     if (obj is not IPlayerCharacter pc) continue;
-                    if (pc.Address == localAddr) continue; // skip self
-                    if (!set.Contains(pc.Address)) continue;
-                    if (!_actorRedrawStates.TryGetValue(pc.Address, out var state)) continue;
+                    if (pc.Address == localAddr) continue;
+
+                    if (!_actorRedrawStates.TryGetValue(pc.Address, out var state))
+                        continue;
 
                     var doRedraw = false;
-                    var remove = false;
 
                     lock (state.Gate)
                     {
-                        if (now < state.NextRedrawUtc)
+                        if (now >= state.DueUtc)
                         {
-                            // still within cooldown
-                        }
-                        else if (!state.FirstRedrawDone)
-                        {
-                            if ((now - state.FirstTouchUtc) >= TimeSpan.FromMilliseconds(250))
+                            if (state.LastRedrawUtc == DateTime.MinValue ||
+                                (now - state.LastRedrawUtc) >= TimeSpan.FromMilliseconds(ActorMinRedrawIntervalMs))
                             {
                                 doRedraw = true;
-                                state.FirstRedrawDone = true;
-                                state.NextRedrawUtc = now.AddMilliseconds(900);
+                                state.LastRedrawUtc = now;
                             }
-                        }
-                        else
-                        {
-                            if ((now - state.LastTouchUtc) >= TimeSpan.FromMilliseconds(1200))
-                            {
-                                doRedraw = true;
-                                remove = true;
-                            }
+
+                            toRemove.Add(pc.Address);
                         }
                     }
 
                     if (doRedraw)
                         _mareMediator.Publish(new PenumbraRedrawCharacterMessage(pc));
-
-                    if (remove)
-                        toRemove.Add(pc.Address);
                 }
 
                 foreach (var addr in toRemove)
@@ -545,6 +564,23 @@ namespace RavaSync.WebAPI.Files
             {
                 _logger.LogWarning(ex, "Failed to recover quarantine orphans");
             }
+        }
+
+        private static bool IsRedrawCriticalFinalPath(string finalPath)
+        {
+            if (string.IsNullOrWhiteSpace(finalPath)) return false;
+
+            return finalPath.EndsWith(".pap", StringComparison.OrdinalIgnoreCase)
+                || finalPath.EndsWith(".tmb", StringComparison.OrdinalIgnoreCase)
+                || finalPath.EndsWith(".sklb", StringComparison.OrdinalIgnoreCase)
+                || finalPath.EndsWith(".phyb", StringComparison.OrdinalIgnoreCase)
+                || finalPath.EndsWith(".pbd", StringComparison.OrdinalIgnoreCase)
+                || finalPath.EndsWith(".avfx", StringComparison.OrdinalIgnoreCase)
+                || finalPath.EndsWith(".atex", StringComparison.OrdinalIgnoreCase)
+                || finalPath.EndsWith(".shpk", StringComparison.OrdinalIgnoreCase)
+                || finalPath.EndsWith(".scd", StringComparison.OrdinalIgnoreCase)
+                || finalPath.EndsWith(".eid", StringComparison.OrdinalIgnoreCase)
+                || finalPath.EndsWith(".skp", StringComparison.OrdinalIgnoreCase);
         }
 
         public void Dispose()

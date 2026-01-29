@@ -54,6 +54,7 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
     private static readonly SemaphoreSlim GlobalApplySemaphore = new(3, 3);
     private string? _lastAttemptedDataHash;
     private string? _lastAppliedTempModsFingerprint;
+    private Task? _deferredHardDelayedApplyTask;
 
     private readonly object _missingCheckGate = new();
     private string? _lastMissingCheckedHash;
@@ -91,6 +92,7 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
         Mediator.Subscribe<ZoneSwitchStartMessage>(this, (_) =>
         {
             _downloadCancellationTokenSource?.CancelDispose();
+            _applicationCancellationTokenSource?.CancelDispose();
             _charaHandler?.Invalidate();
             IsVisible = false;
         });
@@ -207,7 +209,7 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
         bool sameHash = string.Equals(newHash, _cachedData?.DataHash.Value ?? string.Empty, StringComparison.Ordinal);
 
 
-        if (sameHash && !forceApplyCustomization)
+        if (sameHash && !forceApplyCustomization && !_redrawOnNextApplication)
         {
             if (TryGetRecentMissingCheck(newHash, out var hadMissing))
             {
@@ -247,8 +249,11 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
             _forceApplyMods = false;
         }
 
-        if (_redrawOnNextApplication && charaDataToUpdate.TryGetValue(ObjectKind.Player, out var player))
+        if (_redrawOnNextApplication)
         {
+            if (!charaDataToUpdate.TryGetValue(ObjectKind.Player, out var player))
+                charaDataToUpdate[ObjectKind.Player] = player = new HashSet<PlayerChanges>();
+
             player.Add(PlayerChanges.ForcedRedraw);
             _redrawOnNextApplication = false;
         }
@@ -435,14 +440,7 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
                         break;
 
                     case PlayerChanges.ForcedRedraw:
-                        if (changes.Key != ObjectKind.Player || allowPlayerRedraw)
-                        {
-                            needsRedraw = true;
-                        }
-                        else
-                        {
-                            Logger.LogDebug("[{applicationId}] Ignoring ForcedRedraw for Player because no Penumbra state changed this pass", applicationId);
-                        }
+                        needsRedraw = true;
                         break;
 
                     default:
@@ -476,6 +474,98 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
         await _ipcManager.Penumbra.RedrawAsync(Logger, _charaHandler, applicationId, token).ConfigureAwait(false);
     }
 
+    private async Task ApplyDeferredHardDelayedModsAsync(Guid applicationId,Dictionary<(string GamePath, string? Hash), string> fullModdedPaths,HashSet<(string GamePath, string? Hash)> deferredKeys,CancellationToken token)
+    {
+        try
+        {
+            if (deferredKeys.Count == 0) return;
+
+            var lastUnsafeUtc = DateTime.UtcNow;
+
+            while (!token.IsCancellationRequested)
+            {
+                if (_applicationId != applicationId)
+                    return;
+
+                if (GlobalApplySemaphore.CurrentCount == 0)
+                {
+                    await Task.Delay(200, token).ConfigureAwait(false);
+                    continue;
+                }
+
+                if (_applicationId != applicationId)
+                    return;
+
+                var unsafeNow =
+                    _dalamudUtil.IsZoning ||
+                    _dalamudUtil.IsInCutscene ||
+                    _dalamudUtil.IsInGpose ||
+                    _dalamudUtil.IsInCombatOrPerforming;
+
+                if (unsafeNow)
+                {
+                    lastUnsafeUtc = DateTime.UtcNow;
+                    await Task.Delay(200, token).ConfigureAwait(false);
+                    continue;
+                }
+
+                if ((DateTime.UtcNow - lastUnsafeUtc) < TimeSpan.FromSeconds(1))
+                {
+                    await Task.Delay(200, token).ConfigureAwait(false);
+                    continue;
+                }
+
+                var allCommitted = true;
+                foreach (var key in deferredKeys)
+                {
+                    if (!fullModdedPaths.TryGetValue(key, out var finalPath) || string.IsNullOrEmpty(finalPath) || !File.Exists(finalPath))
+                    {
+                        allCommitted = false;
+                        break;
+                    }
+                }
+
+                if (!allCommitted)
+                {
+                    await Task.Delay(250, token).ConfigureAwait(false);
+                    continue;
+                }
+
+                if (_charaHandler == null || _charaHandler.Address == nint.Zero)
+                    return;
+
+                var objIndex = await _dalamudUtil
+                    .RunOnFrameworkThread(() => _charaHandler!.GetGameObject()!.ObjectIndex)
+                    .ConfigureAwait(false);
+
+                var ok = await _ipcManager.Penumbra
+                    .AssignTemporaryCollectionAsync(Logger, _penumbraCollection, objIndex)
+                    .ConfigureAwait(false);
+
+                if (!ok)
+                    return;
+
+                var tempMods = BuildPenumbraTempMods(fullModdedPaths);
+                var fingerprint = ComputeTempModsFingerprint(tempMods);
+
+                await _ipcManager.Penumbra
+                    .SetTemporaryModsAsync(Logger, applicationId, _penumbraCollection, tempMods)
+                    .ConfigureAwait(false);
+
+                _lastAppliedTempModsFingerprint = fingerprint;
+
+                await OnePassRedrawAsync(applicationId, token).ConfigureAwait(false);
+                return;
+            }
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        catch (Exception ex)
+        {
+            Logger.LogWarning(ex, "[{applicationId}] Deferred hard-delayed apply failed", applicationId);
+        }
+    }
 
     private void DownloadAndApplyCharacter(Guid applicationBase, CharacterData charaData, Dictionary<ObjectKind, HashSet<PlayerChanges>> updatedData)
     {
@@ -681,7 +771,7 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
 
         while ((!_applicationTask?.IsCompleted ?? false)
                && !downloadToken.IsCancellationRequested
-               && (!appToken?.IsCancellationRequested ?? false))
+               && (appToken == null || !appToken.Value.IsCancellationRequested))
         {
             var now = Environment.TickCount64;
             if (now - lastWaitLog >= 1000)
@@ -697,7 +787,7 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
 
         if (downloadToken.IsCancellationRequested || (appToken?.IsCancellationRequested ?? false)) return;
 
-        _applicationCancellationTokenSource = _applicationCancellationTokenSource.CancelRecreate() ?? new CancellationTokenSource();
+        _applicationCancellationTokenSource = _applicationCancellationTokenSource?.CancelRecreate() ?? new CancellationTokenSource();
         var token = _applicationCancellationTokenSource.Token;
 
         _applicationTask = ApplyCharacterDataAsync(applicationBase, charaData, updatedData, updateModdedPaths, updateManip, moddedPaths, downloadedAny, token);
@@ -787,23 +877,40 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
 
                     var cacheRoot = _fileDbManager.CacheFolder;
 
-                    // Resolve hard-delayed hashed files to quarantine if needed
+                    // Defer hard-delayed keys until they are committed to the FINAL cache path
+                    var deferredHardDelayed = new HashSet<(string GamePath, string? Hash)>();
                     var resolvedModdedPaths = new Dictionary<(string GamePath, string? Hash), string>(moddedPaths.Count);
 
                     foreach (var kvp in moddedPaths)
                     {
-                        var path = kvp.Value;
+                        var finalCachePath = kvp.Value;
+                        var hash = kvp.Key.Hash;
 
-                        if (!string.IsNullOrEmpty(kvp.Key.Hash) &&
-                            !string.IsNullOrEmpty(path) &&
-                            ActivationPolicy.IsHardDelayed(path) &&
-                            !File.Exists(path) &&
-                            _downloadManager.TryResolveHardDelayedPath(kvp.Key.Hash!, path, out var resolved))
+                        // Always keep the FINAL cache path here — this is what Penumbra should ultimately point at.
+                        resolvedModdedPaths[kvp.Key] = finalCachePath;
+
+                        if (string.IsNullOrEmpty(hash) || string.IsNullOrEmpty(finalCachePath))
+                            continue;
+
+                        if (!ActivationPolicy.IsHardDelayed(finalCachePath))
+                            continue;
+
+                        // If the final cache file isn't present yet, treat it as deferred.
+                        if (!File.Exists(finalCachePath))
                         {
-                            path = resolved;
-                        }
+                            if (_downloadManager.TryResolveHardDelayedPath(hash, finalCachePath, out var resolvedQuarantine)
+                                && !string.IsNullOrWhiteSpace(resolvedQuarantine))
+                            {
+                                deferredHardDelayed.Add(kvp.Key);
+                                continue;
+                            }
 
-                        resolvedModdedPaths[kvp.Key] = path;
+                            if (_fileDbManager.IsHashStaged(hash))
+                            {
+                                deferredHardDelayed.Add(kvp.Key);
+                                continue;
+                            }
+                        }
                     }
 
                     // Validate required files exist at apply-time
@@ -816,7 +923,12 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
                                 return true;
 
                             if (!string.IsNullOrEmpty(kvp.Key.Hash))
+                            {
+                                if (deferredHardDelayed.Contains(kvp.Key))
+                                    return false;
+
                                 return !File.Exists(path);
+                            }
 
                             if (path.StartsWith(cacheRoot, StringComparison.OrdinalIgnoreCase))
                                 return !File.Exists(path);
@@ -855,11 +967,20 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
                         return;
                     }
 
-                    var tempMods = BuildPenumbraTempMods(resolvedModdedPaths);
+                    // Apply now: everything except deferred hard-delayed keys
+                    var applyNowPaths = deferredHardDelayed.Count == 0
+                        ? resolvedModdedPaths
+                        : resolvedModdedPaths
+                            .Where(k => !deferredHardDelayed.Contains(k.Key))
+                            .ToDictionary(k => k.Key, k => k.Value);
+
+                    var tempMods = BuildPenumbraTempMods(applyNowPaths);
                     var fingerprint = ComputeTempModsFingerprint(tempMods);
 
-                    var isFirstTempModsApply = _lastAppliedTempModsFingerprint == null;
-                    var containsHardCriticalPath = resolvedModdedPaths.Keys.Any(k => IsRedrawCriticalGamePath(k.GamePath));
+                    var containsAnimationCriticalPath = applyNowPaths.Keys.Any(k => IsAnimationCriticalGamePath(k.GamePath));
+                    var containsVfxCriticalPath = applyNowPaths.Keys.Any(k => IsVfxCriticalGamePath(k.GamePath));
+
+                    var mustRedrawForContent = downloadedAny || containsAnimationCriticalPath || containsVfxCriticalPath || _redrawOnNextApplication;
 
                     if (!string.Equals(fingerprint, _lastAppliedTempModsFingerprint, StringComparison.Ordinal))
                     {
@@ -873,13 +994,12 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
 
                         _lastAppliedTempModsFingerprint = fingerprint;
                         penumbraStateChanged = true;
-
-                        needsRedraw |= downloadedAny;
+                        needsRedraw |= mustRedrawForContent;
 
                         long totalBytes = 0;
                         bool any = false;
 
-                        foreach (var p in resolvedModdedPaths.Values.Distinct(StringComparer.OrdinalIgnoreCase))
+                        foreach (var p in applyNowPaths.Values.Distinct(StringComparer.OrdinalIgnoreCase))
                         {
                             token.ThrowIfCancellationRequested();
 
@@ -898,14 +1018,21 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
 
                         LastAppliedDataBytes = any ? totalBytes : -1;
 
-                        if (downloadedAny)
+                        if (downloadedAny || containsAnimationCriticalPath)
                         {
-                            Logger.LogDebug("[{applicationId}] TempMods applied with hard-critical paths or first-apply; redraw will be enforced", _applicationId);
+                            Logger.LogDebug("[{applicationId}] Mods applied; redraw will be enforced", _applicationId);
                         }
                     }
                     else
                     {
-                        Logger.LogDebug("[{applicationId}] TempMods unchanged; skipping SetTemporaryModsAsync + redraw", _applicationId);
+                        needsRedraw |= mustRedrawForContent;
+                        Logger.LogDebug("[{applicationId}] TempMods unchanged; skipping SetTemporaryModsAsync, but redraw may still be required", _applicationId);
+                    }
+
+                    if (deferredHardDelayed.Count > 0)
+                    {
+                        var capturedAppId = _applicationId;
+                        _deferredHardDelayedApplyTask = ApplyDeferredHardDelayedModsAsync(capturedAppId, resolvedModdedPaths, deferredHardDelayed, token);
                     }
                 }
 
@@ -933,7 +1060,11 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
                     updatedData.TryGetValue(ObjectKind.Player, out var playerUpdateSet)
                     && playerUpdateSet.Contains(PlayerChanges.Glamourer);
 
-                var allowPlayerRedraw = downloadedAny || updateManip || collectionReassignedThisRun;
+                var forcedRedrawRequested =
+                    updatedData.TryGetValue(ObjectKind.Player, out var playerSetForForced)
+                    && playerSetForForced.Contains(PlayerChanges.ForcedRedraw);
+
+                var allowPlayerRedraw = downloadedAny || updateManip || collectionReassignedThisRun || forcedRedrawRequested;
 
                 foreach (var kind in updatedData)
                 {
@@ -943,13 +1074,7 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
 
                 if (needsRedraw && _charaHandler != null && _charaHandler.Address != nint.Zero)
                 {
-                    var forcedRedrawRequested =
-                        updatedData.TryGetValue(ObjectKind.Player, out var playerSetForForced)
-                        && playerSetForForced.Contains(PlayerChanges.ForcedRedraw);
-
-                    var mustRedrawEvenWithGlamourer =
-                    allowPlayerRedraw
-                    || (forcedRedrawRequested && allowPlayerRedraw);
+                    var mustRedrawEvenWithGlamourer = allowPlayerRedraw || forcedRedrawRequested;
 
                     if (playerGlamourerUpdated && !mustRedrawEvenWithGlamourer)
                     {
@@ -1001,18 +1126,34 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
                 GlobalApplySemaphore.Release();
         }
     }
-    private static bool IsRedrawCriticalGamePath(string gamePath)
+
+    private static bool IsAnimationCriticalGamePath(string gamePath)
     {
         if (string.IsNullOrEmpty(gamePath)) return false;
 
         gamePath = gamePath.Trim();
 
-        return gamePath.EndsWith(".mdl", StringComparison.OrdinalIgnoreCase)
+        return gamePath.EndsWith(".pap", StringComparison.OrdinalIgnoreCase)
+            || gamePath.EndsWith(".tmb", StringComparison.OrdinalIgnoreCase)
             || gamePath.EndsWith(".sklb", StringComparison.OrdinalIgnoreCase)
-            || gamePath.EndsWith(".pap", StringComparison.OrdinalIgnoreCase)
             || gamePath.EndsWith(".phyb", StringComparison.OrdinalIgnoreCase)
             || gamePath.EndsWith(".pbd", StringComparison.OrdinalIgnoreCase);
     }
+
+    private static bool IsVfxCriticalGamePath(string gamePath)
+    {
+        if (string.IsNullOrEmpty(gamePath)) return false;
+
+        gamePath = gamePath.Trim();
+
+        return gamePath.EndsWith(".avfx", StringComparison.OrdinalIgnoreCase)
+            || gamePath.EndsWith(".atex", StringComparison.OrdinalIgnoreCase)
+            || gamePath.EndsWith(".shpk", StringComparison.OrdinalIgnoreCase)
+            || gamePath.EndsWith(".scd", StringComparison.OrdinalIgnoreCase)
+            || gamePath.EndsWith(".eid", StringComparison.OrdinalIgnoreCase)
+            || gamePath.EndsWith(".skp", StringComparison.OrdinalIgnoreCase);
+    }
+
     private bool HasAnyMissingCacheFiles(Guid applicationBase, CharacterData characterData)
     {
         try
@@ -1192,10 +1333,10 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
 
         Logger.LogDebug("[{applicationId}] Reverting all Customization for {alias}/{name} {objectKind}", applicationId, Pair.UserData.AliasOrUID, name, objectKind);
 
-        if (_customizeIds.TryGetValue(objectKind, out var customizeId))
-        {
+        if (!_customizeIds.TryGetValue(objectKind, out var customizeId) || !customizeId.HasValue)
+            customizeId = null;
+        else
             _customizeIds.Remove(objectKind);
-        }
 
         if (objectKind == ObjectKind.Player)
         {
@@ -1208,7 +1349,8 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
             await _ipcManager.Heels.RestoreOffsetForPlayerAsync(address).ConfigureAwait(false);
             tempHandler.CompareNameAndThrow(name);
             Logger.LogDebug("[{applicationId}] Restoring C+ for {alias}/{name}", applicationId, Pair.UserData.AliasOrUID, name);
-            await _ipcManager.CustomizePlus.RevertByIdAsync(customizeId).ConfigureAwait(false);
+            if (customizeId.HasValue)
+                await _ipcManager.CustomizePlus.RevertByIdAsync(customizeId.Value).ConfigureAwait(false);
             tempHandler.CompareNameAndThrow(name);
             Logger.LogDebug("[{applicationId}] Restoring Honorific for {alias}/{name}", applicationId, Pair.UserData.AliasOrUID, name);
             await _ipcManager.Honorific.ClearTitleAsync(address).ConfigureAwait(false);
@@ -1222,7 +1364,8 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
             var minionOrMount = await _dalamudUtil.GetMinionOrMountAsync(address).ConfigureAwait(false);
             if (minionOrMount != nint.Zero)
             {
-                await _ipcManager.CustomizePlus.RevertByIdAsync(customizeId).ConfigureAwait(false);
+                if (customizeId.HasValue)
+                    await _ipcManager.CustomizePlus.RevertByIdAsync(customizeId.Value).ConfigureAwait(false);
                 using GameObjectHandler tempHandler = await _gameObjectHandlerFactory.Create(ObjectKind.MinionOrMount, () => minionOrMount, isWatched: false).ConfigureAwait(false);
                 await _ipcManager.Glamourer.RevertAsync(Logger, tempHandler, applicationId, cancelToken).ConfigureAwait(false);
                 await _ipcManager.Penumbra.RedrawAsync(Logger, tempHandler, applicationId, cancelToken).ConfigureAwait(false);
@@ -1233,7 +1376,8 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
             var pet = await _dalamudUtil.GetPetAsync(address).ConfigureAwait(false);
             if (pet != nint.Zero)
             {
-                await _ipcManager.CustomizePlus.RevertByIdAsync(customizeId).ConfigureAwait(false);
+                if (customizeId.HasValue)
+                    await _ipcManager.CustomizePlus.RevertByIdAsync(customizeId.Value).ConfigureAwait(false);
                 using GameObjectHandler tempHandler = await _gameObjectHandlerFactory.Create(ObjectKind.Pet, () => pet, isWatched: false).ConfigureAwait(false);
                 await _ipcManager.Glamourer.RevertAsync(Logger, tempHandler, applicationId, cancelToken).ConfigureAwait(false);
                 await _ipcManager.Penumbra.RedrawAsync(Logger, tempHandler, applicationId, cancelToken).ConfigureAwait(false);
@@ -1244,8 +1388,10 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
             var companion = await _dalamudUtil.GetCompanionAsync(address).ConfigureAwait(false);
             if (companion != nint.Zero)
             {
-                await _ipcManager.CustomizePlus.RevertByIdAsync(customizeId).ConfigureAwait(false);
-                using GameObjectHandler tempHandler = await _gameObjectHandlerFactory.Create(ObjectKind.Pet, () => companion, isWatched: false).ConfigureAwait(false);
+                if (customizeId.HasValue)
+                    await _ipcManager.CustomizePlus.RevertByIdAsync(customizeId.Value).ConfigureAwait(false);
+                //using GameObjectHandler tempHandler = await _gameObjectHandlerFactory.Create(ObjectKind.Pet, () => companion, isWatched: false).ConfigureAwait(false);
+                using GameObjectHandler tempHandler = await _gameObjectHandlerFactory.Create(ObjectKind.Companion, () => companion, isWatched: false).ConfigureAwait(false);
                 await _ipcManager.Glamourer.RevertAsync(Logger, tempHandler, applicationId, cancelToken).ConfigureAwait(false);
                 await _ipcManager.Penumbra.RedrawAsync(Logger, tempHandler, applicationId, cancelToken).ConfigureAwait(false);
             }

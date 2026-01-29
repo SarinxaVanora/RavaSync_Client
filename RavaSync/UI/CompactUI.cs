@@ -224,22 +224,17 @@ public class CompactUi : WindowMediatorSubscriberBase
 
         if (_apiController.ServerState is ServerState.Connected)
         {
-            // Keep the global top menu (settings / etc.)
             using (ImRaii.PushId("global-topmenu")) _tabMenu.Draw();
             ImGui.Separator();
 
-            // Transfers pane at the top
             using (ImRaii.PushId("transfers")) DrawTransfers();
             ImGui.Separator();
 
-            // Tabs (Direct / Shells / Visible) + always-present search box
             DrawPairViewHeader();
             ImGui.Separator();
 
-            // Main pair list
             using (ImRaii.PushId("pairlist")) DrawPairs();
 
-            // Popups
             using (ImRaii.PushId("group-user-popup")) _selectPairsForGroupUi.Draw(_pairManager.DirectPairs);
             using (ImRaii.PushId("grouping-popup")) _selectGroupForPairUi.Draw();
         }
@@ -394,6 +389,7 @@ public class CompactUi : WindowMediatorSubscriberBase
 
     private void DrawServerStatus()
     {
+        
         var buttonSize = _uiSharedService.GetIconButtonSize(FontAwesomeIcon.Link);
         var userCount = _apiController.OnlineUsers.ToString(CultureInfo.InvariantCulture);
         var userSize = ImGui.CalcTextSize(userCount);
@@ -525,197 +521,336 @@ public class CompactUi : WindowMediatorSubscriberBase
 
     private void DrawUIDHeader()
     {
-        var uidText = GetUidText();
+        var contentW = UiSharedService.GetWindowContentRegionWidth();
+        var scale = ImGuiHelpers.GlobalScale;
 
-        using (_uiSharedService.UidFont.Push())
+        if (_apiController.ServerState is not ServerState.Connected)
         {
-            var uidTextSize = ImGui.CalcTextSize(uidText);
-            ImGui.SetCursorPosX((ImGui.GetWindowContentRegionMax().X - ImGui.GetWindowContentRegionMin().X) / 2 - (uidTextSize.X / 2));
-            ImGui.TextColored(GetUidColor(), uidText);
+            var text = GetServerError();
+            if (!string.IsNullOrEmpty(text))
+                UiSharedService.ColorTextWrapped(text, GetUidColor());
+            else
+                UiSharedService.ColorTextWrapped(GetUidText(), GetUidColor());
+            return;
         }
 
-        if (_apiController.ServerState is ServerState.Connected)
+        long myVramBytes = 0;
+        long myTriangles = 0;
+
+        var analysis = _characterAnalyzer.LastAnalysis;
+        if (analysis is not null && analysis.Count > 0)
         {
-            if (ImGui.IsItemClicked())
+            var snapshot = analysis.ToArray();
+            foreach (var kv in snapshot)
             {
-                ImGui.SetClipboardText(_apiController.DisplayName);
-            }
-            UiSharedService.AttachToolTip("Click to copy");
-
-            if (!string.Equals(_apiController.DisplayName, _apiController.UID, StringComparison.Ordinal))
-            {
-                var origTextSize = ImGui.CalcTextSize(_apiController.UID);
-                ImGui.SetCursorPosX((ImGui.GetWindowContentRegionMax().X - ImGui.GetWindowContentRegionMin().X) / 2 - (origTextSize.X / 2));
-                ImGui.TextColored(GetUidColor(), _apiController.UID);
-                if (ImGui.IsItemClicked())
+                foreach (var e in kv.Value.Values)
                 {
-                    ImGui.SetClipboardText(_apiController.UID);
-                }
-                UiSharedService.AttachToolTip("Click to copy");
-            }
-
-            Vector4 color;
-            // --- Current logged-in player's VRAM footprint (from Character Analysis) ---
-            long myVramBytes = 0;
-
-            // take a safe snapshot to avoid null / concurrent mutation issues
-            var analysis = _characterAnalyzer.LastAnalysis;
-            if (analysis is not null && analysis.Count > 0)
-            {
-                // shallow snapshot to avoid "collection was modified" during draw
-                var snapshot = analysis.ToArray();
-                foreach (var kv in snapshot) // kv.Value : Dictionary<string, CharacterAnalyzer.FileDataEntry>
-                {
-                    myVramBytes += kv.Value.Values.Sum(e => e.OriginalSize);
+                    myVramBytes += e.OriginalSize;
+                    myTriangles += TryReadTriangleCount(e);
                 }
             }
+        }
 
-            // Add a little vertical spacing before the line
-            ImGui.Spacing();
+        Dictionary<string, string[]>? eligibleSet;
+        List<(string fmt, long size)>? items;
+        bool hasEligible = TryBuildEligibleBc7Set(out eligibleSet!, out items!);
+        var (estSaved, estCount, _) = EstimateBc7Savings(items);
 
-            // Compose and center the line
-            string mySize = $"Your current size: {UiSharedService.ByteToString(myVramBytes, addSuffix: true)}";
-            var myTextSize = ImGui.CalcTextSize(mySize);
-            float centerX2 = (ImGui.GetWindowContentRegionMax().X - ImGui.GetWindowContentRegionMin().X) / 2f - (myTextSize.X / 2f);
-            ImGui.SetCursorPosX(centerX2);
+        var btnLabel = estSaved > 0
+            ? $"Reduce my size (~{UiSharedService.ByteToString(estSaved, addSuffix: true)})"
+            : "Reduce my size";
 
-            ImGui.TextColored(ImGuiColors.DalamudWhite, mySize);
+        bool canClick = hasEligible && (_bc7Task == null || _bc7Task.IsCompleted);
 
-            // One-click BC7 conversion button (enabled only when eligible non-BC7 textures exist)
-            Dictionary<string, string[]>? eligibleSet;
-            List<(string fmt, long size)>? items;
-            bool hasEligible = TryBuildEligibleBc7Set(out eligibleSet!, out items!);
+        long pairsVramBytes = _pairManager.PairsWithGroups.Keys
+            .Where(p => p.IsDirectlyPaired && p.IsVisible && !(p.UserPair.OwnPermissions.IsPaused() || p.AutoPausedByCap))
+            .Sum(p => System.Math.Max(0, p.LastAppliedApproximateVRAMBytes));
 
-            // Estimate on the same items the converter will touch
-            var (estSaved, estCount, byFmt) = EstimateBc7Savings(items);
+        long shellsVramBytes = _pairManager.PairsWithGroups.Keys
+            .Where(p => !p.IsDirectlyPaired && p.IsVisible && !(p.UserPair.OwnPermissions.IsPaused() || p.AutoPausedByCap))
+            .Sum(p => System.Math.Max(0, p.LastAppliedApproximateVRAMBytes));
 
-            var btnLabel = estSaved > 0
-                ? $"Reduce my size (~{UiSharedService.ByteToString(estSaved, addSuffix: true)})"
-                : "Reduce my size";
+        long totalVramBytes = pairsVramBytes + shellsVramBytes;
 
-            // center button under the line
-            var btnSz = ImGui.CalcTextSize(btnLabel);
-            float centerBtnX = (ImGui.GetWindowContentRegionMax().X - ImGui.GetWindowContentRegionMin().X) / 2f
-                             - (btnSz.X + ImGui.GetStyle().FramePadding.X * 2f) / 2f;
-            ImGui.SetCursorPosX(centerBtnX);
+        Vector4 shellsColor;
+        if (_playerPerformanceConfigService.Current.SyncshellVramCapMiB > 0)
+        {
+            var shellsCapBytes = (long)_playerPerformanceConfigService.Current.SyncshellVramCapMiB * 1024 * 1024;
+            float usage = shellsCapBytes > 0 ? (float)shellsVramBytes / shellsCapBytes : 0f;
 
-            // Only enable if we have anything to convert and no active job
-            bool canClick = hasEligible && (_bc7Task == null || _bc7Task.IsCompleted);
-            using (ImRaii.Disabled(!canClick))
-            {
-                if (_uiSharedService.IconTextButton(FontAwesomeIcon.Recycle, btnLabel))
-                {
-                    BeginBc7Conversion(eligibleSet!);
-                }
-            }
-
-            //why the estimate is what it is
-            if (ImGui.IsItemHovered())
-            {
-                ImGui.BeginTooltip();
-
-                if (estSaved > 0)
-                {
-                    long estAfter = myVramBytes - estSaved;
-                    ImGui.TextUnformatted("Estimated reduction:");
-                    ImGui.Separator();
-                    ImGui.TextUnformatted($"Files affected: {estCount}");
-                    ImGui.TextUnformatted($"Before: {UiSharedService.ByteToString(myVramBytes, addSuffix: true)}");
-                    ImGui.TextUnformatted($"After:  ~{UiSharedService.ByteToString(estAfter, addSuffix: true)}");
-                    ImGui.TextUnformatted($"Saved:  ~{UiSharedService.ByteToString(estSaved, addSuffix: true)}");
-                }
-                else
-                {
-                    ImGui.TextUnformatted("Nothing found to compress.");
-                }
-
-                ImGui.EndTooltip();
-            }
-
-
-            //setup Vram Use output
-            long pairsVramBytes = _pairManager.PairsWithGroups.Keys
-                .Where(p =>
-                    p.IsDirectlyPaired
-                    && p.IsVisible
-                    && !(p.UserPair.OwnPermissions.IsPaused() || p.AutoPausedByCap))
-                .Sum(p => System.Math.Max(0, p.LastAppliedApproximateVRAMBytes));
-
-            long shellsVramBytes = _pairManager.PairsWithGroups.Keys
-                .Where(p =>
-                    !p.IsDirectlyPaired
-                    && p.IsVisible
-                    && !(p.UserPair.OwnPermissions.IsPaused() || p.AutoPausedByCap))
-                .Sum(p => System.Math.Max(0, p.LastAppliedApproximateVRAMBytes));
-
-            long totalVramBytes = pairsVramBytes + shellsVramBytes;
-
-            // Pick color for shells based on Syncshell cap
-            Vector4 shellsColor;
-            if (_playerPerformanceConfigService.Current.SyncshellVramCapMiB > 0)
-            {
-                var capBytes = (long)_playerPerformanceConfigService.Current.SyncshellVramCapMiB * 1024 * 1024;
-                float usagePercent = (float)shellsVramBytes / capBytes;
-
-                if (usagePercent < 0.5f)
-                    shellsColor = ImGuiColors.HealerGreen; // safe
-                else if (usagePercent < 0.8f)
-                    shellsColor = ImGuiColors.TankBlue;    // medium
-                else if (usagePercent < 1f)
-                    shellsColor = ImGuiColors.DalamudYellow;   // warning
-                else
-                    shellsColor = ImGuiColors.DPSRed;      // over cap
-            }
-            else
-            {
-                shellsColor = ImGuiColors.DalamudWhite; // no cap set
-            }
-
-            // Build the mixed-color breakdown
-            string pairsText = $"Pairs: {UiSharedService.ByteToString(pairsVramBytes, addSuffix: true)}";
-            string shellsText = $"Shells: {UiSharedService.ByteToString(shellsVramBytes, addSuffix: true)}";
-
-            string prefix = "VRAM use - ";
-            var prefixSize = ImGui.CalcTextSize(prefix);
-            var pairsSize = ImGui.CalcTextSize(pairsText + "  ");
-            var shellsSize = ImGui.CalcTextSize(shellsText);
-
-            float breakdownWidth = prefixSize.X + pairsSize.X + shellsSize.X;
-            float centerXBreakdown = (ImGui.GetWindowContentRegionMax().X - ImGui.GetWindowContentRegionMin().X) / 2f - (breakdownWidth / 2f);
-            ImGui.SetCursorPosX(centerXBreakdown);
-
-            // Render with mixed colors
-            ImGui.TextColored(ImGuiColors.DalamudWhite, prefix);
-            ImGui.SameLine(0, 0);
-            ImGui.TextColored(ImGuiColors.DalamudWhite, pairsText + "  ");
-            ImGui.SameLine(0, 0);
-            ImGui.TextColored(shellsColor, shellsText);
-
-            // Second line: total, always white, centered
-            string totalText = $"Total: {UiSharedService.ByteToString(totalVramBytes, addSuffix: true)}";
-            var totalSize = ImGui.CalcTextSize(totalText);
-            float centerXTotal = (ImGui.GetWindowContentRegionMax().X - ImGui.GetWindowContentRegionMin().X) / 2f - (totalSize.X / 2f);
-            ImGui.SetCursorPosX(centerXTotal);
-            ImGui.TextColored(ImGuiColors.DalamudWhite, totalText);
-
-            ImGui.Spacing();
-            ImGui.Separator();
-            DrawScopeToggles();
+            if (usage < 0.5f) shellsColor = ImGuiColors.HealerGreen;
+            else if (usage < 0.8f) shellsColor = ImGuiColors.TankBlue;
+            else if (usage < 1f) shellsColor = ImGuiColors.DalamudYellow;
+            else shellsColor = ImGuiColors.DPSRed;
         }
         else
         {
-            UiSharedService.ColorTextWrapped(GetServerError(), GetUidColor());
+            shellsColor = ImGuiColors.DalamudWhite;
         }
-    }
-    private bool PairMatchesCurrentTab(Pair pair)
-    {
-        return _currentPairViewTab switch
+
+        // ---------- Header panel ----------
         {
-            PairViewTab.DirectPairs => pair.IsDirectlyPaired,
-            PairViewTab.Shells => !pair.IsDirectlyPaired,
-            PairViewTab.Visible => pair.IsVisible,
-            _ => true
-        };
+            var dl = ImGui.GetWindowDrawList();
+            var panelStart = ImGui.GetCursorScreenPos();
+
+            ImGui.BeginGroup();
+
+            var name = _apiController.DisplayName ?? string.Empty;
+            var uid = _apiController.UID ?? string.Empty;
+
+            bool showVanity = !string.IsNullOrEmpty(uid) && string.Equals(name, uid, StringComparison.Ordinal);
+
+            float nameH;
+            using (_uiSharedService.UidFont.Push())
+                nameH = ImGui.GetTextLineHeight();
+
+            float uidH = string.IsNullOrEmpty(uid) ? 0f : ImGui.CalcTextSize(uid).Y;
+            float leftH = nameH + (uidH > 0f ? (ImGui.GetStyle().ItemSpacing.Y + uidH) : 0f);
+
+            if (showVanity)
+                leftH += ImGui.GetStyle().ItemSpacing.Y + ImGui.GetFrameHeight();
+
+            var vramVal = (analysis is null || analysis.Count == 0)
+                ? "—"
+                : UiSharedService.ByteToString(myVramBytes, addSuffix: true);
+
+            var triVal = (analysis is null || analysis.Count == 0 || myTriangles <= 0)
+                ? "—"
+                : myTriangles.ToString("N0", CultureInfo.InvariantCulture);
+
+            var statsLine = $"VRAM: {vramVal}  |  Tris: {triVal}";
+            float statsH = ImGui.CalcTextSize(statsLine).Y;
+            float buttonH = ImGui.GetFrameHeight();
+            float rightH = (2f * scale) + statsH + (3f * scale) + buttonH;
+
+            float vCenterPad = MathF.Max(0f, (rightH - leftH) * 0.5f);
+
+            vCenterPad = MathF.Max(0f, vCenterPad + (4f * scale));
+
+            var nameSz = ImGui.CalcTextSize(name);
+            var uidSz = ImGui.CalcTextSize(uid);
+
+            float minLeft = 160f * scale;
+            float maxLeft = contentW * 0.50f;
+            float leftW = Math.Clamp(MathF.Max(nameSz.X, uidSz.X) + 18f * scale, minLeft, maxLeft);
+
+            using (var hdr = ImRaii.Table("##hdrMain", 2, ImGuiTableFlags.SizingStretchProp))
+            {
+                if (hdr)
+                {
+                    ImGui.TableSetupColumn("l", ImGuiTableColumnFlags.WidthFixed, leftW);
+                    ImGui.TableSetupColumn("r", ImGuiTableColumnFlags.WidthStretch);
+
+                    ImGui.TableNextRow();
+
+                    // LEFT
+                    ImGui.TableSetColumnIndex(0);
+                    ImGui.BeginGroup();
+
+                    if (vCenterPad > 0f)
+                        ImGui.Dummy(new Vector2(0, vCenterPad));
+
+                    float colW0 = ImGui.GetColumnWidth();
+                    float baseX0 = ImGui.GetCursorPosX();
+
+                    using (_uiSharedService.UidFont.Push())
+                    {
+                        var nsz = ImGui.CalcTextSize(name);
+                        ImGui.SetCursorPosX(baseX0 + MathF.Max(0f, (colW0 - nsz.X) * 0.5f));
+                        ImGui.TextColored(ImGuiColors.DalamudViolet, name);
+                    }
+
+                    if (ImGui.IsItemClicked())
+                        ImGui.SetClipboardText(name);
+                    UiSharedService.AttachToolTip("Click to copy");
+
+                    if (!string.IsNullOrEmpty(uid))
+                    {
+                        var usz = ImGui.CalcTextSize(uid);
+                        ImGui.SetCursorPosX(baseX0 + MathF.Max(0f, (colW0 - usz.X) * 0.5f));
+                        ImGui.TextColored(ImGuiColors.ParsedBlue, uid);
+
+                        if (ImGui.IsItemClicked())
+                            ImGui.SetClipboardText(uid);
+                        UiSharedService.AttachToolTip("Click to copy");
+                    }
+
+                    if (showVanity)
+                    {
+                        ImGui.Dummy(new Vector2(0, 2f * scale));
+
+                        var vanitySz = _uiSharedService.GetIconButtonSize(FontAwesomeIcon.Users);
+                        ImGui.SetCursorPosX(baseX0 + MathF.Max(0f, (colW0 - vanitySz.X) * 0.5f));
+
+                        void ToolButton(FontAwesomeIcon icon, string label, string tooltip, Action? onClick = null)
+                        {
+                            if (_uiSharedService.IconTextButton(icon, label, -1))
+                                onClick?.Invoke();
+
+                            if (ImGui.IsItemHovered())
+                            {
+                                ImGui.BeginTooltip();
+                                ImGui.TextUnformatted(tooltip);
+                                ImGui.EndTooltip();
+                            }
+                        }
+
+                        ToolButton(FontAwesomeIcon.Users, "Set Vanity",
+                            "Setup Vanity (custom ID) here!",
+                            () => Mediator.Publish(new UiToggleMessage(typeof(VanityUi))));
+                    }
+
+                    ImGui.EndGroup();
+
+                    // RIGHT
+                    ImGui.TableSetColumnIndex(1);
+                    ImGui.BeginGroup();
+
+                    ImGui.Dummy(new Vector2(0, 2f * scale));
+
+                    ImGui.AlignTextToFramePadding();
+                    ImGui.TextUnformatted($"VRAM: {vramVal}");
+                    ImGui.SameLine(0, 0);
+                    ImGui.PushStyleColor(ImGuiCol.Text, ImGuiColors.DalamudGrey2);
+                    ImGui.TextUnformatted("  |  ");
+                    ImGui.PopStyleColor();
+                    ImGui.SameLine(0, 0);
+                    ImGui.TextUnformatted($"Tris: {triVal}");
+
+                    ImGui.Dummy(new Vector2(0, 1f * scale));
+
+                    float rightPad = 12f * scale;
+
+                    float colMinX = ImGui.GetCursorPosX();
+                    float colMaxX = colMinX + ImGui.GetColumnWidth();
+
+                    var labelSz2 = ImGui.CalcTextSize(btnLabel);
+                    float iconW = 18f * scale; 
+                    float btnW = labelSz2.X + ImGui.GetStyle().FramePadding.X * 2f + iconW;
+
+                    float usableW = MathF.Max(0f, (colMaxX - rightPad) - (colMinX + rightPad));
+                    float x = colMinX + rightPad + MathF.Max(0f, (usableW - btnW) * 0.5f);
+
+                    ImGui.SetCursorPosX(x);
+
+                    ImGui.PushStyleVar(ImGuiStyleVar.FrameRounding, 8f * scale);
+                    ImGui.PushStyleVar(ImGuiStyleVar.FramePadding, new Vector2(10f, 6f) * scale);
+                    using (ImRaii.Disabled(!canClick))
+                    {
+                        if (_uiSharedService.IconTextButton(FontAwesomeIcon.Recycle, btnLabel))
+                            BeginBc7Conversion(eligibleSet!);
+                    }
+                    ImGui.PopStyleVar(2);
+
+                    if (ImGui.IsItemHovered())
+                    {
+                        ImGui.BeginTooltip();
+                        if (analysis is null || analysis.Count == 0)
+                        {
+                            ImGui.TextUnformatted("Run Character Analysis to compute your footprint.");
+                        }
+                        else if (estSaved > 0)
+                        {
+                            long estAfter = myVramBytes - estSaved;
+                            ImGui.TextUnformatted("Estimated reduction:");
+                            ImGui.Separator();
+                            ImGui.TextUnformatted($"Files affected: {estCount}");
+                            ImGui.TextUnformatted($"Before: {UiSharedService.ByteToString(myVramBytes, addSuffix: true)}");
+                            ImGui.TextUnformatted($"After:  ~{UiSharedService.ByteToString(estAfter, addSuffix: true)}");
+                            ImGui.TextUnformatted($"Saved:  ~{UiSharedService.ByteToString(estSaved, addSuffix: true)}");
+                        }
+                        else
+                        {
+                            ImGui.TextUnformatted("Nothing found to compress.");
+                        }
+                        ImGui.EndTooltip();
+                    }
+
+                    ImGui.EndGroup();
+                }
+            }
+
+            ImGui.EndGroup();
+
+            var panelEnd = ImGui.GetCursorScreenPos();
+            var w = contentW;
+            var h = MathF.Max(0f, panelEnd.Y - panelStart.Y);
+
+            var bg = ImGui.GetColorU32(new Vector4(0.40f, 0.20f, 0.60f, 0.10f));
+            var border = ImGui.GetColorU32(new Vector4(0.60f, 0.35f, 0.90f, 0.18f));
+
+            dl.AddRectFilled(panelStart, panelStart + new Vector2(w, h), bg, 10f * scale);
+            dl.AddRect(panelStart, panelStart + new Vector2(w, h), border, 10f * scale);
+
+            ImGui.Dummy(new Vector2(0, 6f * scale));
+        }
+
+        // ---------- VRAM panel ----------
+        {
+            var dl = ImGui.GetWindowDrawList();
+            var start = ImGui.GetCursorScreenPos();
+
+            ImGui.BeginGroup();
+
+            float padX = 12f * scale;
+            float rightPadX = 12f * scale; 
+
+            var title = "VRAM use";
+            var titleSz = ImGui.CalcTextSize(title);
+            ImGui.SetCursorPosX(MathF.Max(0f, (contentW - titleSz.X) * 0.5f));
+            ImGui.PushStyleColor(ImGuiCol.Text, ImGuiColors.DalamudGrey2);
+            ImGui.TextUnformatted(title);
+            ImGui.PopStyleColor();
+
+
+            var totalText = $"Total {UiSharedService.ByteToString(totalVramBytes, addSuffix: true)}";
+            var totalSz = ImGui.CalcTextSize(totalText);
+
+            var contentMinX = ImGui.GetWindowContentRegionMin().X;
+            var contentMaxX = ImGui.GetWindowContentRegionMax().X;
+
+            // LEFT
+            ImGui.SetCursorPosX(contentMinX + padX);
+            ImGui.AlignTextToFramePadding();
+
+            ImGui.TextUnformatted($"Pairs {UiSharedService.ByteToString(pairsVramBytes, addSuffix: true)}");
+            ImGui.SameLine(0, 0);
+            ImGui.PushStyleColor(ImGuiCol.Text, ImGuiColors.DalamudGrey2);
+            ImGui.TextUnformatted("  |  ");
+            ImGui.PopStyleColor();
+            ImGui.SameLine(0, 0);
+            ImGui.TextUnformatted("Shells ");
+            ImGui.SameLine(0, 0);
+            ImGui.PushStyleColor(ImGuiCol.Text, shellsColor);
+            ImGui.TextUnformatted(UiSharedService.ByteToString(shellsVramBytes, addSuffix: true));
+            ImGui.PopStyleColor();
+
+            // RIGHT
+            ImGui.SameLine();
+            ImGui.SetCursorPosX(MathF.Max(contentMinX + padX, contentMaxX - padX - totalSz.X));
+            ImGui.AlignTextToFramePadding();
+            ImGui.TextUnformatted(totalText);
+
+
+            ImGui.EndGroup();
+
+            var end = ImGui.GetCursorScreenPos();
+            var w = contentW;
+            var h = MathF.Max(0f, end.Y - start.Y);
+
+            var bg = ImGui.GetColorU32(new Vector4(0.40f, 0.20f, 0.60f, 0.10f));
+            var border = ImGui.GetColorU32(new Vector4(0.60f, 0.35f, 0.90f, 0.18f));
+
+            dl.AddRectFilled(start, start + new Vector2(w, h), bg, 10f * scale);
+            dl.AddRect(start, start + new Vector2(w, h), border, 10f * scale);
+
+            ImGui.Dummy(new Vector2(0, 4f * scale));
+        }
+
+        ImGui.Separator();
+        ImGui.Dummy(new Vector2(0, 3f * scale));
+
+        DrawScopeToggles();
     }
 
     private IEnumerable<IDrawFolder> GetDrawFolders()
@@ -732,14 +867,13 @@ public class CompactUi : WindowMediatorSubscriberBase
             {
                 return _currentPairViewTab switch
                 {
-                    PairViewTab.DirectPairs => entry.Key.IsDirectlyPaired,   // no shells
-                    PairViewTab.Shells => !entry.Key.IsDirectlyPaired,  // shells only
-                    _ => true                          // Visible / anything else
+                    PairViewTab.DirectPairs => entry.Key.IsDirectlyPaired,   
+                    PairViewTab.Shells => !entry.Key.IsDirectlyPaired,  
+                    _ => true                        
                 };
             })
             .ToDictionary(k => k.Key, k => k.Value);
 
-        // Then apply the always-present search box
         var filteredPairs = allPairs
             .Where(p =>
             {
@@ -763,15 +897,6 @@ public class CompactUi : WindowMediatorSubscriberBase
             : (u.Key.IsOnline
                || (!u.Key.IsOnline && !_configService.Current.ShowOfflineUsersSeparately)
                || u.Key.UserPair.OwnPermissions.IsPaused());
-
-        //bool FilterOnlineOrPausedSelf(KeyValuePair<Pair, List<GroupFullInfoDto>> u)
-        //    => (u.Key.IsOnline || (!u.Key.IsOnline && !_configService.Current.ShowOfflineUsersSeparately)
-        //            || u.Key.UserPair.OwnPermissions.IsPaused());
-        //Dictionary<Pair, List<GroupFullInfoDto>> BasicSortedDictionary(IEnumerable<KeyValuePair<Pair, List<GroupFullInfoDto>>> u)
-        //    => u.OrderByDescending(u => u.Key.IsVisible)
-        //        .ThenByDescending(u => u.Key.IsOnline)
-        //        .ThenBy(AlphabeticalSort, StringComparer.OrdinalIgnoreCase)
-        //        .ToDictionary(u => u.Key, u => u.Value);
         Dictionary<Pair, List<GroupFullInfoDto>> BasicSortedDictionary(IEnumerable<KeyValuePair<Pair, List<GroupFullInfoDto>>> u)
             => (_configService.Current.SortPairsByVRAM
             ? u.OrderByDescending(u => System.Math.Max(u.Key.LastAppliedApproximateVRAMBytes, 0))
@@ -793,11 +918,6 @@ public class CompactUi : WindowMediatorSubscriberBase
             => u.Value.Exists(g => string.Equals(g.GID, group.GID, StringComparison.Ordinal));
         bool FilterNotTaggedUsers(KeyValuePair<Pair, List<GroupFullInfoDto>> u)
             => u.Key.IsDirectlyPaired && !u.Key.IsOneSidedPair && !_tagHandler.HasAnyTag(u.Key.UserData.UID);
-        //bool FilterOfflineUsers(KeyValuePair<Pair, List<GroupFullInfoDto>> u)
-        //    => ((u.Key.IsDirectlyPaired && _configService.Current.ShowSyncshellOfflineUsersSeparately)
-        //        || !_configService.Current.ShowSyncshellOfflineUsersSeparately)
-        //        && (!u.Key.IsOneSidedPair || u.Value.Any()) && !u.Key.IsOnline && !u.Key.UserPair.OwnPermissions.IsPaused();
-
         bool FilterOfflineUsers(KeyValuePair<Pair, List<GroupFullInfoDto>> u)
             => isDirectTab
             ? (!u.Key.IsOnline && !u.Key.UserPair.OwnPermissions.IsPaused())
@@ -823,7 +943,6 @@ public class CompactUi : WindowMediatorSubscriberBase
             return drawFolders;
         }
 
-        // Normal behaviour when *not* on the Visible tab
         if (_configService.Current.ShowVisibleUsersSeparately)
         {
             var allVisiblePairs = ImmutablePairList(allPairs.Where(FilterVisibleUsers));
@@ -995,7 +1114,6 @@ public class CompactUi : WindowMediatorSubscriberBase
     }
 
 
-    // --- BC7 one-click conversion state
     private readonly Progress<(string fileName, int index)> _bc7Progress = new();
     private CancellationTokenSource _bc7Cts = new();
     private Task? _bc7Task;
@@ -1006,8 +1124,6 @@ public class CompactUi : WindowMediatorSubscriberBase
     private bool _bc7ModalOpen = false;
     private readonly Dictionary<string, string[]> _bc7Set = new(StringComparer.Ordinal);
 
-    // Build mapping of non-BC7 textures from the latest CharacterAnalyzer snapshot.
-    // Key = primary file path, Value = duplicate paths to also convert.
     private bool TryBuildEligibleBc7Set(out Dictionary<string, string[]> set, out List<(string fmt, long size)> sourceItems)
     {
         set = new(StringComparer.Ordinal);
@@ -1022,7 +1138,6 @@ public class CompactUi : WindowMediatorSubscriberBase
             {
                 if (!string.Equals(e.FileType, "tex", StringComparison.Ordinal)) continue;
 
-                // converter includes everything that isn't already BC7
                 if (string.Equals(e.Format.Value, "BC7", StringComparison.Ordinal)) continue;
 
                 var primary = e.FilePaths[0];
@@ -1037,6 +1152,36 @@ public class CompactUi : WindowMediatorSubscriberBase
         return set.Count > 0;
     }
 
+    private static long TryReadLong(object obj, params string[] names)
+    {
+        var t = obj.GetType();
+        foreach (var n in names)
+        {
+            var p = t.GetProperty(n, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+            if (p != null)
+            {
+                var v = p.GetValue(obj);
+                if (v is int i) return i;
+                if (v is long l) return l;
+            }
+
+            var f = t.GetField(n, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+            if (f != null)
+            {
+                var v = f.GetValue(obj);
+                if (v is int i2) return i2;
+                if (v is long l2) return l2;
+            }
+        }
+        return 0;
+    }
+
+    private static long TryReadTriangleCount(CharacterAnalyzer.FileDataEntry e)
+    {
+        return TryReadLong(e,
+            "TriangleCount", "Triangles", "TriCount", "Tris",
+            "NumTriangles", "TriangleCnt");
+    }
 
     private void BeginBc7Conversion(Dictionary<string, string[]> set)
     {
@@ -1054,33 +1199,26 @@ public class CompactUi : WindowMediatorSubscriberBase
         _bc7Task = _ipcManager.Penumbra.ConvertTextureFiles(
             _logger, _bc7Set, _bc7Progress, _bc7Cts.Token);
 
-        // open our own modal; Analysis window stays closed
         _bc7ShowModal = true;
     }
 
-    // --- Format → bits-per-pixel mapping for size estimation
     private static bool TryGetBppForFormat(string fmt, out int bpp)
     {
         fmt = fmt?.Trim()?.ToUpperInvariant() ?? "";
 
-        // uncompressed 32 bpp common aliases
         if (fmt is "A8R8G8B8" or "R8G8B8A8" or "RGBA8" or "ARGB8" or "X8R8G8B8") { bpp = 32; return true; }
 
-        // block-compressed 4 bpp
         if (fmt is "DXT1" or "BC1" or "BC4") { bpp = 4; return true; }
 
-        // block-compressed 8 bpp
         if (fmt is "DXT3" or "DXT5" or "BC2" or "BC3" or "BC5" or "BC7") { bpp = 8; return true; }
 
-        // HDR etc (treat as 8 bpp for conservative estimate if unknown)
         bpp = 8; // safe default so we don't claim savings incorrectly
         return false;
     }
 
-    // Estimate using the exact items we’ll convert.
-    // Returns (before, after, deltaSaved, count, perFormat)
+
     private (long saved, int count, Dictionary<string, (int files, long before, long after)> byFmt)
-        EstimateBc7Savings(List<(string fmt, long size)> items)
+    EstimateBc7Savings(List<(string fmt, long size)> items)
     {
         long before = 0, after = 0;
         var byFmt = new Dictionary<string, (int files, long b, long a)>(StringComparer.OrdinalIgnoreCase);
@@ -1105,6 +1243,7 @@ public class CompactUi : WindowMediatorSubscriberBase
 
         return (before - after, items.Count, byFmt);
     }
+
     private void DrawScopeToggles()
     {
         var transient = _transientConfigService.Current;
@@ -1112,52 +1251,41 @@ public class CompactUi : WindowMediatorSubscriberBase
 
         using (ImRaii.PushId("ScopeToggles"))
         {
-            // --- Measurements
             float contentWidth = UiSharedService.GetWindowContentRegionWidth();
             var style = ImGui.GetStyle();
 
-            // Header (centered)
-            const string header = "Limit Sync to:";
-            var headerSize = ImGui.CalcTextSize(header);
-            ImGui.SetCursorPosX((contentWidth - headerSize.X) * 0.5f);
-            ImGui.TextUnformatted(header);
+            ImGui.PushStyleColor(ImGuiCol.Text, ImGuiColors.DalamudGrey2);
+            const string l = "Limit Sync to:";
+            var lsz = ImGui.CalcTextSize(l);
+            ImGui.SetCursorPosX(MathF.Max(0f, (UiSharedService.GetWindowContentRegionWidth() - lsz.X) * 0.5f));
+            ImGui.TextUnformatted(l);
+            ImGui.PopStyleColor();
 
-            // Small vertical gap under header
-            ImGui.Dummy(new Vector2(0, 2f * ImGuiHelpers.GlobalScale));
+            ImGui.Dummy(new Vector2(0, 1f * ImGuiHelpers.GlobalScale));
 
-            // Fixed cell width for consistency
-            float cellWidth = 100f * ImGuiHelpers.GlobalScale;
-            float spacingX = style.ItemSpacing.X;
-            float rowWidth = (cellWidth * 3f) + (spacingX * 2f);
+            ImGui.PushStyleVar(ImGuiStyleVar.ItemSpacing, new Vector2(10f, style.ItemSpacing.Y) * ImGuiHelpers.GlobalScale);
+            ImGui.PushStyleVar(ImGuiStyleVar.FramePadding, new Vector2(style.FramePadding.X, 2f) * ImGuiHelpers.GlobalScale);
 
-            // Center the entire row
-            ImGui.SetCursorPosX((contentWidth - rowWidth) * 0.5f);
+            string[] names = ["Pairs & Shells", "Friends", "Party", "Alliance"];
+            ScopeMode[] modes = [ScopeMode.Everyone, ScopeMode.Friends, ScopeMode.Party, ScopeMode.Alliance];
 
-            // Helper to draw a single toggle cell
-            void DrawToggle(string label, ScopeMode mode)
+            float rowW = 0f;
+            for (int i = 0; i < names.Length; i++)
+                rowW += ImGui.CalcTextSize(names[i]).X + ImGui.GetStyle().ItemSpacing.X + (22f * ImGuiHelpers.GlobalScale);
+
+            ImGui.SetCursorPosX(MathF.Max(0, (contentWidth - rowW) * 0.5f));
+
+            for (int i = 0; i < names.Length; i++)
             {
-                bool isSet = (selected == mode);
-                if (ImGui.RadioButton(label, isSet) && !isSet)
-                    selected = mode;
+                if (i != 0) ImGui.SameLine();
+                bool isSet = selected == modes[i];
+
+                if (ImGui.RadioButton(names[i], isSet) && !isSet)
+                    selected = modes[i];
             }
 
-            // Row: Everyone | Friends | Party | Alliance
-            float startX = ImGui.GetCursorPosX();
-            DrawToggle("Everyone", ScopeMode.Everyone);
+            ImGui.PopStyleVar(2);
 
-            ImGui.SameLine(startX + cellWidth - 0.5f);
-            DrawToggle("Friends", ScopeMode.Friends);
-
-            ImGui.SameLine(startX + (cellWidth * 1.85f));
-            DrawToggle("Party", ScopeMode.Party);
-
-            ImGui.SameLine(startX + (cellWidth * 2.55f));
-            DrawToggle("Alliance", ScopeMode.Alliance);
-
-            // Small padding below
-            ImGui.Spacing();
-
-            // Apply selection change
             if ((ScopeMode)transient.SelectedScopeMode != selected)
             {
                 transient.SelectedScopeMode = (int)selected;
@@ -1166,9 +1294,6 @@ public class CompactUi : WindowMediatorSubscriberBase
             }
         }
     }
-
-
-
 
 
 }

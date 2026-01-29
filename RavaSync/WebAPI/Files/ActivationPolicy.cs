@@ -6,7 +6,7 @@ namespace RavaSync.WebAPI.Files
     public static class ActivationPolicy
     {
         private static readonly string[] HardDelayExts =
-            [".pap", ".tmb", ".tmb2", ".sklb", ".phyb", ".scd", ".avfx"];
+            [".pap", ".tmb", ".tmb2", ".sklb", ".phyb", ".scd", ".avfx",".atex"];
 
         private static readonly string[] SoftDelayExts =
             [".mdl", ".mtrl"];

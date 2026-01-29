@@ -30,7 +30,7 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
     private static readonly TimeSpan _transientSendDelay = TimeSpan.FromMilliseconds(750);
     private HashSet<string> _semiTransientAll = new(StringComparer.OrdinalIgnoreCase);
     private CancellationTokenSource _penumbraSettingsChangedDebounceCts = new();
-    private readonly ConcurrentQueue<(string? EmoteKey, string TriggerPath)> _autoRecordTriggerQueue = new();
+    private readonly ConcurrentQueue<(string? EmoteKey, string TriggerPath, nint OwnerAddress, string? FilePrefix, string? Collection)> _autoRecordTriggerQueue = new();
     private volatile bool _inCombatOrPerformingSnapshot = false;
     private volatile string _playerPersistentDataKey = string.Empty;
 
@@ -44,6 +44,9 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
     private static readonly TimeSpan _autoRecordMinDuration = TimeSpan.FromSeconds(2);
     private static readonly TimeSpan _autoRecordIdleStop = TimeSpan.FromMilliseconds(1500);
 
+    private nint _recordingOwnerAddress = nint.Zero;
+    private string? _recordingFilePrefix = null;
+    private string? _recordingCollection = null;
 
     private long _autoRecordLastActivityTicks = 0;
 
@@ -445,6 +448,8 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
         var filePathRaw = msg.FilePath ?? string.Empty;
 
         var replacedGamePath = NormalizePath(gamePathRaw);
+        if (string.IsNullOrWhiteSpace(replacedGamePath))
+            return;
 
         lock (_cacheAdditionLock)
         {
@@ -452,15 +457,22 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
             _cachedHandledPaths.Add(replacedGamePath);
         }
 
+        string? collection = null;
         var filePath = filePathRaw;
 
         if (!string.IsNullOrEmpty(filePath) && filePath.StartsWith("|", StringComparison.OrdinalIgnoreCase))
         {
             var parts = filePath.Split("|");
-            if (parts.Length >= 3) filePath = parts[2];
+            if (parts.Length >= 3)
+            {
+                collection = parts[1];
+                filePath = parts[2];
+            }
         }
 
         filePath = NormalizePath(filePath);
+        if (IsTransientRecording && string.IsNullOrWhiteSpace(filePath))
+            return;
 
         if (string.Equals(filePath, replacedGamePath, StringComparison.OrdinalIgnoreCase))
             return;
@@ -472,24 +484,62 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
         if (!isHandled)
             return;
 
-        if (!_cachedFrameAddresses.TryGetValue(gameObjectAddress, out var objectKind))
+        ObjectKind objectKind = ObjectKind.Player;
+        var hasMappedKind = _cachedFrameAddresses.TryGetValue(gameObjectAddress, out objectKind);
+
+        if (!hasMappedKind && !IsTransientRecording)
             return;
 
 
         // -------------------- AUTO RECORD TRIGGER --------------------
         if (!IsTransientRecording
+            && hasMappedKind
             && objectKind == ObjectKind.Player
             && !_inCombatOrPerformingSnapshot
             && ShouldAutoRecordVfxOnly(replacedGamePath))
         {
-            var key = IsEmoteKeyPath(replacedGamePath) ? replacedGamePath : null;
-            QueueAutoRecordTrigger(key, replacedGamePath);
+            GameObjectHandler? ownerForTrigger = null;
+            foreach (var ptr in _playerRelatedPointers)
+            {
+                if (ptr.Address == gameObjectAddress)
+                {
+                    ownerForTrigger = ptr;
+                    break;
+                }
+            }
+
+            if (ownerForTrigger != null)
+            {
+                var key = IsEmoteKeyPath(replacedGamePath) ? replacedGamePath : null;
+                var prefix = GetFilePrefix(filePath);
+                QueueAutoRecordTrigger(key, replacedGamePath, ownerForTrigger.Address, prefix, collection);
+            }
         }
 
         if (IsTransientRecording)
         {
             if (!ShouldAutoRecordVfxOnly(replacedGamePath))
                 return;
+
+            if (_recordingOwnerAddress == nint.Zero)
+                return;
+
+            if (hasMappedKind)
+            {
+                if (gameObjectAddress != _recordingOwnerAddress)
+                    return;
+            }
+            else
+            {
+                if (gameObjectAddress != nint.Zero)
+                    return;
+
+                if (string.IsNullOrWhiteSpace(_recordingCollection) || !string.Equals(collection, _recordingCollection, StringComparison.OrdinalIgnoreCase))
+                    return;
+
+                if (string.IsNullOrWhiteSpace(_recordingFilePrefix) || string.IsNullOrWhiteSpace(filePath) || !StartsWithNormalized(filePath, _recordingFilePrefix))
+                    return;
+            }
 
             Interlocked.Exchange(ref _autoRecordLastActivityTicks, DateTime.UtcNow.Ticks);
         }
@@ -501,12 +551,28 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
         }
 
         GameObjectHandler? owner = null;
-        foreach (var ptr in _playerRelatedPointers)
+
+        // During recording, we always attach to the session owner
+        if (IsTransientRecording && _recordingOwnerAddress != nint.Zero)
         {
-            if (ptr.Address == gameObjectAddress)
+            foreach (var ptr in _playerRelatedPointers)
             {
-                owner = ptr;
-                break;
+                if (ptr.Address == _recordingOwnerAddress)
+                {
+                    owner = ptr;
+                    break;
+                }
+            }
+        }
+        else
+        {
+            foreach (var ptr in _playerRelatedPointers)
+            {
+                if (ptr.Address == gameObjectAddress)
+                {
+                    owner = ptr;
+                    break;
+                }
             }
         }
 
@@ -734,7 +800,7 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
         }
     }
 
-    private void TryStartAutoRecordSession(string? emoteKeyNormalized, string triggerPathNormalized)
+    private void TryStartAutoRecordSession(string? emoteKeyNormalized, string triggerPathNormalized, nint ownerAddress, string? filePrefix, string? collection)
     {
         if (!PlayerConfig.AutoRecordEmotes)
         {
@@ -762,6 +828,10 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
 
         _autoRecordCooldownUntilUtc = DateTime.UtcNow + _autoRecordCooldown;
         Interlocked.Exchange(ref _autoRecordLastActivityTicks, DateTime.UtcNow.Ticks);
+
+        _recordingOwnerAddress = ownerAddress;
+        _recordingFilePrefix = string.IsNullOrWhiteSpace(filePrefix) ? null : NormalizePath(filePrefix).TrimEnd('/') + "/";
+        _recordingCollection = string.IsNullOrWhiteSpace(collection) ? null : collection;
 
         Logger.LogInformation("Auto-record starting (key={key}, trigger={trigger})", normalizedKey ?? "<none>", triggerPathNormalized);
 
@@ -821,30 +891,49 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
                 }
                 finally
                 {
+                    _recordingOwnerAddress = nint.Zero;
+                    _recordingFilePrefix = null;
+                    _recordingCollection = null;
                     Interlocked.Exchange(ref _autoRecordRunning, 0);
                 }
             }
         });
     }
 
-    private void QueueAutoRecordTrigger(string? emoteKeyNormalized, string triggerPathNormalized)
+    private void QueueAutoRecordTrigger(string? emoteKeyNormalized, string triggerPathNormalized, nint ownerAddress, string? filePrefix, string? collection)
     {
-        _autoRecordTriggerQueue.Enqueue((emoteKeyNormalized, triggerPathNormalized));
+        _autoRecordTriggerQueue.Enqueue((emoteKeyNormalized, triggerPathNormalized, ownerAddress, filePrefix, collection));
     }
 
     private void ProcessQueuedAutoRecordTriggers()
     {
         if (_autoRecordTriggerQueue.IsEmpty) return;
 
-        (string? EmoteKey, string TriggerPath) last = default;
+        (string? EmoteKey, string TriggerPath, nint OwnerAddress, string? FilePrefix, string? Collection) last = default;
         while (_autoRecordTriggerQueue.TryDequeue(out var item))
         {
             last = item;
         }
 
         if (string.IsNullOrWhiteSpace(last.TriggerPath)) return;
+        if (last.OwnerAddress == nint.Zero) return;
 
-        TryStartAutoRecordSession(last.EmoteKey, last.TriggerPath);
+        TryStartAutoRecordSession(last.EmoteKey, last.TriggerPath, last.OwnerAddress, last.FilePrefix, last.Collection);
+    }
+
+    private static string? GetFilePrefix(string normalizedFilePath)
+    {
+        if (string.IsNullOrWhiteSpace(normalizedFilePath)) return null;
+        var p = NormalizePath(normalizedFilePath);
+        var lastSlash = p.LastIndexOf('/');
+        if (lastSlash <= 0) return null;
+        return p.Substring(0, lastSlash + 1);
+    }
+
+    private static bool StartsWithNormalized(string value, string prefix)
+    {
+        if (string.IsNullOrWhiteSpace(value) || string.IsNullOrWhiteSpace(prefix)) return false;
+        return NormalizePath(value).StartsWith(NormalizePath(prefix), StringComparison.OrdinalIgnoreCase);
     }
 
     private volatile ConcurrentBag<TransientRecord> _recordedTransients = new();
