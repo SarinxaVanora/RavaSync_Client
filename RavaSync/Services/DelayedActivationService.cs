@@ -24,7 +24,7 @@ namespace RavaSync.WebAPI.Files
         private readonly MareMediator _mareMediator;
         private readonly DalamudUtilService _dalamudUtil;
         private readonly IObjectTable _objectTable;
-        private int _globalRedrawRequested = 0;
+        //private int _globalRedrawRequested = 0;
 
         private readonly ConcurrentDictionary<string, byte> _pendingHashes = new(StringComparer.OrdinalIgnoreCase);
 
@@ -302,19 +302,20 @@ namespace RavaSync.WebAPI.Files
                 if (f.ActorAddress is nint addr && addr != nint.Zero)
                     TouchActor(addr);
                 else
-                    Interlocked.Exchange(ref _globalRedrawRequested, 1);
+                    _logger.LogDebug("Redraw-critical finalize without actor address: {path} ({hash})", f.FinalPath, f.FileHash);
             }
+
         }
 
-        private DateTime _globalDueUtc = DateTime.MinValue;
-        private const int GlobalCoalesceDelayMs = 350;
-        private const int GlobalMinIntervalMs = 1000;
+        //private DateTime _globalDueUtc = DateTime.MinValue;
+        //private const int GlobalCoalesceDelayMs = 350;
+        //private const int GlobalMinIntervalMs = 1000;
 
         private void TryDoRedrawPass()
         {
             try
             {
-                if (_actorRedrawStates.IsEmpty && Volatile.Read(ref _globalRedrawRequested) == 0)
+                if (_actorRedrawStates.IsEmpty)
                     return;
 
                 var now = DateTime.UtcNow;
@@ -331,24 +332,6 @@ namespace RavaSync.WebAPI.Files
 
                 var local = _dalamudUtil.GetPlayerCharacter();
                 var localAddr = local?.Address ?? nint.Zero;
-
-                if (Interlocked.Exchange(ref _globalRedrawRequested, 0) == 1)
-                {
-                    var pushed = now.AddMilliseconds(GlobalCoalesceDelayMs);
-                    if (_globalDueUtc < pushed) _globalDueUtc = pushed;
-                }
-
-                if (_globalDueUtc != DateTime.MinValue && now >= _globalDueUtc)
-                {
-                    _globalDueUtc = now.AddMilliseconds(GlobalMinIntervalMs);
-
-                    foreach (var obj in _objectTable)
-                    {
-                        if (obj is not IPlayerCharacter pc) continue;
-                        if (pc.Address == localAddr) continue;
-                        _mareMediator.Publish(new PenumbraRedrawCharacterMessage(pc));
-                    }
-                }
 
                 if (_actorRedrawStates.IsEmpty)
                     return;

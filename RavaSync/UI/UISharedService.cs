@@ -79,6 +79,7 @@ public partial class UiSharedService : DisposableMediatorSubscriberBase
     private readonly IFontManager _fontManager;
     bool _didPrewarmFonts = false;
     private const string RavaCacheSubdirName = "RavaFiles";
+    private bool _themeBootstrapped = false;
 
 
     public UiSharedService(ILogger<UiSharedService> logger, IpcManager ipcManager, ApiController apiController,
@@ -104,6 +105,7 @@ public partial class UiSharedService : DisposableMediatorSubscriberBase
         _localization.SetupWithLangCode("en");
 
         _isDirectoryWritable = IsDirectoryWritable(_configService.Current.CacheFolder);
+        EnsureThemeBootstrapped();
 
         Mediator.Subscribe<DelayedFrameworkUpdateMessage>(this, (_) =>
         {
@@ -116,17 +118,10 @@ public partial class UiSharedService : DisposableMediatorSubscriberBase
             _petNamesExists = _ipcManager.PetNames.APIAvailable;
             _brioExists = _ipcManager.Brio.APIAvailable;
 
-            //if (!_didPrewarmFonts)
-            //{
-            //    _didPrewarmFonts = true;
-            //    var keepId = _fontManager.Current?.Id ?? _configService.Current.FontId;
-            //    _fontManager.LoadAll();
-            //    if (!string.IsNullOrWhiteSpace(keepId)) _fontManager.TryApply(keepId); }
         if (!_didPrewarmFonts)
         {
             _didPrewarmFonts = true;
 
-            // Cheap catalog load (no prebaking). This makes the dropdown complete after first paint.
             var keep = _configService.Current.FontId;
 
             _fontManager.LoadAll();
@@ -139,44 +134,36 @@ public partial class UiSharedService : DisposableMediatorSubscriberBase
         {
             e.OnPreBuild(tk => tk.AddDalamudAssetFont(Dalamud.DalamudAsset.NotoSansJpMedium, new()
             {
-                SizePx = 35
+                SizePx = 30
             }));
         });
         GameFont = _pluginInterface.UiBuilder.FontAtlas.NewGameFontHandle(new(GameFontFamilyAndSize.Axis12));
         IconFont = _pluginInterface.UiBuilder.IconFontFixedWidthHandle;
 
-        //_fontManager.SetUserSizePx(_configService.Current.FontSizePx);
-
-        //_fontManager.LoadAll();
-        //if (!string.IsNullOrWhiteSpace(_configService.Current.FontId))
-        //    _fontManager.TryApply(_configService.Current.FontId);
-
-        //_fontManager.SetUserSizePx(_configService.Current.FontSizePx);
-
-        //var chosenId = _configService.Current.FontId; 
-        //var initialSize = _fontManager.GetUserSizePx();
-
-        //_fontManager.LoadOnlyFace(chosenId ?? "", new[] { initialSize });
-
-        //// keep the current selection consistent
-        //if (!string.IsNullOrWhiteSpace(chosenId))
-        //    _fontManager.TryApply(chosenId);
         _fontManager.SetUserSizePx(_configService.Current.FontSizePx);
 
         var chosen = _configService.Current.FontId;
+
         if (string.IsNullOrWhiteSpace(chosen))
-            chosen = _themeManager.Current?.Typography?.DisplayFont ?? "";
+        {
+            if (!string.IsNullOrWhiteSpace(_themeManager.Current?.Id)
+                && !string.Equals(_themeManager.Current.Id, ThemeManager.NoneId, StringComparison.OrdinalIgnoreCase))
+            {
+                chosen = _themeManager.Current?.Typography?.DisplayFont ?? "";
+            }
+            else
+            {
+                chosen = "";
+            }
+        }
 
         var initialSize = _fontManager.GetUserSizePx();
 
-        // Build only the chosen face+size for first paint (fast).
         _fontManager.LoadOnlyFace(chosen ?? "", new[] { initialSize });
 
-        // Apply chosen (id OR name). If it doesn't exist, LoadOnlyFace already fell back safely.
         if (!string.IsNullOrWhiteSpace(chosen))
             _fontManager.TryApply(chosen);
 
-        // Keep config sane if a name was used / or the old font vanished.
         var persistId = _fontManager.Current?.Id;
         if (!string.IsNullOrWhiteSpace(persistId) &&
             !string.Equals(_configService.Current.FontId, persistId, StringComparison.OrdinalIgnoreCase))
@@ -188,36 +175,50 @@ public partial class UiSharedService : DisposableMediatorSubscriberBase
 
     }
 
+    private void EnsureThemeBootstrapped()
+    {
+        if (_themeBootstrapped) return;
+        _themeBootstrapped = true;
+
+        _themeManager.LoadAll();
+
+        var id = _configService.Current.SelectedThemeId;
+
+        if (string.IsNullOrWhiteSpace(id))
+        {
+            id = ThemeManager.NoneId;
+            _configService.Current.SelectedThemeId = id;
+            _configService.Save();
+        }
+
+        if (!_themeManager.TryApply(id))
+        {
+            _configService.Current.SelectedThemeId = ThemeManager.NoneId;
+            _configService.Save();
+            _themeManager.TryApply(ThemeManager.NoneId);
+        }
+    }
 
     public IDisposable BeginThemed()
     {
+        EnsureThemeBootstrapped();
+
         var stack = new List<IDisposable>();
 
-        // If "No theme" is active, push nothing: default colors + default font.
-        if (!string.Equals(_themeManager.Current.Id, ThemeManager.NoneId, StringComparison.OrdinalIgnoreCase))
-        {
-            stack.Add(_themeManager.PushImGuiScope());
+        var curId = _themeManager.Current?.Id;
 
-            var handle = _fontManager.GetCurrentHandle();
-            if (handle is not null)
-                stack.Add(handle.Push());
-        }
+        if (string.IsNullOrWhiteSpace(curId)
+            || string.Equals(curId, ThemeManager.NoneId, StringComparison.OrdinalIgnoreCase))
+            return new Scope(stack);
+
+        stack.Add(_themeManager.PushImGuiScope());
+
+        var handle = _fontManager.GetCurrentHandle();
+        if (handle is not null)
+            stack.Add(handle.Push());
 
         return new Scope(stack);
     }
-
-    //public IDisposable BeginThemed()
-    //{
-    //    var stack = new List<IDisposable>();
-
-    //    stack.Add(_themeManager.PushImGuiScope());
-
-    //    var handle = _fontManager.GetCurrentHandle();
-    //    if (handle is not null)
-    //        stack.Add(handle.Push());
-
-    //    return new Scope(stack);
-    //}
 
 
     private sealed class Scope : IDisposable

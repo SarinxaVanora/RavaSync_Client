@@ -1,7 +1,8 @@
-﻿using RavaSync.MareConfiguration.Models;
-using RavaSync.UI;
+﻿using FFXIVClientStructs.FFXIV.Common.Math;
 using Microsoft.Extensions.Logging;
-using FFXIVClientStructs.FFXIV.Common.Math;
+using RavaSync.MareConfiguration.Models;
+using RavaSync.Themes;
+using RavaSync.UI;
 
 namespace RavaSync.MareConfiguration.Configurations;
 
@@ -65,7 +66,7 @@ public class MareConfig : IMareConfiguration
     public NotificationLocation WarningNotification { get; set; } = NotificationLocation.Both;
     public bool UseFocusTarget { get; set; } = false;
     public bool SortPairsByVRAM { get; set; } = false;
-    public string SelectedThemeId { get; set; } = "avernus";
+    public string SelectedThemeId { get; set; } = ThemeManager.NoneId;
     public string FontId { get; set; } = "axis";
     public float FontSizePx { get; set; } = 16f;
     public float FontRasterizerMultiply { get; set; } = 1.0f;
@@ -85,12 +86,9 @@ public class MareConfig : IMareConfiguration
     public bool CacheFolderSubdirMigrationDone { get; set; } = false;
 
     public bool EditGlobalTransferOverlay { get; set; } = false;
-
-    public float GlobalTransferOverlayX { get; set; } = float.NaN;
-    public float GlobalTransferOverlayY { get; set; } = float.NaN;
-
+    public float GlobalTransferOverlayX { get; set; } = -1f;
+    public float GlobalTransferOverlayY { get; set; } = -1f;
     public float GlobalTransferOverlayScale { get; set; } = 1.0f;
-
     public bool GlobalTransferOverlayRowLayout { get; set; } = false;
 
 

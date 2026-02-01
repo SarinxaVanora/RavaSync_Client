@@ -353,7 +353,6 @@ public class SettingsUi : WindowMediatorSubscriberBase
 
         if (!showTransferBars) ImGui.BeginDisabled();
 
-
         ImGui.Indent();
         bool transferBarShowText = _configService.Current.TransferBarsShowText;
         if (ImGui.Checkbox("Show Download Text", ref transferBarShowText))
@@ -376,6 +375,10 @@ public class SettingsUi : WindowMediatorSubscriberBase
             _configService.Save();
         }
         _uiShared.DrawHelpText("Height of the displayed transfer bars (will never be less tall than the displayed text)");
+        ImGui.Unindent();
+
+        if (!showTransferBars) ImGui.EndDisabled();
+
         bool showUploading = _configService.Current.ShowUploading;
         if (ImGui.Checkbox("Show 'Uploading' text below players that are currently uploading", ref showUploading))
         {
@@ -384,7 +387,6 @@ public class SettingsUi : WindowMediatorSubscriberBase
         }
         _uiShared.DrawHelpText("This will render an 'Uploading' text at the feet of the player that is in progress of uploading data.");
 
-        ImGui.Unindent();
         if (!showUploading) ImGui.BeginDisabled();
         ImGui.Indent();
         bool showUploadingBigText = _configService.Current.ShowUploadingBigText;
@@ -394,11 +396,9 @@ public class SettingsUi : WindowMediatorSubscriberBase
             _configService.Save();
         }
         _uiShared.DrawHelpText("This will render an 'Uploading' text in a larger font.");
-
         ImGui.Unindent();
-
         if (!showUploading) ImGui.EndDisabled();
-        if (!showTransferBars) ImGui.EndDisabled();
+
 
         if (_apiController.IsConnected)
         {

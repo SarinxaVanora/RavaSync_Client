@@ -35,7 +35,31 @@ public abstract class ConfigurationServiceBase<T> : IConfigService<T> where T : 
     public void Save()
     {
         ConfigSave?.Invoke(this, EventArgs.Empty);
+
+        // First-run safety: if the config file doesn't exist yet, write immediately.
+        if (!File.Exists(ConfigurationPath))
+        {
+            try
+            {
+                Directory.CreateDirectory(ConfigurationDirectory);
+
+                File.WriteAllText(
+                    ConfigurationPath,
+                    JsonSerializer.Serialize(Current, typeof(T), new JsonSerializerOptions
+                    {
+                        WriteIndented = true
+                    })
+                );
+
+                UpdateLastWriteTime();
+            }
+            catch
+            {
+                // Intentionally swallow: periodic saver will still try again later.
+            }
+        }
     }
+
 
     public void UpdateLastWriteTime()
     {

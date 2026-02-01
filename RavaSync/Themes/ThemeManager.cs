@@ -30,7 +30,7 @@ public sealed class ThemeManager : IThemeManager
     private readonly string _pluginThemesDir; 
     private readonly List<Theme> _builtIn = new();
     private readonly List<Theme> _custom = new();
-    private Theme _current = new();
+    private Theme _current = new Theme { Id = NoneId, Name = "No Theme" };
     public event Action<Theme>? ThemeChanged;
     public const string NoneId = "none";
 
@@ -144,7 +144,6 @@ public sealed class ThemeManager : IThemeManager
         _builtIn.RemoveAll(b => string.IsNullOrWhiteSpace(b.Id));
         _custom.RemoveAll(c => string.IsNullOrWhiteSpace(c.Id));
 
-        // optional: if nothing loaded, inject a tiny fallback so we never crash later
         if (_builtIn.Count == 0 && _custom.Count == 0)
         {
             _builtIn.Add(new Theme { Id = "fallback", Name = "Fallback" });
@@ -160,19 +159,9 @@ public sealed class ThemeManager : IThemeManager
         }
         catch
         {
-            // swallow bad files; we don't want to block plugin load
         }
     }
 
-    //public bool TryApply(string id)
-    //{
-    //    var theme = _custom.Concat(_builtIn).FirstOrDefault(t => t.Id.Equals(id, StringComparison.OrdinalIgnoreCase));
-    //    if (theme == null) return false;
-
-    //    _current = ResolveInheritance(theme);
-    //    ThemeChanged?.Invoke(_current);
-    //    return true;
-    //}
 
     public bool TryApply(string id)
     {

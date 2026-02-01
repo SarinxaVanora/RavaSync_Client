@@ -3,6 +3,7 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using System.Reflection;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 
 namespace RavaSync.MareConfiguration;
 
@@ -71,53 +72,106 @@ public class ConfigurationSaveService : IHostedService
     private async Task SaveConfig<T>(IConfigService<T> config) where T : IMareConfiguration
     {
         _logger.LogTrace("Saving {configName}", config.ConfigurationName);
-        var configDir = config.ConfigurationPath.Replace(config.ConfigurationName, string.Empty);
+
+        var configDir = Path.GetDirectoryName(config.ConfigurationPath);
+        if (string.IsNullOrWhiteSpace(configDir))
+            configDir = config.ConfigurationPath.Replace(config.ConfigurationName, string.Empty);
 
         try
         {
-            var configBackupFolder = Path.Join(configDir, BackupFolder);
-            if (!Directory.Exists(configBackupFolder))
-                Directory.CreateDirectory(configBackupFolder);
+            if (!string.IsNullOrWhiteSpace(configDir) && !Directory.Exists(configDir))
+                Directory.CreateDirectory(configDir);
 
-            var configNameSplit = config.ConfigurationName.Split(".");
-            var existingConfigs = Directory.EnumerateFiles(
-                configBackupFolder,
-                configNameSplit[0] + "*")
-                .Select(c => new FileInfo(c))
-                .OrderByDescending(c => c.LastWriteTime).ToList();
-            if (existingConfigs.Skip(10).Any())
+            if (File.Exists(config.ConfigurationPath))
             {
-                foreach (var oldBak in existingConfigs.Skip(10).ToList())
-                {
-                    oldBak.Delete();
-                }
-            }
+                var configBackupFolder = Path.Join(configDir, BackupFolder);
+                if (!Directory.Exists(configBackupFolder))
+                    Directory.CreateDirectory(configBackupFolder);
 
-            string backupPath = Path.Combine(configBackupFolder, configNameSplit[0] + "." + DateTime.Now.ToString("yyyyMMddHHmmss") + "." + configNameSplit[1]);
-            _logger.LogTrace("Backing up current config to {backupPath}", backupPath);
-            File.Copy(config.ConfigurationPath, backupPath, overwrite: true);
-            FileInfo fi = new(backupPath);
-            fi.LastWriteTimeUtc = DateTime.UtcNow;
+                var configNameSplit = config.ConfigurationName.Split(".");
+                var existingConfigs = Directory.EnumerateFiles(configBackupFolder, configNameSplit[0] + "*")
+                    .Select(c => new FileInfo(c))
+                    .OrderByDescending(c => c.LastWriteTimeUtc)
+                    .ToList();
+
+                if (existingConfigs.Skip(10).Any())
+                {
+                    foreach (var oldBak in existingConfigs.Skip(10).ToList())
+                        oldBak.Delete();
+                }
+
+                string backupPath = Path.Combine(
+                    configBackupFolder,
+                    configNameSplit[0] + "." + DateTime.Now.ToString("yyyyMMddHHmmss") + "." + configNameSplit[1]);
+
+                _logger.LogTrace("Backing up current config to {backupPath}", backupPath);
+                File.Copy(config.ConfigurationPath, backupPath, overwrite: true);
+
+                FileInfo fi = new(backupPath);
+                fi.LastWriteTimeUtc = DateTime.UtcNow;
+            }
         }
         catch (Exception ex)
         {
-            // ignore if file cannot be backupped
             _logger.LogWarning(ex, "Could not create backup for {config}", config.ConfigurationPath);
         }
 
         var temp = config.ConfigurationPath + ".tmp";
         try
         {
-            await File.WriteAllTextAsync(temp, JsonSerializer.Serialize(config.Current, typeof(T), new JsonSerializerOptions()
+            var options = new JsonSerializerOptions
             {
-                WriteIndented = true
-            })).ConfigureAwait(false);
+                WriteIndented = true,
+                DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
+            };
+            options.Converters.Add(new SafeFloatConverter());
+            options.Converters.Add(new SafeDoubleConverter());
+
+            var json = JsonSerializer.Serialize(config.Current, typeof(T), options);
+
+            await File.WriteAllTextAsync(temp, json).ConfigureAwait(false);
             File.Move(temp, config.ConfigurationPath, true);
+
             config.UpdateLastWriteTime();
         }
         catch (Exception ex)
         {
+            try
+            {
+                if (File.Exists(temp))
+                    File.Delete(temp);
+            }
+            catch
+            {
+            }
+
             _logger.LogWarning(ex, "Error during config save of {config}", config.ConfigurationName);
+        }
+    }
+
+
+
+    sealed class SafeFloatConverter : JsonConverter<float>
+    {
+        public override float Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+            => reader.GetSingle();
+
+        public override void Write(Utf8JsonWriter writer, float value, JsonSerializerOptions options)
+        {
+            if (float.IsNaN(value) || float.IsInfinity(value)) writer.WriteNumberValue(0f);
+            else writer.WriteNumberValue(value);
+        }
+    }
+
+    sealed class SafeDoubleConverter : JsonConverter<double>
+    {
+        public override double Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+            => reader.GetDouble();
+
+        public override void Write(Utf8JsonWriter writer, double value, JsonSerializerOptions options)
+        {
+            if (double.IsNaN(value) || double.IsInfinity(value)) writer.WriteNumberValue(0d);
+            else writer.WriteNumberValue(value);
         }
     }
 

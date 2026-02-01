@@ -202,10 +202,35 @@ public class DownloadUi : WindowMediatorSubscriberBase
                 {
                     var statuses = item.Value.Status.Values.ToList();
 
-                    var dlSlot = statuses.Count(c => c.DownloadStatus == DownloadStatus.WaitingForSlot);
-                    var dlQueue = statuses.Count(c => c.DownloadStatus == DownloadStatus.WaitingForQueue);
-                    var dlProg = statuses.Count(c => c.DownloadStatus == DownloadStatus.Downloading);
-                    var dlDecomp = statuses.Count(c => c.DownloadStatus == DownloadStatus.Decompressing);
+                    var dlSlot = 0;
+                    var dlQueue = 0;
+                    var dlProg = 0;
+                    var dlDecomp = 0;
+
+                    foreach (var s in statuses)
+                    {
+                        var remaining = Math.Max(0, s.TotalFiles - s.TransferredFiles);
+
+                        switch (s.DownloadStatus)
+                        {
+                            case DownloadStatus.WaitingForSlot:
+                                dlSlot += remaining;
+                                break;
+
+                            case DownloadStatus.WaitingForQueue:
+                                dlQueue += remaining;
+                                break;
+
+                            case DownloadStatus.Downloading:
+                                dlProg += remaining;
+                                break;
+
+                            case DownloadStatus.Decompressing:
+                                dlDecomp += Math.Max(1, remaining);
+                                break;
+                        }
+                    }
+
 
                     var totalFiles = item.Value.AccTotalFiles + statuses.Sum(s => s.TotalFiles);
                     var transferredFiles = item.Value.AccTransferredFiles + statuses.Sum(s => s.TransferredFiles);
@@ -228,7 +253,7 @@ public class DownloadUi : WindowMediatorSubscriberBase
             }
         }
 
-        if (_configService.Current.ShowTransferBars)
+        if (_configService.Current.ShowTransferBars || _configService.Current.ShowUploading)
         {
             const byte transparency = 220;
 
@@ -239,143 +264,183 @@ public class DownloadUi : WindowMediatorSubscriberBase
             var dtPos = ImGui.GetIO().DeltaTime;
             var keepKeys = new HashSet<IntPtr>();
 
-            foreach (var transfer in _currentDownloads.ToList())
+            if (_configService.Current.ShowTransferBars)
             {
-                if (transfer.Value.Finished && (now - transfer.Value.LastUpdateUtc) > DownloadUiHoldWindow)
+                foreach (var transfer in _currentDownloads.ToList())
                 {
-                    _currentDownloads.TryRemove(transfer.Key, out _);
-                    continue;
+                    if (transfer.Value.Finished && (now - transfer.Value.LastUpdateUtc) > DownloadUiHoldWindow)
+                    {
+                        _currentDownloads.TryRemove(transfer.Key, out _);
+                        continue;
+                    }
+
+                    var go = transfer.Key.GetGameObject();
+                    var screenPos = _dalamudUtilService.WorldToScreen(go);
+                    if (screenPos == Vector2.Zero) continue;
+
+                    var statuses = transfer.Value.Status.Values.ToList();
+                    if (statuses.Count == 0) continue;
+
+                    var totalBytes = transfer.Value.AccTotalBytes + statuses.Sum(s => s.TotalBytes);
+                    var transferredBytes = transfer.Value.AccTransferredBytes + statuses.Sum(s => s.TransferredBytes);
+
+                    if (totalBytes <= 0 || totalBytes < MinVisibleDownloadBytes)
+                        continue;
+
+                    keepKeys.Add(transfer.Key.Address);
+                    screenPos = SmoothAndSnapScreen(transfer.Key.Address, screenPos, dtPos);
+
+                    var allPreparing = statuses.All(s =>
+                        (s.DownloadStatus == DownloadStatus.Initializing
+                         || s.DownloadStatus == DownloadStatus.WaitingForSlot
+                         || s.DownloadStatus == DownloadStatus.WaitingForQueue)
+                        && s.TransferredBytes == 0);
+
+                    var hasInit = statuses.Any(s => s.DownloadStatus == DownloadStatus.Initializing);
+                    var hasSlot = statuses.Any(s => s.DownloadStatus == DownloadStatus.WaitingForSlot);
+                    var hasQueue = statuses.Any(s => s.DownloadStatus == DownloadStatus.WaitingForQueue);
+                    var hasProg = statuses.Any(s => s.DownloadStatus == DownloadStatus.Downloading);
+                    var hasDecomp = statuses.Any(s => s.DownloadStatus == DownloadStatus.Decompressing);
+
+                    var sInit = 0;
+                    var sSlot = 0;
+                    var sQueue = 0;
+                    var sProg = 0;
+                    var sDecomp = 0;
+
+                    foreach (var s in statuses)
+                    {
+                        var remaining = Math.Max(0, s.TotalFiles - s.TransferredFiles);
+
+                        switch (s.DownloadStatus)
+                        {
+                            case DownloadStatus.Initializing:
+                                sInit += remaining > 0 ? remaining : 1;
+                                break;
+
+                            case DownloadStatus.WaitingForSlot:
+                                sSlot += remaining;
+                                break;
+
+                            case DownloadStatus.WaitingForQueue:
+                                sQueue += remaining;
+                                break;
+
+                            case DownloadStatus.Downloading:
+                                sProg += remaining;
+                                break;
+
+                            case DownloadStatus.Decompressing:
+                                sDecomp += Math.Max(1, remaining);
+                                break;
+                        }
+                    }
+
+                    var isWaiting = (hasSlot || hasQueue) && !hasProg && !hasDecomp;
+                    var isInitializing = hasInit && !hasProg && !hasDecomp;
+                    var shouldPulse = isWaiting || isInitializing;
+
+                    double dlProgressPercent;
+                    string downloadText;
+
+                    if (hasProg)
+                    {
+                        dlProgressPercent = totalBytes <= 0 ? 0.0 : transferredBytes / (double)totalBytes;
+                        dlProgressPercent = Math.Clamp(dlProgressPercent, 0.0, 1.0);
+
+                        downloadText = $"{UiSharedService.ByteToString(transferredBytes, addSuffix: false)}/{UiSharedService.ByteToString(totalBytes)}";
+                    }
+                    else if (hasDecomp)
+                    {
+                        dlProgressPercent = totalBytes <= 0 ? 0.0 : transferredBytes / (double)totalBytes;
+                        dlProgressPercent = Math.Clamp(dlProgressPercent, 0.0, 1.0);
+
+                        downloadText = totalBytes > 0
+                            ? $"Decompressing ({sDecomp})  {UiSharedService.ByteToString(transferredBytes, addSuffix: false)}/{UiSharedService.ByteToString(totalBytes)}"
+                            : $"Decompressing ({sDecomp})";
+                    }
+                    else if (hasSlot || hasQueue || hasInit)
+                    {
+                        dlProgressPercent = 0.0;
+
+                        var parts = new List<string>(5);
+                        if (sSlot > 0) parts.Add($"W:{sSlot}");
+                        if (sQueue > 0) parts.Add($"Q:{sQueue}");
+                        if (sProg > 0) parts.Add($"P:{sProg}");
+                        if (sDecomp > 0) parts.Add($"D:{sDecomp}");
+                        if (sInit > 0) parts.Add($"I:{sInit}");
+
+                        var breakdown = parts.Count > 0 ? string.Join(" ", parts) : string.Empty;
+
+                        if (hasSlot) downloadText = $"Waiting  [{breakdown}]";
+                        else if (hasQueue) downloadText = $"Queued  [{breakdown}]";
+                        else downloadText = $"Initializing  [{breakdown}]";
+                    }
+                    else
+                    {
+                        dlProgressPercent = totalBytes <= 0 ? 0.0 : transferredBytes / (double)totalBytes;
+                        dlProgressPercent = Math.Clamp(dlProgressPercent, 0.0, 1.0);
+
+                        downloadText = $"{UiSharedService.ByteToString(transferredBytes, addSuffix: false)}/{UiSharedService.ByteToString(totalBytes)}";
+                    }
+
+                    var dt = ImGui.GetIO().DeltaTime;
+                    var target = (isWaiting || isInitializing) ? 0f : (float)dlProgressPercent;
+
+                    transfer.Value.SmoothedPercent = LerpExp(transfer.Value.SmoothedPercent, target, lambda: 12f, dt);
+                    transfer.Value.AnimPhase += dt;
+
+                    int dlBarWidth;
+                    int dlBarHeight;
+
+                    if (haveAether)
+                    {
+                        dlBarWidth = Math.Max(_configService.Current.TransferBarsWidth, 320);
+
+                        var aspect = _aetherFrameSize.Y / _aetherFrameSize.X;
+                        dlBarHeight = Math.Max(_configService.Current.TransferBarsHeight, (int)MathF.Round(dlBarWidth * aspect));
+
+                        var minH = Math.Max(_configService.Current.TransferBarsHeight, 34);
+                        if (dlBarHeight < minH) { dlBarHeight = minH; dlBarWidth = (int)MathF.Round(dlBarHeight / aspect); }
+
+                        dlBarWidth = (int)MathF.Round(dlBarWidth * 1.10f);
+                        dlBarHeight = (int)MathF.Round(dlBarHeight * 1.10f);
+                    }
+                    else
+                    {
+                        dlBarWidth = Math.Max(_configService.Current.TransferBarsWidth, 320);
+                        dlBarHeight = Math.Max(_configService.Current.TransferBarsHeight, 28);
+                    }
+
+                    const float barYOffsetPx = 0f;
+
+                    var barCenter = screenPos + new Vector2(0f, barYOffsetPx);
+
+                    var dlBarStart = new Vector2(barCenter.X - dlBarWidth / 2f, barCenter.Y - dlBarHeight / 2f);
+                    var dlBarEnd = new Vector2(barCenter.X + dlBarWidth / 2f, barCenter.Y + dlBarHeight / 2f);
+                    dlBarStart = new Vector2(MathF.Round(dlBarStart.X), MathF.Round(dlBarStart.Y));
+                    dlBarEnd = new Vector2(MathF.Round(dlBarEnd.X), MathF.Round(dlBarEnd.Y));
+
+                    var drawList = ImGui.GetBackgroundDrawList();
+
+                    DrawAetherBarComposite(drawList, dlBarStart, dlBarEnd, transfer.Value.SmoothedPercent, transparency, allPreparing, transfer.Value.AnimPhase);
+
+                    if (_configService.Current.TransferBarsShowText)
+                    {
+                        GetFillRect(dlBarStart, dlBarEnd, out var fillStart, out var fillEnd);
+                        var mid = (fillStart + fillEnd) * 0.5f;
+
+                        var textSizeCurrent = ImGui.CalcTextSize(downloadText);
+
+                        UiSharedService.DrawOutlinedFont(
+                            drawList,
+                            downloadText,
+                            new Vector2(mid.X - textSizeCurrent.X / 2f, mid.Y - textSizeCurrent.Y / 2f),
+                            UiSharedService.Color(255, 255, 255, 255),
+                            UiSharedService.Color(0, 0, 0, 220),
+                            2);
+                    }
                 }
-
-                var go = transfer.Key.GetGameObject();
-                var screenPos = _dalamudUtilService.WorldToScreen(go);
-                if (screenPos == Vector2.Zero) continue;
-
-                var statuses = transfer.Value.Status.Values.ToList();
-                if (statuses.Count == 0) continue;
-
-                var totalBytes = transfer.Value.AccTotalBytes + statuses.Sum(s => s.TotalBytes);
-                var transferredBytes = transfer.Value.AccTransferredBytes + statuses.Sum(s => s.TransferredBytes);
-
-                if (totalBytes > 0 && totalBytes < MinVisibleDownloadBytes)
-                    continue;
-
-                keepKeys.Add(transfer.Key.Address);
-                screenPos = SmoothAndSnapScreen(transfer.Key.Address, screenPos, dtPos);
-
-                var allPreparing = statuses.All(s =>
-                    (s.DownloadStatus == DownloadStatus.Initializing
-                     || s.DownloadStatus == DownloadStatus.WaitingForSlot
-                     || s.DownloadStatus == DownloadStatus.WaitingForQueue)
-                    && s.TransferredBytes == 0);
-
-                // Progress
-                var sInit = statuses.Count(s => s.DownloadStatus == DownloadStatus.Initializing);
-                var sSlot = statuses.Count(s => s.DownloadStatus == DownloadStatus.WaitingForSlot);
-                var sQueue = statuses.Count(s => s.DownloadStatus == DownloadStatus.WaitingForQueue);
-                var sProg = statuses.Count(s => s.DownloadStatus == DownloadStatus.Downloading);
-                var sDecomp = statuses.Count(s => s.DownloadStatus == DownloadStatus.Decompressing);
-
-                var isWaiting = (sSlot > 0 || sQueue > 0) && sProg == 0 && sDecomp == 0;
-                var isInitializing = sInit > 0 && sProg == 0 && sDecomp == 0;
-                var shouldPulse = isWaiting || isInitializing;
-
-                double dlProgressPercent;
-                string downloadText;
-
-                if (sProg > 0)
-                {
-                    dlProgressPercent = totalBytes <= 0 ? 0.0 : transferredBytes / (double)totalBytes;
-                    dlProgressPercent = Math.Clamp(dlProgressPercent, 0.0, 1.0);
-
-                    downloadText = $"{UiSharedService.ByteToString(transferredBytes, addSuffix: false)}/{UiSharedService.ByteToString(totalBytes)}";
-                }
-                else if (sDecomp > 0)
-                {
-                    dlProgressPercent = totalBytes <= 0 ? 0.0 : transferredBytes / (double)totalBytes;
-                    dlProgressPercent = Math.Clamp(dlProgressPercent, 0.0, 1.0);
-
-                    downloadText = totalBytes > 0
-                        ? $"Decompressing ({sDecomp})  {UiSharedService.ByteToString(transferredBytes, addSuffix: false)}/{UiSharedService.ByteToString(totalBytes)}"
-                        : $"Decompressing ({sDecomp})";
-                }
-                else if (sSlot > 0 || sQueue > 0 || sInit > 0)
-                {
-                    dlProgressPercent = 0.0;
-
-                    var parts = new List<string>(4);
-                    if (sSlot > 0) parts.Add($"W:{sSlot}");
-                    if (sQueue > 0) parts.Add($"Q:{sQueue}");
-                    if (sProg > 0) parts.Add($"P:{sProg}");
-                    if (sDecomp > 0) parts.Add($"D:{sDecomp}");
-                    if (sInit > 0) parts.Add($"I:{sInit}");
-
-                    var breakdown = parts.Count > 0 ? string.Join(" ", parts) : string.Empty;
-
-                    if (sSlot > 0) downloadText = $"Waiting  [{breakdown}]";
-                    else if (sQueue > 0) downloadText = $"Queued  [{breakdown}]";
-                    else downloadText = $"Initializing  [{breakdown}]";
-                }
-                else
-                {
-                    dlProgressPercent = totalBytes <= 0 ? 0.0 : transferredBytes / (double)totalBytes;
-                    dlProgressPercent = Math.Clamp(dlProgressPercent, 0.0, 1.0);
-
-                    downloadText = $"{UiSharedService.ByteToString(transferredBytes, addSuffix: false)}/{UiSharedService.ByteToString(totalBytes)}";
-                }
-
-                var dt = ImGui.GetIO().DeltaTime;
-                var target = (isWaiting || isInitializing) ? 0f : (float)dlProgressPercent;
-
-                transfer.Value.SmoothedPercent = LerpExp(transfer.Value.SmoothedPercent, target, lambda: 12f, dt);
-                transfer.Value.AnimPhase += dt;
-
-                int dlBarWidth;
-                int dlBarHeight;
-
-                if (haveAether)
-                {
-                    dlBarWidth = Math.Max(_configService.Current.TransferBarsWidth, 320);
-                    
-                    var aspect = _aetherFrameSize.Y / _aetherFrameSize.X;
-                    dlBarHeight = Math.Max(_configService.Current.TransferBarsHeight, (int)MathF.Round(dlBarWidth * aspect));
-
-                    var minH = Math.Max(_configService.Current.TransferBarsHeight, 34);
-                    if (dlBarHeight < minH) { dlBarHeight = minH; dlBarWidth = (int)MathF.Round(dlBarHeight / aspect); }
-
-                    dlBarWidth = (int)MathF.Round(dlBarWidth * 1.10f);
-                    dlBarHeight = (int)MathF.Round(dlBarHeight * 1.10f);
-
-                }
-                else
-                {
-                    dlBarWidth = Math.Max(_configService.Current.TransferBarsWidth, 320);
-                    dlBarHeight = Math.Max(_configService.Current.TransferBarsHeight, 28);
-                }
-
-                const float barYOffsetPx = 0f;
-
-                var barCenter = screenPos + new Vector2(0f, barYOffsetPx);
-
-                var dlBarStart = new Vector2(barCenter.X - dlBarWidth / 2f, barCenter.Y - dlBarHeight / 2f);
-                var dlBarEnd = new Vector2(barCenter.X + dlBarWidth / 2f, barCenter.Y + dlBarHeight / 2f);
-                dlBarStart = new Vector2(MathF.Round(dlBarStart.X), MathF.Round(dlBarStart.Y));
-                dlBarEnd = new Vector2(MathF.Round(dlBarEnd.X), MathF.Round(dlBarEnd.Y));
-
-                var drawList = ImGui.GetBackgroundDrawList();
-
-                DrawAetherBarComposite(drawList, dlBarStart, dlBarEnd, transfer.Value.SmoothedPercent, transparency, shouldPulse, transfer.Value.AnimPhase);
-
-                if (_configService.Current.TransferBarsShowText)
-                {
-                    GetFillRect(dlBarStart, dlBarEnd, out var fillStart, out var fillEnd);
-                    var mid = (fillStart + fillEnd) * 0.5f;
-
-                    var textSizeCurrent = ImGui.CalcTextSize(downloadText);
-
-                    UiSharedService.DrawOutlinedFont(drawList, downloadText, new Vector2(mid.X - textSizeCurrent.X / 2f, mid.Y - textSizeCurrent.Y / 2f), UiSharedService.Color(255, 255, 255, 255), UiSharedService.Color(0, 0, 0, 220), 2);
-                }
-
             }
 
             if (_configService.Current.ShowUploading)
@@ -397,19 +462,18 @@ public class DownloadUi : WindowMediatorSubscriberBase
 
                         var drawList = ImGui.GetBackgroundDrawList();
                         var tp = new Vector2(
-                        MathF.Round(screenPos.X - textSize.X / 2f - 1f),
-                        MathF.Round(screenPos.Y - textSize.Y / 2f - 1f)
+                            MathF.Round(screenPos.X - textSize.X / 2f - 1f),
+                            MathF.Round(screenPos.Y - textSize.Y / 2f - 1f)
                         );
-
 
                         UiSharedService.DrawOutlinedFont(
-                        drawList,
-                        uploadText,
-                        tp,
-                        UiSharedService.Color(112, 28, 180, 255),
-                        UiSharedService.Color(0, 0, 0, 200),2
+                            drawList,
+                            uploadText,
+                            tp,
+                            UiSharedService.Color(112, 28, 180, 255),
+                            UiSharedService.Color(0, 0, 0, 200),
+                            2
                         );
-
                     }
                     catch
                     {
@@ -417,6 +481,7 @@ public class DownloadUi : WindowMediatorSubscriberBase
                     }
                 }
             }
+
             PruneSmoothedScreens(keepKeys);
         }
 
@@ -835,7 +900,7 @@ public class DownloadUi : WindowMediatorSubscriberBase
         var px = _configService.Current.GlobalTransferOverlayX;
         var py = _configService.Current.GlobalTransferOverlayY;
 
-        if (float.IsNaN(px) || float.IsNaN(py))
+        if (px < 0f || py < 0f)
         {
             var defaultPos = vp.WorkPos + new Vector2(vp.WorkSize.X * 0.5f, 90f);
             ImGui.SetNextWindowPos(defaultPos, ImGuiCond.FirstUseEver, new Vector2(0.5f, 0f));
@@ -857,8 +922,8 @@ public class DownloadUi : WindowMediatorSubscriberBase
         {
             var pos = ImGui.GetWindowPos();
             var changed =
-                float.IsNaN(_configService.Current.GlobalTransferOverlayX) ||
-                float.IsNaN(_configService.Current.GlobalTransferOverlayY) ||
+                _configService.Current.GlobalTransferOverlayX < 0f ||
+                _configService.Current.GlobalTransferOverlayY < 0f ||
                 MathF.Abs(_configService.Current.GlobalTransferOverlayX - pos.X) > 0.5f ||
                 MathF.Abs(_configService.Current.GlobalTransferOverlayY - pos.Y) > 0.5f;
 
@@ -913,8 +978,8 @@ public class DownloadUi : WindowMediatorSubscriberBase
             if (ImGui.SmallButton("Reset##globalTransfers"))
             {
                 _configService.Current.GlobalTransferOverlayScale = 1.0f;
-                _configService.Current.GlobalTransferOverlayX = float.NaN;
-                _configService.Current.GlobalTransferOverlayY = float.NaN;
+                _configService.Current.GlobalTransferOverlayX = -1f;
+                _configService.Current.GlobalTransferOverlayY = -1f;
                 _configService.Current.GlobalTransferOverlayRowLayout = false;
                 _configService.Save();
             }
@@ -936,7 +1001,7 @@ public class DownloadUi : WindowMediatorSubscriberBase
         int dlTotalFiles = 0;
         int dlTransferredFiles = 0;
 
-        int dlSlot = 0, dlQueue = 0, dlProg = 0, dlDecomp = 0;
+        int dlInit = 0, dlSlot = 0, dlQueue = 0, dlProg = 0, dlDecomp = 0;
         bool dlAllPreparing = true;
 
         if (_configService.Current.ShowGlobalTransferBars && haveDownloads)
@@ -946,15 +1011,38 @@ public class DownloadUi : WindowMediatorSubscriberBase
                 var statuses = entry.Value.Status.Values.ToList();
 
                 var entryTotalBytes = entry.Value.AccTotalBytes + statuses.Sum(s => s.TotalBytes);
-                if (entryTotalBytes > 0 && entryTotalBytes < MinVisibleDownloadBytes)
+                if (entryTotalBytes <= 0 || entryTotalBytes < MinVisibleDownloadBytes)
                     continue;
 
                 anyVisibleDl = true;
 
-                dlSlot += statuses.Count(c => c.DownloadStatus == DownloadStatus.WaitingForSlot);
-                dlQueue += statuses.Count(c => c.DownloadStatus == DownloadStatus.WaitingForQueue);
-                dlProg += statuses.Count(c => c.DownloadStatus == DownloadStatus.Downloading);
-                dlDecomp += statuses.Count(c => c.DownloadStatus == DownloadStatus.Decompressing);
+                foreach (var s in statuses)
+                {
+                    var remaining = Math.Max(0, s.TotalFiles - s.TransferredFiles);
+
+                    var count = remaining;
+                    if (count == 0 && s.TotalFiles == 0 && s.TransferredFiles == 0)
+                        count = 1;
+
+                    switch (s.DownloadStatus)
+                    {
+                        case DownloadStatus.Initializing:
+                            dlInit += count;
+                            break;
+                        case DownloadStatus.WaitingForSlot:
+                            dlSlot += count;
+                            break;
+                        case DownloadStatus.WaitingForQueue:
+                            dlQueue += count;
+                            break;
+                        case DownloadStatus.Downloading:
+                            dlProg += count;
+                            break;
+                        case DownloadStatus.Decompressing:
+                            dlDecomp += Math.Max(1, count);
+                            break;
+                    }
+                }
 
                 dlTotalBytes += entryTotalBytes;
                 dlTransferredBytes += entry.Value.AccTransferredBytes + statuses.Sum(s => s.TransferredBytes);
@@ -1020,42 +1108,41 @@ public class DownloadUi : WindowMediatorSubscriberBase
 
             ImGui.Dummy(new Vector2(barW, barH));
 
-            //This wasn't updating in live operation. Rather than showing it all scuffed, we just simply wont.
-            //int hSlot = 0, hQueue = 0, hProg = 0, hDecomp = 0;
+            var hintParts = new List<string>(5);
+            if (dlInit > 0) hintParts.Add($"Initializing: {dlInit}");
+            if (dlSlot > 0) hintParts.Add($"Slot wait: {dlSlot}");
+            if (dlQueue > 0) hintParts.Add($"Queued: {dlQueue}");
+            if (dlProg > 0) hintParts.Add($"Downloading: {dlProg}");
+            if (dlDecomp > 0) hintParts.Add($"Decompressing: {dlDecomp}");
 
-            //foreach (var entry in _currentDownloads.ToList())
-            //{
-            //    var values = entry.Value.Status?.Values;
-            //    if (values == null) continue;
+            if (hintParts.Count == 0 && dlAllPreparing)
+                hintParts.Add("Preparing...");
 
-            //    foreach (var s in values)
-            //    {
-            //        if (s == null) continue;
+            if (hintParts.Count > 0)
+            {
+                var hint = string.Join("  •  ", hintParts);
+                var hintSize = ImGui.CalcTextSize(hint);
 
-            //        if (s.DownloadStatus == DownloadStatus.WaitingForSlot) hSlot++;
-            //        else if (s.DownloadStatus == DownloadStatus.WaitingForQueue) hQueue++;
-            //        else if (s.DownloadStatus == DownloadStatus.Downloading) hProg++;
-            //        else if (s.DownloadStatus == DownloadStatus.Decompressing) hDecomp++;
-            //    }
-            //}
+                var hintPos = new Vector2(
+                    p0.X + (barW - hintSize.X) * 0.5f,
+                    p1.Y + 6f
+                );
 
-            //var hint = $"Slot wait: {hSlot}  •  Queued: {hQueue}  •  Downloading: {hProg}  •  Decompressing: {hDecomp}";
-            //var hintSize = ImGui.CalcTextSize(hint);
+                var fg = ImGui.GetForegroundDrawList();
 
-            //var hintPos = new Vector2(
-            //    p0.X + (barW - hintSize.X) * 0.5f,
-            //    p1.Y + 6f
-            //);
+                UiSharedService.DrawOutlinedFont(
+                    fg,
+                    hint,
+                    hintPos,
+                    UiSharedService.Color(255, 255, 255, 210),
+                    UiSharedService.Color(0, 0, 0, 200),
+                    2
+                );
+            }
 
-            //UiSharedService.DrawOutlinedFont(
-            //    dl,
-            //    hint,
-            //    hintPos,
-            //    UiSharedService.Color(255, 255, 255, 210),
-            //    UiSharedService.Color(0, 0, 0, 200),2
-            //);
 
             ImGui.Dummy(new Vector2(1, ImGui.GetTextLineHeight() + 10f));
+
 
         }
 
@@ -1136,15 +1223,49 @@ public class DownloadUi : WindowMediatorSubscriberBase
                 var totalBytes = kv.Value.AccTotalBytes + statuses.Sum(s => s.TotalBytes);
                 var transferredBytes = kv.Value.AccTransferredBytes + statuses.Sum(s => s.TransferredBytes);
 
-                var sSlot = statuses.Count(c => c.DownloadStatus == DownloadStatus.WaitingForSlot);
-                var sQueue = statuses.Count(c => c.DownloadStatus == DownloadStatus.WaitingForQueue);
-                var sProg = statuses.Count(c => c.DownloadStatus == DownloadStatus.Downloading);
-                var sDecomp = statuses.Count(c => c.DownloadStatus == DownloadStatus.Decompressing);
+                var sSlot = 0;
+                var sQueue = 0;
+                var sProg = 0;
+                var sDecomp = 0;
+                var sInit = 0;
+
+                foreach (var s in statuses)
+                {
+                    var remaining = Math.Max(0, s.TotalFiles - s.TransferredFiles);
+
+                    var count = remaining;
+                    if (count == 0 && s.TotalFiles == 0 && s.TransferredFiles == 0)
+                        count = 1;
+
+                    switch (s.DownloadStatus)
+                    {
+                        case DownloadStatus.Initializing:
+                            sInit += count;
+                            break;
+
+                        case DownloadStatus.WaitingForSlot:
+                            sSlot += count;
+                            break;
+
+                        case DownloadStatus.WaitingForQueue:
+                            sQueue += count;
+                            break;
+
+                        case DownloadStatus.Downloading:
+                            sProg += count;
+                            break;
+
+                        case DownloadStatus.Decompressing:
+                            sDecomp += Math.Max(1, count);
+                            break;
+                    }
+                }
+
 
                 var pct = (totalBytes <= 0) ? 0f : (float)(transferredBytes / (double)totalBytes);
                 pct = Math.Clamp(pct, 0f, 1f);
 
-                ImGui.TextUnformatted($"{kv.Key.Name}  [W:{sSlot}/Q:{sQueue}/P:{sProg}/D:{sDecomp}]");
+                ImGui.TextUnformatted($"{kv.Key.Name}  [I:{sInit}/W:{sSlot}/Q:{sQueue}/P:{sProg}/D:{sDecomp}]");
                 ImGui.SameLine();
                 ImGui.TextDisabled($"{UiSharedService.ByteToString(transferredBytes, addSuffix: false)}/{UiSharedService.ByteToString(totalBytes)}");
 
@@ -1194,9 +1315,15 @@ public class DownloadUi : WindowMediatorSubscriberBase
     {
         if (_uiShared.EditTrackerPosition) 
             return true;
-        
-        if (!_configService.Current.ShowTransferWindow && !_configService.Current.ShowTransferBars && !_configService.Current.ShowGlobalTransferBars && !_configService.Current.ShowUploadProgress && !_configService.Current.EditGlobalTransferOverlay)
+
+        if (!_configService.Current.ShowTransferWindow
+            && !_configService.Current.ShowTransferBars
+            && !_configService.Current.ShowGlobalTransferBars
+            && !_configService.Current.ShowUploadProgress
+            && !_configService.Current.ShowUploading
+            && !_configService.Current.EditGlobalTransferOverlay)
             return false;
+
 
         if (!_configService.Current.EditGlobalTransferOverlay && !_currentDownloads.Any() && !_fileTransferManager.CurrentUploads.Any() && !_uploadingPlayers.Any())
             return false;

@@ -51,17 +51,14 @@ public class CompactUi : WindowMediatorSubscriberBase
     private readonly CharacterAnalyzer _characterAnalyzer;
     private readonly PlayerPerformanceConfigService _playerPerformanceConfigService;
     private readonly TransientConfigService _transientConfigService;
-    private readonly ICommandManager _commandManager;
     private List<IDrawFolder> _drawFolders;
     private Pair? _lastAddedUser;
     private string _lastAddedUserComment = string.Empty;
     private Vector2 _lastPosition = Vector2.One;
     private Vector2 _lastSize = Vector2.One;
     private bool _showModalForUserAddition;
-    private float _transferPartHeight;
     private bool _wasOpen;
     private float _windowContentWidth;
-    private Dictionary<ObjectKind, Dictionary<string, CharacterAnalyzer.FileDataEntry>>? _cachedAnalysis;
 
     private enum PairViewTab
     {
@@ -72,7 +69,6 @@ public class CompactUi : WindowMediatorSubscriberBase
 
     private PairViewTab _currentPairViewTab = PairViewTab.DirectPairs;
     private string _pairSearch = string.Empty;
-    private bool _toolsFlyoutOpen = false;
 
 
     protected override IDisposable? BeginThemeScope() => _uiSharedService.BeginThemed();
@@ -81,7 +77,7 @@ public class CompactUi : WindowMediatorSubscriberBase
     public CompactUi(ILogger<CompactUi> logger, UiSharedService uiShared, MareConfigService configService, ApiController apiController, PairManager pairManager,
         ServerConfigurationManager serverManager, MareMediator mediator, FileUploadManager fileTransferManager,
         TagHandler tagHandler, DrawEntityFactory drawEntityFactory, SelectTagForPairUi selectTagForPairUi, SelectPairForTagUi selectPairForTagUi,
-        PerformanceCollectorService performanceCollectorService, IpcManager ipcManager, PlayerPerformanceConfigService playerPerformanceConfigService, CharacterAnalyzer characterAnalyzer, TransientConfigService transientConfigService, ICommandManager commandManager)
+        PerformanceCollectorService performanceCollectorService, IpcManager ipcManager, PlayerPerformanceConfigService playerPerformanceConfigService, CharacterAnalyzer characterAnalyzer, TransientConfigService transientConfigService)
         : base(logger, mediator, "###RavaSyncMainUI", performanceCollectorService)
     {
         _uiSharedService = uiShared;
@@ -98,7 +94,6 @@ public class CompactUi : WindowMediatorSubscriberBase
         _playerPerformanceConfigService = playerPerformanceConfigService;
         _characterAnalyzer = characterAnalyzer;
         _transientConfigService = transientConfigService;
-        _commandManager = commandManager;
         _tabMenu = new TopTabMenu(Mediator, _apiController, _pairManager, _uiSharedService);
         _bc7Progress.ProgressChanged += (_, e) =>
         {
@@ -322,7 +317,6 @@ public class CompactUi : WindowMediatorSubscriberBase
                                 - style.WindowPadding.Y;
         if (availableHeight < 1f) availableHeight = 1f;
 
-        // Main pair list – full width
         ImGui.BeginChild("pairlist-main", new Vector2(_windowContentWidth, 0), border: false);
 
         foreach (var item in _drawFolders)
@@ -598,17 +592,17 @@ public class CompactUi : WindowMediatorSubscriberBase
             var name = _apiController.DisplayName ?? string.Empty;
             var uid = _apiController.UID ?? string.Empty;
 
-            bool showVanity = !string.IsNullOrEmpty(uid) && string.Equals(name, uid, StringComparison.Ordinal);
+            bool needsVanity = !string.IsNullOrEmpty(uid) && string.Equals(name, uid, StringComparison.Ordinal);
 
             float nameH;
             using (_uiSharedService.UidFont.Push())
                 nameH = ImGui.GetTextLineHeight();
 
             float uidH = string.IsNullOrEmpty(uid) ? 0f : ImGui.CalcTextSize(uid).Y;
-            float leftH = nameH + (uidH > 0f ? (ImGui.GetStyle().ItemSpacing.Y + uidH) : 0f);
 
-            if (showVanity)
-                leftH += ImGui.GetStyle().ItemSpacing.Y + ImGui.GetFrameHeight();
+            float firstLineH = needsVanity ? ImGui.GetFrameHeight() : nameH;
+            float leftH = firstLineH + (uidH > 0f ? (ImGui.GetStyle().ItemSpacing.Y + uidH) : 0f);
+
 
             var vramVal = (analysis is null || analysis.Count == 0)
                 ? "—"
@@ -627,8 +621,12 @@ public class CompactUi : WindowMediatorSubscriberBase
 
             vCenterPad = MathF.Max(0f, vCenterPad + (4f * scale));
 
-            var nameSz = ImGui.CalcTextSize(name);
+            Vector2 nameSz;
+            using (_uiSharedService.UidFont.Push())
+                nameSz = ImGui.CalcTextSize(name);
+
             var uidSz = ImGui.CalcTextSize(uid);
+
 
             float minLeft = 160f * scale;
             float maxLeft = contentW * 0.50f;
@@ -651,53 +649,61 @@ public class CompactUi : WindowMediatorSubscriberBase
                         ImGui.Dummy(new Vector2(0, vCenterPad));
 
                     float colW0 = ImGui.GetColumnWidth();
-                    float baseX0 = ImGui.GetCursorPosX();
+                    float padXLeft = 10f * scale;
 
-                    using (_uiSharedService.UidFont.Push())
+                    if (needsVanity)
                     {
-                        var nsz = ImGui.CalcTextSize(name);
-                        ImGui.SetCursorPosX(baseX0 + MathF.Max(0f, (colW0 - nsz.X) * 0.5f));
-                        ImGui.TextColored(ImGuiColors.DalamudViolet, name);
+                        const string vanityLabel = "Set Vanity";
+                        var style = ImGui.GetStyle();
+                        var txt = ImGui.CalcTextSize(vanityLabel);
+                        float vanityW = txt.X + (style.FramePadding.X * 2f) + (22f * scale);
+
+                        float innerW = MathF.Max(0f, colW0 - (padXLeft * 2f));
+                        float useW = MathF.Min(vanityW, innerW);
+
+                        var cur = ImGui.GetCursorScreenPos();
+                        float x = cur.X + padXLeft + MathF.Max(0f, (innerW - useW) * 0.5f);
+                        SetCursorScreenPosX(x);
+
+                        if (_uiSharedService.IconTextButton(FontAwesomeIcon.Users, vanityLabel, useW))
+                            Mediator.Publish(new UiToggleMessage(typeof(VanityUi)));
+
+                        UiSharedService.AttachToolTip("Setup Vanity (custom ID) here!");
                     }
-
-                    if (ImGui.IsItemClicked())
-                        ImGui.SetClipboardText(name);
-                    UiSharedService.AttachToolTip("Click to copy");
-
-                    if (!string.IsNullOrEmpty(uid))
+                    else
                     {
-                        var usz = ImGui.CalcTextSize(uid);
-                        ImGui.SetCursorPosX(baseX0 + MathF.Max(0f, (colW0 - usz.X) * 0.5f));
-                        ImGui.TextColored(ImGuiColors.ParsedBlue, uid);
+                        bool clickedName;
+                        using (_uiSharedService.UidFont.Push())
+                        {
+                            clickedName = DrawCenteredTextAutoFit(
+                                "##name_line",
+                                name,
+                                ImGuiColors.DalamudViolet,
+                                colW0,
+                                padXLeft,
+                                minScale: 0.70f);
+                        }
 
-                        if (ImGui.IsItemClicked())
-                            ImGui.SetClipboardText(uid);
+                        if (clickedName)
+                            ImGui.SetClipboardText(name);
+
                         UiSharedService.AttachToolTip("Click to copy");
                     }
 
-                    if (showVanity)
+                    if (!string.IsNullOrEmpty(uid))
                     {
-                        ImGui.Dummy(new Vector2(0, 2f * scale));
+                        bool clickedUid = DrawCenteredTextAutoFit(
+                            "##uid_line",
+                            uid,
+                            ImGuiColors.ParsedBlue,
+                            colW0,
+                            padXLeft,
+                            minScale: 0.80f);
 
-                        var vanitySz = _uiSharedService.GetIconButtonSize(FontAwesomeIcon.Users);
-                        ImGui.SetCursorPosX(baseX0 + MathF.Max(0f, (colW0 - vanitySz.X) * 0.5f));
+                        if (clickedUid)
+                            ImGui.SetClipboardText(uid);
 
-                        void ToolButton(FontAwesomeIcon icon, string label, string tooltip, Action? onClick = null)
-                        {
-                            if (_uiSharedService.IconTextButton(icon, label, -1))
-                                onClick?.Invoke();
-
-                            if (ImGui.IsItemHovered())
-                            {
-                                ImGui.BeginTooltip();
-                                ImGui.TextUnformatted(tooltip);
-                                ImGui.EndTooltip();
-                            }
-                        }
-
-                        ToolButton(FontAwesomeIcon.Users, "Set Vanity",
-                            "Setup Vanity (custom ID) here!",
-                            () => Mediator.Publish(new UiToggleMessage(typeof(VanityUi))));
+                        UiSharedService.AttachToolTip("Click to copy");
                     }
 
                     ImGui.EndGroup();
@@ -708,38 +714,132 @@ public class CompactUi : WindowMediatorSubscriberBase
 
                     ImGui.Dummy(new Vector2(0, 2f * scale));
 
-                    ImGui.AlignTextToFramePadding();
-                    ImGui.TextUnformatted($"VRAM: {vramVal}");
-                    ImGui.SameLine(0, 0);
-                    ImGui.PushStyleColor(ImGuiCol.Text, ImGuiColors.DalamudGrey2);
-                    ImGui.TextUnformatted("  |  ");
-                    ImGui.PopStyleColor();
-                    ImGui.SameLine(0, 0);
-                    ImGui.TextUnformatted($"Tris: {triVal}");
+                    float colW = ImGui.GetColumnWidth();
+
+                    float rightPad = 12f * scale;
+                    float innerWR = MathF.Max(0f, colW - (rightPad * 2f));
+
+                    float minStatsScale = 0.80f;
+
+                    {
+                        var vramSeg = $"VRAM: {vramVal}";
+                        var sepSeg = "  |  ";
+                        var trisSeg = $"Tris: {triVal}";
+
+                        float vramW = ImGui.CalcTextSize(vramSeg).X;
+                        float sepW = ImGui.CalcTextSize(sepSeg).X;
+                        float trisW = ImGui.CalcTextSize(trisSeg).X;
+
+                        float totalW = vramW + sepW + trisW;
+
+                        float scaleStats = (totalW > 0f && innerWR > 0f) ? MathF.Min(1f, innerWR / totalW) : 1f;
+                        scaleStats = MathF.Max(minStatsScale, scaleStats);
+
+                        float fontSize = ImGui.GetFontSize() * scaleStats;
+                        float lineH = ImGui.GetTextLineHeight();
+                        float drawW = totalW * scaleStats;
+
+                        var start = ImGui.GetCursorScreenPos();
+
+                        ImGui.InvisibleButton("##stats_line", new Vector2(colW, lineH));
+
+                        float x = start.X + rightPad + MathF.Max(0f, (innerWR - drawW) * 0.5f);
+                        float y = start.Y + (lineH - fontSize) * 0.5f;
+
+                        var dlR = ImGui.GetWindowDrawList();
+                        var rMin = start;
+                        var rMax = start + new Vector2(colW, lineH);
+
+                        dlR.PushClipRect(rMin, rMax, true);
+
+                        var font = ImGui.GetFont();
+
+                        dlR.AddText(font, fontSize, new Vector2(x, y), ImGui.GetColorU32(ImGuiCol.Text), vramSeg);
+                        x += vramW * scaleStats;
+
+                        dlR.AddText(font, fontSize, new Vector2(x, y), ImGui.GetColorU32(ImGuiColors.DalamudGrey2), sepSeg);
+                        x += sepW * scaleStats;
+
+                        dlR.AddText(font, fontSize, new Vector2(x, y), ImGui.GetColorU32(ImGuiCol.Text), trisSeg);
+
+                        dlR.PopClipRect();
+                    }
 
                     ImGui.Dummy(new Vector2(0, 1f * scale));
 
-                    float rightPad = 12f * scale;
+                    bool IconTextButtonAutoFit(FontAwesomeIcon icon, string text, float width, float minTextScale = 0.80f)
+                    {
+                        var style = ImGui.GetStyle();
+                        float h = ImGui.GetFrameHeight();
 
-                    float colMinX = ImGui.GetCursorPosX();
-                    float colMaxX = colMinX + ImGui.GetColumnWidth();
+                        ImGui.PushID(text);
+                        bool pressed = ImGui.Button(string.Empty, new Vector2(width, h));
 
-                    var labelSz2 = ImGui.CalcTextSize(btnLabel);
-                    float iconW = 18f * scale; 
-                    float btnW = labelSz2.X + ImGui.GetStyle().FramePadding.X * 2f + iconW;
+                        var dl = ImGui.GetWindowDrawList();
+                        var rMin = ImGui.GetItemRectMin();
+                        var rMax = ImGui.GetItemRectMax();
 
-                    float usableW = MathF.Max(0f, (colMaxX - rightPad) - (colMinX + rightPad));
-                    float x = colMinX + rightPad + MathF.Max(0f, (usableW - btnW) * 0.5f);
+                        dl.PushClipRect(rMin, rMax, true);
 
-                    ImGui.SetCursorPosX(x);
+                        float gap = 3f * ImGuiHelpers.GlobalScale;
+
+                        string iconStr = icon.ToIconString();
+                        Vector2 iconSz;
+                        using (_uiSharedService.IconFont.Push())
+                            iconSz = ImGui.CalcTextSize(iconStr);
+
+                        float padX = style.FramePadding.X;
+                        float iconX = rMin.X + padX;
+                        float iconFontSize = ImGui.GetFontSize();
+                        float iconY = rMin.Y + (h - iconFontSize) * 0.5f;
+
+                        using (_uiSharedService.IconFont.Push())
+                            dl.AddText(new Vector2(iconX, iconY), ImGui.GetColorU32(ImGuiCol.Text), iconStr);
+
+                        float textX = iconX + iconSz.X + gap;
+                        float padW = padX * 2f;
+                        float maxTextW = MathF.Max(0f, width - (iconSz.X + gap + padW));
+
+                        float baseTextW = ImGui.CalcTextSize(text).X;
+                        float tScale = (baseTextW > 0f && maxTextW > 0f) ? MathF.Min(1f, maxTextW / baseTextW) : 1f;
+                        tScale = MathF.Max(minTextScale, tScale);
+
+                        var font = ImGui.GetFont();
+                        float textFontSize = ImGui.GetFontSize() * tScale;
+                        float textY = rMin.Y + (h - textFontSize) * 0.5f;
+
+                        dl.AddText(font, textFontSize, new Vector2(textX, textY), ImGui.GetColorU32(ImGuiCol.Text), text);
+
+                        dl.PopClipRect();
+                        ImGui.PopID();
+
+                        return pressed;
+                    }
+
+                    static void SetCursorScreenPosX(float targetScreenX)
+                    {
+                        var curScreen = ImGui.GetCursorScreenPos();
+                        var curLocalX = ImGui.GetCursorPosX();
+                        var delta = targetScreenX - curScreen.X;
+                        ImGui.SetCursorPosX(curLocalX + delta);
+                    }
 
                     ImGui.PushStyleVar(ImGuiStyleVar.FrameRounding, 8f * scale);
                     ImGui.PushStyleVar(ImGuiStyleVar.FramePadding, new Vector2(10f, 6f) * scale);
+
+                    var naturalBtnW = _uiSharedService.GetIconTextButtonSize(FontAwesomeIcon.Recycle, btnLabel);
+                    float useBtnW = MathF.Min(naturalBtnW, innerWR);
+
+                    var btnStart = ImGui.GetCursorScreenPos();
+                    float btnTargetX = btnStart.X + rightPad + MathF.Max(0f, (innerWR - useBtnW) * 0.5f);
+                    SetCursorScreenPosX(btnTargetX);
+
                     using (ImRaii.Disabled(!canClick))
                     {
-                        if (_uiSharedService.IconTextButton(FontAwesomeIcon.Recycle, btnLabel))
+                        if (IconTextButtonAutoFit(FontAwesomeIcon.Recycle, btnLabel, useBtnW, minTextScale: 0.80f))
                             BeginBc7Conversion(eligibleSet!);
                     }
+
                     ImGui.PopStyleVar(2);
 
                     if (ImGui.IsItemHovered())
@@ -767,6 +867,7 @@ public class CompactUi : WindowMediatorSubscriberBase
                     }
 
                     ImGui.EndGroup();
+
                 }
             }
 
@@ -782,7 +883,7 @@ public class CompactUi : WindowMediatorSubscriberBase
             dl.AddRectFilled(panelStart, panelStart + new Vector2(w, h), bg, 10f * scale);
             dl.AddRect(panelStart, panelStart + new Vector2(w, h), border, 10f * scale);
 
-            ImGui.Dummy(new Vector2(0, 6f * scale));
+            ImGui.Dummy(new Vector2(0, 0.5f * scale));
         }
 
         // ---------- VRAM panel ----------
@@ -844,11 +945,11 @@ public class CompactUi : WindowMediatorSubscriberBase
             dl.AddRectFilled(start, start + new Vector2(w, h), bg, 10f * scale);
             dl.AddRect(start, start + new Vector2(w, h), border, 10f * scale);
 
-            ImGui.Dummy(new Vector2(0, 4f * scale));
+            //ImGui.Dummy(new Vector2(0, 1f * scale));
         }
 
         ImGui.Separator();
-        ImGui.Dummy(new Vector2(0, 3f * scale));
+        ImGui.Dummy(new Vector2(0, 0.5f * scale));
 
         DrawScopeToggles();
     }
@@ -1251,7 +1352,9 @@ public class CompactUi : WindowMediatorSubscriberBase
 
         using (ImRaii.PushId("ScopeToggles"))
         {
-            float contentWidth = UiSharedService.GetWindowContentRegionWidth();
+            float contentWidth = ImGui.GetContentRegionAvail().X;
+            float baseX = ImGui.GetCursorPosX();
+
             var style = ImGui.GetStyle();
 
             ImGui.PushStyleColor(ImGuiCol.Text, ImGuiColors.DalamudGrey2);
@@ -1261,30 +1364,66 @@ public class CompactUi : WindowMediatorSubscriberBase
             ImGui.TextUnformatted(l);
             ImGui.PopStyleColor();
 
-            ImGui.Dummy(new Vector2(0, 1f * ImGuiHelpers.GlobalScale));
-
-            ImGui.PushStyleVar(ImGuiStyleVar.ItemSpacing, new Vector2(10f, style.ItemSpacing.Y) * ImGuiHelpers.GlobalScale);
-            ImGui.PushStyleVar(ImGuiStyleVar.FramePadding, new Vector2(style.FramePadding.X, 2f) * ImGuiHelpers.GlobalScale);
+            //ImGui.Dummy(new Vector2(0, 0.5f * ImGuiHelpers.GlobalScale));
 
             string[] names = ["Pairs & Shells", "Friends", "Party", "Alliance"];
             ScopeMode[] modes = [ScopeMode.Everyone, ScopeMode.Friends, ScopeMode.Party, ScopeMode.Alliance];
 
-            float rowW = 0f;
-            for (int i = 0; i < names.Length; i++)
-                rowW += ImGui.CalcTextSize(names[i]).X + ImGui.GetStyle().ItemSpacing.X + (22f * ImGuiHelpers.GlobalScale);
+            float scale = ImGuiHelpers.GlobalScale;
 
-            ImGui.SetCursorPosX(MathF.Max(0, (contentWidth - rowW) * 0.5f));
+            float spacingX = 10f * scale;
+            float minSpacingX = 2f * scale;
+
+            float innerSpacingX = style.ItemInnerSpacing.X;
+            float minInnerSpacingX = 2f * scale;
+
+            float circleW = ImGui.GetFrameHeight();
+
+            float CalcRowW(float sX, float isX)
+            {
+                float w = 0f;
+                for (int i = 0; i < names.Length; i++)
+                {
+                    float tW = ImGui.CalcTextSize(names[i]).X;
+                    float itemW = circleW + isX + tW;
+                    w += itemW;
+                    if (i != names.Length - 1) w += sX;
+                }
+                return w;
+            }
+
+            float rowW = CalcRowW(spacingX, innerSpacingX);
+
+            int guard = 0;
+            while (rowW > contentWidth && guard++ < 50)
+            {
+                bool changed = false;
+
+                if (spacingX > minSpacingX) { spacingX -= 1f * scale; changed = true; }
+                else if (innerSpacingX > minInnerSpacingX) { innerSpacingX -= 1f * scale; changed = true; }
+
+                if (!changed) break;
+
+                rowW = CalcRowW(spacingX, innerSpacingX);
+            }
+
+            ImGui.PushStyleVar(ImGuiStyleVar.ItemSpacing, new Vector2(spacingX, style.ItemSpacing.Y));
+            ImGui.PushStyleVar(ImGuiStyleVar.ItemInnerSpacing, new Vector2(innerSpacingX, style.ItemInnerSpacing.Y));
+            ImGui.PushStyleVar(ImGuiStyleVar.FramePadding, new Vector2(style.FramePadding.X, 2f * scale));
+
+            ImGui.SetCursorPosX(baseX + MathF.Max(0f, (contentWidth - rowW) * 0.5f));
 
             for (int i = 0; i < names.Length; i++)
             {
                 if (i != 0) ImGui.SameLine();
-                bool isSet = selected == modes[i];
 
+                bool isSet = selected == modes[i];
                 if (ImGui.RadioButton(names[i], isSet) && !isSet)
                     selected = modes[i];
             }
 
-            ImGui.PopStyleVar(2);
+            ImGui.PopStyleVar(3);
+
 
             if ((ScopeMode)transient.SelectedScopeMode != selected)
             {
@@ -1295,5 +1434,40 @@ public class CompactUi : WindowMediatorSubscriberBase
         }
     }
 
+    private static bool DrawCenteredTextAutoFit(string id,string text,Vector4 color,float regionW,float padX,float minScale)
+    {
+        var dl = ImGui.GetWindowDrawList();
+        var start = ImGui.GetCursorScreenPos();
+
+        float lineH = ImGui.GetTextLineHeight();
+        ImGui.InvisibleButton(id, new Vector2(regionW, lineH));
+
+        if (string.IsNullOrEmpty(text) || regionW <= 1f)
+            return ImGui.IsItemClicked();
+
+        float innerW = MathF.Max(0f, regionW - (padX * 2f));
+        if (innerW <= 1f)
+            return ImGui.IsItemClicked();
+
+        float baseW = ImGui.CalcTextSize(text).X;
+        float scale = (baseW > 0f) ? MathF.Min(1f, innerW / baseW) : 1f;
+        scale = MathF.Max(minScale, scale);
+
+        var font = ImGui.GetFont();
+        float fontSize = ImGui.GetFontSize() * scale;
+
+        float drawW = baseW * scale;
+        float x = start.X + padX + MathF.Max(0f, (innerW - drawW) * 0.5f);
+        float y = start.Y + (lineH - fontSize) * 0.5f;
+
+        var rMin = start;
+        var rMax = start + new Vector2(regionW, lineH);
+
+        dl.PushClipRect(rMin, rMax, true);
+        dl.AddText(font, fontSize, new Vector2(x, y), ImGui.GetColorU32(color), text);
+        dl.PopClipRect();
+
+        return ImGui.IsItemClicked();
+    }
 
 }
