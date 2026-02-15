@@ -48,12 +48,7 @@ public sealed class PairManager : DisposableMediatorSubscriberBase
         _dalamudContextMenu = dalamudContextMenu;
         _mediator = mediator;
         _dalamudUtil = dalamudUtil;
-
-        Mediator.Subscribe<DisconnectedMessage>(this, _ =>
-        {
-            ClearPairs();
-        });
-
+        
         Mediator.Subscribe<DisconnectedMessage>(this, (_) => ClearPairs());
         Mediator.Subscribe<CutsceneEndMessage>(this, (_) => ReapplyPairData());
         _directPairsInternal = DirectPairsLazy();
@@ -65,7 +60,7 @@ public sealed class PairManager : DisposableMediatorSubscriberBase
     public List<Pair> DirectPairs => _directPairsInternal.Value;
 
     public Dictionary<GroupFullInfoDto, List<Pair>> GroupPairs => _groupPairsInternal.Value;
-    public Dictionary<GroupData, GroupFullInfoDto> Groups => _allGroups.ToDictionary(k => k.Key, k => k.Value);
+    public Dictionary<GroupData, GroupFullInfoDto> Groups => _allGroups.ToDictionary(k => k.Key, k => k.Value, GroupDataComparer.Instance);
     public Pair? LastAddedUser { get; internal set; }
     public Dictionary<Pair, List<GroupFullInfoDto>> PairsWithGroups => _pairsWithGroupsInternal.Value;
 
@@ -139,11 +134,40 @@ public sealed class PairManager : DisposableMediatorSubscriberBase
         RecreateLazy();
     }
 
-    public List<Pair> GetOnlineUserPairs() => _allClientPairs.Where(p => !string.IsNullOrEmpty(p.Value.GetPlayerNameHash())).Select(p => p.Value).ToList();
+    public List<Pair> GetOnlineUserPairs()
+    {
+        var list = new List<Pair>(_allClientPairs.Count);
+        foreach (var kvp in _allClientPairs)
+        {
+            var pair = kvp.Value;
+            if (!string.IsNullOrEmpty(pair.GetPlayerNameHash()))
+                list.Add(pair);
+        }
+        return list;
+    }
 
-    public int GetVisibleUserCount() => _allClientPairs.Count(p => p.Value.IsVisible);
+    public int GetVisibleUserCount()
+    {
+        var count = 0;
+        foreach (var kvp in _allClientPairs)
+        {
+            if (kvp.Value.IsVisible)
+                count++;
+        }
+        return count;
+    }
 
-    public List<UserData> GetVisibleUsers() => [.. _allClientPairs.Where(p => p.Value.IsVisible).Select(p => p.Key)];
+    public List<UserData> GetVisibleUsers()
+    {
+        var list = new List<UserData>(_allClientPairs.Count);
+        foreach (var kvp in _allClientPairs)
+        {
+            if (kvp.Value.IsVisible)
+                list.Add(kvp.Key);
+        }
+        return list;
+    }
+
 
     public void MarkPairOffline(UserData user)
     {
@@ -363,17 +387,29 @@ public sealed class PairManager : DisposableMediatorSubscriberBase
         if (args.MenuType == ContextMenuType.Inventory) return;
         if (!_configurationService.Current.EnableRightClickMenus) return;
 
-        // Existing pair-specific menus
-        foreach (var pair in _allClientPairs.Where(p => p.Value.IsVisible))
+        foreach (var kvp in _allClientPairs)
         {
-            pair.Value.AddContextMenu(args);
+            var pair = kvp.Value;
+            if (!pair.IsVisible) continue;
+
+            pair.AddContextMenu(args);
         }
+
 
     }
 
 
-    private Lazy<List<Pair>> DirectPairsLazy() => new(() => _allClientPairs.Select(k => k.Value)
-        .Where(k => k.IndividualPairStatus != API.Data.Enum.IndividualPairStatus.None).ToList());
+    private Lazy<List<Pair>> DirectPairsLazy() => new(() =>
+    {
+        var list = new List<Pair>(_allClientPairs.Count);
+        foreach (var kvp in _allClientPairs)
+        {
+            var pair = kvp.Value;
+            if (pair.IndividualPairStatus != API.Data.Enum.IndividualPairStatus.None)
+                list.Add(pair);
+        }
+        return list;
+    });
 
     private void DisposePairs()
     {
@@ -391,13 +427,33 @@ public sealed class PairManager : DisposableMediatorSubscriberBase
         return new Lazy<Dictionary<GroupFullInfoDto, List<Pair>>>(() =>
         {
             Dictionary<GroupFullInfoDto, List<Pair>> outDict = [];
+
             foreach (var group in _allGroups)
+                outDict[group.Value] = new List<Pair>();
+
+            var gidToGroup = new Dictionary<string, GroupFullInfoDto>(StringComparer.Ordinal);
+            foreach (var group in _allGroups)
+                gidToGroup[group.Key.GID] = group.Value;
+
+            foreach (var kvp in _allClientPairs)
             {
-                outDict[group.Value] = _allClientPairs.Select(p => p.Value).Where(p => p.UserPair.Groups.Exists(g => GroupDataComparer.Instance.Equals(group.Key, new(g)))).ToList();
+                var pair = kvp.Value;
+                var gids = pair.UserPair.Groups;
+
+                for (int i = 0; i < gids.Count; i++)
+                {
+                    var gid = gids[i];
+                    if (gidToGroup.TryGetValue(gid, out var groupDto))
+                    {
+                        outDict[groupDto].Add(pair);
+                    }
+                }
             }
+
             return outDict;
         });
     }
+
 
     private Lazy<Dictionary<Pair, List<GroupFullInfoDto>>> PairsWithGroupsLazy()
     {
@@ -405,9 +461,18 @@ public sealed class PairManager : DisposableMediatorSubscriberBase
         {
             Dictionary<Pair, List<GroupFullInfoDto>> outDict = [];
 
-            foreach (var pair in _allClientPairs.Select(k => k.Value))
+            foreach (var kvp in _allClientPairs)
             {
-                outDict[pair] = _allGroups.Where(k => pair.UserPair.Groups.Contains(k.Key.GID, StringComparer.Ordinal)).Select(k => k.Value).ToList();
+                var pair = kvp.Value;
+                var list = new List<GroupFullInfoDto>();
+
+                foreach (var g in _allGroups)
+                {
+                    if (pair.UserPair.Groups.Contains(g.Key.GID, StringComparer.Ordinal))
+                        list.Add(g.Value);
+                }
+
+                outDict[pair] = list;
             }
 
             return outDict;

@@ -40,7 +40,10 @@ public abstract class WindowMediatorSubscriberBase : Window, IMediatorSubscriber
         var scope = BeginThemeScope();
         try
         {
-            _performanceCollectorService.LogPerformance(this, $"Draw", DrawInternal);
+            if (_performanceCollectorService.Enabled)
+                _performanceCollectorService.LogPerformance(this, $"Draw", DrawInternal);
+            else
+                DrawInternal();
         }
         finally
         {

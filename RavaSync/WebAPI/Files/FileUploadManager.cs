@@ -84,7 +84,7 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
                         AuthMode.NeedAuthorization, Array.Empty<string>());
     }
 
-    private async Task UploadFileStreamedFromDisk(string fileHash, string filePath, bool munged, IProgress<UploadProgress>? progress, CancellationToken uploadToken)
+    private async Task UploadFileStreamedFromDisk(string fileHash, string filePath, bool munged, IProgress<UploadProgress>? progress, CancellationToken uploadToken, int streamBufferSize)
     {
         if (!_orchestrator.IsInitialized) throw new InvalidOperationException("FileTransferManager is not initialized");
         uploadToken.ThrowIfCancellationRequested();
@@ -93,127 +93,113 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
 
         var fileSize = new FileInfo(filePath).Length;
 
-        try
-        {
-            var ticketUri = MareFiles.ServerFilesUploadTicketFullPath(_orchestrator.UploadCdnUri!, fileHash);
-            var ticketReq = new UploadTicketRequestDto(fileSize, munged, 0);
+        var ticketUri = MareFiles.ServerFilesUploadTicketFullPath(_orchestrator.UploadCdnUri!, fileHash);
+        var ticketReq = new UploadTicketRequestDto(fileSize, munged, 0);
 
-            var ticketResp = await _orchestrator.SendRequestAsync(HttpMethod.Post, ticketUri, ticketReq, uploadToken).ConfigureAwait(false);
-            if (ticketResp.StatusCode != HttpStatusCode.NotFound && ticketResp.IsSuccessStatusCode)
-            {
-                var ticketJson = await ticketResp.Content.ReadAsStringAsync(uploadToken).ConfigureAwait(false);
-                var ticket = JsonSerializer.Deserialize<UploadTicketResponseDto>(ticketJson, new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+        // Acquire ticket (must be DirectB2)
+        var ticketResp = await _orchestrator.SendRequestAsync(HttpMethod.Post, ticketUri, ticketReq, uploadToken).ConfigureAwait(false);
+        if (ticketResp.StatusCode == HttpStatusCode.NotFound)
+            throw new InvalidOperationException($"[{fileHash}] Upload ticket endpoint not found; refusing legacy upload.");
 
-                if (ticket != null && ticket.Mode == "DirectB2")
-                {
-                    if (!ticket.UploadRequired)
-                    {
-                        return;
-                        //REMOVED DUE TO Added time to hit uploading. Server checks B2 instead now. D'oh
-                        //if (await CdnHasFileAsync(fileHash, uploadToken).ConfigureAwait(false))
-                        //    return;
+        ticketResp.EnsureSuccessStatusCode();
 
-                        //Logger.LogWarning("[{hash}] Ticket says upload not required but CDN is missing it; forcing DirectB2 re-upload.", fileHash);
+        var ticketJson = await ticketResp.Content.ReadAsStringAsync(uploadToken).ConfigureAwait(false);
+        var ticket = JsonSerializer.Deserialize<UploadTicketResponseDto>(ticketJson, new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
 
-                        //var forcedTicketUri = new UriBuilder(ticketUri) { Query = "force=1" }.Uri;
-                        //var forcedResp = await _orchestrator.SendRequestAsync(HttpMethod.Post, forcedTicketUri, ticketReq, uploadToken).ConfigureAwait(false);
-                        //forcedResp.EnsureSuccessStatusCode();
+        if (ticket == null)
+            throw new InvalidOperationException($"[{fileHash}] Upload ticket response could not be parsed.");
 
-                        //var forcedJson = await forcedResp.Content.ReadAsStringAsync(uploadToken).ConfigureAwait(false);
-                        //ticket = JsonSerializer.Deserialize<UploadTicketResponseDto>(forcedJson, new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+        if (!string.Equals(ticket.Mode, "DirectB2", StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException($"[{fileHash}] Server did not provide DirectB2 ticket (mode={ticket.Mode}); refusing legacy upload.");
 
-                        //if (ticket == null || ticket.Mode != "DirectB2" || !ticket.UploadRequired)
-                        //    throw new InvalidOperationException($"[{fileHash}] Forced ticket refused but CDN is missing the file.");
-                    }
+        if (!ticket.UploadRequired)
+            return;
 
+        Logger.LogDebug("[{hash}] Direct upload ticket acquired, compressing to temp (LZ4)", fileHash);
 
-                    Logger.LogDebug("[{hash}] Direct upload ticket acquired, compressing to temp (LZ4)", fileHash);
+        var rawProgress = progress == null ? null : new Progress<long>(b => progress.Report(new UploadProgress(b, fileSize)));
+        await using var temp = await TempLz4UploadFile.CreateAsync(filePath, uploadToken, rawProgress).ConfigureAwait(false);
 
-                    var rawProgress = progress == null ? null : new Progress<long>(b => progress.Report(new UploadProgress(fileSize, b)));
-                    await using var temp = await TempLz4UploadFile.CreateAsync(filePath, uploadToken, rawProgress).ConfigureAwait(false);
-
-                    progress?.Report(new UploadProgress(fileSize, fileSize));
-
-                    await using var fs = new FileStream(temp.TempPath, FileMode.Open, FileAccess.Read, FileShare.Read,
-                        bufferSize: 1024 * 1024, options: FileOptions.Asynchronous | FileOptions.SequentialScan);
-
-                    using var put = new HttpRequestMessage(HttpMethod.Put, ticket.UploadUrl);
-                    var content = new StreamContent(fs, 1024 * 1024);
-                    content.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
-                    content.Headers.ContentLength = temp.CompressedSize;
-                    try { content.Headers.ContentMD5 = Convert.FromBase64String(temp.Md5Base64); } catch { }
-                    put.Content = content;
-                    put.Headers.ExpectContinue = false;
-
-                    var putResp = await _directUploadClient.SendAsync(put, HttpCompletionOption.ResponseHeadersRead, uploadToken).ConfigureAwait(false);
-                    Logger.LogDebug("[{hash}] Direct upload PUT Status: {status}", fileHash, putResp.StatusCode);
-                    putResp.EnsureSuccessStatusCode();
-
-                    var etag = putResp.Headers.ETag?.Tag;
-
-                    var completeUri = MareFiles.ServerFilesUploadCompleteFullPath(_orchestrator.UploadCdnUri!, fileHash);
-                    var complete = new UploadCompleteDto(temp.RawSize, temp.CompressedSize, temp.Md5Base64, etag, true);
-
-                    var completeResp = await _orchestrator.SendRequestAsync(HttpMethod.Post, completeUri, complete, uploadToken).ConfigureAwait(false);
-                    Logger.LogDebug("[{hash}] UploadComplete Status: {status}", fileHash, completeResp.StatusCode);
-                    completeResp.EnsureSuccessStatusCode();
-
-                    if (_orchestrator.FilesCdnUri != null)
-                    {
-                        await CdnPrewarmHelper.PrewarmAsync(
-                            _orchestrator.FilesCdnUri,
-                            new[] { fileHash },
-                            uploadToken).ConfigureAwait(false);
-                    }
-
-                    return;
-                }
-            }
-        }
-        catch (Exception ex)
-        {
-            Logger.LogDebug(ex, "[{hash}] Direct upload path failed/unsupported, falling back to legacy upload", fileHash);
-        }
-
-        Logger.LogDebug("[{hash}] Legacy upload (streaming via file server)", fileHash);
-
-        using var legacyContent = new Lz4FileContent(
-            path: filePath,
-            fileSize: fileSize,
-            progress: progress,
-            xorKey: munged ? (byte)0x2A : null
-        );
-
-        HttpResponseMessage response;
-        if (!munged)
-        {
-            response = await _orchestrator.SendRequestAsync(
-                HttpMethod.Post,
-                MareFiles.ServerFilesUploadFullPath(_orchestrator.UploadCdnUri!, fileHash),
-                legacyContent,
-                uploadToken).ConfigureAwait(false);
-        }
-        else
-        {
-            response = await _orchestrator.SendRequestAsync(
-                HttpMethod.Post,
-                MareFiles.ServerFilesUploadMunged(_orchestrator.UploadCdnUri!, fileHash),
-                legacyContent,
-                uploadToken).ConfigureAwait(false);
-        }
-
-        Logger.LogDebug("[{hash}] Upload Status: {status}", fileHash, response.StatusCode);
-        response.EnsureSuccessStatusCode();
-
+        // compression done (raw -> temp)
         progress?.Report(new UploadProgress(fileSize, fileSize));
 
-        if (_orchestrator.FilesCdnUri != null)
+        const int maxAttempts = 4;
+        Exception? last = null;
+
+        for (int attempt = 1; attempt <= maxAttempts; attempt++)
         {
-            await CdnPrewarmHelper.PrewarmAsync(
-                _orchestrator.FilesCdnUri,
-                new[] { fileHash },
-                uploadToken).ConfigureAwait(false);
+            uploadToken.ThrowIfCancellationRequested();
+
+            try
+            {
+                var fs0 = new FileStream(temp.TempPath, FileMode.Open, FileAccess.Read, FileShare.Read,
+                    bufferSize: 1024 * 1024, options: FileOptions.Asynchronous | FileOptions.SequentialScan);
+
+                // report *network bytes sent* (based on bytes read by HttpClient from the stream)
+                var netProgress = progress == null
+                    ? null
+                    : new Progress<long>(sent => progress.Report(new UploadProgress(sent, temp.CompressedSize)));
+
+                await using Stream fs = netProgress == null ? fs0 : new ProgressReadStream(fs0, netProgress);
+
+                using var put = new HttpRequestMessage(HttpMethod.Put, ticket.UploadUrl);
+
+                var content = new StreamContent(fs, streamBufferSize);
+                content.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
+                content.Headers.ContentLength = temp.CompressedSize;
+                try { content.Headers.ContentMD5 = Convert.FromBase64String(temp.Md5Base64); } catch { }
+
+                put.Content = content;
+                put.Headers.ExpectContinue = false;
+
+                var putResp = await _directUploadClient.SendAsync(put, HttpCompletionOption.ResponseHeadersRead, uploadToken).ConfigureAwait(false);
+                Logger.LogDebug("[{hash}] Direct upload PUT attempt {attempt}/{max} Status: {status}", fileHash, attempt, maxAttempts, putResp.StatusCode);
+
+                putResp.EnsureSuccessStatusCode();
+
+                var etag = putResp.Headers.ETag?.Tag;
+
+                var completeUri = MareFiles.ServerFilesUploadCompleteFullPath(_orchestrator.UploadCdnUri!, fileHash);
+                var complete = new UploadCompleteDto(temp.RawSize, temp.CompressedSize, temp.Md5Base64, etag, true);
+
+                var completeResp = await _orchestrator.SendRequestAsync(HttpMethod.Post, completeUri, complete, uploadToken).ConfigureAwait(false);
+                Logger.LogDebug("[{hash}] UploadComplete Status: {status}", fileHash, completeResp.StatusCode);
+                completeResp.EnsureSuccessStatusCode();
+
+                if (_orchestrator.FilesCdnUri != null)
+                {
+                    _ = Task.Run(async () =>
+                    {
+                        try
+                        {
+                            await CdnPrewarmHelper.PrewarmAsync(
+                                _orchestrator.FilesCdnUri,
+                                new[] { fileHash },
+                                CancellationToken.None).ConfigureAwait(false);
+                        }
+                        catch (Exception ex)
+                        {
+                            Logger.LogTrace(ex, "[{hash}] CDN prewarm failed (ignored)", fileHash);
+                        }
+                    });
+                }
+
+                return;
+            }
+            catch (Exception ex) when (attempt < maxAttempts)
+            {
+                last = ex;
+                Logger.LogWarning(ex, "[{hash}] Direct upload PUT failed (attempt {attempt}/{max}); retrying", fileHash, attempt, maxAttempts);
+                await Task.Delay(250 * attempt, uploadToken).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                last = ex;
+                break;
+            }
         }
+
+        throw new InvalidOperationException($"[{fileHash}] DirectB2 upload failed after {maxAttempts} attempts.", last);
     }
 
     public async Task<CharacterData> UploadFiles(CharacterData data, List<UserData> visiblePlayers)
@@ -416,6 +402,8 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
             return forbidden;
 
         // ---- UI bookkeeping ----
+        var sizeByHash = new Dictionary<string, long>(StringComparer.Ordinal);
+
         foreach (var h in allowedHashes)
         {
             try
@@ -425,9 +413,12 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
                     var cacheEntry = _fileDbManager.GetFileCacheByHash(h);
                     if (cacheEntry == null) continue;
 
+                    var size = new FileInfo(cacheEntry.ResolvedFilepath).Length;
+                    sizeByHash[h] = size;
+
                     CurrentUploads.Add(new UploadFileTransfer(new UploadFileDto { Hash = h })
                     {
-                        Total = new FileInfo(cacheEntry.ResolvedFilepath).Length,
+                        Total = size,
                     });
                 }
             }
@@ -439,96 +430,235 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
 
         const int MaxUploadAttempts = 3;
 
-        var maxParallelUploads = GetEffectiveParallelUploads();
-        using var sem = new System.Threading.SemaphoreSlim(maxParallelUploads, maxParallelUploads);
+        // fixed if user explicitly configured, adaptive only for Auto (0)
+        var configured = _mareConfigService.Current.ParallelUploads;
+        var cpuAuto = GetCpuAutoParallelUploads();
+        var isAuto = configured <= 0;
 
-        var tasks = new List<Task>(allowedHashes.Count);
+        var desiredParallel = isAuto ? 1 : Math.Clamp(configured, 1, 10);
+        var maxParallel = isAuto ? Math.Clamp(cpuAuto, 1, 10) : desiredParallel;
+
+        if (isAuto && allowedHashes.Count >= 4 && sizeByHash.Count > 0)
+        {
+            var small = 0;
+            foreach (var s in sizeByHash.Values)
+                if (s <= 256 * 1024) small++;
+
+            if (small >= (sizeByHash.Count * 3 / 4))
+                desiredParallel = Math.Min(maxParallel, 4);
+        }
+
+        var bytesSinceSample = 0L;
+        var lastUploadedByHash = new System.Collections.Concurrent.ConcurrentDictionary<string, long>(StringComparer.Ordinal);
+
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var lastSampleAt = TimeSpan.Zero;
+        double ewmaBps = 0;
+
+        // hysteresis so we don’t flap
+        int pendingDesired = desiredParallel;
+        int pendingHits = 0;
+
+        bool fastStartUsed = false;
+
+        double SampleBpsIfReady()
+        {
+            var now = sw.Elapsed;
+            if (now - lastSampleAt < TimeSpan.FromSeconds(2))
+                return -1;
+
+            var dt = (now - lastSampleAt).TotalSeconds;
+            lastSampleAt = now;
+
+            var bytes = Interlocked.Exchange(ref bytesSinceSample, 0);
+            var instant = dt > 0 ? bytes / dt : 0;
+
+            // EWMA smoothing
+            ewmaBps = ewmaBps <= 0 ? instant : (ewmaBps * 0.70) + (instant * 0.30);
+            return ewmaBps;
+        }
+
+        int ComputeDesiredFromBps(double bps)
+        {
+            // One “slot” per ~128 KiB/s of sustained throughput, rounded, clamped.
+            const double slot = 128 * 1024;
+
+            if (bps <= 0) return 1;
+
+            var bySpeed = (int)Math.Round(bps / slot, MidpointRounding.AwayFromZero);
+            bySpeed = Math.Clamp(bySpeed, 1, maxParallel);
+
+            return bySpeed;
+        }
+
+        var queue = new System.Collections.Concurrent.ConcurrentQueue<string>(allowedHashes);
+        var running = new List<Task>(Math.Min(allowedHashes.Count, maxParallel));
         var succeeded = new System.Collections.Concurrent.ConcurrentDictionary<string, byte>(StringComparer.Ordinal);
         int idx = 0;
 
-        foreach (var hash in allowedHashes)
+        while (!queue.IsEmpty || running.Count > 0)
         {
-            var localIdx = Interlocked.Increment(ref idx);
-            tasks.Add(UploadOneAsync(hash, localIdx, token));
-        }
-
-        await Task.WhenAll(tasks).ConfigureAwait(false);
-
-        async Task UploadOneAsync(string hash, int localIdx, CancellationToken token)
-        {
-            await sem.WaitAsync(token).ConfigureAwait(false);
-            try
+            // launch up to desiredParallel
+            while (running.Count < desiredParallel && queue.TryDequeue(out var hash))
             {
-                for (int attempt = 1; attempt <= MaxUploadAttempts; attempt++)
+                var localIdx = Interlocked.Increment(ref idx);
+                running.Add(UploadOneCoreAsync(hash, localIdx, token));
+            }
+
+            // Adaptive step every ~2s (Auto only) — only when we have active uploads
+            if (isAuto && running.Count > 0)
+            {
+                var bps = SampleBpsIfReady();
+                if (bps >= 0)
                 {
-                    try
+                    var next = ComputeDesiredFromBps(bps);
+
+                    // ---- Fast-start boost (one-time jump) ----
+                    const double fastStartBps = 2 * 1024 * 1024; // 2 MiB/s
+                    if (!fastStartUsed && desiredParallel == 1 && bps >= fastStartBps)
                     {
-                        var cache = _fileDbManager.GetFileCacheByHash(hash);
-                        if (cache is null)
-                        {
-                            Logger.LogWarning("[{hash}] Upload skipped: cache entry disappeared", hash);
-                            return;
-                        }
-
-                        var filePath = cache.ResolvedFilepath;
-
-                        var prog = new Progress<UploadProgress>(up =>
-                        {
-                            try
-                            {
-                                var pct = up.Size > 0 ? (int)(100L * up.Uploaded / up.Size) : 0;
-                                if (pct % 10 == 0)
-                                    Logger.LogTrace("[{idx}] {file}: {pct}% (attempt {attempt}/{max})",
-                                        localIdx, Path.GetFileName(filePath), pct, attempt, MaxUploadAttempts);
-                            }
-                            catch
-                            {
-                                // ignore
-                            }
-                        });
-
-                        await UploadFileStreamedFromDisk(
-                            fileHash: hash,
-                            filePath: filePath,
-                            munged: _mareConfigService.Current.UseAlternativeFileUpload,
-                            progress: prog,
-                            uploadToken: token
-                        ).ConfigureAwait(false);
-
-                        _verifiedUploadedHashes[hash] = DateTime.UtcNow;
-                        succeeded[hash] = 1;
-
-                        var entry = CurrentUploads.FirstOrDefault(
-                            u => string.Equals(u.Hash, hash, StringComparison.Ordinal));
-                        if (entry != null) entry.Transferred = entry.Total;
-
-                        return; // success
+                        desiredParallel = Math.Min(maxParallel, 4);
+                        pendingHits = 0;
+                        pendingDesired = desiredParallel;
+                        fastStartUsed = true;
                     }
-                    catch (OperationCanceledException)
+                    else
                     {
-                        Logger.LogDebug("[{hash}] Upload cancelled on attempt {attempt}/{max}", hash, attempt, MaxUploadAttempts);
-                        throw;
-                    }
-                    catch (Exception ex)
-                    {
-                        Logger.LogWarning(ex,
-                            "[{hash}] Upload failed on attempt {attempt}/{max}",
-                            hash, attempt, MaxUploadAttempts);
-
-                        if (attempt == MaxUploadAttempts)
+                        // hysteresis: require 2 consecutive samples before changing,
+                        // and only step by 1 each time.
+                        if (next != desiredParallel)
                         {
-                            Logger.LogWarning("[{hash}] All upload attempts failed, marking as failed for this run", hash);
+                            if (pendingDesired != next)
+                            {
+                                pendingDesired = next;
+                                pendingHits = 1;
+                            }
+                            else if (++pendingHits >= 2)
+                            {
+                                desiredParallel += Math.Sign(pendingDesired - desiredParallel);
+                                desiredParallel = Math.Clamp(desiredParallel, 1, maxParallel);
+                                pendingHits = 0;
+                            }
                         }
                         else
                         {
-                            await Task.Delay(200, token).ConfigureAwait(false);
+                            pendingHits = 0;
+                            pendingDesired = desiredParallel;
                         }
                     }
                 }
             }
-            finally
+
+            if (running.Count == 0)
             {
-                sem.Release();
+                // nothing running yet; loop will start more
+                continue;
+            }
+
+            var finished = await Task.WhenAny(running).ConfigureAwait(false);
+            running.Remove(finished);
+        }
+
+        async Task UploadOneCoreAsync(string hash, int localIdx, CancellationToken tokenInner)
+        {
+            for (int attempt = 1; attempt <= MaxUploadAttempts; attempt++)
+            {
+                try
+                {
+                    var cache = _fileDbManager.GetFileCacheByHash(hash);
+                    if (cache is null)
+                    {
+                        Logger.LogWarning("[{hash}] Upload skipped: cache entry disappeared", hash);
+                        return;
+                    }
+
+                    var filePath = cache.ResolvedFilepath;
+                    var origSize = sizeByHash.TryGetValue(hash, out var s) ? s : new FileInfo(filePath).Length;
+
+                    var prog = new Progress<UploadProgress>(up =>
+                    {
+                        try
+                        {
+                            // Update UI entry
+                            var entry = CurrentUploads.FirstOrDefault(u => string.Equals(u.Hash, hash, StringComparison.Ordinal));
+                            if (entry != null)
+                            {
+                                entry.Total = up.Size;
+                                entry.Transferred = up.Uploaded;
+                            }
+
+                            if (up.Size != origSize)
+                            {
+                                long delta = 0;
+                                lastUploadedByHash.AddOrUpdate(hash,
+                                    up.Uploaded,
+                                    (_, old) =>
+                                    {
+                                        delta = up.Uploaded - old;
+                                        return up.Uploaded;
+                                    });
+
+                                if (delta > 0)
+                                    Interlocked.Add(ref bytesSinceSample, delta);
+                            }
+
+                            // light trace
+                            var pct = up.Size > 0 ? (int)(100L * up.Uploaded / up.Size) : 0;
+                            if (pct % 25 == 0)
+                                Logger.LogTrace("[{idx}] {file}: {pct}% (attempt {attempt}/{max})",
+                                    localIdx, Path.GetFileName(filePath), pct, attempt, MaxUploadAttempts);
+                        }
+                        catch
+                        {
+                            // ignore
+                        }
+                    });
+
+                    IProgress<UploadProgress> throttledProg = new ThrottledProgress<UploadProgress>(prog, TimeSpan.FromMilliseconds(100));
+
+                    var buf = ChooseUploadStreamBufferSize(ewmaBps);
+
+                    await UploadFileStreamedFromDisk(
+                        fileHash: hash,
+                        filePath: filePath,
+                        munged: _mareConfigService.Current.UseAlternativeFileUpload,
+                        progress: throttledProg,
+                        uploadToken: tokenInner,
+                        streamBufferSize: buf
+                    ).ConfigureAwait(false);
+
+                    _verifiedUploadedHashes[hash] = DateTime.UtcNow;
+                    succeeded[hash] = 1;
+
+                    var finalEntry = CurrentUploads.FirstOrDefault(u => string.Equals(u.Hash, hash, StringComparison.Ordinal));
+                    if (finalEntry != null) finalEntry.Transferred = finalEntry.Total;
+
+                    return; // success
+                }
+                catch (OperationCanceledException)
+                {
+                    Logger.LogDebug("[{hash}] Upload cancelled on attempt {attempt}/{max}", hash, attempt, MaxUploadAttempts);
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    Logger.LogWarning(ex,
+                        "[{hash}] Upload failed on attempt {attempt}/{max}",
+                        hash, attempt, MaxUploadAttempts);
+
+                    if (attempt == MaxUploadAttempts)
+                    {
+                        Logger.LogWarning("[{hash}] All upload attempts failed, marking as failed for this run", hash);
+                    }
+                    else
+                    {
+                        await Task.Delay(200, tokenInner).ConfigureAwait(false);
+                    }
+                }
+                finally
+                {
+                    lastUploadedByHash.TryRemove(hash, out _);
+                }
             }
         }
 
@@ -546,14 +676,76 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
         return failed;
     }
 
-    private int GetEffectiveParallelUploads()
+    private sealed class ThrottledProgress<T> : IProgress<T>
     {
-        var configured = _mareConfigService.Current.ParallelUploads;
+        private readonly IProgress<T> _inner;
+        private readonly TimeSpan _minInterval;
+        private readonly object _gate = new();
 
-        if (configured > 0)
-            return Math.Clamp(configured, 1, 10);
+        private long _lastTicks;
+        private bool _hasPending;
+        private T _pending;
 
-        // 0 = Auto
+        public ThrottledProgress(IProgress<T> inner, TimeSpan minInterval)
+        {
+            _inner = inner;
+            _minInterval = minInterval;
+            _lastTicks = 0;
+            _hasPending = false;
+            _pending = default!;
+        }
+
+        public void Report(T value)
+        {
+            var now = DateTime.UtcNow.Ticks;
+
+            lock (_gate)
+            {
+                _pending = value;
+
+                var elapsed = now - _lastTicks;
+                if (_lastTicks != 0 && elapsed < _minInterval.Ticks)
+                {
+                    if (_hasPending) return;
+
+                    _hasPending = true;
+                    var due = _minInterval - TimeSpan.FromTicks(elapsed);
+                    _ = FlushLater(due);
+                    return;
+                }
+
+                _lastTicks = now;
+            }
+
+            _inner.Report(value);
+        }
+
+        private async Task FlushLater(TimeSpan delay)
+        {
+            try
+            {
+                await Task.Delay(delay).ConfigureAwait(false);
+
+                T value;
+                lock (_gate)
+                {
+                    _hasPending = false;
+                    value = _pending;
+                    _pending = default!;
+                    _lastTicks = DateTime.UtcNow.Ticks;
+                }
+
+                _inner.Report(value);
+            }
+            catch
+            {
+                // ignore
+            }
+        }
+    }
+
+    private int GetCpuAutoParallelUploads()
+    {
         var cpu = Environment.ProcessorCount;
 
         var auto =
@@ -565,6 +757,100 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
         return Math.Clamp(auto, 1, 10);
     }
 
+    private static int ChooseUploadStreamBufferSize(double ewmaBps)
+    {
+        if (ewmaBps > 0 && ewmaBps < 128 * 1024) return 64 * 1024;     // <128 KiB/s
+        if (ewmaBps > 0 && ewmaBps < 1024 * 1024) return 256 * 1024;  // <1 MiB/s
+        return 1024 * 1024;                                           // default
+    }
+    private sealed class ProgressReadStream : Stream
+    {
+        private const int ReportEveryBytes = 64 * 1024;
+
+        private readonly Stream _inner;
+        private readonly IProgress<long> _progress;
+        private long _totalRead;
+        private long _sinceReport;
+
+        public ProgressReadStream(Stream inner, IProgress<long> progress)
+        {
+            _inner = inner;
+            _progress = progress;
+        }
+
+        public override bool CanRead => _inner.CanRead;
+        public override bool CanSeek => _inner.CanSeek;
+        public override bool CanWrite => false;
+        public override long Length => _inner.Length;
+
+        public override long Position
+        {
+            get => _inner.Position;
+            set => _inner.Position = value;
+        }
+
+        public override void Flush() => _inner.Flush();
+
+        private void OnRead(int read)
+        {
+            if (read <= 0)
+            {
+                if (_sinceReport > 0)
+                {
+                    _sinceReport = 0;
+                    _progress.Report(_totalRead);
+                }
+                return;
+            }
+
+            _totalRead += read;
+            _sinceReport += read;
+
+            if (_sinceReport >= ReportEveryBytes)
+            {
+                _sinceReport = 0;
+                _progress.Report(_totalRead);
+            }
+        }
+
+        public override int Read(byte[] buffer, int offset, int count)
+        {
+            var read = _inner.Read(buffer, offset, count);
+            OnRead(read);
+            return read;
+        }
+
+        public override int Read(Span<byte> buffer)
+        {
+            var read = _inner.Read(buffer);
+            OnRead(read);
+            return read;
+        }
+
+        public override async Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+        {
+            var read = await _inner.ReadAsync(buffer, offset, count, cancellationToken).ConfigureAwait(false);
+            OnRead(read);
+            return read;
+        }
+
+        public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            var read = await _inner.ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
+            OnRead(read);
+            return read;
+        }
+
+        public override long Seek(long offset, SeekOrigin origin) => _inner.Seek(offset, origin);
+        public override void SetLength(long value) => _inner.SetLength(value);
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing) _inner.Dispose();
+            base.Dispose(disposing);
+        }
+    }
 
     private static HttpClient CreateDirectUploadClient()
     {
@@ -576,15 +862,19 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
             KeepAlivePingDelay = TimeSpan.FromSeconds(60),
             KeepAlivePingTimeout = TimeSpan.FromSeconds(30),
             KeepAlivePingPolicy = HttpKeepAlivePingPolicy.WithActiveRequests,
-            AutomaticDecompression = DecompressionMethods.None
+            AutomaticDecompression = DecompressionMethods.None,
+
+            AllowAutoRedirect = false,
         };
 
         var client = new HttpClient(handler)
         {
-            Timeout = TimeSpan.FromMinutes(30)
+            Timeout = TimeSpan.FromMinutes(120),
+
+            DefaultRequestVersion = HttpVersion.Version11,
+            DefaultVersionPolicy = HttpVersionPolicy.RequestVersionExact
         };
 
         return client;
     }
-
 }

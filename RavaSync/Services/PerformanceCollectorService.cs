@@ -22,6 +22,8 @@ public sealed class PerformanceCollectorService : IHostedService
         _mareConfigService = mareConfigService;
     }
 
+    public bool Enabled => _mareConfigService.Current.LogPerformance;
+
     public T LogPerformance<T>(object sender, MareInterpolatedStringHandler counterName, Func<T> func, int maxEntries = 10000)
     {
         if (!_mareConfigService.Current.LogPerformance) return func.Invoke();

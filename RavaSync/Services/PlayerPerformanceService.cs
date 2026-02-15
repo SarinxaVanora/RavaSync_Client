@@ -29,8 +29,14 @@ public class PlayerPerformanceService : MediatorSubscriberBase
     // pooled VRAM (bytes) per non-direct (Syncshell) UID
     private readonly ConcurrentDictionary<string, long> _syncshellVramByUid = new(StringComparer.Ordinal);
 
-    private long GetTotalSyncshellVramBytes() => _syncshellVramByUid.Values.Sum();
-    // Track who we auto-paused (by UID) and their last-known VRAM when we paused them
+    private long GetTotalSyncshellVramBytes()
+    {
+        long sum = 0;
+        foreach (var kv in _syncshellVramByUid)
+            sum += kv.Value;
+        return sum;
+    }
+
     private readonly ConcurrentDictionary<string, long> _autoCapPausedVramByUid = new();
     private readonly ConcurrentDictionary<string, UserData> _autoCapPausedUsers = new();
     private readonly ConcurrentDictionary<string, UserData> _knownUsersByUid = new(StringComparer.Ordinal);
@@ -42,6 +48,13 @@ public class PlayerPerformanceService : MediatorSubscriberBase
     // debounce writes
     private int _stateDirty; // 0/1 via Interlocked
     private DateTime _lastSave = DateTime.MinValue;
+
+    private static readonly TimeSpan AutoPauseInterval = TimeSpan.FromMilliseconds(500);
+    private DateTime _nextAutoPauseUtc = DateTime.MinValue;
+
+    private static readonly TimeSpan AutoCapCheckInterval = TimeSpan.FromMilliseconds(500);
+    private DateTime _nextAutoCapCheckUtc = DateTime.MinValue;
+
 
 
 
@@ -59,8 +72,17 @@ public class PlayerPerformanceService : MediatorSubscriberBase
         _mediator.Subscribe<FrameworkUpdateMessage>(this, _ => AutoPauseHandler());
         _mediator.Subscribe<DelayedFrameworkUpdateMessage>(this, _ => AutoPauseHandler());
         LoadAutoCapState();
-        _mediator.Subscribe<FrameworkUpdateMessage>(this, async _ => await SaveAutoCapStateAsync().ConfigureAwait(false));
-        _mediator.Subscribe<DelayedFrameworkUpdateMessage>(this, async _ => await SaveAutoCapStateAsync().ConfigureAwait(false));
+        Mediator.Subscribe<FrameworkUpdateMessage>(this, (frm) =>
+        {
+            if (Interlocked.CompareExchange(ref _stateDirty, 0, 0) != 0)
+                _ = SaveAutoCapStateAsync();
+        });
+        Mediator.Subscribe<DelayedFrameworkUpdateMessage>(this, (frm) =>
+        {
+            if (Interlocked.CompareExchange(ref _stateDirty, 0, 0) != 0)
+                _ = SaveAutoCapStateAsync();
+        });
+
 
     }
 
@@ -159,7 +181,8 @@ public class PlayerPerformanceService : MediatorSubscriberBase
 
         pair.LastAppliedDataTris = triUsage;
 
-        _logger.LogDebug("Calculated VRAM usage for {p}", pairHandler);
+        if (_logger.IsEnabled(LogLevel.Debug))
+            _logger.LogDebug("Calculated VRAM usage for {p}", pairHandler);
 
         // no warning of any kind on ignored pairs
         if (config.UIDsToIgnore
@@ -223,11 +246,26 @@ public class PlayerPerformanceService : MediatorSubscriberBase
 
                 if (fileEntry.Size == null)
                 {
-                    fileEntry.Size = new FileInfo(fileEntry.ResolvedFilepath).Length;
-                    _fileCacheManager.UpdateHashedFile(fileEntry, computeProperties: true);
+                    try
+                    {
+                        var fi = new FileInfo(fileEntry.ResolvedFilepath);
+                        fileEntry.Size = fi.Length;
+                        fileEntry.LastModifiedDateTicks = fi.LastWriteTimeUtc.Ticks.ToString(System.Globalization.CultureInfo.InvariantCulture);
+
+                        _fileCacheManager.UpdateHashedFile(fileEntry, computeProperties: false);
+                    }
+                    catch (IOException)
+                    {
+                        continue;
+                    }
+                    catch (UnauthorizedAccessException)
+                    {
+                        continue;
+                    }
                 }
 
                 fileSize = fileEntry.Size.Value;
+
             }
 
             vramUsage += fileSize;
@@ -320,34 +358,49 @@ public class PlayerPerformanceService : MediatorSubscriberBase
 
     private void AutoPauseHandler()
     {
+        // This runs on both FrameworkUpdate + DelayedFrameworkUpdate.
+        // Throttle to prevent repeated expensive work and reduce hitching when player lists churn.
+        var now = DateTime.UtcNow;
+        if (now < _nextAutoCapCheckUtc) return;
+        _nextAutoCapCheckUtc = now + AutoCapCheckInterval;
+
         int capMiB = _playerPerformanceConfigService.Current.SyncshellVramCapMiB;
         if (capMiB <= 0) return;
 
         long capBytes = (long)capMiB * 1024L * 1024L;
         long totalBytes = GetTotalSyncshellVramBytes();
 
-        //Over cap - Pause ONE highest-VRAM contributor not yet auto-capped
+        // Over cap: pause ONE highest-VRAM contributor not yet auto-capped (no sorting/allocations)
         if (totalBytes > capBytes)
         {
-            var nextUid = _syncshellVramByUid
-                .OrderByDescending(kv => kv.Value)
-                .Select(kv => kv.Key)
-                .FirstOrDefault(uid => !_autoCapPausedUsers.ContainsKey(uid));
+            string? nextUid = null;
+            long nextVram = long.MinValue;
+
+            foreach (var kv in _syncshellVramByUid)
+            {
+                var uid = kv.Key;
+                var vram = kv.Value;
+
+                if (_autoCapPausedUsers.ContainsKey(uid)) continue;
+
+                if (vram > nextVram)
+                {
+                    nextVram = vram;
+                    nextUid = uid;
+                }
+            }
 
             if (nextUid != null && _knownUsersByUid.TryGetValue(nextUid, out var user))
             {
-                // remember we auto-capped this UID (use last-known VRAM for smart resume later)
                 var last = _syncshellVramByUid.GetValueOrDefault(nextUid, 0);
                 _autoCapPausedUsers[nextUid] = user;
                 _autoCapPausedVramByUid[nextUid] = last;
 
-                // tell server to pause; per-pair local flag will sort itself next tick,
-                // and server-side Paused=true is authoritative anyway
                 _mediator.Publish(new PauseMessage(user));
                 _syncshellVramByUid.TryRemove(nextUid, out _);
                 MarkStateDirty();
 
-                _logger.LogInformation("Auto-paused {user} — lastVRAM {last} — pool {total}/{cap}",
+                _logger.LogInformation("Auto-paused {user} \x97 lastVRAM {last} \x97 pool {total}/{cap}",
                     user.AliasOrUID,
                     UiSharedService.ByteToString(last, true),
                     UiSharedService.ByteToString(totalBytes, true),
@@ -357,15 +410,25 @@ public class PlayerPerformanceService : MediatorSubscriberBase
             }
         }
 
-        //Under cap - Resume ONE smallest-VRAM auto-capped UID
+        // Under cap: resume ONE smallest-VRAM auto-capped UID (no sorting/allocations)
         if (totalBytes <= capBytes && !_autoCapPausedUsers.IsEmpty)
         {
-            var nextUid = _autoCapPausedVramByUid
-                .OrderBy(kv => kv.Value)
-                .Select(kv => kv.Key)
-                .FirstOrDefault();
-            if (nextUid is null) return;
+            string? nextUid = null;
+            long nextVram = long.MaxValue;
 
+            foreach (var kv in _autoCapPausedVramByUid)
+            {
+                var uid = kv.Key;
+                var vram = kv.Value;
+
+                if (vram < nextVram)
+                {
+                    nextVram = vram;
+                    nextUid = uid;
+                }
+            }
+
+            if (nextUid is null) return;
             if (!_autoCapPausedUsers.TryGetValue(nextUid, out var user)) return;
 
             long lastKnown = _autoCapPausedVramByUid.GetValueOrDefault(nextUid, long.MaxValue);
@@ -377,15 +440,17 @@ public class PlayerPerformanceService : MediatorSubscriberBase
 
             _mediator.Publish(new ResumeMessage(user));
 
-            _logger.LogInformation("Auto-unpaused {user} — lastVRAM {last} — pool {total}/{cap}",
+            _logger.LogInformation("Auto-unpaused {user} \x97 lastVRAM {last} \x97 pool {total}/{cap}",
                 user.AliasOrUID,
                 UiSharedService.ByteToString(lastKnown, true),
                 UiSharedService.ByteToString(totalBytes, true),
                 UiSharedService.ByteToString(capBytes, true));
+
             _syncshellVramByUid.TryRemove(nextUid, out _);
             MarkStateDirty();
         }
     }
+
 
 
 

@@ -39,6 +39,8 @@ public sealed class RavaDiscoveryService
     private static readonly TimeSpan HelloInterval = TimeSpan.FromSeconds(3);
     private static readonly TimeSpan PeerTtl = TimeSpan.FromSeconds(9);
     private static readonly TimeSpan PruneInterval = TimeSpan.FromSeconds(1);
+    private static readonly TimeSpan HelloScanInterval = TimeSpan.FromMilliseconds(250);
+    private DateTime _nextHelloScanUtc = DateTime.MinValue;
 
     private const int MaxHellosPerTick = 6;
 
@@ -201,22 +203,24 @@ public sealed class RavaDiscoveryService
         var now = DateTime.UtcNow;
         PrunePeers(now);
 
+        if (now < _nextHelloScanUtc) return;
+        _nextHelloScanUtc = now + HelloScanInterval;
+
         int sent = 0;
 
-        var players = _objects
-            .OfType<IPlayerCharacter>()
-            .Where(p => p.Address != IntPtr.Zero && _clientState.LocalPlayer!.Address != p.Address)
-            .ToArray();
+        var len = _objects.Length;
+        if (len == 0) return;
 
-        if (players.Length == 0) return;
-
-        if (_roundRobinStartIndex >= players.Length)
+        if (_roundRobinStartIndex >= len)
             _roundRobinStartIndex = 0;
 
-        for (int i = 0; i < players.Length && sent < MaxHellosPerTick; i++)
+        for (int offset = 0; offset < len && sent < MaxHellosPerTick; offset++)
         {
-            var idx = (_roundRobinStartIndex + i) % players.Length;
-            var pc = players[idx];
+            var idx = (_roundRobinStartIndex + offset) % len;
+
+            if (_objects[idx] is not IPlayerCharacter pc) continue;
+            if (pc.Address == IntPtr.Zero) continue;
+            if (_clientState.LocalPlayer!.Address == pc.Address) continue;
 
             string ident;
             try
@@ -246,7 +250,7 @@ public sealed class RavaDiscoveryService
             sent++;
         }
 
-        _roundRobinStartIndex = (_roundRobinStartIndex + MaxHellosPerTick) % players.Length;
+        _roundRobinStartIndex = (_roundRobinStartIndex + MaxHellosPerTick) % len;
     }
 
     private Task OnMeshMessageAsync(string sessionId, IRavaMeshMessage message)

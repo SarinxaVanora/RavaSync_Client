@@ -202,7 +202,6 @@ public class DownloadUi : WindowMediatorSubscriberBase
                 {
                     var statuses = item.Value.Status.Values.ToList();
 
-                    var dlSlot = 0;
                     var dlQueue = 0;
                     var dlProg = 0;
                     var dlDecomp = 0;
@@ -214,7 +213,7 @@ public class DownloadUi : WindowMediatorSubscriberBase
                         switch (s.DownloadStatus)
                         {
                             case DownloadStatus.WaitingForSlot:
-                                dlSlot += remaining;
+                                dlQueue += remaining;
                                 break;
 
                             case DownloadStatus.WaitingForQueue:
@@ -241,10 +240,11 @@ public class DownloadUi : WindowMediatorSubscriberBase
                     UiSharedService.DrawOutlinedFont($"▼", ImGuiColors.DalamudWhite, new Vector4(0, 0, 0, 255), 1);
                     ImGui.SameLine();
                     var xDistance = ImGui.GetCursorPosX();
-                    UiSharedService.DrawOutlinedFont($"{item.Key.Name} [W:{dlSlot}/Q:{dlQueue}/P:{dlProg}/D:{dlDecomp}]",ImGuiColors.DalamudWhite, new Vector4(0, 0, 0, 255), 1);
+                    UiSharedService.DrawOutlinedFont($"{item.Key.Name} [Q:{dlQueue}/P:{dlProg}/D:{dlDecomp}]", ImGuiColors.DalamudWhite, new Vector4(0, 0, 0, 255), 1);
                     ImGui.NewLine();
                     ImGui.SameLine(xDistance);
-                    UiSharedService.DrawOutlinedFont($"{transferredFiles}/{totalFiles} ({UiSharedService.ByteToString(transferredBytes, addSuffix: false)}/{UiSharedService.ByteToString(totalBytes)})",ImGuiColors.DalamudWhite, new Vector4(0, 0, 0, 255), 1);
+                    UiSharedService.DrawOutlinedFont($"{transferredFiles}/{totalFiles} ({UiSharedService.ByteToString(transferredBytes, addSuffix: false)}/{UiSharedService.ByteToString(totalBytes)})", ImGuiColors.DalamudWhite, new Vector4(0, 0, 0, 255), 1);
+
                 }
             }
             catch
@@ -297,13 +297,12 @@ public class DownloadUi : WindowMediatorSubscriberBase
                         && s.TransferredBytes == 0);
 
                     var hasInit = statuses.Any(s => s.DownloadStatus == DownloadStatus.Initializing);
-                    var hasSlot = statuses.Any(s => s.DownloadStatus == DownloadStatus.WaitingForSlot);
-                    var hasQueue = statuses.Any(s => s.DownloadStatus == DownloadStatus.WaitingForQueue);
+                    var hasQueue = statuses.Any(s => s.DownloadStatus == DownloadStatus.WaitingForQueue
+                                                     || s.DownloadStatus == DownloadStatus.WaitingForSlot);
                     var hasProg = statuses.Any(s => s.DownloadStatus == DownloadStatus.Downloading);
                     var hasDecomp = statuses.Any(s => s.DownloadStatus == DownloadStatus.Decompressing);
 
                     var sInit = 0;
-                    var sSlot = 0;
                     var sQueue = 0;
                     var sProg = 0;
                     var sDecomp = 0;
@@ -319,7 +318,7 @@ public class DownloadUi : WindowMediatorSubscriberBase
                                 break;
 
                             case DownloadStatus.WaitingForSlot:
-                                sSlot += remaining;
+                                sQueue += remaining;
                                 break;
 
                             case DownloadStatus.WaitingForQueue:
@@ -336,7 +335,7 @@ public class DownloadUi : WindowMediatorSubscriberBase
                         }
                     }
 
-                    var isWaiting = (hasSlot || hasQueue) && !hasProg && !hasDecomp;
+                    var isWaiting = hasQueue && !hasProg && !hasDecomp;
                     var isInitializing = hasInit && !hasProg && !hasDecomp;
                     var shouldPulse = isWaiting || isInitializing;
 
@@ -359,12 +358,11 @@ public class DownloadUi : WindowMediatorSubscriberBase
                             ? $"Decompressing ({sDecomp})  {UiSharedService.ByteToString(transferredBytes, addSuffix: false)}/{UiSharedService.ByteToString(totalBytes)}"
                             : $"Decompressing ({sDecomp})";
                     }
-                    else if (hasSlot || hasQueue || hasInit)
+                    else if (hasQueue || hasInit)
                     {
                         dlProgressPercent = 0.0;
 
-                        var parts = new List<string>(5);
-                        if (sSlot > 0) parts.Add($"W:{sSlot}");
+                        var parts = new List<string>(4);
                         if (sQueue > 0) parts.Add($"Q:{sQueue}");
                         if (sProg > 0) parts.Add($"P:{sProg}");
                         if (sDecomp > 0) parts.Add($"D:{sDecomp}");
@@ -372,8 +370,7 @@ public class DownloadUi : WindowMediatorSubscriberBase
 
                         var breakdown = parts.Count > 0 ? string.Join(" ", parts) : string.Empty;
 
-                        if (hasSlot) downloadText = $"Waiting  [{breakdown}]";
-                        else if (hasQueue) downloadText = $"Queued  [{breakdown}]";
+                        if (hasQueue) downloadText = $"Queued  [{breakdown}]";
                         else downloadText = $"Initializing  [{breakdown}]";
                     }
                     else
@@ -1001,7 +998,7 @@ public class DownloadUi : WindowMediatorSubscriberBase
         int dlTotalFiles = 0;
         int dlTransferredFiles = 0;
 
-        int dlInit = 0, dlSlot = 0, dlQueue = 0, dlProg = 0, dlDecomp = 0;
+        int dlInit = 0, dlQueue = 0, dlProg = 0, dlDecomp = 0;
         bool dlAllPreparing = true;
 
         if (_configService.Current.ShowGlobalTransferBars && haveDownloads)
@@ -1030,7 +1027,7 @@ public class DownloadUi : WindowMediatorSubscriberBase
                             dlInit += count;
                             break;
                         case DownloadStatus.WaitingForSlot:
-                            dlSlot += count;
+                            dlQueue += count;
                             break;
                         case DownloadStatus.WaitingForQueue:
                             dlQueue += count;
@@ -1108,9 +1105,8 @@ public class DownloadUi : WindowMediatorSubscriberBase
 
             ImGui.Dummy(new Vector2(barW, barH));
 
-            var hintParts = new List<string>(5);
+            var hintParts = new List<string>(4);
             if (dlInit > 0) hintParts.Add($"Initializing: {dlInit}");
-            if (dlSlot > 0) hintParts.Add($"Slot wait: {dlSlot}");
             if (dlQueue > 0) hintParts.Add($"Queued: {dlQueue}");
             if (dlProg > 0) hintParts.Add($"Downloading: {dlProg}");
             if (dlDecomp > 0) hintParts.Add($"Decompressing: {dlDecomp}");
@@ -1223,7 +1219,6 @@ public class DownloadUi : WindowMediatorSubscriberBase
                 var totalBytes = kv.Value.AccTotalBytes + statuses.Sum(s => s.TotalBytes);
                 var transferredBytes = kv.Value.AccTransferredBytes + statuses.Sum(s => s.TransferredBytes);
 
-                var sSlot = 0;
                 var sQueue = 0;
                 var sProg = 0;
                 var sDecomp = 0;
@@ -1244,7 +1239,7 @@ public class DownloadUi : WindowMediatorSubscriberBase
                             break;
 
                         case DownloadStatus.WaitingForSlot:
-                            sSlot += count;
+                            sQueue += count;
                             break;
 
                         case DownloadStatus.WaitingForQueue:
@@ -1265,7 +1260,7 @@ public class DownloadUi : WindowMediatorSubscriberBase
                 var pct = (totalBytes <= 0) ? 0f : (float)(transferredBytes / (double)totalBytes);
                 pct = Math.Clamp(pct, 0f, 1f);
 
-                ImGui.TextUnformatted($"{kv.Key.Name}  [I:{sInit}/W:{sSlot}/Q:{sQueue}/P:{sProg}/D:{sDecomp}]");
+                ImGui.TextUnformatted($"{kv.Key.Name}  [I:{sInit}/Q:{sQueue}/P:{sProg}/D:{sDecomp}]");
                 ImGui.SameLine();
                 ImGui.TextDisabled($"{UiSharedService.ByteToString(transferredBytes, addSuffix: false)}/{UiSharedService.ByteToString(totalBytes)}");
 

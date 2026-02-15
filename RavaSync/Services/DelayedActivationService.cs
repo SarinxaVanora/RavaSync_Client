@@ -24,7 +24,9 @@ namespace RavaSync.WebAPI.Files
         private readonly MareMediator _mareMediator;
         private readonly DalamudUtilService _dalamudUtil;
         private readonly IObjectTable _objectTable;
-        //private int _globalRedrawRequested = 0;
+        private const int MaxFilesPerFrame = 6;
+        private readonly List<PendingFile> _pendingDrain = new(MaxFilesPerFrame);
+        private readonly List<PendingFile> _pendingBatch = new(MaxFilesPerFrame);
 
         private readonly ConcurrentDictionary<string, byte> _pendingHashes = new(StringComparer.OrdinalIgnoreCase);
 
@@ -88,8 +90,8 @@ namespace RavaSync.WebAPI.Files
             if (f is null) return;
             if (string.IsNullOrWhiteSpace(f.FileHash)) return;
 
-            _pendingHashes.TryAdd(f.FileHash, 0);
-            _pending.Enqueue(f);
+            if (_pendingHashes.TryAdd(f.FileHash, 0))
+                _pending.Enqueue(f);
         }
         private const int ActorCoalesceDelayMs = 150;
         private const int ActorMaxHoldMs = 1500;  
@@ -144,9 +146,9 @@ namespace RavaSync.WebAPI.Files
 
                 if (!_gate.SafeNow(cfg.SafeIdleSeconds, cfg.ApplyOnlyOnZoneChange)) return;
 
-                const int MaxFilesPerFrame = 6;
+                var drained = _pendingDrain;
+                drained.Clear();
 
-                var drained = new List<PendingFile>(MaxFilesPerFrame);
                 while (drained.Count < MaxFilesPerFrame && _pending.TryDequeue(out var f))
                 {
                     if (f is not null)
@@ -159,7 +161,9 @@ namespace RavaSync.WebAPI.Files
                     return;
                 }
 
-                var batch = new List<PendingFile>(drained.Count);
+                var batch = _pendingBatch;
+                batch.Clear();
+                if (batch.Capacity < drained.Count) batch.Capacity = drained.Count;
                 foreach (var f in drained)
                 {
                     if (f.HardDelay ||

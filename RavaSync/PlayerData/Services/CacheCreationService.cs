@@ -10,7 +10,7 @@ namespace RavaSync.PlayerData.Services;
 
 public sealed class CacheCreationService : DisposableMediatorSubscriberBase
 {
-    private readonly SemaphoreSlim _cacheCreateLock = new(1);
+    private readonly object _cacheCreateLockObj = new();
     private readonly HashSet<ObjectKind> _cachesToCreate = [];
     private readonly PlayerDataFactory _characterDataFactory;
     private readonly HashSet<ObjectKind> _currentlyCreating = [];
@@ -161,23 +161,37 @@ public sealed class CacheCreationService : DisposableMediatorSubscriberBase
         _debounceCts.Dispose();
         _debounceCts = new();
         var token = _debounceCts.Token;
-        _cacheCreateLock.Wait();
-        _debouncedObjectCache.Add(kind);
-        _cacheCreateLock.Release();
+
+        lock (_cacheCreateLockObj)
+        {
+            _debouncedObjectCache.Add(kind);
+        }
 
         _ = Task.Run(async () =>
         {
-            await Task.Delay(TimeSpan.FromSeconds(1), token).ConfigureAwait(false);
-            Logger.LogTrace("Debounce complete, inserting objects to create for: {obj}", string.Join(", ", _debouncedObjectCache));
-            await _cacheCreateLock.WaitAsync(token).ConfigureAwait(false);
-            foreach (var item in _debouncedObjectCache)
+            try
             {
-                _cachesToCreate.Add(item);
+                await Task.Delay(TimeSpan.FromSeconds(1), token).ConfigureAwait(false);
+
+                List<ObjectKind> snapshot;
+                lock (_cacheCreateLockObj)
+                {
+                    snapshot = _debouncedObjectCache.ToList();
+                    foreach (var item in snapshot)
+                        _cachesToCreate.Add(item);
+
+                    _debouncedObjectCache.Clear();
+                }
+
+                Logger.LogTrace("Debounce complete, inserting objects to create for: {obj}", string.Join(", ", snapshot));
             }
-            _debouncedObjectCache.Clear();
-            _cacheCreateLock.Release();
+            catch (OperationCanceledException)
+            {
+                // debounce restarted; ignore
+            }
         });
     }
+
 
     private void ProcessCacheCreation()
     {
@@ -195,14 +209,16 @@ public sealed class CacheCreationService : DisposableMediatorSubscriberBase
         _creationCts.Cancel();
         _creationCts.Dispose();
         _creationCts = new();
-        _cacheCreateLock.Wait(_creationCts.Token);
-        var objectKindsToCreate = _cachesToCreate.ToList();
-        foreach (var creationObj in objectKindsToCreate)
+
+        List<ObjectKind> objectKindsToCreate;
+        lock (_cacheCreateLockObj)
         {
-            _currentlyCreating.Add(creationObj);
+            objectKindsToCreate = _cachesToCreate.ToList();
+            foreach (var creationObj in objectKindsToCreate)
+                _currentlyCreating.Add(creationObj);
+
+            _cachesToCreate.Clear();
         }
-        _cachesToCreate.Clear();
-        _cacheCreateLock.Release();
 
         _ = Task.Run(async () =>
         {

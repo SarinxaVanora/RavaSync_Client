@@ -14,6 +14,10 @@ namespace RavaSync.FileCache;
 public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
 {
     private readonly object _cacheAdditionLock = new();
+    private DateTime _nextHandledPathsClearUtc = DateTime.MinValue;
+    private static readonly TimeSpan _handledPathsClearInterval = TimeSpan.FromMilliseconds(250);
+    private const int _handledPathsMaxSizeBeforeClear = 4096;
+
     private readonly HashSet<string> _cachedHandledPaths = new(StringComparer.Ordinal);
     private readonly TransientConfigService _configurationService;
     private readonly DalamudUtilService _dalamudUtil;
@@ -298,14 +302,14 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
 
     private void DalamudUtil_FrameworkUpdate()
     {
+        _cachedFrameAddresses.Clear();
 
-        var addrToKind = new Dictionary<nint, ObjectKind>(_playerRelatedPointers.Count);
         foreach (var p in _playerRelatedPointers)
         {
             if (p.Address != nint.Zero)
-                addrToKind[p.Address] = p.ObjectKind;
+                _cachedFrameAddresses[p.Address] = p.ObjectKind;
         }
-        _cachedFrameAddresses = addrToKind;
+
 
         _inCombatOrPerformingSnapshot = _dalamudUtil.IsInCombatOrPerforming;
 
@@ -313,21 +317,30 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
         {
             try
             {
-                var name = _dalamudUtil.GetPlayerNameAsync().GetAwaiter().GetResult();
-                var world = _dalamudUtil.GetHomeWorldIdAsync().GetAwaiter().GetResult();
+                var name = _dalamudUtil.GetPlayerName();
+                var world = _dalamudUtil.GetHomeWorldId();
+
                 if (!string.IsNullOrEmpty(name) && world != 0)
                     _playerPersistentDataKey = name + "_" + world;
             }
             catch
             {
-                // swallow;
+                // swallow; 
             }
         }
 
-        lock (_cacheAdditionLock)
+        var now = DateTime.UtcNow;
+        if (now >= _nextHandledPathsClearUtc || _cachedHandledPaths.Count > _handledPathsMaxSizeBeforeClear)
         {
-            _cachedHandledPaths.Clear();
+            _nextHandledPathsClearUtc = now.Add(_handledPathsClearInterval);
+
+            lock (_cacheAdditionLock)
+            {
+                _cachedHandledPaths.Clear();
+            }
         }
+
+
         ProcessQueuedAutoRecordTriggers();
 
         if (_lastClassJobId != _dalamudUtil.ClassJobId)

@@ -11,6 +11,7 @@ using RavaSync.Services;
 using RavaSync.Services.Mediator;
 using RavaSync.Services.ServerConfiguration;
 using RavaSync.Utils;
+using RavaSync.WebAPI.Files.Models;
 using System;
 using System.Linq;
 
@@ -230,6 +231,9 @@ public class Pair
 
     public void CreateCachedPlayer(OnlineUserIdentDto? dto = null)
     {
+        PairHandler? oldPlayer = null;
+        bool shouldCreate = false;
+
         try
         {
             _creationSemaphore.Wait();
@@ -238,17 +242,37 @@ public class Pair
 
             if (dto == null && _onlineUserIdentDto == null)
             {
-                CachedPlayer?.Dispose();
+                oldPlayer = CachedPlayer;
                 CachedPlayer = null;
                 return;
             }
-            if (dto != null)
-            {
-                _onlineUserIdentDto = dto;
-            }
 
-            CachedPlayer?.Dispose();
-            CachedPlayer = _cachedPlayerFactory.Create(this);
+            if (dto != null)
+                _onlineUserIdentDto = dto;
+
+            oldPlayer = CachedPlayer;
+            CachedPlayer = null;
+            shouldCreate = _onlineUserIdentDto != null;
+        }
+        finally
+        {
+            _creationSemaphore.Release();
+        }
+
+        // Dispose outside lock
+        oldPlayer?.Dispose();
+
+        if (!shouldCreate) return;
+
+        var created = _cachedPlayerFactory.Create(this);
+
+        try
+        {
+            _creationSemaphore.Wait();
+            if (CachedPlayer == null)
+                CachedPlayer = created;
+            else
+                created.Dispose();
         }
         finally
         {
@@ -273,14 +297,16 @@ public class Pair
 
     public void MarkOffline(bool wait = true)
     {
+        PairHandler? player = null;
+
         try
         {
             if (wait)
                 _creationSemaphore.Wait();
+
             LastReceivedCharacterData = null;
-            var player = CachedPlayer;
+            player = CachedPlayer;
             CachedPlayer = null;
-            player?.Dispose();
             _onlineUserIdentDto = null;
         }
         finally
@@ -288,7 +314,11 @@ public class Pair
             if (wait)
                 _creationSemaphore.Release();
         }
+
+        // Dispose outside lock
+        player?.Dispose();
     }
+
 
     public void SetNote(string note)
     {
@@ -301,7 +331,24 @@ public class Pair
         CachedPlayer?.SetUploading();
     }
 
-    private bool IsUploadingRecently => (Environment.TickCount64 - _lastUploadStatusTick) < 2000;
+    public bool IsUploadingRecently => (Environment.TickCount64 - _lastUploadStatusTick) < 2000;
+
+    public enum VisibleTransferIndicator
+    {
+        None = 0,
+        Downloading = 1,
+        LoadingFiles = 2,
+    }
+
+    private volatile VisibleTransferIndicator _visibleTransferIndicator = VisibleTransferIndicator.None;
+    public VisibleTransferIndicator VisibleTransferStatus => _visibleTransferIndicator;
+    internal void SetVisibleTransferStatus(VisibleTransferIndicator status) => _visibleTransferIndicator = status;
+
+    private Dictionary<string, FileDownloadStatus>? _currentDownloadStatus;
+    public IReadOnlyDictionary<string, FileDownloadStatus>? CurrentDownloadStatus => _currentDownloadStatus;
+    internal void SetCurrentDownloadStatus(Dictionary<string, FileDownloadStatus>? status) => _currentDownloadStatus = status;
+
+
 
     public void ToggleMetadataAndReapply()
     {
@@ -334,7 +381,7 @@ public class Pair
             _logger.LogTrace("Data cleaned up: Animations disabled: {disableAnimations}, Sounds disabled: {disableSounds}, VFX disabled: {disableVFX}",
                 disableIndividualAnimations, disableIndividualSounds, disableIndividualVFX);
 
-            foreach (var objectKind in data.FileReplacements.Select(k => k.Key))
+            foreach (var objectKind in data.FileReplacements.Keys)
             {
                 if (disableIndividualSounds)
                     data.FileReplacements[objectKind] = data.FileReplacements[objectKind]

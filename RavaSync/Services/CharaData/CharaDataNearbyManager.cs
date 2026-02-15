@@ -12,7 +12,7 @@ namespace RavaSync.Services;
 
 public sealed class CharaDataNearbyManager : DisposableMediatorSubscriberBase
 {
-    public record NearbyCharaDataEntry
+    public readonly record struct NearbyCharaDataEntry
     {
         public float Direction { get; init; }
         public float Distance { get; init; }
@@ -28,7 +28,13 @@ public sealed class CharaDataNearbyManager : DisposableMediatorSubscriberBase
     private Task? _filterEntriesRunningTask;
     private (Guid VfxId, PoseEntryExtended Pose)? _hoveredVfx = null;
     private DateTime _lastExecutionTime = DateTime.UtcNow;
-    private SemaphoreSlim _sharedDataUpdateSemaphore = new(1, 1);
+    private readonly List<PoseEntryExtended> _previousPosesBuffer = new(256);
+    private readonly object _sharedDataUpdateLock = new();
+    private readonly List<KeyValuePair<UserData, List<CharaDataMetaInfoExtendedDto>>> _metaInfoSnapshotBuffer = new(256);
+    private bool _wispsDirty = true;
+
+
+
     public CharaDataNearbyManager(ILogger<CharaDataNearbyManager> logger, MareMediator mediator,
         DalamudUtilService dalamudUtilService, VfxSpawnManager vfxSpawnManager,
         ServerConfigurationManager serverConfigurationManager,
@@ -49,27 +55,22 @@ public sealed class CharaDataNearbyManager : DisposableMediatorSubscriberBase
 
     public string UserNoteFilter { get; set; } = string.Empty;
 
-    public void UpdateSharedData(Dictionary<string, CharaDataMetaInfoExtendedDto?> newData)
+    public void UpdateSharedData(IReadOnlyDictionary<string, CharaDataMetaInfoExtendedDto?> newData)
     {
-        _sharedDataUpdateSemaphore.Wait();
-        try
+        lock (_sharedDataUpdateLock)
         {
             _metaInfoCache.Clear();
-            foreach (var kvp in newData)
+            foreach (var item in newData)
             {
-                if (kvp.Value == null) continue;
+                var dto = item.Value;
+                var uploader = dto?.Uploader;
+                if (uploader == null) continue;
 
-                if (!_metaInfoCache.TryGetValue(kvp.Value.Uploader, out var list))
-                {
-                    _metaInfoCache[kvp.Value.Uploader] = list = [];
-                }
+                if (!_metaInfoCache.TryGetValue(uploader, out var list))
+                    _metaInfoCache[uploader] = list = [];
 
-                list.Add(kvp.Value);
+                list.Add(dto);
             }
-        }
-        finally
-        {
-            _sharedDataUpdateSemaphore.Release();
         }
     }
 
@@ -179,15 +180,19 @@ public sealed class CharaDataNearbyManager : DisposableMediatorSubscriberBase
             _vfxSpawnManager.DespawnObject(vfx.Value);
         }
         _poseVfx.Clear();
+        _wispsDirty = true;
     }
 
     private async Task FilterEntriesAsync(Vector3 cameraPos, Vector3 cameraLookAt)
     {
-        var previousPoses = _nearbyData.Keys.ToList();
+        var previousPoses = _previousPosesBuffer;
+        previousPoses.Clear();
+        foreach (var k in _nearbyData.Keys)
+            previousPoses.Add(k);
+
         _nearbyData.Clear();
 
-        var ownLocation = await _dalamudUtilService.RunOnFrameworkThread(() => _dalamudUtilService.GetMapData()).ConfigureAwait(false);
-        var player = await _dalamudUtilService.RunOnFrameworkThread(() => _dalamudUtilService.GetPlayerCharacter()).ConfigureAwait(false);
+        var (ownLocation, player) = await _dalamudUtilService.RunOnFrameworkThread(() => (_dalamudUtilService.GetMapData(), _dalamudUtilService.GetPlayerCharacter())).ConfigureAwait(false);
         var currentServer = player.CurrentWorld;
         var playerPos = player.Position;
 
@@ -196,49 +201,114 @@ public sealed class CharaDataNearbyManager : DisposableMediatorSubscriberBase
         bool ignoreHousingLimits = _charaDataConfigService.Current.NearbyIgnoreHousingLimitations;
         bool onlyCurrentServer = _charaDataConfigService.Current.NearbyOwnServerOnly;
         bool showOwnData = _charaDataConfigService.Current.NearbyShowOwnData;
+        float maxDistance = _charaDataConfigService.Current.NearbyDistanceFilter;
+        float maxDistanceSq = maxDistance * maxDistance;
 
-        // initial filter on name
-        foreach (var data in _metaInfoCache.Where(d => (string.IsNullOrWhiteSpace(UserNoteFilter)
-            || ((d.Key.Alias ?? string.Empty).Contains(UserNoteFilter, StringComparison.OrdinalIgnoreCase)
-            || d.Key.UID.Contains(UserNoteFilter, StringComparison.OrdinalIgnoreCase)
-            || (_serverConfigurationManager.GetNoteForUid(UserNoteFilter) ?? string.Empty).Contains(UserNoteFilter, StringComparison.OrdinalIgnoreCase))))
-            .ToDictionary(k => k.Key, k => k.Value))
+        var filter = UserNoteFilter;
+        bool hasFilter = !string.IsNullOrWhiteSpace(filter);
+        var noteForFilter = hasFilter ? (_serverConfigurationManager.GetNoteForUid(filter) ?? string.Empty) : string.Empty;
+
+        var snapshot = _metaInfoSnapshotBuffer;
+        snapshot.Clear();
+
+        lock (_sharedDataUpdateLock)
         {
-            // filter all poses based on territory, that always must be correct
-            foreach (var pose in data.Value.Where(v => v.HasPoses && v.HasWorldData && (showOwnData || !v.IsOwnData))
-                .SelectMany(k => k.PoseExtended)
-                .Where(p => p.HasPoseData
-                    && p.HasWorldData
-                    && p.WorldData!.Value.LocationInfo.TerritoryId == ownLocation.TerritoryId)
-                .ToList())
+            foreach (var kvp in _metaInfoCache)
             {
-                var poseLocation = pose.WorldData!.Value.LocationInfo;
-
-                bool isInHousing = poseLocation.WardId != 0;
-                var distance = Vector3.Distance(playerPos, pose.Position);
-                if (distance > _charaDataConfigService.Current.NearbyDistanceFilter) continue;
-
-
-                bool addEntry = (!isInHousing && poseLocation.MapId == ownLocation.MapId
-                        && (!onlyCurrentServer || poseLocation.ServerId == currentServer.RowId))
-                    || (isInHousing
-                        && (((ignoreHousingLimits && !onlyCurrentServer)
-                            || (ignoreHousingLimits && onlyCurrentServer) && poseLocation.ServerId == currentServer.RowId)
-                            || poseLocation.ServerId == currentServer.RowId)
-                        && ((poseLocation.HouseId == 0 && poseLocation.DivisionId == ownLocation.DivisionId
-                                && (ignoreHousingLimits || poseLocation.WardId == ownLocation.WardId))
-                            || (poseLocation.HouseId > 0
-                                && (ignoreHousingLimits || (poseLocation.HouseId == ownLocation.HouseId && poseLocation.WardId == ownLocation.WardId && poseLocation.DivisionId == ownLocation.DivisionId && poseLocation.RoomId == ownLocation.RoomId)))
-                           ));
-
-                if (addEntry)
-                    _nearbyData[pose] = new() { Direction = GetAngleToTarget(cameraPos, cameraYaw, pose.Position), Distance = distance };
+                snapshot.Add(kvp);
             }
         }
 
-        if (_charaDataConfigService.Current.NearbyDrawWisps && !_dalamudUtilService.IsInGpose && !_dalamudUtilService.IsInCombatOrPerforming)
-            await _dalamudUtilService.RunOnFrameworkThread(() => ManageWispsNearby(previousPoses)).ConfigureAwait(false);
+        for (int s = 0; s < snapshot.Count; s++)
+        {
+            var kvp = snapshot[s];
+
+            var user = kvp.Key;
+
+            if (hasFilter)
+            {
+                var alias = user.Alias ?? string.Empty;
+                if (!(alias.Contains(filter, StringComparison.OrdinalIgnoreCase)
+                      || user.UID.Contains(filter, StringComparison.OrdinalIgnoreCase)
+                      || noteForFilter.Contains(filter, StringComparison.OrdinalIgnoreCase)))
+                {
+                    continue;
+                }
+            }
+
+            var list = kvp.Value;
+            for (int i = 0; i < list.Count; i++)
+            {
+                var meta = list[i];
+
+                if (!meta.HasPoses || !meta.HasWorldData) continue;
+                if (!showOwnData && meta.IsOwnData) continue;
+
+                var poses = meta.PoseExtended;
+                for (int p = 0; p < poses.Count; p++)
+                {
+                    var pose = poses[p];
+
+                    if (!pose.HasPoseData || !pose.HasWorldData) continue;
+                    if (pose.WorldData!.Value.LocationInfo.TerritoryId != ownLocation.TerritoryId) continue;
+
+                    var poseLocation = pose.WorldData!.Value.LocationInfo;
+
+                    bool isInHousing = poseLocation.WardId != 0;
+                    var distSq = Vector3.DistanceSquared(playerPos, pose.Position);
+                    if (distSq > maxDistanceSq) continue;
+
+                    bool addEntry = (!isInHousing && poseLocation.MapId == ownLocation.MapId
+                            && (!onlyCurrentServer || poseLocation.ServerId == currentServer.RowId))
+                        || (isInHousing
+                            && (((ignoreHousingLimits && !onlyCurrentServer)
+                                || (ignoreHousingLimits && onlyCurrentServer) && poseLocation.ServerId == currentServer.RowId)
+                                || poseLocation.ServerId == currentServer.RowId)
+                            && ((poseLocation.HouseId == 0 && poseLocation.DivisionId == ownLocation.DivisionId
+                                    && (ignoreHousingLimits || poseLocation.WardId == ownLocation.WardId))
+                                || (poseLocation.HouseId > 0
+                                    && (ignoreHousingLimits || (poseLocation.HouseId == ownLocation.HouseId && poseLocation.WardId == ownLocation.WardId && poseLocation.DivisionId == ownLocation.DivisionId && poseLocation.RoomId == ownLocation.RoomId)))
+                               ));
+
+                    if (addEntry)
+                    {
+                        _nearbyData[pose] = new()
+                        {
+                            Direction = GetAngleToTarget(cameraPos, cameraYaw, pose.Position),
+                            Distance = MathF.Sqrt(distSq),
+                        };
+                    }
+                }
+            }
+        }
+
+        if (_charaDataConfigService.Current.NearbyDrawWisps
+            && !_dalamudUtilService.IsInGpose
+            && !_dalamudUtilService.IsInCombatOrPerforming)
+        {
+            bool unchanged = !_wispsDirty && previousPoses.Count == _nearbyData.Count;
+
+            if (unchanged)
+            {
+                for (int i = 0; i < previousPoses.Count; i++)
+                {
+                    if (!_nearbyData.ContainsKey(previousPoses[i]))
+                    {
+                        unchanged = false;
+                        break;
+                    }
+                }
+            }
+
+            if (!unchanged)
+            {
+                await _dalamudUtilService
+                    .RunOnFrameworkThread(() => ManageWispsNearby(previousPoses))
+                    .ConfigureAwait(false);
+            }
+        }
     }
+
 
     private unsafe void HandleFrameworkUpdate()
     {
@@ -253,8 +323,11 @@ public sealed class CharaDataNearbyManager : DisposableMediatorSubscriberBase
             return;
         }
 
-        if (!_charaDataConfigService.Current.NearbyDrawWisps || _dalamudUtilService.IsInGpose || _dalamudUtilService.IsInCombatOrPerforming)
+        if ((!_charaDataConfigService.Current.NearbyDrawWisps || _dalamudUtilService.IsInGpose || _dalamudUtilService.IsInCombatOrPerforming)
+            && _poseVfx.Any())
+        {
             ClearAllVfx();
+        }
 
         var camera = CameraManager.Instance()->CurrentCamera;
         Vector3 cameraPos = new(camera->Position.X, camera->Position.Y, camera->Position.Z);
@@ -285,12 +358,15 @@ public sealed class CharaDataNearbyManager : DisposableMediatorSubscriberBase
             }
         }
 
-        foreach (var data in previousPoses.Except(_nearbyData.Keys))
+        for (int i = 0; i < previousPoses.Count; i++)
         {
+            var data = previousPoses[i];
+            if (_nearbyData.ContainsKey(data)) continue;
+
             if (_poseVfx.Remove(data, out var guid))
-            {
                 _vfxSpawnManager.DespawnObject(guid);
-            }
         }
+        _wispsDirty = false;
     }
+
 }

@@ -7,6 +7,7 @@ using RavaSync.MareConfiguration;
 using RavaSync.PlayerData.Pairs;
 using RavaSync.Services.Mediator;
 using RavaSync.Services.ServerConfiguration;
+using RavaSync.WebAPI.Files.Models;
 
 namespace RavaSync.UI.Handlers;
 
@@ -110,7 +111,76 @@ public class IdDisplayHandler
             ImGui.SetCursorPosX(textPosX);
             ImGui.SetCursorPosY(startY + line + spacing * 0.25f);
 
-            if (pair.LastAppliedApproximateVRAMBytes >= 0)
+            // If this pair is actively downloading/loading, show progress where VRAM normally sits.
+            // Once downloads finish (PairHandler clears it), this naturally falls back to VRAM.
+            var dl = pair.CurrentDownloadStatus;
+            if (dl != null && dl.Count > 0)
+            {
+                // Snapshot defensively: the underlying dictionary updates during the pipeline.
+                var snapshot = new List<FileDownloadStatus>(dl.Count);
+                try
+                {
+                    foreach (var s in dl.Values)
+                        snapshot.Add(s);
+                }
+                catch
+                {
+                    snapshot.Clear();
+                }
+
+                bool anyDownloading = false;
+                bool anyLoading = false;
+
+                long totalBytes = 0;
+                long transferredBytes = 0;
+                int totalFiles = 0;
+                int transferredFiles = 0;
+
+                foreach (var s in snapshot)
+                {
+                    switch (s.DownloadStatus)
+                    {
+                        case DownloadStatus.Downloading:
+                        case DownloadStatus.WaitingForQueue:
+                        case DownloadStatus.WaitingForSlot:
+                            anyDownloading = true;
+                            break;
+
+                        case DownloadStatus.Initializing:
+                        case DownloadStatus.Decompressing:
+                            anyLoading = true;
+                            break;
+                    }
+
+                    if (s.TotalBytes > 0) totalBytes += s.TotalBytes;
+                    if (s.TransferredBytes > 0) transferredBytes += s.TransferredBytes;
+                    if (s.TotalFiles > 0) totalFiles += s.TotalFiles;
+                    if (s.TransferredFiles > 0) transferredFiles += s.TransferredFiles;
+                }
+
+                string label = anyLoading && !anyDownloading ? "Loading" : "DL";
+                string text;
+
+                if (totalBytes > 0)
+                {
+                    var pct = (double)transferredBytes * 100d / (double)totalBytes;
+                    text = $"{label}: {UiSharedService.ByteToString(transferredBytes, addSuffix: true)}/{UiSharedService.ByteToString(totalBytes, addSuffix: true)} ({pct:0}%)";
+                }
+                else if (totalFiles > 0)
+                {
+                    var pct = (double)transferredFiles * 100d / (double)totalFiles;
+                    text = $"{label}: {transferredFiles}/{totalFiles} files ({pct:0}%)";
+                }
+                else
+                {
+                    text = anyLoading ? "Loading files…" : "Downloading…";
+                }
+
+                ImGui.PushStyleColor(ImGuiCol.Text, anyLoading ? ImGuiColors.DalamudViolet : ImGuiColors.ParsedBlue);
+                ImGui.TextUnformatted(text);
+                ImGui.PopStyleColor();
+            }
+            else if (pair.LastAppliedApproximateVRAMBytes >= 0)
             {
                 ImGui.PushStyleColor(ImGuiCol.Text, ImGuiColors.DalamudGrey);
                 ImGui.TextUnformatted($"VRAM use: {UiSharedService.ByteToString(pair.LastAppliedApproximateVRAMBytes, addSuffix: true)}");
@@ -121,6 +191,7 @@ public class IdDisplayHandler
                 // keep the second line empty but still take space
                 ImGui.Dummy(new(0, line));
             }
+
 
             // 3) ensure the cell height is at least two lines so the whole table row grows
             float used = ImGui.GetCursorPosY() - startY;

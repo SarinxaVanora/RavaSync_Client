@@ -341,6 +341,7 @@ public sealed class Plugin : IDalamudPlugin
             collection.AddScoped<WindowMediatorSubscriberBase, CompactUi>();
             collection.AddScoped<WindowMediatorSubscriberBase, IntroUi>();
             collection.AddScoped<WindowMediatorSubscriberBase, DownloadUi>();
+            collection.AddScoped<WindowMediatorSubscriberBase, MinimisedRestoreUi>();
             collection.AddScoped<WindowMediatorSubscriberBase, TournamentHpUi>();
             collection.AddScoped<WindowMediatorSubscriberBase, PopoutProfileUi>();
             collection.AddScoped<WindowMediatorSubscriberBase, DataAnalysisUi>();

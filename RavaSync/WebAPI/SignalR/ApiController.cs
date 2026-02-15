@@ -446,20 +446,34 @@ public sealed partial class ApiController : DisposableMediatorSubscriberBase, IM
 
     private void DalamudUtilOnLogIn()
     {
-        var charaName = _dalamudUtil.GetPlayerNameAsync().GetAwaiter().GetResult();
-        var worldId = _dalamudUtil.GetHomeWorldIdAsync().GetAwaiter().GetResult();
-        var auth = _serverManager.CurrentServer.Authentications.Find(f => string.Equals(f.CharacterName, charaName, StringComparison.Ordinal) && f.WorldId == worldId);
-        if (auth?.AutoLogin ?? false)
+        _ = Task.Run(async () =>
         {
-            Logger.LogInformation("Logging into {chara}", charaName);
-            _ = Task.Run(CreateConnectionsAsync);
-        }
-        else
-        {
-            Logger.LogInformation("Not logging into {chara}, auto login disabled", charaName);
-            _ = Task.Run(async () => await StopConnectionAsync(ServerState.NoAutoLogon).ConfigureAwait(false));
-        }
+            try
+            {
+                var charaName = await _dalamudUtil.GetPlayerNameAsync().ConfigureAwait(false);
+                var worldId = await _dalamudUtil.GetHomeWorldIdAsync().ConfigureAwait(false);
+
+                var auth = _serverManager.CurrentServer.Authentications.Find(f =>
+                    string.Equals(f.CharacterName, charaName, StringComparison.Ordinal) && f.WorldId == worldId);
+
+                if (auth?.AutoLogin ?? false)
+                {
+                    Logger.LogInformation("Logging into {chara}", charaName);
+                    await CreateConnectionsAsync().ConfigureAwait(false);
+                }
+                else
+                {
+                    Logger.LogInformation("Not logging into {chara}, auto login disabled", charaName);
+                    await StopConnectionAsync(ServerState.NoAutoLogon).ConfigureAwait(false);
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.LogWarning(ex, "Auto-login handling failed");
+            }
+        });
     }
+
 
     private void DalamudUtilOnLogOut()
     {

@@ -195,6 +195,7 @@
     <Content Include="Fonts\VT323-Regular.ttf">
       <CopyToOutputDirectory>Always</CopyToOutputDirectory>
     </Content>
+    <EmbeddedResource Include="Resources\icon.png" />
     <EmbeddedResource Include="Resources\aether_fill_blue.png" />
     <EmbeddedResource Include="Resources\aether_fill_green.png" />
     <EmbeddedResource Include="Resources\aether_fill_strip.png" />

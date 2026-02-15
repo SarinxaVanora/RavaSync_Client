@@ -255,13 +255,68 @@ public class DrawUserPair
         }
         else if (_pair.IsVisible)
         {
-            _uiSharedService.IconText(FontAwesomeIcon.Eye, ImGuiColors.ParsedGreen);
-            userPairText = _pair.UserData.AliasOrUID + " is visible: " + _pair.PlayerName + Environment.NewLine + "Click to target this player";
+            var icon = FontAwesomeIcon.Eye;
+            var color = ImGuiColors.ParsedGreen;
+            var stateText = "Visible";
+
+            if (_pair.IsUploadingRecently)
+            {
+                icon = FontAwesomeIcon.Upload;
+                color = ImGuiColors.DalamudYellow;
+                stateText = "Visible - Uploading";
+            }
+            else
+            {
+                var dl = _pair.CurrentDownloadStatus;
+
+                try
+                {
+                    if (dl != null && dl.Count > 0)
+                    {
+                        var statuses = dl.Values.ToArray();
+
+                        bool hasDownloading = statuses.Any(s =>
+                            s.DownloadStatus == RavaSync.WebAPI.Files.Models.DownloadStatus.Downloading
+                            || s.DownloadStatus == RavaSync.WebAPI.Files.Models.DownloadStatus.WaitingForQueue
+                            || s.DownloadStatus == RavaSync.WebAPI.Files.Models.DownloadStatus.WaitingForSlot);
+
+                        bool hasLoading = statuses.Any(s =>
+                            s.DownloadStatus == RavaSync.WebAPI.Files.Models.DownloadStatus.Initializing
+                            || s.DownloadStatus == RavaSync.WebAPI.Files.Models.DownloadStatus.Decompressing);
+
+                        if (hasDownloading)
+                        {
+                            icon = FontAwesomeIcon.Download;
+                            color = ImGuiColors.ParsedBlue;
+                            stateText = "Visible - Downloading";
+                        }
+                        else if (hasLoading)
+                        {
+                            icon = FontAwesomeIcon.Sync;
+                            color = ImGuiColors.DalamudViolet;
+                            stateText = "Visible - Loading files";
+                        }
+                    }
+                }
+                catch
+                {
+                    // ignore
+                }
+            }
+
+            _uiSharedService.IconText(icon, color);
+
+            userPairText = $"{_pair.UserData.AliasOrUID} is {stateText}: {_pair.PlayerName}"
+                + Environment.NewLine
+                + "Click to target this player";
+
             if (ImGui.IsItemClicked())
             {
                 _mediator.Publish(new TargetPairMessage(_pair));
             }
         }
+
+
         else
         {
             using var _ = ImRaii.PushColor(ImGuiCol.Text, ImGuiColors.HealerGreen);

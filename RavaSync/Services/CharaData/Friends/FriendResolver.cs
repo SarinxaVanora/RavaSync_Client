@@ -14,8 +14,13 @@ public sealed class FriendResolver : IFriendResolver, IDisposable
     private readonly IFramework _framework;
     private readonly IObjectTable _objects;
 
-    // live set of visible-friend names (case-sensitive like MiniMappingway)
-    private readonly ConcurrentDictionary<string, byte> _friendNames = new(StringComparer.Ordinal);
+    // live set of visible-friend names
+    private readonly ConcurrentDictionary<string, int> _friendNames = new(StringComparer.Ordinal);
+
+    private int _friendScanId = 0;
+    private long _nextScanAtTick = 0;
+    private const int FriendScanIntervalMs = 250;
+
 
     public FriendResolver(
         ILogger<FriendResolver> logger,
@@ -32,12 +37,16 @@ public sealed class FriendResolver : IFriendResolver, IDisposable
     public bool IsFriend(string playerName)
         => !string.IsNullOrEmpty(playerName) && _friendNames.ContainsKey(playerName);
 
-    private void OnFrameworkUpdate(IFramework _)
+    private void OnFrameworkUpdate(IFramework _frm)
     {
         try
         {
-            // Rebuild the set from what's currently visible
-            var seen = new HashSet<string>(StringComparer.Ordinal);
+            var nowTick = Environment.TickCount64;
+            if (nowTick < _nextScanAtTick)
+                return;
+
+            _nextScanAtTick = nowTick + FriendScanIntervalMs;
+            var scanId = unchecked(++_friendScanId);
 
             for (int i = 0; i < _objects.Length; i++)
             {
@@ -45,29 +54,27 @@ public sealed class FriendResolver : IFriendResolver, IDisposable
                 if (obj is null || obj.ObjectKind != ObjectKind.Player)
                     continue;
 
+                unsafe
+                {
+                    var ch = (Character*)obj.Address;
+                    if (ch == null || !ch->IsFriend)
+                        continue;
+                }
+
                 var name = obj.Name.ToString();
                 if (string.IsNullOrEmpty(name))
                     continue;
 
-                unsafe
-                {
-                    // MiniMappingway casts to Character* and reads IsFriend
-                    var ch = (Character*)obj.Address;
-                    if (ch != null && ch->IsFriend)
-                        seen.Add(name);
-                }
+                _friendNames[name] = scanId;
             }
 
-            // minimal churn: remove those no longer friends this frame
-            foreach (var existing in _friendNames.Keys)
+
+            foreach (var kv in _friendNames)
             {
-                if (!seen.Contains(existing))
-                    _friendNames.TryRemove(existing, out byte _);
+                if (kv.Value != scanId)
+                    _friendNames.TryRemove(kv.Key, out _);
             }
 
-            // add new ones
-            foreach (var n in seen)
-                _friendNames[n] = 1;
         }
         catch (Exception ex)
         {

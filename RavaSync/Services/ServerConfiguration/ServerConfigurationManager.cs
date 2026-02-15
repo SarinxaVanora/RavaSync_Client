@@ -98,9 +98,22 @@ public class ServerConfigurationManager
         }
         hasMulti = false;
 
-        var charaName = _dalamudUtil.GetPlayerNameAsync().GetAwaiter().GetResult();
-        var worldId = _dalamudUtil.GetHomeWorldIdAsync().GetAwaiter().GetResult();
-        var cid = _dalamudUtil.GetCIDAsync().GetAwaiter().GetResult();
+        string charaName;
+        uint worldId;
+        ulong cid;
+
+        if (_dalamudUtil.IsOnFrameworkThread)
+        {
+            charaName = _dalamudUtil.GetPlayerName();
+            worldId = _dalamudUtil.GetHomeWorldId();
+            cid = _dalamudUtil.GetCID();
+        }
+        else
+        {
+            charaName = _dalamudUtil.GetPlayerNameAsync().GetAwaiter().GetResult();
+            worldId = _dalamudUtil.GetHomeWorldIdAsync().GetAwaiter().GetResult();
+            cid = _dalamudUtil.GetCIDAsync().GetAwaiter().GetResult();
+        }
 
         var auth = currentServer.Authentications.FindAll(f => string.Equals(f.CharacterName, charaName) && f.WorldId == worldId);
         if (auth.Count >= 2)
@@ -145,9 +158,23 @@ public class ServerConfigurationManager
         }
         hasMulti = false;
 
-        var charaName = _dalamudUtil.GetPlayerNameAsync().GetAwaiter().GetResult();
-        var worldId = _dalamudUtil.GetHomeWorldIdAsync().GetAwaiter().GetResult();
-        var cid = _dalamudUtil.GetCIDAsync().GetAwaiter().GetResult();
+        string charaName;
+        uint worldId;
+        ulong cid;
+
+        if (_dalamudUtil.IsOnFrameworkThread)
+        {
+            charaName = _dalamudUtil.GetPlayerName();
+            worldId = _dalamudUtil.GetHomeWorldId();
+            cid = _dalamudUtil.GetCID();
+        }
+        else
+        {
+            charaName = _dalamudUtil.GetPlayerNameAsync().GetAwaiter().GetResult();
+            worldId = _dalamudUtil.GetHomeWorldIdAsync().GetAwaiter().GetResult();
+            cid = _dalamudUtil.GetCIDAsync().GetAwaiter().GetResult();
+        }
+
         if (!currentServer.Authentications.Any() && currentServer.SecretKeys.Any())
         {
             currentServer.Authentications.Add(new Authentication()

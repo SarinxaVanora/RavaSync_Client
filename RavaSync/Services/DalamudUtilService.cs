@@ -48,10 +48,41 @@ public class DalamudUtilService : IHostedService, IMediatorSubscriber
     private string _lastGlobalBlockPlayer = string.Empty;
     private string _lastGlobalBlockReason = string.Empty;
     private ushort _lastZone = 0;
-    private readonly Dictionary<string, (string Name, nint Address)> _playerCharas = new(StringComparer.Ordinal);
+    //private readonly Dictionary<string, (string Name, nint Address)> _playerCharas = new(StringComparer.Ordinal);
     private readonly List<string> _notUpdatedCharas = [];
     private bool _sentBetweenAreas = false;
     private Lazy<ulong> _cid;
+
+
+    private struct PlayerCharaInfo
+    {
+        public string Name;
+        public nint Address;
+        public int LastSeenScan;
+
+        public PlayerCharaInfo(string name, nint address, int lastSeenScan)
+        {
+            Name = name;
+            Address = address;
+            LastSeenScan = lastSeenScan;
+        }
+    }
+
+    private readonly Dictionary<string, PlayerCharaInfo> _playerCharas = new(StringComparer.Ordinal);
+
+    private readonly Dictionary<nint, string> _identByAddress = new();
+    private readonly Dictionary<string, nint> _addressBySessionId = new(StringComparer.Ordinal);
+
+    private readonly Dictionary<ulong, string> _cidHashCache = new();
+    private const int _cidHashCacheMax = 512;
+
+    private int _playerCharaScanId = 0;
+    private DateTime _nextPlayerCharaScan = DateTime.MinValue;
+    private DateTime _nextPlayerCharaPrune = DateTime.MinValue;
+    private static readonly TimeSpan _playerCharaScanInterval = TimeSpan.FromMilliseconds(250);
+    private static readonly TimeSpan _playerCharaPruneInterval = TimeSpan.FromSeconds(2);
+
+
 
     public DalamudUtilService(ILogger<DalamudUtilService> logger, IClientState clientState, IObjectTable objectTable, IFramework framework,
         IGameGui gameGui, ICondition condition, IDataManager gameData, ITargetManager targetManager, IGameConfig gameConfig,
@@ -395,12 +426,12 @@ public class DalamudUtilService : IHostedService, IMediatorSubscriber
 
     public async Task<string> GetPlayerNameHashedAsync()
     {
-        return await RunOnFrameworkThread(() => _cid.Value.ToString().GetHash256()).ConfigureAwait(false);
+        return await RunOnFrameworkThread(() => _cid.Value.GetHash256()).ConfigureAwait(false);
     }
 
     private unsafe static string GetHashedCIDFromPlayerPointer(nint ptr)
     {
-        return ((BattleChara*)ptr)->Character.ContentId.ToString().GetHash256();
+        return ((BattleChara*)ptr)->Character.ContentId.GetHash256();
     }
 
     public IntPtr GetPlayerPtr()
@@ -523,61 +554,65 @@ public class DalamudUtilService : IHostedService, IMediatorSubscriber
 
     public async Task RunOnFrameworkThread(System.Action act, [CallerMemberName] string callerMember = "", [CallerFilePath] string callerFilePath = "", [CallerLineNumber] int callerLineNumber = 0)
     {
-        //var fileName = Path.GetFileNameWithoutExtension(callerFilePath);
-        //await _performanceCollector.LogPerformance(this, $"RunOnFramework:Act/{fileName}>{callerMember}:{callerLineNumber}", async () =>
-        //{
-        //    if (!_framework.IsInFrameworkUpdateThread)
-        //    {
-        //        await _framework.RunOnFrameworkThread(act).ContinueWith((_) => Task.CompletedTask).ConfigureAwait(false);
-        //        while (_framework.IsInFrameworkUpdateThread) // yield the thread again, should technically never be triggered
-        //        {
-        //            _logger.LogTrace("Still on framework");
-        //            await Task.Delay(1).ConfigureAwait(false);
-        //        }
-        //    }
-        //    else
-        //        act();
-        //}).ConfigureAwait(false);
+        if (_performanceCollector.Enabled)
+        {
+            var fileName = Path.GetFileNameWithoutExtension(callerFilePath);
 
-        var fileName = Path.GetFileNameWithoutExtension(callerFilePath);
-
-        await _performanceCollector.LogPerformance(
-            this,
-            $"RunOnFrameworkThread:Act/{fileName}>{callerMember}:{callerLineNumber}",
-            async () =>
-            {
-                // If we’re already on the framework thread, just do the thing.
-                if (_framework.IsInFrameworkUpdateThread)
+            await _performanceCollector.LogPerformance(
+                this,
+                $"RunOnFrameworkThread:Act/{fileName}>{callerMember}:{callerLineNumber}",
+                async () =>
                 {
-                    act();
-                    return;
-                }
+                    if (_framework.IsInFrameworkUpdateThread)
+                    {
+                        act();
+                        return;
+                    }
 
-                // Otherwise schedule once on the framework thread and *don’t* spin-wait afterwards.
-                await _framework
-                    .RunOnFrameworkThread(act)
-                    .ConfigureAwait(false);
-            }).ConfigureAwait(false);
+                    await _framework
+                        .RunOnFrameworkThread(act)
+                        .ConfigureAwait(false);
+                }).ConfigureAwait(false);
+
+            return;
+        }
+
+        // Fast path: no perf logging, no extra allocations.
+        if (_framework.IsInFrameworkUpdateThread)
+        {
+            act();
+            return;
+        }
+
+        await _framework
+            .RunOnFrameworkThread(act)
+            .ConfigureAwait(false);
     }
 
     public async Task<T> RunOnFrameworkThread<T>(Func<T> func, [CallerMemberName] string callerMember = "", [CallerFilePath] string callerFilePath = "", [CallerLineNumber] int callerLineNumber = 0)
     {
-        var fileName = Path.GetFileNameWithoutExtension(callerFilePath);
-        return await _performanceCollector.LogPerformance(this, $"RunOnFramework:Func<{typeof(T)}>/{fileName}>{callerMember}:{callerLineNumber}", async () =>
+        if (_performanceCollector.Enabled)
         {
-            if (!_framework.IsInFrameworkUpdateThread)
-            {
-                var result = await _framework.RunOnFrameworkThread(func).ContinueWith((task) => task.Result).ConfigureAwait(false);
-                while (_framework.IsInFrameworkUpdateThread) // yield the thread again, should technically never be triggered
-                {
-                    _logger.LogTrace("Still on framework");
-                    await Task.Delay(1).ConfigureAwait(false);
-                }
-                return result;
-            }
+            var fileName = Path.GetFileNameWithoutExtension(callerFilePath);
 
+            return await _performanceCollector.LogPerformance(
+                this,
+                $"RunOnFramework:Func<{typeof(T)}>/{fileName}>{callerMember}:{callerLineNumber}",
+                async () =>
+                {
+                    if (_framework.IsInFrameworkUpdateThread)
+                        return func.Invoke();
+
+                    return await _framework.RunOnFrameworkThread(func).ConfigureAwait(false);
+
+                }).ConfigureAwait(false);
+        }
+
+        // Fast path: no perf logging, no extra allocations.
+        if (_framework.IsInFrameworkUpdateThread)
             return func.Invoke();
-        }).ConfigureAwait(false);
+
+        return await _framework.RunOnFrameworkThread(func).ConfigureAwait(false);
     }
 
     public Task StartAsync(CancellationToken cancellationToken)
@@ -711,8 +746,98 @@ public class DalamudUtilService : IHostedService, IMediatorSubscriber
 
     internal (string Name, nint Address) FindPlayerByNameHash(string ident)
     {
-        _playerCharas.TryGetValue(ident, out var result);
-        return result;
+        if (_playerCharas.TryGetValue(ident, out var info))
+            return (info.Name, info.Address);
+
+        return default;
+    }
+
+
+    private void UpdatePlayerCharaCache()
+    {
+        var now = DateTime.UtcNow;
+
+        if (now < _nextPlayerCharaScan)
+            return;
+
+        _nextPlayerCharaScan = now.Add(_playerCharaScanInterval);
+        var scanId = unchecked(++_playerCharaScanId);
+
+        // rebuild fast lookup caches (used heavily by UI every frame)
+        _identByAddress.Clear();
+        _addressBySessionId.Clear();
+
+        for (var i = 0; i < 200; i += 2)
+        {
+            var chara = _objectTable[i] as IPlayerCharacter;
+            if (chara == null) continue;
+
+            if (chara.Address == nint.Zero || chara.ObjectKind == (uint)ObjectKind.None)
+                continue;
+
+            var charaName = chara.Name.TextValue;
+            if (string.IsNullOrEmpty(charaName))
+                continue;
+
+            unsafe
+            {
+                var cid = ((BattleChara*)chara.Address)->Character.ContentId;
+
+                if (!_cidHashCache.TryGetValue(cid, out var hash))
+                {
+                    hash = cid.GetHash256();
+
+                    // simple cap to avoid unbounded growth
+                    if (_cidHashCache.Count > _cidHashCacheMax)
+                        _cidHashCache.Clear();
+
+                    _cidHashCache[cid] = hash;
+                }
+
+                if (string.IsNullOrEmpty(hash))
+                    continue;
+
+                _identByAddress[chara.Address] = hash;
+
+                // Precompute session id mapping so UI doesn’t do N^2 scans every frame
+                var sid = RavaSync.Services.Discovery.RavaSessionId.FromIdent(hash);
+                if (!string.IsNullOrEmpty(sid))
+                    _addressBySessionId[sid] = chara.Address;
+
+                if (_playerCharas.TryGetValue(hash, out var existing))
+                {
+                    existing.Name = charaName;
+                    existing.Address = chara.Address;
+                    existing.LastSeenScan = scanId;
+                    _playerCharas[hash] = existing;
+                }
+                else
+                {
+                    _playerCharas[hash] = new PlayerCharaInfo(charaName, chara.Address, scanId);
+                }
+            }
+        }
+
+        if (now < _nextPlayerCharaPrune || _playerCharas.Count == 0)
+            return;
+
+        _nextPlayerCharaPrune = now.Add(_playerCharaPruneInterval);
+
+        List<string>? toRemove = null;
+
+        foreach (var kvp in _playerCharas)
+        {
+            if (kvp.Value.LastSeenScan == scanId)
+                continue;
+
+            toRemove ??= new List<string>(8);
+            toRemove.Add(kvp.Key);
+        }
+
+        if (toRemove == null) return;
+
+        foreach (var k in toRemove)
+            _playerCharas.Remove(k);
     }
 
     private unsafe void CheckCharacterForDrawing(nint address, string characterName)
@@ -771,7 +896,10 @@ public class DalamudUtilService : IHostedService, IMediatorSubscriber
 
     private void FrameworkOnUpdate(IFramework framework)
     {
-        _performanceCollector.LogPerformance(this, $"FrameworkOnUpdate", FrameworkOnUpdateInternal);
+        if (_performanceCollector.Enabled)
+            _performanceCollector.LogPerformance(this, $"FrameworkOnUpdate", FrameworkOnUpdateInternal);
+        else
+            FrameworkOnUpdateInternal();
     }
 
     private unsafe void FrameworkOnUpdateInternal()
@@ -783,41 +911,14 @@ public class DalamudUtilService : IHostedService, IMediatorSubscriber
 
         bool isNormalFrameworkUpdate = DateTime.UtcNow < _delayedFrameworkUpdateCheck.AddSeconds(1);
 
-        _performanceCollector.LogPerformance(this, $"FrameworkOnUpdateInternal+{(isNormalFrameworkUpdate ? "Regular" : "Delayed")}", () =>
+        System.Action update = () =>
         {
             IsAnythingDrawing = false;
-            _performanceCollector.LogPerformance(this, $"ObjTableToCharas",
-                () =>
-                {
-                    _notUpdatedCharas.AddRange(_playerCharas.Keys);
 
-                    for (int i = 0; i < 200; i += 2)
-                    {
-                        var chara = _objectTable[i];
-                        if (chara == null || chara.ObjectKind != Dalamud.Game.ClientState.Objects.Enums.ObjectKind.Player)
-                            continue;
-
-                        if (_blockedCharacterHandler.IsCharacterBlocked(chara.Address, out bool firstTime) && firstTime)
-                        {
-                            _logger.LogTrace("Skipping character {addr}, blocked/muted", chara.Address.ToString("X"));
-                            continue;
-                        }
-
-                        var charaName = ((GameObject*)chara.Address)->NameString;
-                        var hash = GetHashedCIDFromPlayerPointer(chara.Address);
-                        if (!IsAnythingDrawing)
-                            CheckCharacterForDrawing(chara.Address, charaName);
-                        _notUpdatedCharas.Remove(hash);
-                        _playerCharas[hash] = (charaName, chara.Address);
-                    }
-
-                    foreach (var notUpdatedChara in _notUpdatedCharas)
-                    {
-                        _playerCharas.Remove(notUpdatedChara);
-                    }
-
-                    _notUpdatedCharas.Clear();
-                });
+            if (_performanceCollector.Enabled)
+                _performanceCollector.LogPerformance(this, $"ObjTableToCharas", UpdatePlayerCharaCache);
+            else
+                UpdatePlayerCharaCache();
 
             if (!IsAnythingDrawing && !string.IsNullOrEmpty(_lastGlobalBlockPlayer))
             {
@@ -945,7 +1046,12 @@ public class DalamudUtilService : IHostedService, IMediatorSubscriber
             Mediator.Publish(new DelayedFrameworkUpdateMessage());
 
             _delayedFrameworkUpdateCheck = DateTime.UtcNow;
-        });
+        };
+
+        if (_performanceCollector.Enabled)
+            _performanceCollector.LogPerformance(this, $"FrameworkOnUpdateInternal+{(isNormalFrameworkUpdate ? "Regular" : "Delayed")}", update);
+        else
+            update();
     }
     public bool TryGetRegisterableVenue(IGameGui gameGui, out VenueAddress address, out string denyReason)
     {
@@ -1014,37 +1120,17 @@ public class DalamudUtilService : IHostedService, IMediatorSubscriber
         if (gameObject == null || gameObject.Address == IntPtr.Zero)
             return null;
 
-        var addr = gameObject.Address;
-
-        foreach (var kvp in _playerCharas)
-        {
-            if (kvp.Value.Address == addr)
-                return kvp.Key; // ident
-        }
-
-        return null;
+        return _identByAddress.TryGetValue(gameObject.Address, out var ident) ? ident : null;
     }
 
     public IGameObject? GetGameObjectBySessionId(string sessionId)
     {
+        EnsureIsOnFramework();
+
         if (string.IsNullOrEmpty(sessionId)) return null;
 
-        foreach (var obj in _objectTable)
-        {
-            try
-            {
-                var ident = GetIdentFromGameObject(obj);
-                if (string.IsNullOrEmpty(ident)) continue;
-
-                var sid = RavaSync.Services.Discovery.RavaSessionId.FromIdent(ident);
-                if (string.Equals(sid, sessionId, StringComparison.Ordinal))
-                    return obj;
-            }
-            catch
-            {
-                //*ignore*
-            }
-        }
+        if (_addressBySessionId.TryGetValue(sessionId, out var addr) && addr != nint.Zero)
+            return CreateGameObject((IntPtr)addr);
 
         return null;
     }

@@ -61,10 +61,14 @@ public class PlayerDataFactory
 
         try
         {
-            return await _performanceCollector.LogPerformance(this, $"CreateCharacterData>{playerRelatedObject.ObjectKind}", async () =>
+            if (_performanceCollector.Enabled)
             {
-                return await CreateCharacterData(playerRelatedObject, token).ConfigureAwait(false);
-            }).ConfigureAwait(true);
+                return await _performanceCollector.LogPerformance(this, $"CreateCharacterData>{playerRelatedObject.ObjectKind}", async () =>
+                {
+                    return await CreateCharacterData(playerRelatedObject, token).ConfigureAwait(false);
+                }).ConfigureAwait(true);
+            }
+            return await CreateCharacterData(playerRelatedObject, token).ConfigureAwait(true);
         }
         catch (OperationCanceledException)
         {

@@ -42,6 +42,8 @@ internal sealed partial class CharaDataHubUi : WindowMediatorSubscriberBase
     private bool _filterWorldOnly = false;
     private string _gposeTarget = string.Empty;
     private bool _hasValidGposeTarget;
+    private Task<(bool CanApply, string TargetName)>? _gposeCheckTask;
+    private DateTime _nextGposeCheckUtc = DateTime.MinValue;
     private string _importCode = string.Empty;
     private bool _isHandlingSelf = false;
     private DateTime _lastFavoriteUpdateTime = DateTime.UtcNow;
@@ -165,7 +167,27 @@ internal sealed partial class CharaDataHubUi : WindowMediatorSubscriberBase
             UpdateFilteredFavorites();
         }
 
-        (_hasValidGposeTarget, _gposeTarget) = _charaDataManager.CanApplyInGpose().GetAwaiter().GetResult();
+        var now = DateTime.UtcNow;
+        if (now >= _nextGposeCheckUtc)
+        {
+            _nextGposeCheckUtc = now.AddMilliseconds(250);
+
+            if (_gposeCheckTask == null || _gposeCheckTask.IsCompleted)
+                _gposeCheckTask = _charaDataManager.CanApplyInGpose();
+        }
+
+        if (_gposeCheckTask != null && _gposeCheckTask.IsCompleted)
+        {
+            try
+            {
+                (_hasValidGposeTarget, _gposeTarget) = _gposeCheckTask.Result;
+            }
+            catch
+            {
+                _hasValidGposeTarget = false;
+                _gposeTarget = string.Empty;
+            }
+        }
 
         if (!_charaDataManager.BrioAvailable)
         {
@@ -383,10 +405,11 @@ internal sealed partial class CharaDataHubUi : WindowMediatorSubscriberBase
                 UiSharedService.AttachToolTip($"Target the GPose Character {CharaName(actor.Name.TextValue)}");
                 ImGui.AlignTextToFramePadding();
                 var pos = ImGui.GetCursorPosX();
-                using (ImRaii.PushColor(ImGuiCol.Text, ImGuiColors.HealerGreen, actor.Address == (_dalamudUtilService.GetGposeTargetGameObjectAsync().GetAwaiter().GetResult()?.Address ?? nint.Zero)))
+                using (ImRaii.PushColor(ImGuiCol.Text, ImGuiColors.HealerGreen, _hasValidGposeTarget && string.Equals(actor.Name.TextValue, _gposeTarget, StringComparison.Ordinal)))
                 {
                     ImGui.TextUnformatted(CharaName(actor.Name.TextValue));
                 }
+
                 ImGui.SameLine(250);
                 var handled = _charaDataManager.HandledCharaData.FirstOrDefault(c => string.Equals(c.Name, actor.Name.TextValue, StringComparison.Ordinal));
                 using (ImRaii.Disabled(handled == null))

@@ -54,12 +54,19 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
 
     private int GetCdnParallelTarget(int configuredParallel, int filesInGroup)
     {
+        var maxParallel = AutoCdnMaxParallel;
+
+        // During room-entry storms, clamp parallelism to reduce IO/CPU spikes.
+        if (SyncStorm.IsActive)
+            maxParallel = Math.Min(maxParallel, 4);
+
         if (configuredParallel > 0)
-            return Math.Clamp(configuredParallel, 1, Math.Min(AutoCdnMaxParallel, Math.Max(1, filesInGroup)));
+            return Math.Clamp(configuredParallel, 1, Math.Min(maxParallel, Math.Max(1, filesInGroup)));
 
         var p = Volatile.Read(ref _autoCdnParallel);
-        p = Math.Clamp(p, AutoCdnMinParallel, AutoCdnMaxParallel);
+        p = Math.Clamp(p, AutoCdnMinParallel, maxParallel);
         return Math.Clamp(p, 1, Math.Max(1, filesInGroup));
+
     }
 
     private void UpdateAutoCdnParallel(int usedParallel, bool success, bool hadTimeoutOrBackoff, bool hadSlow)
@@ -525,15 +532,16 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
         {
             _downloadStatus[downloadGroup.Key] = new FileDownloadStatus()
             {
-                DownloadStatus = DownloadStatus.Initializing,
+                DownloadStatus = DownloadStatus.WaitingForQueue,
                 TotalBytes = downloadGroup.Sum(c => c.Total),
-                TotalFiles = 1,
+                TotalFiles = downloadGroup.Count(),
                 TransferredBytes = 0,
                 TransferredFiles = 0
             };
         }
 
         Mediator.Publish(new DownloadStartedMessage(gameObjectHandler, _downloadStatus));
+
 
         var anyGroupFailure = 0;
         var failedGroups = new ConcurrentBag<string>();
@@ -1001,8 +1009,17 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
             var results = new ConcurrentBag<CdnDownloadedFile>();
             var groupKey = fileGroup.Key;
 
+            if (_downloadStatus.TryGetValue(groupKey, out var statusStart))
+            {
+                lock (statusStart)
+                {
+                    statusStart.DownloadStatus = DownloadStatus.Downloading;
+                }
+            }
+
             var index = -1;
             var workers = new List<Task>(cdnParallel);
+
 
             for (int i = 0; i < cdnParallel; i++)
             {
@@ -1068,7 +1085,10 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
 
             if (_downloadStatus.TryGetValue(groupKey, out var status))
             {
-                status.DownloadStatus = DownloadStatus.Decompressing;
+                lock (status)
+                {
+                    status.DownloadStatus = DownloadStatus.Decompressing;
+                }
             }
 
             Logger.LogDebug("CDN fast-path: completed all files for group {group} via CDN", groupKey);

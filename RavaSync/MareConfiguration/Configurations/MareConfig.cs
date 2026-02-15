@@ -80,6 +80,7 @@ public class MareConfig : IMareConfiguration
     public int ParallelApplyDegree { get; set; } = 0;
     public bool ShowFriendshapedHeart { get; set; } = true;
     public bool EnableSendPairRequestContextMenu { get; set; } = true;
+    public bool ShowMinimizedRestoreIcon { get; set; } = true;
     public bool AutoDeclineIncomingPairRequests { get; set; } = false;
     public bool SeenDiscoveryIntro { get; set; } = false;
     public bool EnableRavaDiscoveryPresence { get; set; } = false;

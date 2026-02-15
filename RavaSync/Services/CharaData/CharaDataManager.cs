@@ -42,6 +42,16 @@ public sealed partial class CharaDataManager : DisposableMediatorSubscriberBase
     private CancellationTokenSource _uploadCts = new();
     private Uri? _filesCdnUri;
 
+    private readonly SemaphoreSlim _distributionSemaphore = new(1, 1);
+    private int _distributionPending = 0;
+    private Task? _distributionWorker = null;
+    private readonly object _distributionWorkerLock = new();
+    private CancellationTokenSource _distributionCts = new();
+    private readonly Dictionary<string, CharaDataMetaInfoExtendedDto?> _metaInfoDistributionSnapshot = new(StringComparer.Ordinal);
+    private readonly object _stateLock = new();
+    private int _stateEpoch = 0;
+
+
     public CharaDataManager(ILogger<CharaDataManager> logger, ApiController apiController,
         CharaDataFileHandler charaDataFileHandler,
         MareMediator mareMediator, IpcManager ipcManager, DalamudUtilService dalamudUtilService,
@@ -59,20 +69,42 @@ public sealed partial class CharaDataManager : DisposableMediatorSubscriberBase
         _pairManager = pairManager;
         mareMediator.Subscribe<ConnectedMessage>(this, (msg) =>
         {
+            System.Threading.Interlocked.Increment(ref _stateEpoch);
+            _applicationCts = _applicationCts.CancelRecreate();
+            _uploadCts = _uploadCts.CancelRecreate();
+            _getAllDataCts = _getAllDataCts.CancelRecreate();
+            _getSharedDataCts = _getSharedDataCts.CancelRecreate();
+            _charaDataCreateCts = _charaDataCreateCts.CancelRecreate();
+
             _connectCts?.Cancel();
             _connectCts?.Dispose();
             _connectCts = new();
 
+            _distributionCts.Cancel();
+            _distributionCts.Dispose();
+            _distributionCts = new();
+            _distributionWorker = null;
+            System.Threading.Interlocked.Exchange(ref _distributionPending, 0);
+
             _filesCdnUri = msg.Connection.ServerInfo.FileServerAddress;
 
-            _ownCharaData.Clear();
+            lock (_stateLock)
+            {
+                _ownCharaData.Clear();
+                _sharedWithYouData.Clear();
+                _updateDtos.Clear();
+                _sharedMetaInfoTimeoutTasks.Clear();
+            }
             _metaInfoCache.Clear();
-            _sharedWithYouData.Clear();
-            _updateDtos.Clear();
+            _metaInfoDistributionSnapshot.Clear();
+
+
             Initialized = false;
+
             MaxCreatableCharaData = string.IsNullOrEmpty(msg.Connection.User.Alias)
                 ? msg.Connection.ServerInfo.MaxCharaData
                 : msg.Connection.ServerInfo.MaxCharaDataVanity;
+
             if (_configService.Current.DownloadMcdDataOnConnection)
             {
                 var token = _connectCts.Token;
@@ -81,14 +113,36 @@ public sealed partial class CharaDataManager : DisposableMediatorSubscriberBase
             }
         });
 
+
         mareMediator.Subscribe<DisconnectedMessage>(this, (msg) =>
         {
-            _ownCharaData.Clear();
+            System.Threading.Interlocked.Increment(ref _stateEpoch);
+
+            _applicationCts = _applicationCts.CancelRecreate();
+            _uploadCts = _uploadCts.CancelRecreate();
+            _getAllDataCts = _getAllDataCts.CancelRecreate();
+            _getSharedDataCts = _getSharedDataCts.CancelRecreate();
+            _charaDataCreateCts = _charaDataCreateCts.CancelRecreate();
+
+            _distributionCts.Cancel();
+            _distributionCts.Dispose();
+            _distributionCts = new();
+            _distributionWorker = null;
+            System.Threading.Interlocked.Exchange(ref _distributionPending, 0);
+
+            lock (_stateLock)
+            {
+                _ownCharaData.Clear();
+                _sharedWithYouData.Clear();
+                _updateDtos.Clear();
+                _sharedMetaInfoTimeoutTasks.Clear();
+            }
             _metaInfoCache.Clear();
-            _sharedWithYouData.Clear();
-            _updateDtos.Clear();
+            _metaInfoDistributionSnapshot.Clear();
+
             Initialized = false;
         });
+
     }
 
     public Task? AttachingPoseTask { get; private set; }
@@ -223,17 +277,24 @@ public sealed partial class CharaDataManager : DisposableMediatorSubscriberBase
         return UiBlockingComputation = Task.Run(async () =>
         {
             var apply = await CanApplyInGpose().ConfigureAwait(false);
-            if (pose.WorldData == default || !(await CanApplyInGpose().ConfigureAwait(false)).CanApply) return;
-            var gposeChara = await _dalamudUtilService.GetGposeCharacterFromObjectTableByNameAsync(targetName, true).ConfigureAwait(false);
-            if (gposeChara == null) return;
+            if (!apply.CanApply) return;
 
             if (pose.WorldData == null || pose.WorldData == default) return;
 
+            var gposeChara = await _dalamudUtilService
+                .GetGposeCharacterFromObjectTableByNameAsync(targetName, true)
+                .ConfigureAwait(false);
+
+            if (gposeChara == null) return;
+
             Logger.LogDebug("Applying World data {data}", pose.WorldData);
 
-            await _ipcManager.Brio.ApplyTransformAsync(gposeChara.Address, pose.WorldData.Value).ConfigureAwait(false);
+            await _ipcManager.Brio
+                .ApplyTransformAsync(gposeChara.Address, pose.WorldData.Value)
+                .ConfigureAwait(false);
         });
     }
+
 
     public Task ApplyWorldDataToGPoseTarget(PoseEntry pose)
     {
@@ -328,34 +389,57 @@ public sealed partial class CharaDataManager : DisposableMediatorSubscriberBase
         var ret = await _apiController.CharaDataDelete(dto.Id).ConfigureAwait(false);
         if (ret)
         {
-            _ownCharaData.Remove(dto.Id);
+            lock (_stateLock)
+            {
+                _ownCharaData.Remove(dto.Id);
+                _updateDtos.Remove(dto.Id);
+            }
+
             _metaInfoCache.Remove(dto.FullId, out _);
         }
-        DistributeMetaInfo();
+
+        RequestDistributeMetaInfo();
     }
 
     public void DownloadMetaInfo(string importCode, bool store = true)
     {
         DownloadMetaInfoTask = Task.Run(async () =>
         {
+            var epoch = System.Threading.Volatile.Read(ref _stateEpoch);
+
             try
             {
                 if (store)
                 {
                     LastDownloadedMetaInfo = null;
                 }
+
                 var metaInfo = await _apiController.CharaDataGetMetainfo(importCode).ConfigureAwait(false);
-                _sharedMetaInfoTimeoutTasks[importCode] = Task.Delay(TimeSpan.FromSeconds(10));
+
+                if (epoch != System.Threading.Volatile.Read(ref _stateEpoch))
+                    return ("Ok", false);
+
+                lock (_stateLock)
+                {
+                    _sharedMetaInfoTimeoutTasks[importCode] = Task.Delay(TimeSpan.FromSeconds(10));
+                }
+
                 if (metaInfo == null)
                 {
                     _metaInfoCache[importCode] = null;
                     return ("Failed to download meta info for this code. Check if the code is valid and you have rights to access it.", false);
                 }
+
                 await CacheData(metaInfo).ConfigureAwait(false);
+
                 if (store)
                 {
+                    if (epoch != System.Threading.Volatile.Read(ref _stateEpoch))
+                        return ("Ok", false);
+
                     LastDownloadedMetaInfo = await CharaDataMetaInfoExtendedDto.Create(metaInfo, _dalamudUtilService).ConfigureAwait(false);
                 }
+
                 return ("Ok", true);
             }
             finally
@@ -366,35 +450,52 @@ public sealed partial class CharaDataManager : DisposableMediatorSubscriberBase
         });
     }
 
+
     public async Task GetAllData(CancellationToken cancelToken)
     {
-        foreach (var data in _ownCharaData)
+        var epoch = System.Threading.Volatile.Read(ref _stateEpoch);
+
+        lock (_stateLock)
         {
-            _metaInfoCache.Remove(data.Key, out _);
+            _ownCharaData.Clear();
+            _updateDtos.Clear();
         }
-        _ownCharaData.Clear();
+        _metaInfoCache.Clear();
 
         UiBlockingComputation = GetAllDataTask = Task.Run(async () =>
         {
             _getAllDataCts = _getAllDataCts.CancelRecreate();
             var result = await _apiController.CharaDataGetOwn().ConfigureAwait(false);
 
+            // drop stale results (e.g. reconnect happened mid-flight)
+            if (epoch != System.Threading.Volatile.Read(ref _stateEpoch))
+                return new List<CharaDataFullExtendedDto>();
+
             Initialized = true;
 
-            //prewarm CDN for all own OriginalFiles
+            // prewarm CDN for all own OriginalFiles
             if (_filesCdnUri != null && result.Any())
             {
                 try
                 {
-                    var hashes = result
-                        .SelectMany(d => d.OriginalFiles ?? Enumerable.Empty<GamePathEntry>())
-                        .Select(e => e.HashOrFileSwap)
-                        .Where(h => !string.IsNullOrWhiteSpace(h))
-                        .Distinct(StringComparer.OrdinalIgnoreCase)
-                        .ToArray();
+                    var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-                    if (hashes.Length > 0)
+                    for (int i = 0; i < result.Count; i++)
                     {
+                        var d = result[i];
+                        if (d.OriginalFiles == null) continue;
+
+                        for (int j = 0; j < d.OriginalFiles.Count; j++)
+                        {
+                            var h = d.OriginalFiles[j].HashOrFileSwap;
+                            if (!string.IsNullOrWhiteSpace(h))
+                                set.Add(h);
+                        }
+                    }
+
+                    if (set.Count > 0)
+                    {
+                        var hashes = set.ToArray();
                         using var ct = CancellationTokenSource.CreateLinkedTokenSource(_getAllDataCts.Token, cancelToken);
                         _ = CdnPrewarmHelper.PrewarmAsync(_filesCdnUri, hashes, ct.Token);
                     }
@@ -425,25 +526,43 @@ public sealed partial class CharaDataManager : DisposableMediatorSubscriberBase
         });
 
         var result = await GetAllDataTask.ConfigureAwait(false);
-        foreach (var item in result)
+
+        if (epoch != System.Threading.Volatile.Read(ref _stateEpoch))
         {
-            await AddOrUpdateDto(item).ConfigureAwait(false);
+            GetAllDataTask = null;
+            return;
         }
 
-        foreach (var id in _updateDtos.Keys.Where(r => !result.Any(res => string.Equals(res.Id, r, StringComparison.Ordinal))).ToList())
+        for (int i = 0; i < result.Count; i++)
         {
-            _updateDtos.Remove(id);
+            await AddOrUpdateDto(result[i]).ConfigureAwait(false);
+        }
+
+        lock (_stateLock)
+        {
+            var ids = new HashSet<string>(result.Select(r => r.Id), StringComparer.Ordinal);
+            foreach (var id in _updateDtos.Keys.Where(k => !ids.Contains(k)).ToList())
+            {
+                _updateDtos.Remove(id);
+            }
         }
 
         GetAllDataTask = null;
     }
 
+
     public async Task GetAllSharedData(CancellationToken token)
     {
+        var epoch = System.Threading.Volatile.Read(ref _stateEpoch);
+
         Logger.LogDebug("Getting Shared with You Data");
 
         UiBlockingComputation = GetSharedWithYouTask = _apiController.CharaDataGetShared();
-        _sharedWithYouData.Clear();
+
+        lock (_stateLock)
+        {
+            _sharedWithYouData.Clear();
+        }
 
         GetSharedWithYouTimeoutTask = Task.Run(async () =>
         {
@@ -452,17 +571,29 @@ public sealed partial class CharaDataManager : DisposableMediatorSubscriberBase
 #if !DEBUG
             await Task.Delay(TimeSpan.FromMinutes(1), ct.Token).ConfigureAwait(false);
 #else
-            await Task.Delay(TimeSpan.FromSeconds(5), ct.Token).ConfigureAwait(false);
+        await Task.Delay(TimeSpan.FromSeconds(5), ct.Token).ConfigureAwait(false);
 #endif
             GetSharedWithYouTimeoutTask = null;
             Logger.LogDebug("Finished Shared with You Data Timeout");
         });
 
         var result = await GetSharedWithYouTask.ConfigureAwait(false);
+
+        // drop stale results
+        if (epoch != System.Threading.Volatile.Read(ref _stateEpoch))
+        {
+            Logger.LogDebug("Shared-with-you result dropped due to epoch change");
+            GetSharedWithYouTask = null;
+            return;
+        }
+
+        // build new map outside lock
+        var newMap = new Dictionary<UserData, List<CharaDataMetaInfoExtendedDto>>();
         foreach (var grouping in result.GroupBy(r => r.Uploader))
         {
             var pair = _pairManager.GetPairByUID(grouping.Key.UID);
             if (pair?.IsPaused ?? false) continue;
+
             List<CharaDataMetaInfoExtendedDto> newList = new();
             foreach (var item in grouping)
             {
@@ -470,26 +601,51 @@ public sealed partial class CharaDataManager : DisposableMediatorSubscriberBase
                 newList.Add(extended);
                 CacheData(extended);
             }
-            _sharedWithYouData[grouping.Key] = newList;
+
+            newMap[grouping.Key] = newList;
         }
 
-        DistributeMetaInfo();
+        // commit map
+        lock (_stateLock)
+        {
+            if (epoch != System.Threading.Volatile.Read(ref _stateEpoch))
+            {
+                Logger.LogDebug("Shared-with-you commit dropped due to epoch change");
+            }
+            else
+            {
+                _sharedWithYouData.Clear();
+                foreach (var kvp in newMap)
+                    _sharedWithYouData[kvp.Key] = kvp.Value;
+            }
+        }
+
+        RequestDistributeMetaInfo();
 
         Logger.LogDebug("Finished getting Shared with You Data");
         GetSharedWithYouTask = null;
     }
 
+
     public CharaDataExtendedUpdateDto? GetUpdateDto(string id)
     {
-        if (_updateDtos.TryGetValue(id, out var dto))
-            return dto;
-        return null;
+        lock (_stateLock)
+        {
+            return _updateDtos.TryGetValue(id, out var dto) ? dto : null;
+        }
     }
+
 
     public bool IsInTimeout(string key)
     {
-        if (!_sharedMetaInfoTimeoutTasks.TryGetValue(key, out var task)) return false;
-        return !task?.IsCompleted ?? false;
+        Task? task;
+        lock (_stateLock)
+        {
+            if (!_sharedMetaInfoTimeoutTasks.TryGetValue(key, out task))
+                return false;
+        }
+
+        return !(task?.IsCompleted ?? true);
     }
 
     public void LoadMcdf(string filePath)
@@ -593,17 +749,21 @@ public sealed partial class CharaDataManager : DisposableMediatorSubscriberBase
 
     public void SetAppearanceData(string dtoId)
     {
-        var hasDto = _ownCharaData.TryGetValue(dtoId, out var dto);
-        if (!hasDto || dto == null) return;
+        CharaDataExtendedUpdateDto? updateDto;
 
-        var hasUpdateDto = _updateDtos.TryGetValue(dtoId, out var updateDto);
-        if (!hasUpdateDto || updateDto == null) return;
+        lock (_stateLock)
+        {
+            _updateDtos.TryGetValue(dtoId, out updateDto);
+        }
+
+        if (updateDto == null) return;
 
         UiBlockingComputation = Task.Run(async () =>
         {
             await _fileHandler.UpdateCharaDataAsync(updateDto).ConfigureAwait(false);
         });
     }
+
 
     public Task<HandledCharaDataEntry?> SpawnAndApplyData(CharaDataDownloadDto charaDataDownloadDto)
     {
@@ -649,7 +809,7 @@ public sealed partial class CharaDataManager : DisposableMediatorSubscriberBase
 
         var extended = await CharaDataMetaInfoExtendedDto.Create(metaInfo, _dalamudUtilService, isOwnData: true).ConfigureAwait(false);
         _metaInfoCache[extended.FullId] = extended;
-        DistributeMetaInfo();
+        RequestDistributeMetaInfo();
 
         return extended;
     }
@@ -658,20 +818,70 @@ public sealed partial class CharaDataManager : DisposableMediatorSubscriberBase
     {
         var extended = await CharaDataMetaInfoExtendedDto.Create(metaInfo, _dalamudUtilService, isOwnData).ConfigureAwait(false);
         _metaInfoCache[extended.FullId] = extended;
-        DistributeMetaInfo();
+        RequestDistributeMetaInfo();
 
         return extended;
     }
 
-    private readonly SemaphoreSlim _distributionSemaphore = new(1, 1);
 
-    private void DistributeMetaInfo()
+    private void RequestDistributeMetaInfo()
     {
-        _distributionSemaphore.Wait();
-        _nearbyManager.UpdateSharedData(_metaInfoCache.ToDictionary());
-        _characterHandler.UpdateHandledData(_metaInfoCache.ToDictionary());
-        _distributionSemaphore.Release();
+        // Mark pending; if a worker is already scheduled/running, it will pick it up.
+        System.Threading.Interlocked.Exchange(ref _distributionPending, 1);
+
+        lock (_distributionWorkerLock)
+        {
+            if (_distributionWorker == null || _distributionWorker.IsCompleted)
+            {
+                var token = _distributionCts.Token;
+                _distributionWorker = Task.Run(() => DistributeMetaInfoWorkerAsync(token), token);
+
+            }
+        }
     }
+
+    private async Task DistributeMetaInfoWorkerAsync(CancellationToken token)
+    {
+        try
+        {
+            while (!token.IsCancellationRequested)
+            {
+                // Debounce window
+                await Task.Delay(50, token).ConfigureAwait(false);
+
+                if (System.Threading.Interlocked.Exchange(ref _distributionPending, 0) == 0)
+                    return;
+
+                await _distributionSemaphore.WaitAsync(token).ConfigureAwait(false);
+                try
+                {
+                    _metaInfoDistributionSnapshot.Clear();
+                    foreach (var kvp in _metaInfoCache)
+                    {
+                        _metaInfoDistributionSnapshot[kvp.Key] = kvp.Value;
+                    }
+
+                    _nearbyManager.UpdateSharedData(_metaInfoDistributionSnapshot);
+                    _characterHandler.UpdateHandledData(_metaInfoDistributionSnapshot);
+                }
+                finally
+                {
+                    _distributionSemaphore.Release();
+                }
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // normal during dispose
+        }
+        catch (Exception ex)
+        {
+            Logger.LogWarning(ex, "DistributeMetaInfo worker crashed");
+        }
+    }
+
+
+
 
     private void CacheData(CharaDataMetaInfoExtendedDto charaData)
     {
@@ -687,7 +897,13 @@ public sealed partial class CharaDataManager : DisposableMediatorSubscriberBase
     {
         UiBlockingComputation = Task.Run(async () =>
         {
-            foreach (var updateDto in _updateDtos.Values.Where(u => u.HasChanges))
+            List<CharaDataExtendedUpdateDto> snapshot;
+            lock (_stateLock)
+            {
+                snapshot = _updateDtos.Values.ToList();
+            }
+
+            foreach (var updateDto in snapshot.Where(u => u.HasChanges))
             {
                 CharaUpdateTask = CharaUpdateAsync(updateDto);
                 await CharaUpdateTask.ConfigureAwait(false);
@@ -695,18 +911,29 @@ public sealed partial class CharaDataManager : DisposableMediatorSubscriberBase
         });
     }
 
+
     public void UploadCharaData(string id)
     {
-        var hasUpdateDto = _updateDtos.TryGetValue(id, out var updateDto);
-        if (!hasUpdateDto || updateDto == null) return;
+        CharaDataExtendedUpdateDto? updateDto;
+        lock (_stateLock)
+        {
+            _updateDtos.TryGetValue(id, out updateDto);
+        }
+
+        if (updateDto == null) return;
 
         UiBlockingComputation = CharaUpdateTask = CharaUpdateAsync(updateDto);
     }
 
     public void UploadMissingFiles(string id)
     {
-        var hasDto = _ownCharaData.TryGetValue(id, out var dto);
-        if (!hasDto || dto == null) return;
+        CharaDataFullExtendedDto? dto;
+        lock (_stateLock)
+        {
+            _ownCharaData.TryGetValue(id, out dto);
+        }
+
+        if (dto == null) return;
 
         UiBlockingComputation = UploadTask = RestoreThenUpload(dto);
     }
@@ -716,10 +943,16 @@ public sealed partial class CharaDataManager : DisposableMediatorSubscriberBase
         var newDto = await _apiController.CharaDataAttemptRestore(dto.Id).ConfigureAwait(false);
         if (newDto == null)
         {
-            _ownCharaData.Remove(dto.Id);
+            lock (_stateLock)
+            {
+                _ownCharaData.Remove(dto.Id);
+                _updateDtos.Remove(dto.Id);
+            }
+
             _metaInfoCache.Remove(dto.FullId, out _);
             UiBlockingComputation = null;
             return ("No such DTO found", false);
+
         }
 
         await AddOrUpdateDto(newDto).ConfigureAwait(false);
@@ -734,11 +967,9 @@ public sealed partial class CharaDataManager : DisposableMediatorSubscriberBase
         var missingFileList = extendedDto!.MissingFiles.ToList();
         var result = await UploadFiles(missingFileList, async () =>
         {
-            var newFilePaths = dto.FileGamePaths;
-            foreach (var missing in missingFileList)
-            {
-                newFilePaths.Add(missing);
-            }
+            var newFilePaths = dto.FileGamePaths.ToList();
+            newFilePaths.AddRange(missingFileList);
+
             CharaDataUpdateDto updateDto = new(dto.Id)
             {
                 FileGamePaths = newFilePaths
@@ -872,6 +1103,8 @@ public sealed partial class CharaDataManager : DisposableMediatorSubscriberBase
             _applicationCts.Dispose();
             _connectCts?.Cancel();
             _connectCts?.Dispose();
+            _distributionCts.Cancel();
+            _distributionCts.Dispose();
         }
     }
 
@@ -879,10 +1112,29 @@ public sealed partial class CharaDataManager : DisposableMediatorSubscriberBase
     {
         if (dto == null) return;
 
-        _ownCharaData[dto.Id] = new(dto);
-        _updateDtos[dto.Id] = new(new(dto.Id), _ownCharaData[dto.Id]);
+        CharaDataFullExtendedDto extended;
 
-        await CacheData(_ownCharaData[dto.Id]).ConfigureAwait(false);
+        lock (_stateLock)
+        {
+            extended = new(dto);
+            _ownCharaData[dto.Id] = extended;
+            _updateDtos[dto.Id] = new(new(dto.Id), extended);
+        }
+
+        await CacheData(extended).ConfigureAwait(false);
+    }
+
+    private async Task AddOrUpdateDto(CharaDataFullExtendedDto dto)
+    {
+        if (dto == null) return;
+
+        lock (_stateLock)
+        {
+            _ownCharaData[dto.Id] = dto;
+            _updateDtos[dto.Id] = new(new(dto.Id), dto);
+        }
+
+        await CacheData(dto).ConfigureAwait(false);
     }
 
     private async Task ApplyDataAsync(
@@ -932,23 +1184,32 @@ public sealed partial class CharaDataManager : DisposableMediatorSubscriberBase
                 .SetManipulationDataAsync(Logger, applicationId, penumbraCollection, manipData ?? string.Empty)
                 .ConfigureAwait(false);
 
-            var needsRedraw = !string.IsNullOrEmpty(manipData)
-                || modPaths.Keys.Any(static gp =>
-                {
-                    var ext = System.IO.Path.GetExtension(gp).TrimStart('.');
-                    if (string.IsNullOrEmpty(ext)) return false;
+            var needsRedraw = !string.IsNullOrEmpty(manipData);
 
-                    return ext.Equals("tmb", StringComparison.OrdinalIgnoreCase)
-                        || ext.Equals("pap", StringComparison.OrdinalIgnoreCase)
-                        || ext.Equals("avfx", StringComparison.OrdinalIgnoreCase)
-                        || ext.Equals("atex", StringComparison.OrdinalIgnoreCase)
-                        || ext.Equals("sklb", StringComparison.OrdinalIgnoreCase)
-                        || ext.Equals("eid", StringComparison.OrdinalIgnoreCase)
-                        || ext.Equals("phyb", StringComparison.OrdinalIgnoreCase)
-                        || ext.Equals("scd", StringComparison.OrdinalIgnoreCase)
-                        || ext.Equals("skp", StringComparison.OrdinalIgnoreCase)
-                        || ext.Equals("shpk", StringComparison.OrdinalIgnoreCase);
-                });
+            if (!needsRedraw)
+            {
+                foreach (var gp in modPaths.Keys)
+                {
+                    var ext = System.IO.Path.GetExtension(gp);
+                    if (string.IsNullOrEmpty(ext)) continue;
+
+                    if (ext.Equals(".tmb", StringComparison.OrdinalIgnoreCase)
+                        || ext.Equals(".pap", StringComparison.OrdinalIgnoreCase)
+                        || ext.Equals(".avfx", StringComparison.OrdinalIgnoreCase)
+                        || ext.Equals(".atex", StringComparison.OrdinalIgnoreCase)
+                        || ext.Equals(".sklb", StringComparison.OrdinalIgnoreCase)
+                        || ext.Equals(".eid", StringComparison.OrdinalIgnoreCase)
+                        || ext.Equals(".phyb", StringComparison.OrdinalIgnoreCase)
+                        || ext.Equals(".scd", StringComparison.OrdinalIgnoreCase)
+                        || ext.Equals(".skp", StringComparison.OrdinalIgnoreCase)
+                        || ext.Equals(".shpk", StringComparison.OrdinalIgnoreCase))
+                    {
+                        needsRedraw = true;
+                        break;
+                    }
+                }
+            }
+
 
             Logger.LogTrace("[{appId}] Applying Glamourer data{redraw}", applicationId, needsRedraw ? " and redrawing" : string.Empty);
             DataApplicationProgress = needsRedraw ? "Applying Glamourer and redrawing Character" : "Applying Glamourer";

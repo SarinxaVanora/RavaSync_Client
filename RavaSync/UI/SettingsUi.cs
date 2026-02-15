@@ -965,6 +965,14 @@ public class SettingsUi : WindowMediatorSubscriberBase
         var sortPairsByVRAM = _configService.Current.SortPairsByVRAM;
 
 
+        bool showMinimizedRestoreIcon = _configService.Current.ShowMinimizedRestoreIcon;
+        if (ImGui.Checkbox("Show minimised icon", ref showMinimizedRestoreIcon))
+        {
+            _configService.Current.ShowMinimizedRestoreIcon = showMinimizedRestoreIcon;
+            _configService.Save();
+        }
+        _uiShared.DrawHelpText("If disabled, the draggable icon will not appear.");
+
         if (ImGui.Checkbox("Enable Game Right Click Menu Entries", ref enableRightClickMenu))
         {
             _configService.Current.EnableRightClickMenus = enableRightClickMenu;

@@ -122,16 +122,33 @@ public static class VariousExtensions
                             logger.LogTrace("[BASE-{appbase}] ExistingFace: {of}, NewFace: {fc}; ExistingHair: {eh}, NewHair: {nh}; ExistingTail: {et}, NewTail: {nt}; ExistingTransient: {etr}, NewTransient: {ntr}", applicationBase,
                                 existingFace.Count, newFace.Count, existingHair.Count, newHair.Count, existingTail.Count, newTail.Count, existingTransients.Count, newTransients.Count);
 
+                            //var differentFace = !existingFace.SequenceEqual(newFace, PlayerData.Data.FileReplacementDataComparer.Instance);
+                            //var differentHair = !existingHair.SequenceEqual(newHair, PlayerData.Data.FileReplacementDataComparer.Instance);
+                            //var differentTail = !existingTail.SequenceEqual(newTail, PlayerData.Data.FileReplacementDataComparer.Instance);
+                            //var differenTransients = !existingTransients.SequenceEqual(newTransients, PlayerData.Data.FileReplacementDataComparer.Instance);
+                            //if (differentFace || differentHair || differentTail || differenTransients)
+                            //{
+                            //    logger.LogDebug("[BASE-{appbase}] Different Subparts: Face: {face}, Hair: {hair}, Tail: {tail}, Transients: {transients} => {change}", applicationBase,
+                            //        differentFace, differentHair, differentTail, differenTransients, PlayerChanges.ForcedRedraw);
+                            //    charaDataToUpdate[objectKind].Add(PlayerChanges.ForcedRedraw);
+                            //}
                             var differentFace = !existingFace.SequenceEqual(newFace, PlayerData.Data.FileReplacementDataComparer.Instance);
                             var differentHair = !existingHair.SequenceEqual(newHair, PlayerData.Data.FileReplacementDataComparer.Instance);
                             var differentTail = !existingTail.SequenceEqual(newTail, PlayerData.Data.FileReplacementDataComparer.Instance);
                             var differenTransients = !existingTransients.SequenceEqual(newTransients, PlayerData.Data.FileReplacementDataComparer.Instance);
-                            if (differentFace || differentHair || differentTail || differenTransients)
+
+                            if (differenTransients)
                             {
-                                logger.LogDebug("[BASE-{appbase}] Different Subparts: Face: {face}, Hair: {hair}, Tail: {tail}, Transients: {transients} => {change}", applicationBase,
-                                    differentFace, differentHair, differentTail, differenTransients, PlayerChanges.ForcedRedraw);
+                                logger.LogDebug("[BASE-{appbase}] Different Subparts: Transients: {transients} => {change}", applicationBase,
+                                    differenTransients, PlayerChanges.ForcedRedraw);
                                 charaDataToUpdate[objectKind].Add(PlayerChanges.ForcedRedraw);
                             }
+                            else if (differentFace || differentHair || differentTail)
+                            {
+                                logger.LogDebug("[BASE-{appbase}] Different Subparts: Face: {face}, Hair: {hair}, Tail: {tail} => no forced redraw", applicationBase,
+                                    differentFace, differentHair, differentTail);
+                            }
+
                         }
                     }
                 }

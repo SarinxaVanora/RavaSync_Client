@@ -19,6 +19,10 @@ public sealed class GameObjectHandler : DisposableMediatorSubscriberBase, IHighP
     private Task? _delayedZoningTask;
     private bool _haltProcessing = false;
     private CancellationTokenSource _zoningCts = new();
+    private DateTime _nextUpdateUtc = DateTime.MinValue;
+    private static readonly TimeSpan _ownedUpdateInterval = TimeSpan.FromMilliseconds(33);   // ~30Hz
+    private static readonly TimeSpan _otherUpdateInterval = TimeSpan.FromMilliseconds(100);  // 10Hz
+
 
     public GameObjectHandler(ILogger<GameObjectHandler> logger, PerformanceCollectorService performanceCollector,
         MareMediator mediator, DalamudUtilService dalamudUtil, ObjectKind objectKind, Func<IntPtr> getAddress, bool ownedObject = true) : base(logger, mediator)
@@ -77,7 +81,17 @@ public sealed class GameObjectHandler : DisposableMediatorSubscriberBase, IHighP
 
         Mediator.Publish(new GameObjectHandlerCreatedMessage(this, _isOwnedObject));
 
-        _dalamudUtil.RunOnFrameworkThread(CheckAndUpdateObject).GetAwaiter().GetResult();
+        _ = _dalamudUtil.RunOnFrameworkThread(() =>
+        {
+            try
+            {
+                CheckAndUpdateObject();
+            }
+            catch (Exception ex)
+            {
+                Logger.LogWarning(ex, "Initial CheckAndUpdateObject failed for {this}", this);
+            }
+        });
     }
 
     public enum DrawCondition
@@ -346,10 +360,24 @@ public sealed class GameObjectHandler : DisposableMediatorSubscriberBase, IHighP
     {
         if (!_delayedZoningTask?.IsCompleted ?? false) return;
 
+        var now = DateTime.UtcNow;
+        var interval = _isOwnedObject ? _ownedUpdateInterval : _otherUpdateInterval;
+        if (now < _nextUpdateUtc) return;
+        _nextUpdateUtc = now.Add(interval);
+
         try
         {
-            _performanceCollector.LogPerformance(this, $"CheckAndUpdateObject>{(_isOwnedObject ? "Self" : "Other")}+{ObjectKind}/{(string.IsNullOrEmpty(Name) ? "Unk" : Name)}"
-                + $"+{Address.ToString("X")}", CheckAndUpdateObject);
+            if (_performanceCollector.Enabled)
+            {
+                _performanceCollector.LogPerformance(
+                    this,
+                    $"CheckAndUpdateObject>{(_isOwnedObject ? "Self" : "Other")}+{ObjectKind}/{(string.IsNullOrEmpty(Name) ? "Unk" : Name)}" + $"+{Address.ToString("X")}",
+                    CheckAndUpdateObject);
+            }
+            else
+            {
+                CheckAndUpdateObject();
+            }
         }
         catch (Exception ex)
         {
@@ -357,17 +385,22 @@ public sealed class GameObjectHandler : DisposableMediatorSubscriberBase, IHighP
         }
     }
 
+
     private bool IsBeingDrawn()
     {
         if (_dalamudUtil.IsAnythingDrawing)
         {
-            Logger.LogTrace("[{this}] IsBeingDrawn, Global draw block", this);
+            if (Logger.IsEnabled(LogLevel.Trace))
+                Logger.LogTrace("[{this}] IsBeingDrawn, Global draw block", this);
             return true;
         }
 
-        Logger.LogTrace("[{this}] IsBeingDrawn, Condition: {cond}", this, CurrentDrawCondition);
+        if (Logger.IsEnabled(LogLevel.Trace))
+            Logger.LogTrace("[{this}] IsBeingDrawn, Condition: {cond}", this, CurrentDrawCondition);
+
         return CurrentDrawCondition != DrawCondition.None;
     }
+
 
     private unsafe DrawCondition IsBeingDrawnUnsafe()
     {

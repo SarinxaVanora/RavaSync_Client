@@ -13,6 +13,8 @@ using RavaSync.Services.Mediator;
 using RavaSync.Services.ServerConfiguration;
 using RavaSync.Utils;
 using RavaSync.WebAPI.Files;
+using RavaSync.WebAPI.Files.Models;
+using System.Buffers;
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Security.Cryptography;
@@ -44,7 +46,14 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
     private CombatData? _dataReceivedInDowntime;
     private bool _forceApplyMods = false;
     private bool _isVisible;
+    private bool _wasDrawableLastTick = false;
+    private long _lastDrawableRedrawTick = 0;
+    private bool _pendingFirstDrawableRedraw = false;
+    private bool _hasBecomeDrawableThisVisibility = false;
     private Guid _penumbraCollection;
+    private Task<Guid>? _penumbraCollectionTask;
+    private Task? _initializeTask;
+    private int _initializeStarted;
     private bool _redrawOnNextApplication = false;
     private bool _hasRetriedAfterMissingDownload = false;
     private bool _hasRetriedAfterMissingAtApply = false;
@@ -64,6 +73,15 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
 
     private string? _lastPostApplyRepairHash;
     private long _lastPostApplyRepairTick;
+
+    private readonly object _applyCoalesceGate = new();
+    private CancellationTokenSource? _applyCoalesceCts;
+    private Task? _applyCoalesceTask;
+
+    private Guid _applyQueuedBase;
+    private CharacterData? _applyQueuedData;
+    private bool _applyQueuedForce;
+
 
 
 
@@ -86,19 +104,31 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
         _fileDbManager = fileDbManager;
         _playerPerformanceService = playerPerformanceService;
         _serverConfigManager = serverConfigManager;
-        _penumbraCollection = _ipcManager.Penumbra.CreateTemporaryCollectionAsync(logger, Pair.UserData.UID).ConfigureAwait(false).GetAwaiter().GetResult();
+        _penumbraCollection = Guid.Empty;
+        _penumbraCollectionTask = _ipcManager.Penumbra.CreateTemporaryCollectionAsync(logger, Pair.UserData.UID);
 
         Mediator.Subscribe<FrameworkUpdateMessage>(this, (_) => FrameworkUpdate());
         Mediator.Subscribe<ZoneSwitchStartMessage>(this, (_) =>
         {
-            _downloadCancellationTokenSource?.CancelDispose();
-            _applicationCancellationTokenSource?.CancelDispose();
+            _downloadCancellationTokenSource = _downloadCancellationTokenSource?.CancelRecreate();
+            _applicationCancellationTokenSource = _applicationCancellationTokenSource?.CancelRecreate();
+
             _charaHandler?.Invalidate();
+
+            _addressZeroSinceTick = -1;
+            _initialApplyPending = true;
+
+            _lastAssignedObjectIndex = null;
+            _lastAssignedCollectionAssignUtc = DateTime.MinValue;
+            _lastAppliedTempModsFingerprint = null;
+
             IsVisible = false;
         });
+
         Mediator.Subscribe<PenumbraInitializedMessage>(this, (_) =>
         {
-            _penumbraCollection = _ipcManager.Penumbra.CreateTemporaryCollectionAsync(logger, Pair.UserData.UID).ConfigureAwait(false).GetAwaiter().GetResult();
+            _penumbraCollection = Guid.Empty;
+            _penumbraCollectionTask = _ipcManager.Penumbra.CreateTemporaryCollectionAsync(Logger, Pair.UserData.UID);
 
             _lastAppliedTempModsFingerprint = null;
             _lastAssignedObjectIndex = null;
@@ -109,6 +139,9 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
                 PlayerName = string.Empty;
                 _charaHandler.Dispose();
                 _charaHandler = null;
+
+                Interlocked.Exchange(ref _initializeStarted, 0);
+                _initializeTask = null;
             }
         });
         Mediator.Subscribe<ClassJobChangedMessage>(this, (msg) =>
@@ -118,6 +151,24 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
                 _redrawOnNextApplication = true;
             }
         });
+        Mediator.Subscribe<DownloadStartedMessage>(this, (msg) =>
+        {
+            if (_charaHandler == null) return;
+            if (msg.DownloadId != _charaHandler) return;
+
+            Pair.SetCurrentDownloadStatus(msg.DownloadStatus);
+        });
+
+        Mediator.Subscribe<DownloadFinishedMessage>(this, (msg) =>
+        {
+            if (_charaHandler == null) return;
+            if (msg.DownloadId != _charaHandler) return;
+
+            Pair.SetCurrentDownloadStatus(null);
+            Pair.SetVisibleTransferStatus(Pair.VisibleTransferIndicator.None);
+        });
+
+
         Mediator.Subscribe<CombatOrPerformanceEndMessage>(this, (msg) =>
         {
             if (IsVisible && _dataReceivedInDowntime != null)
@@ -127,6 +178,7 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
                 _dataReceivedInDowntime = null;
             }
         });
+
         Mediator.Subscribe<CombatOrPerformanceStartMessage>(this, _ =>
         {
             _dataReceivedInDowntime = null;
@@ -163,6 +215,60 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
     public string PlayerNameHash => Pair.Ident;
 
     public void ApplyCharacterData(Guid applicationBase, CharacterData characterData, bool forceApplyCustomization = false)
+    {
+        EnqueueApply(applicationBase, characterData, forceApplyCustomization);
+    }
+
+    private void EnqueueApply(Guid applicationBase, CharacterData characterData, bool forceApplyCustomization)
+    {
+        lock (_applyCoalesceGate)
+        {
+            _applyQueuedBase = applicationBase;
+            _applyQueuedData = characterData;
+            _applyQueuedForce = forceApplyCustomization;
+
+            _applyCoalesceCts?.CancelDispose();
+            _applyCoalesceCts = new CancellationTokenSource();
+
+            var token = _applyCoalesceCts.Token;
+
+            _applyCoalesceTask = Task.Run(async () =>
+            {
+                try
+                {
+                    // Short debounce window: collapses rapid apply bursts into one
+                    var delayMs = SyncStorm.IsActive ? 175 : 75;
+                    await Task.Delay(delayMs, token).ConfigureAwait(false);
+
+                    CharacterData? data;
+                    Guid baseId;
+                    bool forced;
+
+                    lock (_applyCoalesceGate)
+                    {
+                        data = _applyQueuedData;
+                        baseId = _applyQueuedBase;
+                        forced = _applyQueuedForce;
+                    }
+
+                    if (data != null)
+                    {
+                        ApplyCharacterDataNow(baseId, data, forced);
+                    }
+                }
+                catch (OperationCanceledException)
+                {
+                    // expected
+                }
+                catch (Exception ex)
+                {
+                    Logger.LogWarning(ex, "Apply coalescer failed for {player}", PlayerName);
+                }
+            }, token);
+        }
+    }
+
+    private void ApplyCharacterDataNow(Guid applicationBase, CharacterData characterData, bool forceApplyCustomization = false)
     {
         if (_dalamudUtil.IsInCombatOrPerforming)
         {
@@ -267,6 +373,7 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
 
         DownloadAndApplyCharacter(applicationBase, characterData.DeepClone(), charaDataToUpdate);
     }
+
 
     public override string ToString()
     {
@@ -578,12 +685,32 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
         var updateModdedPaths = updatedData.Values.Any(v => v.Any(p => p == PlayerChanges.ModFiles));
         var updateManip = updatedData.Values.Any(v => v.Any(p => p == PlayerChanges.ModManip));
 
-
         _downloadCancellationTokenSource = _downloadCancellationTokenSource?.CancelRecreate() ?? new CancellationTokenSource();
-        var downloadToken = _downloadCancellationTokenSource.Token;
 
-        _ = DownloadAndApplyCharacterAsync(applicationBase, charaData, updatedData, updateModdedPaths, updateManip, downloadToken).ConfigureAwait(false);
+        CancellationToken downloadToken;
+        try
+        {
+            downloadToken = _downloadCancellationTokenSource.Token;
+        }
+        catch (ObjectDisposedException)
+        {
+            return;
+        }
+
+        var task = DownloadAndApplyCharacterAsync(applicationBase, charaData, updatedData, updateModdedPaths, updateManip, downloadToken);
+
+        _ = task.ContinueWith(t =>
+        {
+            try
+            {
+                _ = t.Exception;
+            }
+            catch
+            {
+            }
+        }, TaskContinuationOptions.ExecuteSynchronously | TaskContinuationOptions.OnlyOnFaulted);
     }
+
 
     private Task? _pairDownloadTask;
 
@@ -594,6 +721,15 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
         List<FileReplacementData> toDownloadReplacements = [];
 
         bool downloadedAny = false;
+
+        // Smooth room-entry storms: add a tiny jitter so every pair doesn't spike on the same frame
+        if (SyncStorm.IsActive)
+        {
+            var seed = (PlayerNameHash?.GetHashCode(StringComparison.Ordinal) ?? 0) ^ Environment.TickCount;
+            var rnd = new Random(seed);
+            var delay = rnd.Next(75, 250);
+            await Task.Delay(delay, downloadToken).ConfigureAwait(false);
+        }
 
         if (updateModdedPaths)
         {
@@ -625,14 +761,14 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
                 .Select(g => g.First())
                 .ToList();
 
-                var missingDetails = string.Join(", ",
-                    toDownloadReplacements.Select(r =>
-                        $"{r.Hash}:{(r.GamePaths != null && r.GamePaths.Count() > 0 ? r.GamePaths[0] : "nogamepath")}"));
-
-                if (attempts > 1)
+                if (attempts > 1 && Logger.IsEnabled(LogLevel.Debug))
                 {
+                    var missingDetails = string.Join(", ",
+                        toDownloadReplacements.Select(r =>
+                            $"{r.Hash}:{(r.GamePaths != null && r.GamePaths.Any() ? r.GamePaths.First() : "nogamepath")}"));
+
                     Logger.LogDebug("[BASE-{appBase}] Retry {attempt}/10 - still missing {count}: {missing}",
-                    applicationBase, attempts, toDownloadReplacements.Count, missingDetails);
+                        applicationBase, attempts, toDownloadReplacements.Count, missingDetails);
                 }
 
                 Mediator.Publish(new EventMessage(new Event(
@@ -766,7 +902,16 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
 
         downloadToken.ThrowIfCancellationRequested();
 
-        var appToken = _applicationCancellationTokenSource?.Token;
+        CancellationToken? appToken = null;
+        try
+        {
+            appToken = _applicationCancellationTokenSource?.Token;
+        }
+        catch (ObjectDisposedException)
+        {
+            return;
+        }
+
         var lastWaitLog = 0L;
 
         while ((!_applicationTask?.IsCompleted ?? false)
@@ -781,14 +926,33 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
                     applicationBase, _applicationId, PlayerName);
             }
 
-            await Task.Delay(25, downloadToken).ConfigureAwait(false);
-        }
+            await Task.Delay(75, downloadToken).ConfigureAwait(false);
 
+            try
+            {
+                appToken = _applicationCancellationTokenSource?.Token;
+            }
+            catch (ObjectDisposedException)
+            {
+                return;
+            }
+        }
 
         if (downloadToken.IsCancellationRequested || (appToken?.IsCancellationRequested ?? false)) return;
 
-        _applicationCancellationTokenSource = _applicationCancellationTokenSource?.CancelRecreate() ?? new CancellationTokenSource();
-        var token = _applicationCancellationTokenSource.Token;
+        var newCts = new CancellationTokenSource();
+        var oldCts = Interlocked.Exchange(ref _applicationCancellationTokenSource, newCts);
+        oldCts?.CancelDispose();
+
+        CancellationToken token;
+        try
+        {
+            token = newCts.Token;
+        }
+        catch (ObjectDisposedException)
+        {
+            return;
+        }
 
         _applicationTask = ApplyCharacterDataAsync(applicationBase, charaData, updatedData, updateModdedPaths, updateManip, moddedPaths, downloadedAny, token);
 
@@ -796,12 +960,13 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
         {
             try
             {
+                _ = t.Exception;
                 Logger.LogWarning(t.Exception, "[BASE-{appBase}] Application task faulted for {player}", applicationBase, PlayerName);
             }
             catch
             {
             }
-        }, TaskContinuationOptions.OnlyOnFaulted);
+        }, TaskContinuationOptions.ExecuteSynchronously | TaskContinuationOptions.OnlyOnFaulted);
 
     }
 
@@ -982,6 +1147,7 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
 
                     var mustRedrawForContent = downloadedAny || containsAnimationCriticalPath || containsVfxCriticalPath || _redrawOnNextApplication;
 
+
                     if (!string.Equals(fingerprint, _lastAppliedTempModsFingerprint, StringComparison.Ordinal))
                     {
                         await _ipcManager.Penumbra
@@ -1135,6 +1301,7 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
 
         return gamePath.EndsWith(".pap", StringComparison.OrdinalIgnoreCase)
             || gamePath.EndsWith(".tmb", StringComparison.OrdinalIgnoreCase)
+            || gamePath.EndsWith(".tmb2", StringComparison.OrdinalIgnoreCase)
             || gamePath.EndsWith(".sklb", StringComparison.OrdinalIgnoreCase)
             || gamePath.EndsWith(".phyb", StringComparison.OrdinalIgnoreCase)
             || gamePath.EndsWith(".pbd", StringComparison.OrdinalIgnoreCase);
@@ -1153,6 +1320,7 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
             || gamePath.EndsWith(".eid", StringComparison.OrdinalIgnoreCase)
             || gamePath.EndsWith(".skp", StringComparison.OrdinalIgnoreCase);
     }
+
 
     private bool HasAnyMissingCacheFiles(Guid applicationBase, CharacterData characterData)
     {
@@ -1245,6 +1413,8 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
         return false;
     }
 
+    private long _addressZeroSinceTick = -1;
+    private bool _initialApplyPending;
 
     private void FrameworkUpdate()
     {
@@ -1252,54 +1422,113 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
         {
             var pc = _dalamudUtil.FindPlayerByNameHash(Pair.Ident);
             if (pc == default((string, nint))) return;
-            Logger.LogDebug("One-Time Initializing {this}", this);
-            Initialize(pc.Name);
-            Logger.LogDebug("One-Time Initialized {this}", this);
-            Mediator.Publish(new EventMessage(new Event(PlayerName, Pair.UserData, nameof(PairHandler), EventSeverity.Informational,
-                $"Initializing User For Character {pc.Name}")));
-        }
 
-        if (_charaHandler?.Address != nint.Zero && !IsVisible)
-        {
-            Guid appData = Guid.NewGuid();
-            IsVisible = true;
-
-            _lastAssignedObjectIndex = null;
-            _lastAssignedCollectionAssignUtc = DateTime.MinValue;
-            _redrawOnNextApplication = true;
-
-            if (_cachedData != null)
+            if (Interlocked.CompareExchange(ref _initializeStarted, 1, 0) == 0)
             {
-                Logger.LogTrace("[BASE-{appBase}] {this} visibility changed, now: {visi}, cached data exists", appData, this, IsVisible);
+                Logger.LogDebug("One-Time Initializing {this}", this);
 
-                _ = _dalamudUtil.RunOnFrameworkThread(() =>
+                _initializeTask = Task.Run(async () =>
                 {
-                    ApplyCharacterData(appData, _cachedData!, forceApplyCustomization: true);
+                    try
+                    {
+                        await InitializeAsync(pc.Name).ConfigureAwait(false);
+
+                        Logger.LogDebug("One-Time Initialized {this}", this);
+
+                        Mediator.Publish(new EventMessage(new Event(PlayerName!, Pair.UserData, nameof(PairHandler), EventSeverity.Informational,
+                            $"Initializing User For Character {pc.Name}")));
+                    }
+                    catch (Exception ex)
+                    {
+                        Interlocked.Exchange(ref _initializeStarted, 0);
+                        Logger.LogWarning(ex, "InitializeAsync failed for {this}", this);
+                    }
                 });
             }
-            else
+
+            return;
+        }
+
+
+        var addr = _charaHandler?.Address ?? nint.Zero;
+        var nowTick = Environment.TickCount64;
+
+        if (addr != nint.Zero)
+        {
+            _addressZeroSinceTick = -1;
+
+            if (!IsVisible)
             {
-                Logger.LogTrace("{this} visibility changed, now: {visi}, no cached data exists", this, IsVisible);
+                IsVisible = true;
+
+                SyncStorm.RegisterVisibleNow();
+
+                _lastAssignedObjectIndex = null;
+                _lastAssignedCollectionAssignUtc = DateTime.MinValue;
+
+                _initialApplyPending = true;
+
+                Logger.LogTrace("{this} visibility changed, now: {visi}", this, IsVisible);
+            }
+
+        }
+        else if (IsVisible)
+        {
+            if (_addressZeroSinceTick < 0)
+                _addressZeroSinceTick = nowTick;
+
+            if (nowTick - _addressZeroSinceTick >= 750)
+            {
+                var pc = _dalamudUtil.FindPlayerByNameHash(Pair.Ident);
+                if (pc == default((string, nint)))
+                {
+                    IsVisible = false;
+
+                    _lastAssignedObjectIndex = null;
+                    _lastAssignedCollectionAssignUtc = DateTime.MinValue;
+
+                    _initialApplyPending = false;
+
+                    _charaHandler?.Invalidate();
+                    _downloadCancellationTokenSource?.CancelDispose();
+                    _downloadCancellationTokenSource = null;
+
+                    Logger.LogTrace("{this} visibility changed, now: {visi}", this, IsVisible);
+                    return;
+                }
+
+                _addressZeroSinceTick = nowTick;
             }
         }
-        else if (_charaHandler?.Address == nint.Zero && IsVisible)
+
+        if (!IsVisible || !_initialApplyPending) return;
+        if (_charaHandler == null || _cachedData == null) return;
+        if (_charaHandler.CurrentDrawCondition != GameObjectHandler.DrawCondition.None) return;
+
+        _initialApplyPending = false;
+
+        var appData = Guid.NewGuid();
+        _redrawOnNextApplication = true;
+
+        Logger.LogTrace("[BASE-{appBase}] {this} initial apply", appData, this);
+
+        _ = _dalamudUtil.RunOnFrameworkThread(() =>
         {
-            IsVisible = false;
-
-            _lastAssignedObjectIndex = null;
-            _lastAssignedCollectionAssignUtc = DateTime.MinValue;
-
-            _charaHandler.Invalidate();
-            _downloadCancellationTokenSource?.CancelDispose();
-            _downloadCancellationTokenSource = null;
-            Logger.LogTrace("{this} visibility changed, now: {visi}", this, IsVisible);
-        }
+            ApplyCharacterData(appData, _cachedData!, forceApplyCustomization: true);
+        });
     }
 
-    private void Initialize(string name)
+    private async Task InitializeAsync(string name)
     {
+        _penumbraCollectionTask ??= _ipcManager.Penumbra.CreateTemporaryCollectionAsync(Logger, Pair.UserData.UID);
+        _penumbraCollection = await _penumbraCollectionTask.ConfigureAwait(false);
+
         PlayerName = name;
-        _charaHandler = _gameObjectHandlerFactory.Create(ObjectKind.Player, () => _dalamudUtil.GetPlayerCharacterFromCachedTableByIdent(Pair.Ident), isWatched: false).GetAwaiter().GetResult();
+
+        _charaHandler = await _gameObjectHandlerFactory.Create(
+            ObjectKind.Player,
+            () => _dalamudUtil.GetPlayerCharacterFromCachedTableByIdent(Pair.Ident),
+            isWatched: false).ConfigureAwait(false);
 
         _serverConfigManager.AutoPopulateNoteForUid(Pair.UserData.UID, name);
 
@@ -1317,14 +1546,10 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
             await _ipcManager.PetNames.SetPlayerData(PlayerCharacter, _cachedData.PetNamesData).ConfigureAwait(false);
         });
 
-        //_ipcManager.Penumbra.AssignTemporaryCollectionAsync(Logger, _penumbraCollection, _charaHandler.GetGameObject()!.ObjectIndex).GetAwaiter().GetResult();
-        
-        var ok = _ipcManager.Penumbra.AssignTemporaryCollectionAsync(Logger, _penumbraCollection, _charaHandler.GetGameObject()!.ObjectIndex).GetAwaiter().GetResult();
-
-        if (!ok)
-            Logger.LogDebug("[Penumbra] Initial temp collection assign failed for {name}", PlayerName);
 
     }
+
+
 
     private async Task RevertCustomizationDataAsync(ObjectKind objectKind, string name, Guid applicationId, CancellationToken cancelToken)
     {
@@ -1398,29 +1623,72 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
         }
     }
 
-    private List<FileReplacementData> TryCalculateModdedDictionary(Guid applicationBase,CharacterData charaData,out Dictionary<(string GamePath, string? Hash), string> moddedDictionary, CancellationToken token)
+    private List<FileReplacementData> TryCalculateModdedDictionary(Guid applicationBase, CharacterData charaData, out Dictionary<(string GamePath, string? Hash), string> moddedDictionary, CancellationToken token)
     {
         var st = Stopwatch.StartNew();
 
         var missingFiles = new ConcurrentBag<FileReplacementData>();
-        var outputDict = new ConcurrentDictionary<(string GamePath, string? Hash), string>(Environment.ProcessorCount, 256);
+        var outputDict = new ConcurrentDictionary<(string GamePath, string? Hash), string>(
+            Environment.ProcessorCount, 256);
 
         int migrationChanges = 0;
-
         object migrationLock = new();
 
         moddedDictionary = new Dictionary<(string GamePath, string? Hash), string>();
 
+        static bool TryGetFirstNonEmptyGamePath(object gamePathsObj, out string first)
+        {
+            first = string.Empty;
+
+            if (gamePathsObj is IList<string> list)
+            {
+                for (int i = 0; i < list.Count; i++)
+                {
+                    var s = list[i];
+                    if (!string.IsNullOrWhiteSpace(s))
+                    {
+                        first = s;
+                        return true;
+                    }
+                }
+                return false;
+            }
+
+            if (gamePathsObj is IEnumerable<string> enumerable)
+            {
+                foreach (var s in enumerable)
+                {
+                    if (!string.IsNullOrWhiteSpace(s))
+                    {
+                        first = s;
+                        return true;
+                    }
+                }
+            }
+
+            return false;
+        }
+
+        static string GetExtensionOrDat(string gamePath)
+        {
+            var e = Path.GetExtension(gamePath);
+            if (string.IsNullOrWhiteSpace(e) || e.Length <= 1) return "dat";
+            return e.AsSpan(1).ToString();
+        }
+
         try
         {
             var all = charaData.FileReplacements;
+
             var noSwap = new List<FileReplacementData>(256);
             var swaps = new List<FileReplacementData>(64);
 
             foreach (var kv in all)
             {
-                foreach (var v in kv.Value)
+                var list = kv.Value;
+                for (int i = 0; i < list.Count; i++)
                 {
+                    var v = list[i];
                     if (string.IsNullOrWhiteSpace(v.FileSwapPath))
                         noSwap.Add(v);
                     else
@@ -1428,7 +1696,8 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
                 }
             }
 
-            Parallel.ForEach(noSwap,
+            Parallel.ForEach(
+                noSwap,
                 new ParallelOptions
                 {
                     CancellationToken = token,
@@ -1442,27 +1711,36 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
                     if (string.IsNullOrWhiteSpace(hash))
                         return;
 
-                    var gamePaths = item.GamePaths;
-                    if (gamePaths == null)
+                    var gamePathsObj = item.GamePaths;
+                    if (gamePathsObj == null)
                         return;
+
+                    object gamePathsStable = gamePathsObj is IList<string> ? gamePathsObj : (object)gamePathsObj.ToList();
 
                     if (_fileDbManager.IsHashStaged(hash))
                     {
-                        var firstGp = gamePaths.FirstOrDefault();
-                        var ext = "dat";
-                        if (!string.IsNullOrWhiteSpace(firstGp))
-                        {
-                            var e = Path.GetExtension(firstGp);
-                            if (!string.IsNullOrWhiteSpace(e) && e.Length > 1)
-                                ext = e[1..];
-                        }
+                        if (!TryGetFirstNonEmptyGamePath(gamePathsStable, out var firstGp))
+                            return;
 
+                        var ext = GetExtensionOrDat(firstGp);
                         var finalPath = _fileDbManager.GetCacheFilePath(hash, ext);
 
-                        foreach (var gp in gamePaths)
+                        if (gamePathsStable is IList<string> gpList)
                         {
-                            if (string.IsNullOrWhiteSpace(gp)) continue;
-                            outputDict[(gp, hash)] = finalPath;
+                            for (int i = 0; i < gpList.Count; i++)
+                            {
+                                var gp = gpList[i];
+                                if (string.IsNullOrWhiteSpace(gp)) continue;
+                                outputDict[(gp, hash)] = finalPath;
+                            }
+                        }
+                        else
+                        {
+                            foreach (var gp in (IEnumerable<string>)gamePathsStable)
+                            {
+                                if (string.IsNullOrWhiteSpace(gp)) continue;
+                                outputDict[(gp, hash)] = finalPath;
+                            }
                         }
 
                         return;
@@ -1512,45 +1790,55 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
 
                     if (string.IsNullOrEmpty(fi.Extension))
                     {
-                        var firstGp = gamePaths.FirstOrDefault();
-                        if (!string.IsNullOrWhiteSpace(firstGp))
+                        if (TryGetFirstNonEmptyGamePath(gamePathsStable, out var firstGp))
                         {
-                            var e = Path.GetExtension(firstGp);
-                            if (!string.IsNullOrWhiteSpace(e) && e.Length > 1)
-                            {
-                                var targetExt = e[1..];
+                            var targetExt = GetExtensionOrDat(firstGp);
 
-                                lock (migrationLock)
+                            lock (migrationLock)
+                            {
+                                var cacheAgain = _fileDbManager.GetFileCacheByHash(hash);
+                                if (cacheAgain != null)
                                 {
-                                    var cacheAgain = _fileDbManager.GetFileCacheByHash(hash);
-                                    if (cacheAgain != null)
+                                    var fi2 = new FileInfo(cacheAgain.ResolvedFilepath);
+                                    if (string.IsNullOrEmpty(fi2.Extension))
                                     {
-                                        var fi2 = new FileInfo(cacheAgain.ResolvedFilepath);
-                                        if (string.IsNullOrEmpty(fi2.Extension))
-                                        {
-                                            Interlocked.Exchange(ref migrationChanges, 1);
-                                            cacheAgain = _fileDbManager.MigrateFileHashToExtension(cacheAgain, targetExt);
-                                            resolved = cacheAgain.ResolvedFilepath;
-                                        }
-                                        else
-                                        {
-                                            resolved = cacheAgain.ResolvedFilepath;
-                                        }
+                                        Interlocked.Exchange(ref migrationChanges, 1);
+                                        cacheAgain = _fileDbManager.MigrateFileHashToExtension(cacheAgain, targetExt);
+                                        resolved = cacheAgain.ResolvedFilepath;
+                                    }
+                                    else
+                                    {
+                                        resolved = cacheAgain.ResolvedFilepath;
                                     }
                                 }
                             }
                         }
                     }
 
-                    foreach (var gp in gamePaths)
+                    // Map all game paths to resolved cache path
+                    if (gamePathsStable is IList<string> gpList2)
                     {
-                        if (string.IsNullOrWhiteSpace(gp)) continue;
-                        outputDict[(gp, hash)] = resolved;
+                        for (int i = 0; i < gpList2.Count; i++)
+                        {
+                            var gp = gpList2[i];
+                            if (string.IsNullOrWhiteSpace(gp)) continue;
+                            outputDict[(gp, hash)] = resolved;
+                        }
+                    }
+                    else
+                    {
+                        foreach (var gp in (IEnumerable<string>)gamePathsStable)
+                        {
+                            if (string.IsNullOrWhiteSpace(gp)) continue;
+                            outputDict[(gp, hash)] = resolved;
+                        }
                     }
                 });
 
-            foreach (var item in swaps)
+            for (int i = 0; i < swaps.Count; i++)
             {
+                var item = swaps[i];
+
                 var gamePaths = item.GamePaths;
                 if (gamePaths == null) continue;
 
@@ -1563,11 +1851,24 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
                     continue;
                 }
 
-                foreach (var gp in gamePaths)
+                if (gamePaths is IList<string> gpList)
                 {
-                    if (string.IsNullOrWhiteSpace(gp)) continue;
-                    if (string.Equals(gp, swap, StringComparison.OrdinalIgnoreCase)) continue; // swap-to-self = no-op
-                    outputDict[(gp, null)] = swap;
+                    for (int j = 0; j < gpList.Count; j++)
+                    {
+                        var gp = gpList[j];
+                        if (string.IsNullOrWhiteSpace(gp)) continue;
+                        if (string.Equals(gp, swap, StringComparison.OrdinalIgnoreCase)) continue;
+                        outputDict[(gp, null)] = swap;
+                    }
+                }
+                else
+                {
+                    foreach (var gp in gamePaths)
+                    {
+                        if (string.IsNullOrWhiteSpace(gp)) continue;
+                        if (string.Equals(gp, swap, StringComparison.OrdinalIgnoreCase)) continue;
+                        outputDict[(gp, null)] = swap;
+                    }
                 }
             }
 
@@ -1593,22 +1894,48 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
         return missingFiles.ToList();
     }
 
+
     private static string ComputeTempModsFingerprint(Dictionary<string, string> tempMods)
     {
         if (tempMods.Count == 0) return "EMPTY";
 
         using var sha1 = SHA1.Create();
 
+        var pool = ArrayPool<byte>.Shared;
+
         foreach (var kv in tempMods.OrderBy(k => k.Key, StringComparer.Ordinal))
         {
-            var line = kv.Key + "\n" + kv.Value + "\n";
-            var bytes = Encoding.UTF8.GetBytes(line);
-            sha1.TransformBlock(bytes, 0, bytes.Length, null, 0);
+            var key = kv.Key ?? string.Empty;
+            var val = kv.Value ?? string.Empty;
+
+            var keyByteCount = Encoding.UTF8.GetByteCount(key);
+            var valByteCount = Encoding.UTF8.GetByteCount(val);
+
+            var total = keyByteCount + 1 + valByteCount + 1;
+
+            var buf = pool.Rent(total);
+            try
+            {
+                var offset = 0;
+
+                offset += Encoding.UTF8.GetBytes(key, 0, key.Length, buf, offset);
+                buf[offset++] = (byte)'\n';
+
+                offset += Encoding.UTF8.GetBytes(val, 0, val.Length, buf, offset);
+                buf[offset++] = (byte)'\n';
+
+                sha1.TransformBlock(buf, 0, offset, null, 0);
+            }
+            finally
+            {
+                pool.Return(buf);
+            }
         }
 
         sha1.TransformFinalBlock(Array.Empty<byte>(), 0, 0);
         return Convert.ToHexString(sha1.Hash!);
     }
+
 
     private Dictionary<string, string> BuildPenumbraTempMods(Dictionary<(string GamePath, string? Hash), string> moddedPaths)
     {

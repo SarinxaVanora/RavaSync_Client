@@ -37,6 +37,12 @@ public class ScopeAutoPauseService : MediatorSubscriberBase
 
     private volatile ScopeMode _mode;
 
+    private static readonly TimeSpan TickInterval = TimeSpan.FromMilliseconds(250);
+    private DateTime _nextTickUtc = DateTime.MinValue;
+
+    private int _saveScheduled = 0;
+    private CancellationTokenSource _saveCts = new();
+
     public ScopeAutoPauseService(
         ILogger<ScopeAutoPauseService> logger,
         MareMediator mediator,
@@ -194,6 +200,10 @@ public class ScopeAutoPauseService : MediatorSubscriberBase
     // ---------- Per-frame enforcement ----------
     private void Tick()
     {
+        var now = DateTime.UtcNow;
+        if (now < _nextTickUtc) return;
+        _nextTickUtc = now + TickInterval;
+
         // Update last-known names for any visible actors with a live name
         foreach (var kv in _pairManager.PairsWithGroups.Keys)
         {
@@ -302,15 +312,41 @@ public class ScopeAutoPauseService : MediatorSubscriberBase
 
     private void SaveState()
     {
-        try
+        _saveCts.Cancel();
+        _saveCts.Dispose();
+        _saveCts = new();
+        var token = _saveCts.Token;
+
+        // Debounce + do disk I/O off the hot path
+        _ = Task.Run(async () =>
         {
-            Directory.CreateDirectory(Path.GetDirectoryName(_statePath)!);
-            var json = JsonSerializer.Serialize(new PersistedState(_autoScopePausedUids.Keys.ToList()));
-            File.WriteAllText(_statePath, json);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "Failed saving autoScopeState");
-        }
+            try
+            {
+                await Task.Delay(250, token).ConfigureAwait(false);
+
+                // Only one writer snapshot at a time
+                if (Interlocked.Exchange(ref _saveScheduled, 1) == 1) return;
+
+                try
+                {
+                    Directory.CreateDirectory(Path.GetDirectoryName(_statePath)!);
+                    var json = JsonSerializer.Serialize(new PersistedState(_autoScopePausedUids.Keys.ToList()));
+                    File.WriteAllText(_statePath, json);
+                }
+                finally
+                {
+                    Interlocked.Exchange(ref _saveScheduled, 0);
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                // normal debounce cancel
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed saving autoScopeState");
+            }
+        }, token);
     }
+
 }

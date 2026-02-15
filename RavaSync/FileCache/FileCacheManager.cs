@@ -22,6 +22,8 @@ public sealed partial class FileCacheManager : IHostedService
     private readonly ConcurrentDictionary<string, List<FileCacheEntity>> _fileCaches = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, FileCacheEntity> _prefixedPathIndex = new(StringComparer.OrdinalIgnoreCase);
     private readonly SemaphoreSlim _getCachesByPathsSemaphore = new(1, 1);
+    private readonly ConcurrentDictionary<string, long> _missingHashProbeUntilUtcTicks = new(StringComparer.OrdinalIgnoreCase);
+    private static readonly TimeSpan _missingHashProbeTtl = TimeSpan.FromSeconds(5);
     private readonly object _fileWriteLock = new();
     private readonly IpcManager _ipcManager;
     private readonly ILogger<FileCacheManager> _logger;
@@ -234,94 +236,104 @@ public sealed partial class FileCacheManager : IHostedService
             }
         }
 
-        try
-        {
-            var cacheFolder = _configService.Current.CacheFolder;
-            if (!string.IsNullOrEmpty(cacheFolder) && Directory.Exists(cacheFolder))
-            {
-                var matches = Directory.GetFiles(cacheFolder, hash + ".*", SearchOption.AllDirectories);
-                var first = matches.FirstOrDefault();
-                if (!string.IsNullOrEmpty(first))
-                {
-                    var fi = new FileInfo(first);
+        // Negative cache: avoid repeated expensive filesystem scans when many hashes are missing
+        var nowTicks = DateTime.UtcNow.Ticks;
+        if (_missingHashProbeUntilUtcTicks.TryGetValue(hash, out var untilTicks) && untilTicks > nowTicks)
+            return null;
 
-                    try
-                    {
-                        // Can throw if something has an exclusive lock
-                        var computed = Crypto.GetFileHash(fi.FullName);
+        //try
+        //{
+        //    var cacheFolder = _configService.Current.CacheFolder;
+        //    if (!string.IsNullOrEmpty(cacheFolder) && Directory.Exists(cacheFolder))
+        //    {
+        //        var first = Directory.EnumerateFiles(cacheFolder, hash + ".*", SearchOption.AllDirectories).FirstOrDefault();
+        //        if (!string.IsNullOrEmpty(first))
+        //        {
+        //            // Found: clear miss cache
+        //            _missingHashProbeUntilUtcTicks.TryRemove(hash, out _);
 
-                        // Wrong content? Kill the stray and treat as missing
-                        if (!string.Equals(computed, hash, StringComparison.OrdinalIgnoreCase))
-                        {
-                            _logger.LogWarning(
-                                "Cache probe: file {file} has hash {actual} but expected {expected}, deleting",
-                                fi.FullName, computed, hash);
+        //            var fi = new FileInfo(first);
 
-                            try { File.Delete(fi.FullName); } catch { /* ignore */ }
-                            return null;
-                        }
-                    }
-                    catch (IOException ioEx)
-                    {
-                        // The file definitely exists but is temporarily locked (AV, Penumbra, etc.).
-                        // Treat it as present and valid, using the expected hash.
-                        _logger.LogDebug(
-                            ioEx,
-                            "IO lock while hashing {file} for {hash}; treating file as existing and valid",
-                            fi.FullName, hash);
+        //            try
+        //            {
+        //                // Can throw if something has an exclusive lock
+        //                var computed = Crypto.GetFileHash(fi.FullName);
 
-                        var cacheRootLower = cacheFolder.ToLowerInvariant();
-                        var fullNameLower = fi.FullName.ToLowerInvariant();
+        //                // Wrong content? Kill the stray and treat as missing
+        //                if (!string.Equals(computed, hash, StringComparison.OrdinalIgnoreCase))
+        //                {
+        //                    _logger.LogWarning(
+        //                        "Cache probe: file {file} has hash {actual} but expected {expected}, deleting",
+        //                        fi.FullName, computed, hash);
 
-                        if (!fullNameLower.Contains(cacheRootLower, StringComparison.Ordinal))
-                            return null;
+        //                    try { File.Delete(fi.FullName); } catch { /* ignore */ }
 
-                        var prefixedPath = fullNameLower
-                            .Replace(cacheRootLower, CachePrefix + "\\", StringComparison.Ordinal)
-                            .Replace("\\\\", "\\", StringComparison.Ordinal);
+        //                    // mark miss briefly so we don't thrash disk
+        //                    _missingHashProbeUntilUtcTicks[hash] = DateTime.UtcNow.Add(_missingHashProbeTtl).Ticks;
+        //                    return null;
+        //                }
+        //            }
+        //            catch (IOException ioEx)
+        //            {
+        //                // The file definitely exists but is temporarily locked (AV, Penumbra, etc.).
+        //                // Treat it as present and valid, using the expected hash.
+        //                _logger.LogDebug(
+        //                    ioEx,
+        //                    "IO lock while hashing {file} for {hash}; treating file as existing and valid",
+        //                    fi.FullName, hash);
 
-                        var entity = new FileCacheEntity(
-                            hash,
-                            prefixedPath,
-                            fi.LastWriteTimeUtc.Ticks.ToString(CultureInfo.InvariantCulture),
-                            fi.Length);
+        //                var cacheRootLower = cacheFolder.ToLowerInvariant();
+        //                var fullNameLower = fi.FullName.ToLowerInvariant();
 
-                        entity = ReplacePathPrefixes(entity);
-                        AddHashedFile(entity);
+        //                if (!fullNameLower.Contains(cacheRootLower, StringComparison.Ordinal))
+        //                    return null;
 
-                        // Keep CSV in sync for maint tools
-                        lock (_fileWriteLock)
-                        {
-                            File.AppendAllLines(_csvPath, new[] { entity.CsvEntry });
-                        }
+        //                var prefixedPath = fullNameLower
+        //                    .Replace(cacheRootLower, CachePrefix + "\\", StringComparison.Ordinal)
+        //                    .Replace("\\\\", "\\", StringComparison.Ordinal);
 
-                        return entity;
-                    }
+        //                var entity = new FileCacheEntity(
+        //                    hash,
+        //                    prefixedPath,
+        //                    fi.LastWriteTimeUtc.Ticks.ToString(CultureInfo.InvariantCulture),
+        //                    fi.Length);
 
-                    // If we got here, hashing succeeded and matched the expected hash.
-                    // Content matches: register this file with the requested hash
-                    var cacheRootLower2 = cacheFolder.ToLowerInvariant();
-                    var fullNameLower2 = fi.FullName.ToLowerInvariant();
+        //                entity = ReplacePathPrefixes(entity);
+        //                AddHashedFile(entity);
 
-                    if (!fullNameLower2.Contains(cacheRootLower2, StringComparison.Ordinal))
-                        return null;
+        //                // Keep CSV in sync for maint tools
+        //                lock (_fileWriteLock)
+        //                {
+        //                    File.AppendAllLines(_csvPath, new[] { entity.CsvEntry });
+        //                }
 
-                    string prefixedPath2 = fullNameLower2
-                        .Replace(cacheRootLower2, CachePrefix + "\\", StringComparison.Ordinal)
-                        .Replace("\\\\", "\\", StringComparison.Ordinal);
+        //                return entity;
+        //            }
 
-                    // This will AddHashedFile + append to CSV as usual
-                    return CreateFileCacheEntity(fi, prefixedPath2, hash);
-                }
-            }
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "Error while probing cache folder for hash {hash}", hash);
-        }
+        //            // If we got here, hashing succeeded and matched the expected hash.
+        //            var cacheRootLower2 = cacheFolder.ToLowerInvariant();
+        //            var fullNameLower2 = fi.FullName.ToLowerInvariant();
 
+        //            if (!fullNameLower2.Contains(cacheRootLower2, StringComparison.Ordinal))
+        //                return null;
+
+        //            string prefixedPath2 = fullNameLower2
+        //                .Replace(cacheRootLower2, CachePrefix + "\\", StringComparison.Ordinal)
+        //                .Replace("\\\\", "\\", StringComparison.Ordinal);
+
+        //            return CreateFileCacheEntity(fi, prefixedPath2, hash);
+        //        }
+        //    }
+        //}
+        //catch (Exception ex)
+        //{
+        //    _logger.LogWarning(ex, "Error while probing cache folder for hash {hash}", hash);
+        //}
+
+        _missingHashProbeUntilUtcTicks[hash] = DateTime.UtcNow.Add(_missingHashProbeTtl).Ticks;
         return null;
     }
+
 
 
 
@@ -348,35 +360,37 @@ public sealed partial class FileCacheManager : IHostedService
 
         try
         {
-            var cleanedPaths = paths
-                .Distinct(StringComparer.OrdinalIgnoreCase)
-                .ToDictionary(
-                    p => p,
-                    p => p.Replace("/", "\\", StringComparison.OrdinalIgnoreCase)
-                          .Replace(_ipcManager.Penumbra.ModDirectory!, PenumbraPrefix + '\\', StringComparison.OrdinalIgnoreCase)
-                          .Replace(_configService.Current.CacheFolder, CachePrefix + '\\', StringComparison.OrdinalIgnoreCase)
-                          .Replace("\\\\", "\\", StringComparison.Ordinal),
-                    StringComparer.OrdinalIgnoreCase);
+            var modDir = _ipcManager.Penumbra.ModDirectory ?? string.Empty;
+            var cacheDir = _configService.Current.CacheFolder ?? string.Empty;
 
-            Dictionary<string, FileCacheEntity?> result = new(StringComparer.OrdinalIgnoreCase);
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var result = new Dictionary<string, FileCacheEntity?>(StringComparer.OrdinalIgnoreCase);
 
-            foreach (var entry in cleanedPaths)
+            foreach (var original in paths)
             {
-                if (_prefixedPathIndex.TryGetValue(entry.Value, out var entity))
+                if (string.IsNullOrWhiteSpace(original)) continue;
+                if (!seen.Add(original)) continue;
+
+                var prefixed = original
+                    .Replace("/", "\\", StringComparison.OrdinalIgnoreCase);
+
+                if (!string.IsNullOrEmpty(modDir))
+                    prefixed = prefixed.Replace(modDir, PenumbraPrefix + '\\', StringComparison.OrdinalIgnoreCase);
+
+                if (!string.IsNullOrEmpty(cacheDir))
+                    prefixed = prefixed.Replace(cacheDir, CachePrefix + '\\', StringComparison.OrdinalIgnoreCase);
+
+                prefixed = prefixed.Replace("\\\\", "\\", StringComparison.Ordinal);
+
+                if (_prefixedPathIndex.TryGetValue(prefixed, out var entity))
                 {
-                    var validatedCache = GetValidatedFileCache(entity);
-                    result.Add(entry.Key, validatedCache);
+                    result[original] = GetValidatedFileCache(entity);
                 }
                 else
                 {
-                    if (!entry.Value.Contains(CachePrefix, StringComparison.Ordinal))
-                    {
-                        result.Add(entry.Key, CreateFileEntry(entry.Key));
-                    }
-                    else
-                    {
-                        result.Add(entry.Key, CreateCacheEntry(entry.Key));
-                    }
+                    result[original] = !prefixed.Contains(CachePrefix, StringComparison.Ordinal)
+                        ? CreateFileEntry(original)
+                        : CreateCacheEntry(original);
                 }
             }
 
@@ -387,8 +401,6 @@ public sealed partial class FileCacheManager : IHostedService
             _getCachesByPathsSemaphore.Release();
         }
     }
-
-
 
     public void RemoveHashedFile(string hash, string prefixedFilePath)
     {
@@ -644,67 +656,6 @@ public sealed partial class FileCacheManager : IHostedService
         resultingFileCache = Validate(resultingFileCache);
         return resultingFileCache;
     }
-    private void RepairCacheFromFilesystem(CancellationToken cancellationToken)
-    {
-        var cacheFolder = _configService.Current.CacheFolder;
-        if (string.IsNullOrEmpty(cacheFolder) || !Directory.Exists(cacheFolder))
-            return;
-
-        _logger.LogInformation("Repairing file cache index from filesystem at {root}", cacheFolder);
-
-        var cacheRootLower = cacheFolder.ToLowerInvariant();
-
-        foreach (var file in Directory.EnumerateFiles(cacheFolder, "*.*", SearchOption.AllDirectories))
-        {
-            if (cancellationToken.IsCancellationRequested)
-            {
-                _logger.LogInformation("Repair from filesystem cancelled");
-                break;
-            }
-
-            try
-            {
-                var fi = new FileInfo(file);
-                if (!fi.Exists)
-                    continue;
-
-                var fullLower = fi.FullName.ToLowerInvariant();
-                if (!fullLower.Contains(cacheRootLower, StringComparison.Ordinal))
-                    continue;
-
-                // Derive prefixed path ({cache}\...) from the actual full path
-                var prefixedPath = fullLower
-                    .Replace(cacheRootLower, CachePrefix + "\\", StringComparison.Ordinal)
-                    .Replace("\\\\", "\\", StringComparison.Ordinal);
-
-                // Compute hash from content
-                var hash = Crypto.GetFileHash(fi.FullName);
-
-                // Skip if we already have an entry for this hash + path
-                if (_fileCaches.TryGetValue(hash, out var entries) &&
-                    entries.Any(e => string.Equals(e.PrefixedFilePath, prefixedPath, StringComparison.OrdinalIgnoreCase)))
-                {
-                    continue;
-                }
-
-                _logger.LogTrace("Repair: registering cache file {file} as hash {hash}", fi.FullName, hash);
-
-                // This will:
-                // - Add to _fileCaches
-                // - Append to FileCache.csv (because we didn't change CreateFileCacheEntity)
-                CreateFileCacheEntity(fi, prefixedPath, hash);
-            }
-            catch (IOException ioEx)
-            {
-                _logger.LogDebug(ioEx, "Repair: IO error while indexing existing cache file {file}", file);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "Repair: unexpected error while indexing existing cache file {file}", file);
-            }
-        }
-    }
-
 
     private FileCacheEntity ReplacePathPrefixes(FileCacheEntity fileCache)
     {

@@ -59,6 +59,11 @@ public class CompactUi : WindowMediatorSubscriberBase
     private bool _showModalForUserAddition;
     private bool _wasOpen;
     private float _windowContentWidth;
+    private Vector2? _restoreMainUiPos;
+    private bool _restoreUncollapse;
+    private bool _suppressMinimizedRestoreIcon;
+    private bool _wasCollapsed;
+
 
     private enum PairViewTab
     {
@@ -134,8 +139,24 @@ public class CompactUi : WindowMediatorSubscriberBase
                     ImGui.Text("Open RavaSync Event Viewer");
                     ImGui.EndTooltip();
                 }
+            },
+            new TitleBarButton()
+            {
+                Icon = FontAwesomeIcon.WindowMinimize,
+                Click = (msg) =>
+                {
+                    IsOpen = false;
+                },
+                IconOffset = new(2,1),
+                ShowTooltip = () =>
+                {
+                    ImGui.BeginTooltip();
+                    ImGui.Text("Minimize RavaSync");
+                    ImGui.EndTooltip();
+                }
             }
         };
+
 
         _drawFolders = GetDrawFolders().ToList();
 
@@ -156,7 +177,14 @@ public class CompactUi : WindowMediatorSubscriberBase
         Mediator.Subscribe<DownloadFinishedMessage>(this, (msg) => _currentDownloads.TryRemove(msg.DownloadId, out _));
         Mediator.Subscribe<RefreshUiMessage>(this, (msg) => _drawFolders = GetDrawFolders().ToList());
 
-        Flags |= ImGuiWindowFlags.NoDocking;
+        Mediator.Subscribe<RestoreMainUiAtPositionMessage>(this, (msg) =>
+        {
+            _restoreMainUiPos = msg.Position;
+            _restoreUncollapse = true;
+            IsOpen = true;
+        });
+
+        Flags |= ImGuiWindowFlags.NoDocking | ImGuiWindowFlags.NoCollapse;
 
         SizeConstraints = new WindowSizeConstraints()
         {
@@ -165,13 +193,68 @@ public class CompactUi : WindowMediatorSubscriberBase
         };
     }
 
+
+    public override void OnOpen()
+    {
+        _suppressMinimizedRestoreIcon = false;
+
+        if (_configService.Current.ShowMinimizedRestoreIcon)
+            Mediator.Publish(new MainUiRestoredMessage());
+
+        base.OnOpen();
+    }
+
+
+    public override void OnClose()
+    {
+        if (!_suppressMinimizedRestoreIcon && _configService.Current.ShowMinimizedRestoreIcon)
+        {
+            Mediator.Publish(new MainUiMinimizedAtPositionMessage(_lastPosition));
+            Mediator.Publish(new MainUiMinimizedMessage());
+        }
+
+        base.OnClose();
+    }
+
+
+
     protected override void DrawInternal()
     {
         _windowContentWidth = UiSharedService.GetWindowContentRegionWidth();
+
+        if (_configService.Current.ShowMinimizedRestoreIcon)
+            Flags |= ImGuiWindowFlags.NoCollapse;
+        else
+            Flags &= ~ImGuiWindowFlags.NoCollapse;
+
+        if (_restoreMainUiPos != null)
+        {
+            var vp = ImGui.GetMainViewport();
+            var pos1 = _restoreMainUiPos.Value;
+
+            // Keep a little margin.
+            var min = vp.WorkPos;
+            var max = vp.WorkPos + vp.WorkSize - new Vector2(60f, 60f);
+
+            pos1 = Vector2.Clamp(pos1, min, max);
+            ImGui.SetWindowPos(pos1, ImGuiCond.Always);
+
+            _restoreMainUiPos = null;
+        }
+
+        if (_restoreUncollapse)
+        {
+            ImGui.SetWindowCollapsed(false, ImGuiCond.Always);
+            ImGui.SetWindowFocus();
+            _restoreUncollapse = false;
+        }
+
+
         if (!_apiController.IsCurrentVersion)
         {
             var ver = _apiController.CurrentClientVersion;
             var unsupported = "UNSUPPORTED VERSION";
+
             using (_uiSharedService.UidFont.Push())
             {
                 var uidTextSize = ImGui.CalcTextSize(unsupported);
@@ -1205,14 +1288,17 @@ public class CompactUi : WindowMediatorSubscriberBase
 
     private void UiSharedService_GposeEnd()
     {
+        _suppressMinimizedRestoreIcon = false;
         IsOpen = _wasOpen;
     }
 
     private void UiSharedService_GposeStart()
     {
+        _suppressMinimizedRestoreIcon = true;
         _wasOpen = IsOpen;
         IsOpen = false;
     }
+
 
 
     private readonly Progress<(string fileName, int index)> _bc7Progress = new();

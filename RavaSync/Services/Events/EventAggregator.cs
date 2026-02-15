@@ -22,20 +22,9 @@ public class EventAggregator : MediatorSubscriberBase, IHostedService
     {
         Mediator.Subscribe<EventMessage>(this, (msg) =>
         {
-            _lock.Wait();
-            try
-            {
-                Logger.LogTrace("Received Event: {evt}", msg.Event.ToString());
-                _events.Add(msg.Event);
-                WriteToFile(msg.Event);
-            }
-            finally
-            {
-                _lock.Release();
-            }
-
-            RecreateLazy();
+            _ = ProcessEventAsync(msg.Event);
         });
+
 
         EventList = CreateEventLazy();
         _configDirectory = configDirectory;
@@ -49,6 +38,24 @@ public class EventAggregator : MediatorSubscriberBase, IHostedService
 
         EventList = CreateEventLazy();
     }
+
+    private async Task ProcessEventAsync(Event evt)
+    {
+        await _lock.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            Logger.LogTrace("Received Event: {evt}", evt.ToString());
+            _events.Add(evt);
+            WriteToFile(evt);
+        }
+        finally
+        {
+            _lock.Release();
+        }
+
+        RecreateLazy();
+    }
+
 
     private Lazy<List<Event>> CreateEventLazy()
     {
