@@ -113,6 +113,16 @@ public sealed class IpcCallerHonorific : IIpcCaller
         }
     }
 
+    public async Task ClearTitleByObjectIndexAsync(int objectIndex)
+    {
+        if (!APIAvailable) return;
+
+        await _dalamudUtil.RunOnFrameworkThread(() =>
+        {
+            _honorificClearCharacterTitle.InvokeAction(objectIndex);
+        }).ConfigureAwait(false);
+    }
+
     private void OnHonorificDisposing()
     {
         _mareMediator.Publish(new HonorificMessage(string.Empty));

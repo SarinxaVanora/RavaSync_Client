@@ -74,6 +74,17 @@ public sealed class IpcCallerHeels : IIpcCaller
         }).ConfigureAwait(false);
     }
 
+    public async Task UnregisterByObjectIndexAsync(int objectIndex)
+    {
+        if (!APIAvailable) return;
+
+        await _dalamudUtil.RunOnFrameworkThread(() =>
+        {
+            _logger.LogTrace("Heels unregistering idx {idx}", objectIndex);
+            _heelsUnregisterPlayer.InvokeAction(objectIndex);
+        }).ConfigureAwait(false);
+    }
+
     public void CheckAPI()
     {
         try

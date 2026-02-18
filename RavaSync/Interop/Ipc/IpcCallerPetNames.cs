@@ -123,6 +123,17 @@ public sealed class IpcCallerPetNames : IIpcCaller
         }
     }
 
+    public async Task ClearPlayerDataByObjectIndexAsync(int objectIndex)
+    {
+        if (!APIAvailable) return;
+
+        await _dalamudUtil.RunOnFrameworkThread(() =>
+        {
+            _clearPlayerData.InvokeAction((ushort)objectIndex);
+        }).ConfigureAwait(false);
+    }
+
+
     public async Task ClearPlayerData(nint characterPointer)
     {
         if (!APIAvailable) return;

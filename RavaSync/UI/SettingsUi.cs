@@ -851,10 +851,12 @@ public class SettingsUi : WindowMediatorSubscriberBase
                 }
                 else
                 {
-
                     UiSharedService.TextWrapped($"Storage validation is running: {_currentProgress.Item1}/{_currentProgress.Item2}");
-                    UiSharedService.TextWrapped($"Current item: {_currentProgress.Item3.ResolvedFilepath}");
+
+                    var currentItem = _currentProgress.Item3?.ResolvedFilepath;
+                    UiSharedService.TextWrapped($"Current item: {(!string.IsNullOrEmpty(currentItem) ? currentItem : "(starting...)")}");
                 }
+
             }
         }
         ImGui.Separator();

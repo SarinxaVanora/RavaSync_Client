@@ -267,12 +267,12 @@ public sealed class RavaDiscoveryService
 
                 case RavaHello hello:
                     if (!discoveryEnabled) break;
-                    HandleHello(hello);
+                    HandleHello(sessionId, hello);
                     break;
 
                 case RavaHelloAck ack:
                     if (!discoveryEnabled) break;
-                    HandleHelloAck(ack);
+                    HandleHelloAck(sessionId, ack);
                     break;
 
                 case RavaPairRequest pr:
@@ -296,39 +296,41 @@ public sealed class RavaDiscoveryService
 
 
 
-    private void HandleHello(RavaHello hello)
+    private void HandleHello(string transportSessionId, RavaHello hello)
     {
         if (_mySessionId == null) return;
 
+        var from = !string.IsNullOrWhiteSpace(hello.FromSessionId) ? hello.FromSessionId : transportSessionId;
+        if (string.IsNullOrWhiteSpace(from))
+            return;
+
         var info = new RavaPeerInfo(
-            SessionId: hello.FromSessionId,
-            PeerKey: hello.FromPeerKey,
+            SessionId: from,
+            PeerKey: hello.FromPeerKey ?? Array.Empty<byte>(),
             FirstSeenUtc: DateTime.UtcNow,
             LastSeenUtc: DateTime.UtcNow);
 
-        _knownPeers.AddOrUpdate(
-            hello.FromSessionId,
-            info,
-            (_, existing) => existing with { LastSeenUtc = DateTime.UtcNow });
+        _knownPeers.AddOrUpdate(from, info, (_, existing) => existing with { LastSeenUtc = DateTime.UtcNow });
 
-        // reply back so the other side also knows we're here
         var ack = new RavaHelloAck(_mySessionId, _myPeerKey);
-        _ = _mesh.SendAsync(hello.FromSessionId, ack);
+        _ = _mesh.SendAsync(from, ack);
     }
 
-    private void HandleHelloAck(RavaHelloAck ack)
+    private void HandleHelloAck(string transportSessionId, RavaHelloAck ack)
     {
+        var from = !string.IsNullOrWhiteSpace(ack.FromSessionId) ? ack.FromSessionId : transportSessionId;
+        if (string.IsNullOrWhiteSpace(from))
+            return;
+
         var info = new RavaPeerInfo(
-            SessionId: ack.FromSessionId,
-            PeerKey: ack.FromPeerKey,
+            SessionId: from,
+            PeerKey: ack.FromPeerKey ?? Array.Empty<byte>(),
             FirstSeenUtc: DateTime.UtcNow,
             LastSeenUtc: DateTime.UtcNow);
 
-        _knownPeers.AddOrUpdate(
-            ack.FromSessionId,
-            info,
-            (_, existing) => existing with { LastSeenUtc = DateTime.UtcNow });
+        _knownPeers.AddOrUpdate(from, info, (_, existing) => existing with { LastSeenUtc = DateTime.UtcNow });
     }
+
 
 
     private void HandlePairRequest(string localSessionId, RavaPairRequest pr)

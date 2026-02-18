@@ -155,38 +155,6 @@ public sealed class IpcCallerGlamourer : DisposableMediatorSubscriberBase, IIpcC
         return ok ? (result ?? string.Empty) : string.Empty;
     }
 
-    //public async Task RevertAsync(ILogger logger, GameObjectHandler handler, Guid applicationId, CancellationToken token)
-    //{
-    //    if ((!APIAvailable) || _dalamudUtil.IsZoning) return;
-    //    try
-    //    {
-    //        await _redrawManager.RedrawSemaphore.WaitAsync(token).ConfigureAwait(false);
-    //        // Keep the delegate synchronous; protect each IPC call with try/catch
-    //        await _redrawManager.PenumbraRedrawInternalAsync(logger, handler, applicationId, (chara) =>
-    //        {
-    //            try
-    //            {
-    //                logger.LogDebug("[{appid}] Calling On IPC: GlamourerUnlock", applicationId);
-    //                _glamourerUnlock.Invoke(chara.ObjectIndex, LockCode);
-
-    //                logger.LogDebug("[{appid}] Calling On IPC: GlamourerRevert", applicationId);
-    //                _glamourerRevert.Invoke(chara.ObjectIndex, LockCode);
-
-    //                logger.LogDebug("[{appid}] Requesting Penumbra Redraw via mediator", applicationId);
-    //                _mareMediator.Publish(new PenumbraRedrawCharacterMessage(chara));
-    //            }
-    //            catch (Exception ex)
-    //            {
-    //                logger.LogWarning(ex, "[{appid}] Error during GlamourerRevert", applicationId);
-    //            }
-    //        }, token).ConfigureAwait(false);
-    //    }
-    //    finally
-    //    {
-    //        _redrawManager.RedrawSemaphore.Release();
-    //    }
-    //}
-
     public async Task RevertAsync(ILogger logger, GameObjectHandler handler, Guid applicationId, CancellationToken token)
     {
         if (!APIAvailable || _dalamudUtil.IsZoning) return;
@@ -264,6 +232,30 @@ public sealed class IpcCallerGlamourer : DisposableMediatorSubscriberBase, IIpcC
         {
             _logger.LogWarning(ex, "Error during Glamourer RevertByName");
         }
+    }
+
+    public async Task RevertByObjectIndexAsync(ILogger logger, int objectIndex, Guid applicationId)
+    {
+        if ((!APIAvailable) || _dalamudUtil.IsZoning) return;
+
+        await SafeIpc.TryRun(Logger, "Glamourer.RevertByObjectIndex", TimeSpan.FromSeconds(2), async ct =>
+        {
+            await _dalamudUtil.RunOnFrameworkThread(() =>
+            {
+                try
+                {
+                    logger.LogDebug("[{appid}] Glamourer cleanup for idx {idx}: Unlock + Revert", applicationId, objectIndex);
+                    _glamourerUnlock.Invoke(objectIndex, LockCode);
+                    _glamourerRevert.Invoke(objectIndex, LockCode);
+                }
+                catch (Exception ex)
+                {
+                    logger.LogWarning(ex, "[{appid}] Glamourer cleanup failed for idx {idx}", applicationId, objectIndex);
+                }
+
+                return 0;
+            }).ConfigureAwait(false);
+        }).ConfigureAwait(false);
     }
 
     private void GlamourerChanged(nint address)

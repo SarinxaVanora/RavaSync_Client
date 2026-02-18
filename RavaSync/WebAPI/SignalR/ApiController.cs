@@ -348,11 +348,11 @@ public sealed partial class ApiController : DisposableMediatorSubscriberBase, IM
             perm.SetPaused(paused: true);
             await UserSetPairPermissions(new UserPermissionsDto(userData, perm)).ConfigureAwait(false);
             //// wait until it's changed
-            //while (pair.UserPair!.OwnPermissions != perm)
-            //{
-            //    await Task.Delay(250, cts.Token).ConfigureAwait(false);
-            //    Logger.LogTrace("Waiting for permissions change for {data}", userData);
-            //}
+            while (pair.UserPair!.OwnPermissions != perm)
+            {
+                await Task.Delay(1000, cts.Token).ConfigureAwait(false);
+                Logger.LogTrace("Waiting for permissions change for {data}", userData);
+            }
             perm.SetPaused(paused: false);
             await UserSetPairPermissions(new UserPermissionsDto(userData, perm)).ConfigureAwait(false);
         }, cts.Token).ContinueWith((t) => cts.Dispose());

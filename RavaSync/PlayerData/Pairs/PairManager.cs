@@ -300,7 +300,9 @@ public sealed class PairManager : DisposableMediatorSubscriberBase
             pair.UserPair.OtherPermissions.IsDisableSounds(),
             pair.UserPair.OtherPermissions.IsDisableVFX());
 
-        if (!pair.IsPaused)
+        if (pair.IsPaused)
+        { }
+        else
             pair.ApplyLastReceivedData();
 
         RecreateLazy();
@@ -326,11 +328,14 @@ public sealed class PairManager : DisposableMediatorSubscriberBase
             pair.UserPair.OwnPermissions.IsDisableSounds(),
             pair.UserPair.OwnPermissions.IsDisableVFX());
 
-        if (!pair.IsPaused)
+        if (pair.IsPaused)
+        { }
+        else
             pair.ApplyLastReceivedData();
 
         RecreateLazy();
     }
+
 
     internal void ReceiveUploadStatus(UserDto dto)
     {
@@ -416,7 +421,7 @@ public sealed class PairManager : DisposableMediatorSubscriberBase
         Logger.LogDebug("Disposing all Pairs");
         Parallel.ForEach(_allClientPairs, item =>
         {
-            item.Value.MarkOffline(wait: false);
+            item.Value.MarkOffline(wait: true);
         });
 
         RecreateLazy();

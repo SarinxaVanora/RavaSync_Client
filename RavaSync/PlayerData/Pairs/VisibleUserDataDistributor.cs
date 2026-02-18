@@ -17,7 +17,7 @@ public class VisibleUserDataDistributor : DisposableMediatorSubscriberBase
     private CharacterData? _lastCreatedData;
     private CharacterData? _uploadingCharacterData = null;
     private readonly List<UserData> _previouslyVisiblePlayers = [];
-    private Task<CharacterData>? _fileUploadTask = null;
+    private Task<(CharacterData Data, bool Success, string? Error)>? _fileUploadTask = null;
     private readonly HashSet<UserData> _usersToPushDataTo = [];
     private readonly HashSet<UserData> _previouslyVisiblePlayersSet = [];
     private readonly List<UserData> _newVisibleUsersBuffer = [];
@@ -48,8 +48,16 @@ public class VisibleUserDataDistributor : DisposableMediatorSubscriberBase
             }
         });
 
-        Mediator.Subscribe<ConnectedMessage>(this, (_) => PushToAllVisibleUsers());
-        Mediator.Subscribe<DisconnectedMessage>(this, (_) => _previouslyVisiblePlayers.Clear());
+        Mediator.Subscribe<ConnectedMessage>(this, (_) => PushToAllVisibleUsers(forced: true));
+        Mediator.Subscribe<DisconnectedMessage>(this, (_) =>
+        {
+            _previouslyVisiblePlayers.Clear();
+            _previouslyVisiblePlayersSet.Clear();
+            _usersToPushDataTo.Clear();
+            _newVisibleUsersBuffer.Clear();
+            _uploadingCharacterData = null;
+            _fileUploadTask = null;
+        });
     }
 
     protected override void Dispose(bool disposing)
@@ -134,7 +142,14 @@ public class VisibleUserDataDistributor : DisposableMediatorSubscriberBase
 
             if (_fileUploadTask != null)
             {
-                var dataToSend = await _fileUploadTask.ConfigureAwait(false);
+                var uploadResult = await _fileUploadTask.ConfigureAwait(false);
+                if (!uploadResult.Success)
+                {
+                    Logger.LogWarning("Upload/share failed for {hash}: {error}", _uploadingCharacterData?.DataHash.Value ?? "UNKNOWN", uploadResult.Error ?? "Unknown error");
+                    return;
+                }
+
+                var dataToSend = uploadResult.Data;
                 await _pushDataSemaphore.WaitAsync(_runtimeCts.Token).ConfigureAwait(false);
                 try
                 {

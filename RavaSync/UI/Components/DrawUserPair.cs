@@ -259,7 +259,7 @@ public class DrawUserPair
             var color = ImGuiColors.ParsedGreen;
             var stateText = "Visible";
 
-            if (_pair.IsUploadingRecently)
+            if (_pair.IsUploading)
             {
                 icon = FontAwesomeIcon.Upload;
                 color = ImGuiColors.DalamudYellow;

@@ -13,7 +13,26 @@ public class RedrawManager
     private readonly MareMediator _mareMediator;
     private readonly DalamudUtilService _dalamudUtil;
     private readonly ConcurrentDictionary<nint, bool> _penumbraRedrawRequests = [];
+    private readonly ConcurrentDictionary<nint, RedrawQueue> _redrawQueues = new();
     private CancellationTokenSource _disposalCts = new();
+
+    private sealed class RedrawQueue
+    {
+        public readonly ConcurrentQueue<WorkItem> Items = new();
+        public int RunnerActive;
+    }
+
+    private sealed class WorkItem
+    {
+        public required ILogger Logger;
+        public required GameObjectHandler Handler;
+        public required Guid ApplicationId;
+        public required Action<ICharacter> Action;
+        public required TaskCompletionSource<bool> Tcs;
+        public required CancellationToken Token;
+    }
+
+
 
     public SemaphoreSlim RedrawSemaphore { get; init; } = new(2, 2);
 
@@ -25,61 +44,118 @@ public class RedrawManager
 
     public async Task PenumbraRedrawInternalAsync(ILogger logger, GameObjectHandler handler, Guid applicationId, Action<ICharacter> action, CancellationToken token)
     {
-        _mareMediator.Publish(new PenumbraStartRedrawMessage(handler.Address));
+        var queue = _redrawQueues.GetOrAdd(handler.Address, _ => new RedrawQueue());
 
-        _penumbraRedrawRequests[handler.Address] = true;
+        var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
 
-        //try
-        //{
-        //    using CancellationTokenSource cancelToken = new CancellationTokenSource();
-        //    using CancellationTokenSource combinedCts = CancellationTokenSource.CreateLinkedTokenSource(cancelToken.Token, token, _disposalCts.Token);
-        //    var combinedToken = combinedCts.Token;
-        //    cancelToken.CancelAfter(TimeSpan.FromSeconds(15));
-        //    await handler.ActOnFrameworkAfterEnsureNoDrawAsync(action, combinedToken).ConfigureAwait(false);
+        using var reg = token.Register(() => tcs.TrySetCanceled(token));
 
-        //    if (!_disposalCts.Token.IsCancellationRequested)
-        //        await _dalamudUtil.WaitWhileCharacterIsDrawing(logger, handler, applicationId, 15000, combinedToken).ConfigureAwait(false);
-        //}
-        //finally
-        //{
-        //    _penumbraRedrawRequests[handler.Address] = false;
-        //    _mareMediator.Publish(new PenumbraEndRedrawMessage(handler.Address));
-        //}
+        queue.Items.Enqueue(new WorkItem
+        {
+            Logger = logger,
+            Handler = handler,
+            ApplicationId = applicationId,
+            Action = action,
+            Tcs = tcs,
+            Token = token
+        });
 
+        if (Interlocked.CompareExchange(ref queue.RunnerActive, 1, 0) == 0)
+        {
+            _ = Task.Run(() => ProcessQueueAsync(handler.Address, queue));
+        }
+
+        await tcs.Task.ConfigureAwait(false);
+    }
+
+    private async Task ProcessQueueAsync(nint address, RedrawQueue queue)
+    {
         try
         {
-            try
+            await Task.Delay(25).ConfigureAwait(false);
+
+            while (!_disposalCts.IsCancellationRequested)
             {
-                using CancellationTokenSource localTimeout = new();
-                using CancellationTokenSource linked =
-                    CancellationTokenSource.CreateLinkedTokenSource(localTimeout.Token, token, _disposalCts.Token);
+                var batch = new List<WorkItem>(32);
+                while (queue.Items.TryDequeue(out var wi))
+                    batch.Add(wi);
 
-                // enforce a 15s timeout
-                localTimeout.CancelAfter(TimeSpan.FromSeconds(15));
-                var linkedToken = linked.Token;
+                if (batch.Count == 0)
+                    break;
 
-                await handler
-                    .ActOnFrameworkAfterEnsureNoDrawAsync(action, linkedToken)
-                    .ConfigureAwait(false);
+                var handler = batch[0].Handler;
+                var logger = batch[0].Logger;
+                var applicationId = batch[0].ApplicationId;
 
-                if (!_disposalCts.IsCancellationRequested)
+                _mareMediator.Publish(new PenumbraStartRedrawMessage(address));
+                _penumbraRedrawRequests[address] = true;
+
+                try
                 {
-                    await _dalamudUtil
-                        .WaitWhileCharacterIsDrawing(logger, handler, applicationId, 15000, linkedToken)
-                        .ConfigureAwait(false);
+                    using CancellationTokenSource localTimeout = new();
+                    using CancellationTokenSource linked =
+                        CancellationTokenSource.CreateLinkedTokenSource(localTimeout.Token, _disposalCts.Token);
+
+                    localTimeout.CancelAfter(TimeSpan.FromSeconds(15));
+                    var linkedToken = linked.Token;
+
+                    await handler.ActOnFrameworkAfterEnsureNoDrawAsync(chara =>
+                    {
+                        foreach (var wi in batch)
+                        {
+                            if (wi.Tcs.Task.IsCompleted || wi.Token.IsCancellationRequested)
+                            {
+                                wi.Tcs.TrySetCanceled(wi.Token);
+                                continue;
+                            }
+
+                            try
+                            {
+                                wi.Action(chara);
+                                wi.Tcs.TrySetResult(true);
+                            }
+                            catch (Exception ex)
+                            {
+                                wi.Logger.LogDebug(ex, "[{appid}] Redraw batch action failed", wi.ApplicationId);
+                                wi.Tcs.TrySetResult(false);
+                            }
+                        }
+                    }, linkedToken).ConfigureAwait(false);
+
+                    if (!_disposalCts.IsCancellationRequested)
+                    {
+                        await _dalamudUtil
+                            .WaitWhileCharacterIsDrawing(logger, handler, applicationId, 15000, linkedToken)
+                            .ConfigureAwait(false);
+                    }
                 }
-            }
-            catch (OperationCanceledException)
-            {
-                logger.LogDebug("[{appid}] Penumbra redraw cancelled for {name}", applicationId, handler.Name);
+                catch (OperationCanceledException)
+                {
+                    logger.LogDebug("[{appid}] Penumbra redraw batch cancelled for addr {addr}", applicationId, address);
+
+                    foreach (var wi in batch)
+                        wi.Tcs.TrySetCanceled();
+                }
+                finally
+                {
+                    _penumbraRedrawRequests[address] = false;
+                    _mareMediator.Publish(new PenumbraEndRedrawMessage(address));
+                }
+
+                await Task.Yield();
             }
         }
         finally
         {
-            _penumbraRedrawRequests[handler.Address] = false;
-            _mareMediator.Publish(new PenumbraEndRedrawMessage(handler.Address));
+            Interlocked.Exchange(ref queue.RunnerActive, 0);
+
+            if (!queue.Items.IsEmpty && Interlocked.CompareExchange(ref queue.RunnerActive, 1, 0) == 0)
+            {
+                _ = Task.Run(() => ProcessQueueAsync(address, queue));
+            }
         }
     }
+
 
     internal void Cancel()
     {

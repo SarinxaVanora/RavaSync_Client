@@ -133,6 +133,21 @@ public sealed class IpcCallerCustomize : IIpcCaller, IDisposable
         return Convert.ToBase64String(Encoding.UTF8.GetBytes(raw));
     }
 
+    public async Task RevertByObjectIndexAsync(ushort objectIndex)
+    {
+        if (!APIAvailable) return;
+
+        await SafeIpc.TryRun(_logger, "CustomizePlus.RevertByObjectIndex", TimeSpan.FromSeconds(2), async ct =>
+        {
+            await _dalamudUtil.RunOnFrameworkThread(() =>
+            {
+                _logger.LogTrace("CustomizePlus reverting idx {idx}", objectIndex);
+                _customizePlusRevertCharacter.InvokeFunc(objectIndex);
+                return 0;
+            }).ConfigureAwait(false);
+        }).ConfigureAwait(false);
+    }
+
     public void CheckAPI()
     {
         try

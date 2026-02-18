@@ -60,7 +60,23 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
     private int _manualRepairRunning = 0;
     private int? _lastAssignedObjectIndex = null;
     private DateTime _lastAssignedCollectionAssignUtc = DateTime.MinValue;
-    private static readonly SemaphoreSlim GlobalApplySemaphore = new(3, 3);
+    private static int ComputeNormalApplyConcurrency()
+    {
+        var logical = Environment.ProcessorCount;
+
+        // Roughly: 16 threads => 4, 8 threads => 2, 24 threads => 5
+        var normal = logical / 4;
+        if (normal < 2) normal = 2;
+        if (normal > 5) normal = 5;
+
+        return normal;
+    }
+
+    private static readonly int NormalApplyConcurrency = ComputeNormalApplyConcurrency();
+    private static readonly int StormApplyConcurrency = Math.Max(1, NormalApplyConcurrency / 2);
+
+    private static readonly SemaphoreSlim NormalApplySemaphore = new(NormalApplyConcurrency, NormalApplyConcurrency);
+    private static readonly SemaphoreSlim StormApplySemaphore = new(StormApplyConcurrency, StormApplyConcurrency);
     private string? _lastAttemptedDataHash;
     private string? _lastAppliedTempModsFingerprint;
     private Task? _deferredHardDelayedApplyTask;
@@ -385,6 +401,9 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
     internal void SetUploading(bool isUploading = true)
     {
         Logger.LogTrace("Setting {this} uploading {uploading}", this, isUploading);
+
+        Pair?.SetUploadState(isUploading);
+
         if (_charaHandler != null)
         {
             Mediator.Publish(new PlayerUploadingMessage(_charaHandler, isUploading));
@@ -532,11 +551,19 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
                         break;
 
                     case PlayerChanges.Glamourer:
+                        if (allowPlayerRedraw)
+                        {
+                            var extra = SyncStorm.IsActive ? ((PlayerNameHash?.GetHashCode(StringComparison.Ordinal) ?? 0) & 0x7F) : 0;
+                            var delayMs = 250 + extra;
+                            await Task.Delay(delayMs, token).ConfigureAwait(false);
+                        }
+
                         if (charaData.GlamourerData.TryGetValue(changes.Key, out var glamourerData))
                         {
                             await _ipcManager.Glamourer.ApplyAllAsync(Logger, handler, glamourerData, applicationId, token).ConfigureAwait(false);
                         }
                         break;
+
 
                     case PlayerChanges.Moodles:
                         await _ipcManager.Moodles.SetStatusAsync(handler.Address, charaData.MoodlesData).ConfigureAwait(false);
@@ -594,7 +621,8 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
                 if (_applicationId != applicationId)
                     return;
 
-                if (GlobalApplySemaphore.CurrentCount == 0)
+                var sem = SyncStorm.IsActive ? StormApplySemaphore : NormalApplySemaphore;
+                if (sem.CurrentCount == 0)
                 {
                     await Task.Delay(200, token).ConfigureAwait(false);
                     continue;
@@ -973,11 +1001,15 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
     private async Task ApplyCharacterDataAsync(Guid applicationBase, CharacterData charaData, Dictionary<ObjectKind, HashSet<PlayerChanges>> updatedData, bool updateModdedPaths, bool updateManip, Dictionary<(string GamePath, string? Hash), string> moddedPaths, bool downloadedAny, CancellationToken token)
     {
         var acquired = false;
+        SemaphoreSlim? applySemaphore = null;
 
         try
         {
-            await GlobalApplySemaphore.WaitAsync(token).ConfigureAwait(false);
+            applySemaphore = SyncStorm.IsActive ? StormApplySemaphore : NormalApplySemaphore;
+
+            await applySemaphore.WaitAsync(token).ConfigureAwait(false);
             acquired = true;
+
 
             try
             {
@@ -1023,6 +1055,8 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
                     {
                         _lastAssignedCollectionAssignUtc = nowUtc;
 
+                        var oldIdx = _lastAssignedObjectIndex;
+
                         var ok = await _ipcManager.Penumbra
                             .AssignTemporaryCollectionAsync(Logger, _penumbraCollection, objIndex)
                             .ConfigureAwait(false);
@@ -1037,6 +1071,29 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
                         _lastAssignedObjectIndex = objIndex;
 
                         collectionReassignedThisRun = firstAssign || indexChanged;
+
+                        if (indexChanged && oldIdx.HasValue && oldIdx.Value >= 0)
+                        {
+                            var idxToClean = oldIdx.Value;
+
+                            _ = Task.Run(async () =>
+                            {
+                                try
+                                {
+                                    await _ipcManager.Penumbra.AssignEmptyCollectionAsync(Logger, idxToClean).ConfigureAwait(false);
+                                    await _ipcManager.Honorific.ClearTitleByObjectIndexAsync(idxToClean).ConfigureAwait(false);
+                                    await _ipcManager.PetNames.ClearPlayerDataByObjectIndexAsync(idxToClean).ConfigureAwait(false);
+                                    await _ipcManager.Heels.UnregisterByObjectIndexAsync(idxToClean).ConfigureAwait(false);
+                                    await _ipcManager.CustomizePlus.RevertByObjectIndexAsync((ushort)idxToClean).ConfigureAwait(false);
+                                    await _ipcManager.Glamourer.RevertByObjectIndexAsync(Logger, idxToClean, _applicationId).ConfigureAwait(false);
+                                }
+                                catch (Exception ex)
+                                {
+                                    Logger.LogDebug(ex, "[{applicationId}] Failed cleaning stale ObjectIndex {idx}", _applicationId, idxToClean);
+                                }
+                            });
+
+                        }
                     }
 
 
@@ -1087,16 +1144,12 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
                             if (string.IsNullOrEmpty(path))
                                 return true;
 
-                            if (!string.IsNullOrEmpty(kvp.Key.Hash))
+                            // Only guard cache-root paths that do not have a hash.
+                            if (string.IsNullOrEmpty(kvp.Key.Hash) &&
+                                path.StartsWith(cacheRoot, StringComparison.OrdinalIgnoreCase))
                             {
-                                if (deferredHardDelayed.Contains(kvp.Key))
-                                    return false;
-
                                 return !File.Exists(path);
                             }
-
-                            if (path.StartsWith(cacheRoot, StringComparison.OrdinalIgnoreCase))
-                                return !File.Exists(path);
 
                             return false;
                         })
@@ -1132,6 +1185,7 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
                         return;
                     }
 
+
                     // Apply now: everything except deferred hard-delayed keys
                     var applyNowPaths = deferredHardDelayed.Count == 0
                         ? resolvedModdedPaths
@@ -1165,17 +1219,23 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
                         long totalBytes = 0;
                         bool any = false;
 
-                        foreach (var p in applyNowPaths.Values.Distinct(StringComparer.OrdinalIgnoreCase))
+                        foreach (var hash in applyNowPaths.Keys
+                                     .Select(k => k.Hash)
+                                     .Where(h => !string.IsNullOrWhiteSpace(h))
+                                     .Distinct(StringComparer.OrdinalIgnoreCase))
                         {
                             token.ThrowIfCancellationRequested();
 
                             try
                             {
-                                if (string.IsNullOrEmpty(p)) continue;
-                                if (!File.Exists(p)) continue;
+                                var cache = _fileDbManager.GetFileCacheByHash(hash!);
+                                var sz = cache?.Size;
 
-                                totalBytes += new FileInfo(p).Length;
-                                any = true;
+                                if (sz.HasValue && sz.Value > 0)
+                                {
+                                    totalBytes += sz.Value;
+                                    any = true;
+                                }
                             }
                             catch
                             {
@@ -1289,7 +1349,9 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
         finally
         {
             if (acquired)
-                GlobalApplySemaphore.Release();
+            {
+                applySemaphore?.Release();
+            }
         }
     }
 
@@ -1482,10 +1544,13 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
                 var pc = _dalamudUtil.FindPlayerByNameHash(Pair.Ident);
                 if (pc == default((string, nint)))
                 {
+                    var oldIdx = _lastAssignedObjectIndex;
+
                     IsVisible = false;
 
                     _lastAssignedObjectIndex = null;
                     _lastAssignedCollectionAssignUtc = DateTime.MinValue;
+                    _lastAppliedTempModsFingerprint = null;
 
                     _initialApplyPending = false;
 
@@ -1493,8 +1558,33 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
                     _downloadCancellationTokenSource?.CancelDispose();
                     _downloadCancellationTokenSource = null;
 
+                    // If we previously owned an ObjectIndex, clear that slot so it can't leak onto a new actor.
+                    if (oldIdx.HasValue && oldIdx.Value >= 0)
+                    {
+                        var idxToClean = oldIdx.Value;
+
+                        _ = Task.Run(async () =>
+                        {
+                            try
+                            {
+                                await _ipcManager.Penumbra.AssignEmptyCollectionAsync(Logger, idxToClean).ConfigureAwait(false);
+                                await _ipcManager.Honorific.ClearTitleByObjectIndexAsync(idxToClean).ConfigureAwait(false);
+                                await _ipcManager.PetNames.ClearPlayerDataByObjectIndexAsync(idxToClean).ConfigureAwait(false);
+                                await _ipcManager.Heels.UnregisterByObjectIndexAsync(idxToClean).ConfigureAwait(false);
+                                await _ipcManager.CustomizePlus.RevertByObjectIndexAsync((ushort)idxToClean).ConfigureAwait(false);
+                                await _ipcManager.Glamourer.RevertByObjectIndexAsync(Logger, idxToClean, _applicationId).ConfigureAwait(false);
+                            }
+                            catch (Exception ex)
+                            {
+                                Logger.LogDebug(ex, "Cleanup-on-invisible failed for idx {idx}", idxToClean);
+                            }
+                        });
+
+                    }
+
                     Logger.LogTrace("{this} visibility changed, now: {visi}", this, IsVisible);
                     return;
+
                 }
 
                 _addressZeroSinceTick = nowTick;
@@ -1754,7 +1844,7 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
                     }
 
                     var resolved = fileCache.ResolvedFilepath;
-                    if (string.IsNullOrWhiteSpace(resolved) || !File.Exists(resolved))
+                    if (string.IsNullOrWhiteSpace(resolved))
                     {
                         missingFiles.Add(item);
                         return;
@@ -1765,6 +1855,12 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
                     {
                         fi = new FileInfo(resolved);
 
+                        if (!fi.Exists)
+                        {
+                            missingFiles.Add(item);
+                            return;
+                        }
+
                         if (fi.Length == 0)
                         {
                             if ((DateTime.UtcNow - fi.LastWriteTimeUtc) >= TimeSpan.FromSeconds(10))
@@ -1774,6 +1870,7 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
                             }
                         }
                     }
+
                     catch (IOException)
                     {
                         fi = new FileInfo(resolved);

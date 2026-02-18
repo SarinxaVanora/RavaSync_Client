@@ -138,9 +138,22 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
                 // report *network bytes sent* (based on bytes read by HttpClient from the stream)
                 var netProgress = progress == null
                     ? null
-                    : new Progress<long>(sent => progress.Report(new UploadProgress(sent, temp.CompressedSize)));
+                    : new Progress<long>(sent =>
+                    {
+                        var rawTotal = fileSize;
+                        var netTotal = temp.CompressedSize;
+
+                        long mapped = sent;
+                        if (netTotal > 0 && rawTotal > 0)
+                            mapped = (long)((double)sent * rawTotal / netTotal);
+
+                        if (mapped > rawTotal) mapped = rawTotal;
+
+                        progress.Report(new UploadProgress(mapped, rawTotal));
+                    });
 
                 await using Stream fs = netProgress == null ? fs0 : new ProgressReadStream(fs0, netProgress);
+
 
                 using var put = new HttpRequestMessage(HttpMethod.Put, ticket.UploadUrl);
 
@@ -153,7 +166,10 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
                 put.Headers.ExpectContinue = false;
 
                 var putResp = await _directUploadClient.SendAsync(put, HttpCompletionOption.ResponseHeadersRead, uploadToken).ConfigureAwait(false);
-                Logger.LogDebug("[{hash}] Direct upload PUT attempt {attempt}/{max} Status: {status}", fileHash, attempt, maxAttempts, putResp.StatusCode);
+                if (Logger.IsEnabled(LogLevel.Debug))
+                {
+                    Logger.LogDebug("[{hash}] Direct upload PUT attempt {attempt}/{max} Status: {status}", fileHash, attempt, maxAttempts, putResp.StatusCode);
+                }
 
                 putResp.EnsureSuccessStatusCode();
 
@@ -163,33 +179,22 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
                 var complete = new UploadCompleteDto(temp.RawSize, temp.CompressedSize, temp.Md5Base64, etag, true);
 
                 var completeResp = await _orchestrator.SendRequestAsync(HttpMethod.Post, completeUri, complete, uploadToken).ConfigureAwait(false);
-                Logger.LogDebug("[{hash}] UploadComplete Status: {status}", fileHash, completeResp.StatusCode);
-                completeResp.EnsureSuccessStatusCode();
-
-                if (_orchestrator.FilesCdnUri != null)
+                if (Logger.IsEnabled(LogLevel.Debug))
                 {
-                    _ = Task.Run(async () =>
-                    {
-                        try
-                        {
-                            await CdnPrewarmHelper.PrewarmAsync(
-                                _orchestrator.FilesCdnUri,
-                                new[] { fileHash },
-                                CancellationToken.None).ConfigureAwait(false);
-                        }
-                        catch (Exception ex)
-                        {
-                            Logger.LogTrace(ex, "[{hash}] CDN prewarm failed (ignored)", fileHash);
-                        }
-                    });
+                    Logger.LogDebug("[{hash}] UploadComplete Status: {status}", fileHash, completeResp.StatusCode);
                 }
+                completeResp.EnsureSuccessStatusCode();
 
                 return;
             }
             catch (Exception ex) when (attempt < maxAttempts)
             {
                 last = ex;
-                Logger.LogWarning(ex, "[{hash}] Direct upload PUT failed (attempt {attempt}/{max}); retrying", fileHash, attempt, maxAttempts);
+                if (Logger.IsEnabled(LogLevel.Debug))
+                {
+                    Logger.LogDebug(ex, "[{hash}] Direct upload PUT failed (attempt {attempt}/{max}); retrying", fileHash, attempt, maxAttempts);
+                }
+                
                 await Task.Delay(250 * attempt, uploadToken).ConfigureAwait(false);
             }
             catch (Exception ex)
@@ -202,7 +207,7 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
         throw new InvalidOperationException($"[{fileHash}] DirectB2 upload failed after {maxAttempts} attempts.", last);
     }
 
-    public async Task<CharacterData> UploadFiles(CharacterData data, List<UserData> visiblePlayers)
+    public async Task<(CharacterData Data, bool Success, string? Error)> UploadFiles(CharacterData data, List<UserData> visiblePlayers)
     {
         CancelUpload();
 
@@ -211,9 +216,10 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
 
         try
         {
-            Logger.LogDebug("Sending Character data {hash} to service {url}",
+            Logger.LogDebug("Preparing Character data {hash} for upload/share against service {url}",
                 data.DataHash.Value, _serverManager.CurrentApiUrl);
 
+            // Strip anything already known as forbidden from previous runs
             foreach (var kvp in data.FileReplacements)
             {
                 data.FileReplacements[kvp.Key].RemoveAll(i =>
@@ -221,14 +227,102 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
                         string.Equals(f.Hash, i.Hash, StringComparison.OrdinalIgnoreCase)));
             }
 
-            var unverifiedUploads = GetUnverifiedFiles(data);
-            if (unverifiedUploads.Any())
+            // Gather all *hash-based* file references (ignore swaps)
+            var allCandidateHashes = GetAllCandidateHashes(data);
+            if (allCandidateHashes.Count == 0)
+                return (data, true, null);
+
+            // We only try to upload/share hashes that exist locally
+            var presentLocal = allCandidateHashes
+                .Where(h => _fileDbManager.GetFileCacheByHash(h) != null)
+                .ToHashSet(StringComparer.Ordinal);
+
+            var missingLocal = allCandidateHashes
+                .Except(presentLocal, StringComparer.Ordinal)
+                .ToList();
+
+            if (missingLocal.Count > 0)
             {
-                await UploadUnverifiedFiles(unverifiedUploads, visiblePlayers, uploadToken).ConfigureAwait(false);
-                Logger.LogDebug("Verification complete for {hash}", data.DataHash.Value);
+                Logger.LogWarning(
+                    "Upload aborted: {count} hashes are referenced by character data but missing locally (first 20): {list}",
+                    missingLocal.Count, string.Join(", ", missingLocal.Take(20)));
+
+                return (data, false, $"{missingLocal.Count} file(s) missing locally");
             }
 
-            return data;
+            var uids = (visiblePlayers ?? new List<UserData>())
+                .Select(p => p.UID)
+                .Where(u => !string.IsNullOrWhiteSpace(u))
+                .Distinct(StringComparer.Ordinal)
+                .ToList();
+
+            Logger.LogDebug("Authorizing/share-check for {count} hashes to {uids} recipients", presentLocal.Count, uids.Count);
+
+            var auth = await FilesSend([.. presentLocal], uids, uploadToken).ConfigureAwait(false);
+
+            var now = DateTime.UtcNow;
+            foreach (var h in presentLocal)
+                _verifiedUploadedHashes[h] = now;
+
+            foreach (var f in auth.Where(f => f.IsForbidden))
+            {
+                if (_orchestrator.ForbiddenTransfers.TrueForAll(x => !string.Equals(x.Hash, f.Hash, StringComparison.Ordinal)))
+                {
+                    _orchestrator.ForbiddenTransfers.Add(new UploadFileTransfer(f)
+                    {
+                        LocalFile = _fileDbManager.GetFileCacheByHash(f.Hash)?.ResolvedFilepath ?? string.Empty,
+                    });
+                }
+
+                _verifiedUploadedHashes[f.Hash] = now;
+
+                RemoveHashFromCharacterData(data, f.Hash);
+            }
+
+            // Hashes returned from FilesSend that are NOT forbidden are the ones the server wants us to upload.
+            var toPush = auth
+                .Where(f => !f.IsForbidden)
+                .Select(f => f.Hash)
+                .Distinct(StringComparer.Ordinal)
+                .ToList();
+
+            if (toPush.Count > 0)
+            {
+                Logger.LogDebug("Need to upload {count} hashes for this payload", toPush.Count);
+
+                var prog = new Progress<string>(msg => Logger.LogInformation(msg));
+                var failed = await UploadFilesCore(toPush, prog, uploadToken, AuthMode.PreAuthorized).ConfigureAwait(false);
+
+                if (failed.Any())
+                {
+                    Logger.LogWarning("Upload batch incomplete ({count} failed): {list}", failed.Count, string.Join(", ", failed.Take(20)));
+                    return (data, false, $"{failed.Count} upload(s) failed");
+                }
+            }
+
+            if (_orchestrator.FilesCdnUri != null)
+            {
+                try
+                {
+                    await CdnPrewarmHelper.PrewarmAsync(_orchestrator.FilesCdnUri, presentLocal, uploadToken).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    Logger.LogTrace(ex, "CDN prewarm failed (ignored)");
+                }
+            }
+
+            Logger.LogDebug("Upload/share barrier complete for {hash}", data.DataHash.Value);
+            return (data, true, null);
+        }
+        catch (OperationCanceledException)
+        {
+            return (data, false, "Upload cancelled");
+        }
+        catch (Exception ex)
+        {
+            Logger.LogWarning(ex, "Error during character payload upload/share");
+            return (data, false, ex.Message);
         }
         finally
         {
@@ -239,6 +333,38 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
         }
     }
 
+    private static HashSet<string> GetAllCandidateHashes(CharacterData data)
+    {
+        HashSet<string> hashes = new(StringComparer.Ordinal);
+
+        foreach (var kvp in data.FileReplacements)
+        {
+            var list = kvp.Value;
+            for (int i = 0; i < list.Count; i++)
+            {
+                var fr = list[i];
+
+                if (!string.IsNullOrEmpty(fr.FileSwapPath))
+                    continue;
+
+                var hash = fr.Hash;
+                if (string.IsNullOrEmpty(hash))
+                    continue;
+
+                hashes.Add(hash);
+            }
+        }
+
+        return hashes;
+    }
+
+    private static void RemoveHashFromCharacterData(CharacterData data, string hash)
+    {
+        foreach (var kvp in data.FileReplacements)
+        {
+            kvp.Value.RemoveAll(fr => string.Equals(fr.Hash, hash, StringComparison.OrdinalIgnoreCase));
+        }
+    }
 
 
     protected override void Dispose(bool disposing)
@@ -587,8 +713,7 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
                                 entry.Transferred = up.Uploaded;
                             }
 
-                            if (up.Size != origSize)
-                            {
+
                                 long delta = 0;
                                 lastUploadedByHash.AddOrUpdate(hash,
                                     up.Uploaded,
@@ -600,7 +725,7 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
 
                                 if (delta > 0)
                                     Interlocked.Add(ref bytesSinceSample, delta);
-                            }
+                            
 
                             // light trace
                             var pct = up.Size > 0 ? (int)(100L * up.Uploaded / up.Size) : 0;

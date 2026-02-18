@@ -304,10 +304,14 @@ public class Pair
             if (wait)
                 _creationSemaphore.Wait();
 
+            _applicationCts = _applicationCts.CancelRecreate();
+            _pendingEmptyApplyCts?.Cancel();
+            _pendingEmptyApplyCts = null;
+
             LastReceivedCharacterData = null;
+
             player = CachedPlayer;
             CachedPlayer = null;
-            _onlineUserIdentDto = null;
         }
         finally
         {
@@ -315,9 +319,14 @@ public class Pair
                 _creationSemaphore.Release();
         }
 
-        // Dispose outside lock
         player?.Dispose();
+
+        _onlineUserIdentDto = null;
+
+        _isUploading = false;
+        _lastUploadStatusTick = 0;
     }
+
 
 
     public void SetNote(string note)
@@ -325,13 +334,24 @@ public class Pair
         _serverConfigurationManager.SetNoteForUid(UserData.UID, note);
     }
 
+    private bool _isUploading;
+
+    internal void SetUploadState(bool uploading)
+    {
+        _isUploading = uploading;
+        _lastUploadStatusTick = uploading ? Environment.TickCount64 : 0;
+    }
+
     internal void SetIsUploading()
     {
-        _lastUploadStatusTick = Environment.TickCount64;
+        SetUploadState(true);
         CachedPlayer?.SetUploading();
     }
 
+    public bool IsUploading => _isUploading;
+
     public bool IsUploadingRecently => (Environment.TickCount64 - _lastUploadStatusTick) < 2000;
+
 
     public enum VisibleTransferIndicator
     {
