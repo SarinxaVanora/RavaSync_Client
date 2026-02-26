@@ -156,6 +156,7 @@ public class DownloadUi : WindowMediatorSubscriberBase
     protected override void DrawInternal()
     {
         var now = DateTime.UtcNow;
+        var io = ImGui.GetIO();
         PruneExpiredDownloads(now);
 
         if (_configService.Current.ShowGlobalTransferBars || _configService.Current.ShowUploadProgress || _configService.Current.EditGlobalTransferOverlay)
@@ -168,14 +169,21 @@ public class DownloadUi : WindowMediatorSubscriberBase
         {
             try
             {
-                if (_fileTransferManager.CurrentUploads.Any())
+                var currentUploads = _fileTransferManager.CurrentUploads;
+                if (currentUploads.Count > 0)
                 {
-                    var currentUploads = _fileTransferManager.CurrentUploads.ToList();
                     var totalUploads = currentUploads.Count;
 
-                    var doneUploads = currentUploads.Count(c => c.IsTransferred);
-                    var totalUploaded = currentUploads.Sum(c => c.Transferred);
-                    var totalToUpload = currentUploads.Sum(c => c.Total);
+                    var doneUploads = 0;
+                    long totalUploaded = 0;
+                    long totalToUpload = 0;
+
+                    foreach (var c in currentUploads)
+                    {
+                        if (c.IsTransferred) doneUploads++;
+                        totalUploaded += c.Transferred;
+                        totalToUpload += c.Total;
+                    }
 
                     UiSharedService.DrawOutlinedFont($"▲", ImGuiColors.DalamudWhite, new Vector4(0, 0, 0, 255), 1);
                     ImGui.SameLine();
@@ -198,9 +206,9 @@ public class DownloadUi : WindowMediatorSubscriberBase
 
             try
             {
-                foreach (var item in _currentDownloads.ToList())
+                foreach (var item in _currentDownloads.ToArray())
                 {
-                    var statuses = item.Value.Status.Values.ToList();
+                    var statuses = item.Value.Status.Values;
 
                     var dlQueue = 0;
                     var dlProg = 0;
@@ -231,11 +239,18 @@ public class DownloadUi : WindowMediatorSubscriberBase
                     }
 
 
-                    var totalFiles = item.Value.AccTotalFiles + statuses.Sum(s => s.TotalFiles);
-                    var transferredFiles = item.Value.AccTransferredFiles + statuses.Sum(s => s.TransferredFiles);
+                    var totalFiles = item.Value.AccTotalFiles;
+                    var transferredFiles = item.Value.AccTransferredFiles;
+                    var totalBytes = item.Value.AccTotalBytes;
+                    var transferredBytes = item.Value.AccTransferredBytes;
 
-                    var totalBytes = item.Value.AccTotalBytes + statuses.Sum(s => s.TotalBytes);
-                    var transferredBytes = item.Value.AccTransferredBytes + statuses.Sum(s => s.TransferredBytes);
+                    foreach (var s in statuses)
+                    {
+                        totalFiles += s.TotalFiles;
+                        transferredFiles += s.TransferredFiles;
+                        totalBytes += s.TotalBytes;
+                        transferredBytes += s.TransferredBytes;
+                    }
 
                     UiSharedService.DrawOutlinedFont($"▼", ImGuiColors.DalamudWhite, new Vector4(0, 0, 0, 255), 1);
                     ImGui.SameLine();
@@ -261,7 +276,7 @@ public class DownloadUi : WindowMediatorSubscriberBase
             var haveAether = _aetherFrame != null && _aetherFill != null && _aetherFrameSize.X > 1 && _aetherFrameSize.Y > 1;
 
             now = DateTime.UtcNow;
-            var dtPos = ImGui.GetIO().DeltaTime;
+            var dtPos = io.DeltaTime;
             var keepKeys = new HashSet<IntPtr>();
 
             if (_configService.Current.ShowTransferBars)
@@ -278,11 +293,17 @@ public class DownloadUi : WindowMediatorSubscriberBase
                     var screenPos = _dalamudUtilService.WorldToScreen(go);
                     if (screenPos == Vector2.Zero) continue;
 
-                    var statuses = transfer.Value.Status.Values.ToList();
+                    var statuses = transfer.Value.Status.Values;
                     if (statuses.Count == 0) continue;
 
-                    var totalBytes = transfer.Value.AccTotalBytes + statuses.Sum(s => s.TotalBytes);
-                    var transferredBytes = transfer.Value.AccTransferredBytes + statuses.Sum(s => s.TransferredBytes);
+                    var totalBytes = transfer.Value.AccTotalBytes;
+                    var transferredBytes = transfer.Value.AccTransferredBytes;
+
+                    foreach (var s in statuses)
+                    {
+                        totalBytes += s.TotalBytes;
+                        transferredBytes += s.TransferredBytes;
+                    }
 
                     if (totalBytes <= 0 || totalBytes < MinVisibleDownloadBytes)
                         continue;
@@ -381,7 +402,7 @@ public class DownloadUi : WindowMediatorSubscriberBase
                         downloadText = $"{UiSharedService.ByteToString(transferredBytes, addSuffix: false)}/{UiSharedService.ByteToString(totalBytes)}";
                     }
 
-                    var dt = ImGui.GetIO().DeltaTime;
+                    var dt = io.DeltaTime;
                     var target = (isWaiting || isInitializing) ? 0f : (float)dlProgressPercent;
 
                     transfer.Value.SmoothedPercent = LerpExp(transfer.Value.SmoothedPercent, target, lambda: 12f, dt);
@@ -859,6 +880,7 @@ public class DownloadUi : WindowMediatorSubscriberBase
         var haveUploads = (_configService.Current.ShowUploadProgress && AnyUploadsActive(_fileTransferManager)) || editing;
 
         var anyVisibleDl = false;
+        var currentDownloadsSnapshot = _currentDownloads.ToArray();
 
         if (!editing)
         {
@@ -939,12 +961,12 @@ public class DownloadUi : WindowMediatorSubscriberBase
         if (editing)
         {
             ImGui.AlignTextToFramePadding();
-            ImGui.TextUnformatted("Layout:");
+            ImGui.TextUnformatted(_uiShared.L("UI.DownloadUi.011b8d1d", "Layout:"));
             ImGui.SameLine();
 
             var row = _configService.Current.GlobalTransferOverlayRowLayout;
 
-            if (ImGui.RadioButton("Stacked##globalLayout", !row))
+            if (ImGui.RadioButton($"{_uiShared.L("UI.DownloadUi.29B733FD", "Stacked")}##globalLayout", !row))
             {
                 _configService.Current.GlobalTransferOverlayRowLayout = false;
                 _configService.Save();
@@ -952,7 +974,7 @@ public class DownloadUi : WindowMediatorSubscriberBase
             }
 
             ImGui.SameLine();
-            if (ImGui.RadioButton("Row##globalLayout", row))
+            if (ImGui.RadioButton($"{_uiShared.L("UI.DownloadUi.A70367AA", "Row")}##globalLayout", row))
             {
                 _configService.Current.GlobalTransferOverlayRowLayout = true;
                 _configService.Save();
@@ -965,14 +987,14 @@ public class DownloadUi : WindowMediatorSubscriberBase
             ImGui.SameLine(0, 14f);
             float s = _configService.Current.GlobalTransferOverlayScale;
             ImGui.SetNextItemWidth(160f);
-            if (ImGui.SliderFloat("Scale##globalTransfers", ref s, 0.70f, 1.60f, "%.2f"))
+            if (ImGui.SliderFloat($"{_uiShared.L("UI.DownloadUi.85A7CD58", "Scale")}##globalTransfers", ref s, 0.70f, 1.60f, "%.2f"))
             {
                 _configService.Current.GlobalTransferOverlayScale = s;
                 _configService.Save();
             }
 
             ImGui.SameLine();
-            if (ImGui.SmallButton("Reset##globalTransfers"))
+            if (ImGui.SmallButton($"{_uiShared.L("UI.DownloadUi.526D688F", "Reset")}##globalTransfers"))
             {
                 _configService.Current.GlobalTransferOverlayScale = 1.0f;
                 _configService.Current.GlobalTransferOverlayX = -1f;
@@ -982,13 +1004,13 @@ public class DownloadUi : WindowMediatorSubscriberBase
             }
 
             ImGui.SameLine();
-            if (ImGui.SmallButton("Done editing##globalTransfers"))
+            if (ImGui.SmallButton($"{_uiShared.L("UI.DownloadUi.04E6DEF6", "Done editing")}##globalTransfers"))
             {
                 _configService.Current.EditGlobalTransferOverlay = false;
                 _configService.Save();
             }
 
-            ImGui.TextDisabled("Drag this window by the title bar.");
+            ImGui.TextDisabled(_uiShared.L("UI.DownloadUi.33045475", "Drag this window by the title bar."));
             ImGui.Separator();
         }
 
@@ -1003,11 +1025,14 @@ public class DownloadUi : WindowMediatorSubscriberBase
 
         if (_configService.Current.ShowGlobalTransferBars && haveDownloads)
         {
-            foreach (var entry in _currentDownloads.ToList())
+            foreach (var entry in currentDownloadsSnapshot)
             {
-                var statuses = entry.Value.Status.Values.ToList();
+                var statuses = entry.Value.Status.Values;
 
-                var entryTotalBytes = entry.Value.AccTotalBytes + statuses.Sum(s => s.TotalBytes);
+                var entryTotalBytes = entry.Value.AccTotalBytes;
+                foreach (var s in statuses)
+                    entryTotalBytes += s.TotalBytes;
+
                 if (entryTotalBytes <= 0 || entryTotalBytes < MinVisibleDownloadBytes)
                     continue;
 
@@ -1065,12 +1090,22 @@ public class DownloadUi : WindowMediatorSubscriberBase
             : $"{dlTransferredFiles}/{dlTotalFiles}  ({UiSharedService.ByteToString(dlTransferredBytes, addSuffix: false)}/{UiSharedService.ByteToString(dlTotalBytes)})";
 
         // ===== Build upload aggregate =====
-        var uploads = haveUploads ? _fileTransferManager.CurrentUploads.ToList() : null;
+        var uploads = haveUploads ? _fileTransferManager.CurrentUploads : null;
 
         var ulTotalUploads = uploads?.Count ?? 0;
-        var ulDoneUploads = uploads?.Count(c => c.IsTransferred) ?? 0;
-        var ulTotalUploaded = uploads?.Sum(c => c.Transferred) ?? 0;
-        var ulTotalToUpload = uploads?.Sum(c => c.Total) ?? 0;
+        var ulDoneUploads = 0;
+        long ulTotalUploaded = 0;
+        long ulTotalToUpload = 0;
+
+        if (uploads != null)
+        {
+            foreach (var c in uploads)
+            {
+                if (c.IsTransferred) ulDoneUploads++;
+                ulTotalUploaded += c.Transferred;
+                ulTotalToUpload += c.Total;
+            }
+        }
 
         var ulPct = (ulTotalToUpload <= 0) ? 0f : (float)(ulTotalUploaded / (double)ulTotalToUpload);
         ulPct = Math.Clamp(ulPct, 0f, 1f);
@@ -1105,18 +1140,23 @@ public class DownloadUi : WindowMediatorSubscriberBase
 
             ImGui.Dummy(new Vector2(barW, barH));
 
-            var hintParts = new List<string>(4);
-            if (dlInit > 0) hintParts.Add($"Initializing: {dlInit}");
-            if (dlQueue > 0) hintParts.Add($"Queued: {dlQueue}");
-            if (dlProg > 0) hintParts.Add($"Downloading: {dlProg}");
-            if (dlDecomp > 0) hintParts.Add($"Decompressing: {dlDecomp}");
+            string? hint = null;
 
-            if (hintParts.Count == 0 && dlAllPreparing)
-                hintParts.Add("Preparing...");
-
-            if (hintParts.Count > 0)
+            void AppendHint(string part)
             {
-                var hint = string.Join("  •  ", hintParts);
+                hint = hint == null ? part : hint + "  •  " + part;
+            }
+
+            if (dlInit > 0) AppendHint($"Initializing: {dlInit}");
+            if (dlQueue > 0) AppendHint($"Queued: {dlQueue}");
+            if (dlProg > 0) AppendHint($"Downloading: {dlProg}");
+            if (dlDecomp > 0) AppendHint($"Decompressing: {dlDecomp}");
+
+            if (hint == null && dlAllPreparing)
+                hint = "Preparing...";
+
+            if (hint != null)
+            {
                 var hintSize = ImGui.CalcTextSize(hint);
 
                 var hintPos = new Vector2(
@@ -1202,7 +1242,7 @@ public class DownloadUi : WindowMediatorSubscriberBase
         }
 
         // ===== Details list =====
-        if (_globalTransfersExpanded && _currentDownloads.Any())
+        if (_globalTransfersExpanded && currentDownloadsSnapshot.Length > 0)
         {
             var listW = _configService.Current.GlobalTransferOverlayRowLayout && showDlBar && showUlBar ? (barW * 2f + gapX) : barW;
             var listH = 170f * scale;
@@ -1212,12 +1252,18 @@ public class DownloadUi : WindowMediatorSubscriberBase
 
             ImGui.BeginChild("##global_dl_list", new Vector2(listW, listH), false, ImGuiWindowFlags.NoScrollbar);
 
-            foreach (var kv in _currentDownloads.ToList())
+            foreach (var kv in currentDownloadsSnapshot)
             {
-                var statuses = kv.Value.Status.Values.ToList();
+                var statuses = kv.Value.Status.Values;
 
-                var totalBytes = kv.Value.AccTotalBytes + statuses.Sum(s => s.TotalBytes);
-                var transferredBytes = kv.Value.AccTransferredBytes + statuses.Sum(s => s.TransferredBytes);
+                var totalBytes = kv.Value.AccTotalBytes;
+                var transferredBytes = kv.Value.AccTransferredBytes;
+
+                foreach (var s in statuses)
+                {
+                    totalBytes += s.TotalBytes;
+                    transferredBytes += s.TransferredBytes;
+                }
 
                 var sQueue = 0;
                 var sProg = 0;
@@ -1260,7 +1306,7 @@ public class DownloadUi : WindowMediatorSubscriberBase
                 var pct = (totalBytes <= 0) ? 0f : (float)(transferredBytes / (double)totalBytes);
                 pct = Math.Clamp(pct, 0f, 1f);
 
-                ImGui.TextUnformatted($"{kv.Key.Name}  [I:{sInit}/Q:{sQueue}/P:{sProg}/D:{sDecomp}]");
+                ImGui.TextUnformatted(string.Format(_uiShared.L("UI.DownloadUi.374a36b2", "{0}  [I:{1}/Q:{2}/P:{3}/D:{4}]"), kv.Key.Name, sInit, sQueue, sProg, sDecomp));
                 ImGui.SameLine();
                 ImGui.TextDisabled($"{UiSharedService.ByteToString(transferredBytes, addSuffix: false)}/{UiSharedService.ByteToString(totalBytes)}");
 
@@ -1297,13 +1343,11 @@ public class DownloadUi : WindowMediatorSubscriberBase
     {
         if (_smoothedScreens.Count == 0) return;
 
-        var remove = new List<IntPtr>();
-        foreach (var k in _smoothedScreens.Keys)
+        foreach (var k in _smoothedScreens.Keys.ToArray())
+        {
             if (!keep.Contains(k))
-                remove.Add(k);
-
-        foreach (var k in remove)
-            _smoothedScreens.Remove(k);
+                _smoothedScreens.Remove(k);
+        }
     }
 
     public override bool DrawConditions()

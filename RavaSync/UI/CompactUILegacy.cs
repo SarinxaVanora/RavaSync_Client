@@ -105,7 +105,7 @@ public class CompactUiLegacy : WindowMediatorSubscriberBase
                 ShowTooltip = () =>
                 {
                     ImGui.BeginTooltip();
-                    ImGui.Text("Open RavaSync Settings");
+                    ImGui.Text(_uiSharedService.L("UI.CompactUI.57ed29f5", "Open RavaSync Settings"));
                     ImGui.EndTooltip();
                 }
             },
@@ -120,7 +120,7 @@ public class CompactUiLegacy : WindowMediatorSubscriberBase
                 ShowTooltip = () =>
                 {
                     ImGui.BeginTooltip();
-                    ImGui.Text("Open RavaSync Event Viewer");
+                    ImGui.Text(_uiSharedService.L("UI.CompactUI.eb711ab9", "Open RavaSync Event Viewer"));
                     ImGui.EndTooltip();
                 }
             }
@@ -168,8 +168,7 @@ public class CompactUiLegacy : WindowMediatorSubscriberBase
                 ImGui.AlignTextToFramePadding();
                 ImGui.TextColored(ImGuiColors.DalamudRed, unsupported);
             }
-            UiSharedService.ColorTextWrapped($"Your RavaSync installation is out of date, the current version is {ver.Major}.{ver.Minor}.{ver.Build}. " +
-                $"It is highly recommended to keep RavaSync up to date. Open /xlplugins and update the plugin.", ImGuiColors.DalamudRed);
+            UiSharedService.ColorTextWrapped(string.Format(_uiSharedService.L("UI.CompactUILegacy.d6f399f2", "Your RavaSync installation is out of date, the current version is {0}.{1}.{2}. It is highly recommended to keep RavaSync up to date. Open /xlplugins and update the plugin."), ver.Major, ver.Minor, ver.Build), ImGuiColors.DalamudRed);
         }
 
         if (!_ipcManager.Initialized)
@@ -186,16 +185,16 @@ public class CompactUiLegacy : WindowMediatorSubscriberBase
             var penumAvailable = _ipcManager.Penumbra.APIAvailable;
             var glamAvailable = _ipcManager.Glamourer.APIAvailable;
 
-            UiSharedService.ColorTextWrapped($"One or more Plugins essential for RavaSync operation are unavailable. Enable or update following plugins:", ImGuiColors.DalamudRed);
+            UiSharedService.ColorTextWrapped(_uiSharedService.L("UI.CompactUILegacy.0f8d4ba8", "One or more Plugins essential for RavaSync operation are unavailable. Enable or update following plugins:"), ImGuiColors.DalamudRed);
             using var indent = ImRaii.PushIndent(10f);
             if (!penumAvailable)
             {
-                UiSharedService.TextWrapped("Penumbra");
+                UiSharedService.TextWrapped(_uiSharedService.L("UI.CompactUI.2b89c404", "Penumbra"));
                 _uiSharedService.BooleanToColoredIcon(penumAvailable, true);
             }
             if (!glamAvailable)
             {
-                UiSharedService.TextWrapped("Glamourer");
+                UiSharedService.TextWrapped(_uiSharedService.L("UI.CharaDataHubUiMcdOnline.90d38268", "Glamourer"));
                 _uiSharedService.BooleanToColoredIcon(glamAvailable, true);
             }
             ImGui.Separator();
@@ -222,12 +221,12 @@ public class CompactUiLegacy : WindowMediatorSubscriberBase
         {
             _lastAddedUser = _pairManager.LastAddedUser;
             _pairManager.LastAddedUser = null;
-            ImGui.OpenPopup("Set Notes for New User");
+            ImGui.OpenPopup(_uiSharedService.L("UI.CompactUI.94bdb3d2", "Set Notes for New User"));
             _showModalForUserAddition = true;
             _lastAddedUserComment = string.Empty;
         }
 
-        if (ImGui.BeginPopupModal("Set Notes for New User", ref _showModalForUserAddition, UiSharedService.PopupWindowFlags))
+        if (ImGui.BeginPopupModal(_uiSharedService.L("UI.CompactUI.94bdb3d2", "Set Notes for New User"), ref _showModalForUserAddition, UiSharedService.PopupWindowFlags))
         {
             if (_lastAddedUser == null)
             {
@@ -235,9 +234,9 @@ public class CompactUiLegacy : WindowMediatorSubscriberBase
             }
             else
             {
-                UiSharedService.TextWrapped($"You have successfully added {_lastAddedUser.UserData.AliasOrUID}. Set a local note for the user in the field below:");
-                ImGui.InputTextWithHint("##noteforuser", $"Note for {_lastAddedUser.UserData.AliasOrUID}", ref _lastAddedUserComment, 100);
-                if (_uiSharedService.IconTextButton(FontAwesomeIcon.Save, "Save Note"))
+                UiSharedService.TextWrapped(string.Format(_uiSharedService.L("UI.CompactUILegacy.f3a05070", "You have successfully added {0}. Set a local note for the user in the field below:"), _lastAddedUser.UserData.AliasOrUID));
+                ImGui.InputTextWithHint("##noteforuser", string.Format(_uiSharedService.L("UI.CompactUILegacy.22b0675b", "Note for {0}"), _lastAddedUser.UserData.AliasOrUID), ref _lastAddedUserComment, 100);
+                if (_uiSharedService.IconTextButton(FontAwesomeIcon.Save, _uiSharedService.L("UI.CompactUILegacy.5907b7f5", "Save Note")))
                 {
                     _serverManager.SetNoteForUid(_lastAddedUser.UserData.UID, _lastAddedUserComment);
                     _lastAddedUser = null;
@@ -254,15 +253,15 @@ public class CompactUiLegacy : WindowMediatorSubscriberBase
         {
             if (_bc7ShowModal && !_bc7ModalOpen)
             {
-                ImGui.OpenPopup("BC7 Conversion in Progress");
+                ImGui.OpenPopup(_uiSharedService.L("UI.CompactUI.fa170e36", "BC7 Conversion in Progress"));
                 _bc7ModalOpen = true;
             }
 
-            if (ImGui.BeginPopupModal("BC7 Conversion in Progress"))
+            if (ImGui.BeginPopupModal(_uiSharedService.L("UI.CompactUI.fa170e36", "BC7 Conversion in Progress")))
             {
-                ImGui.TextUnformatted($"BC7 Conversion in progress: {_bc7CurIndex}/{_bc7Total}");
-                UiSharedService.TextWrapped($"Current file: {_bc7CurFile}");
-                if (_uiSharedService.IconTextButton(FontAwesomeIcon.StopCircle, "Cancel conversion"))
+                ImGui.TextUnformatted(string.Format(_uiSharedService.L("UI.CompactUILegacy.12539e01", "BC7 Conversion in progress: {0}/{1}"), _bc7CurIndex, _bc7Total));
+                UiSharedService.TextWrapped(string.Format(_uiSharedService.L("UI.CompactUILegacy.55a2bcac", "Current file: {0}"), _bc7CurFile));
+                if (_uiSharedService.IconTextButton(FontAwesomeIcon.StopCircle, _uiSharedService.L("UI.CompactUILegacy.de59c1fe", "Cancel conversion")))
                 {
                     _bc7Cts.Cancel();
                 }
@@ -299,7 +298,7 @@ public class CompactUiLegacy : WindowMediatorSubscriberBase
             : (ImGui.GetWindowContentRegionMax().Y - ImGui.GetWindowContentRegionMin().Y
                 + ImGui.GetTextLineHeight() - ImGui.GetStyle().WindowPadding.Y - ImGui.GetStyle().WindowBorderSize) - _transferPartHeight - ImGui.GetCursorPosY();
 
-        ImGui.BeginChild("list", new Vector2(_windowContentWidth, ySize), border: false);
+        ImGui.BeginChild(_uiSharedService.L("UI.CompactUILegacy.38b62be4", "list"), new Vector2(_windowContentWidth, ySize), border: false);
 
         foreach (var item in _drawFolders)
         {
@@ -313,7 +312,7 @@ public class CompactUiLegacy : WindowMediatorSubscriberBase
         var buttonSize = _uiSharedService.GetIconButtonSize(FontAwesomeIcon.Link);
         var userCount = _apiController.OnlineUsers.ToString(CultureInfo.InvariantCulture);
         var userSize = ImGui.CalcTextSize(userCount);
-        var textSize = ImGui.CalcTextSize("Users Online");
+        var textSize = ImGui.CalcTextSize(_uiSharedService.L("UI.CompactUILegacy.3dfd96d8", "Users Online"));
 #if DEBUG
         string shardConnection = $"Shard: {_apiController.ServerInfo.ShardName}";
 #else
@@ -329,12 +328,12 @@ public class CompactUiLegacy : WindowMediatorSubscriberBase
             ImGui.TextColored(ImGuiColors.ParsedGreen, userCount);
             ImGui.SameLine();
             if (!printShard) ImGui.AlignTextToFramePadding();
-            ImGui.TextUnformatted("Users Online");
+            ImGui.TextUnformatted(_uiSharedService.L("UI.CompactUILegacy.3dfd96d8", "Users Online"));
         }
         else
         {
             ImGui.AlignTextToFramePadding();
-            ImGui.TextColored(ImGuiColors.DalamudRed, "Not connected to any server");
+            ImGui.TextColored(ImGuiColors.DalamudRed, _uiSharedService.L("UI.CompactUILegacy.2e2bfcc0", "Not connected to any server"));
         }
 
         if (printShard)
@@ -380,7 +379,7 @@ public class CompactUiLegacy : WindowMediatorSubscriberBase
                 }
             }
 
-            UiSharedService.AttachToolTip(isConnectingOrConnected ? "Disconnect from " + _serverManager.CurrentServer.ServerName : "Connect to " + _serverManager.CurrentServer.ServerName);
+            UiSharedService.AttachToolTip(isConnectingOrConnected ? _uiSharedService.L("UI.CompactUILegacy.381d8fe6", "Disconnect from ") + _serverManager.CurrentServer.ServerName : _uiSharedService.L("UI.CompactUILegacy.98d6b2c6", "Connect to ") + _serverManager.CurrentServer.ServerName);
         }
     }
 
@@ -409,7 +408,7 @@ public class CompactUiLegacy : WindowMediatorSubscriberBase
         else
         {
             ImGui.AlignTextToFramePadding();
-            ImGui.TextUnformatted("No uploads in progress");
+            ImGui.TextUnformatted(_uiSharedService.L("UI.CompactUI.9a2c8241", "No uploads in progress"));
         }
 
         var currentDownloads = _currentDownloads.SelectMany(d => d.Value.Values).ToList();
@@ -435,7 +434,7 @@ public class CompactUiLegacy : WindowMediatorSubscriberBase
         else
         {
             ImGui.AlignTextToFramePadding();
-            ImGui.TextUnformatted("No downloads in progress");
+            ImGui.TextUnformatted(_uiSharedService.L("UI.CompactUI.34fbbc21", "No downloads in progress"));
         }
     }
 
@@ -456,7 +455,7 @@ public class CompactUiLegacy : WindowMediatorSubscriberBase
             {
                 ImGui.SetClipboardText(_apiController.DisplayName);
             }
-            UiSharedService.AttachToolTip("Click to copy");
+            UiSharedService.AttachToolTip(_uiSharedService.L("UI.CompactUI.8ef07790", "Click to copy"));
 
             if (!string.Equals(_apiController.DisplayName, _apiController.UID, StringComparison.Ordinal))
             {
@@ -467,7 +466,7 @@ public class CompactUiLegacy : WindowMediatorSubscriberBase
                 {
                     ImGui.SetClipboardText(_apiController.UID);
                 }
-                UiSharedService.AttachToolTip("Click to copy");
+                UiSharedService.AttachToolTip(_uiSharedService.L("UI.CompactUI.8ef07790", "Click to copy"));
             }
 
             Vector4 color;
@@ -533,16 +532,16 @@ public class CompactUiLegacy : WindowMediatorSubscriberBase
                 if (estSaved > 0)
                 {
                     long estAfter = myVramBytes - estSaved;
-                    ImGui.TextUnformatted("Estimated reduction:");
+                    ImGui.TextUnformatted(_uiSharedService.L("UI.CompactUI.ad414934", "Estimated reduction:"));
                     ImGui.Separator();
-                    ImGui.TextUnformatted($"Files affected: {estCount}");
-                    ImGui.TextUnformatted($"Before: {UiSharedService.ByteToString(myVramBytes, addSuffix: true)}");
-                    ImGui.TextUnformatted($"After:  ~{UiSharedService.ByteToString(estAfter, addSuffix: true)}");
-                    ImGui.TextUnformatted($"Saved:  ~{UiSharedService.ByteToString(estSaved, addSuffix: true)}");
+                    ImGui.TextUnformatted(string.Format(_uiSharedService.L("UI.CompactUILegacy.3bdf36a7", "Files affected: {0}"), estCount));
+                    ImGui.TextUnformatted(string.Format(_uiSharedService.L("UI.CompactUILegacy.235a7422", "Before: {0}"), UiSharedService.ByteToString(myVramBytes, addSuffix: true)));
+                    ImGui.TextUnformatted(string.Format(_uiSharedService.L("UI.CompactUILegacy.b3286612", "After:  ~{0}"), UiSharedService.ByteToString(estAfter, addSuffix: true)));
+                    ImGui.TextUnformatted(string.Format(_uiSharedService.L("UI.CompactUILegacy.efb6de86", "Saved:  ~{0}"), UiSharedService.ByteToString(estSaved, addSuffix: true)));
                 }
                 else
                 {
-                    ImGui.TextUnformatted("Nothing found to compress.");
+                    ImGui.TextUnformatted(_uiSharedService.L("UI.CompactUI.eab7436e", "Nothing found to compress."));
                 }
 
                 ImGui.EndTooltip();

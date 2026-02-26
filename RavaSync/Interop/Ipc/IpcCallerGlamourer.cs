@@ -111,29 +111,25 @@ public sealed class IpcCallerGlamourer : DisposableMediatorSubscriberBase, IIpcC
     {
         if (!APIAvailable || string.IsNullOrEmpty(customization) || _dalamudUtil.IsZoning) return;
 
-        await _redrawManager.RedrawSemaphore.WaitAsync(token).ConfigureAwait(false);
-
-        try
+        var task = _redrawManager.PenumbraRedrawInternalAsync(logger, handler, applicationId, (chara) =>
         {
-            // The callback here must remain synchronous; protect Invokes with try/catch.
-            await _redrawManager.PenumbraRedrawInternalAsync(logger, handler, applicationId, (chara) =>
+            try
             {
-                try
-                {
-                    logger.LogDebug("[{appid}] Calling on IPC: GlamourerApplyAll", applicationId);
-                    _glamourerApplyAll!.Invoke(customization, chara.ObjectIndex, LockCode);
-                }
-                catch (Exception ex)
-                {
-                    logger.LogWarning(ex, "[{appid}] Failed to apply Glamourer data", applicationId);
-                }
-            }, token).ConfigureAwait(false);
-        }
-        finally
-        {
-            _redrawManager.RedrawSemaphore.Release();
-        }
+                logger.LogDebug("[{appid}] Calling on IPC: GlamourerApplyAll", applicationId);
+                _glamourerApplyAll!.Invoke(customization, chara.ObjectIndex, LockCode);
+            }
+            catch (Exception ex)
+            {
+                logger.LogWarning(ex, "[{appid}] Failed to apply Glamourer data", applicationId);
+            }
+        }, token);
+
+        if (fireAndForget)
+            return;
+
+        await task.ConfigureAwait(false);
     }
+
 
     public async Task<string> GetCharacterCustomizationAsync(IntPtr character)
     {
@@ -155,51 +151,41 @@ public sealed class IpcCallerGlamourer : DisposableMediatorSubscriberBase, IIpcC
         return ok ? (result ?? string.Empty) : string.Empty;
     }
 
-    public async Task RevertAsync(ILogger logger, GameObjectHandler handler, Guid applicationId, CancellationToken token)
+    public async Task RevertAsync(ILogger logger, GameObjectHandler handler, Guid applicationId, CancellationToken token, bool fireAndForget = false)
     {
         if (!APIAvailable || _dalamudUtil.IsZoning) return;
 
-        var semaphore = _redrawManager.RedrawSemaphore;
-        var entered = false;
+        var task = _redrawManager.PenumbraRedrawInternalAsync(logger, handler, applicationId, chara =>
+        {
+            try
+            {
+                logger.LogDebug("[{appid}] Calling On IPC: GlamourerUnlock", applicationId);
+                _glamourerUnlock.Invoke(chara.ObjectIndex, LockCode);
+
+                logger.LogDebug("[{appid}] Calling On IPC: GlamourerRevert", applicationId);
+                _glamourerRevert.Invoke(chara.ObjectIndex, LockCode);
+
+                logger.LogDebug("[{appid}] Requesting Penumbra Redraw via mediator", applicationId);
+                _mareMediator.Publish(new PenumbraRedrawCharacterMessage(chara));
+            }
+            catch (Exception ex)
+            {
+                logger.LogWarning(ex, "[{appid}] Error during GlamourerRevert", applicationId);
+            }
+        }, token);
+
+        if (fireAndForget)
+            return;
 
         try
         {
-            await semaphore.WaitAsync(token).ConfigureAwait(false);
-            entered = true;
-
-            try
-            {
-                await _redrawManager.PenumbraRedrawInternalAsync(logger, handler, applicationId, chara =>
-                {
-                    try
-                    {
-                        logger.LogDebug("[{appid}] Calling On IPC: GlamourerUnlock", applicationId);
-                        _glamourerUnlock.Invoke(chara.ObjectIndex, LockCode);
-
-                        logger.LogDebug("[{appid}] Calling On IPC: GlamourerRevert", applicationId);
-                        _glamourerRevert.Invoke(chara.ObjectIndex, LockCode);
-
-                        logger.LogDebug("[{appid}] Requesting Penumbra Redraw via mediator", applicationId);
-                        _mareMediator.Publish(new PenumbraRedrawCharacterMessage(chara));
-                    }
-                    catch (Exception ex)
-                    {
-                        logger.LogWarning(ex, "[{appid}] Error during GlamourerRevert", applicationId);
-                    }
-                }, token).ConfigureAwait(false);
-            }
-            catch (OperationCanceledException)
-            {
-                logger.LogDebug("[{appid}] Glamourer revert cancelled for {name}", applicationId, handler.Name);
-            }
+            await task.ConfigureAwait(false);
         }
-        finally
+        catch (OperationCanceledException)
         {
-            if (entered)
-                semaphore.Release();
+            logger.LogDebug("[{appid}] Glamourer revert cancelled for {name}", applicationId, handler.Name);
         }
     }
-
 
 
     public async Task RevertByNameAsync(ILogger logger, string name, Guid applicationId)

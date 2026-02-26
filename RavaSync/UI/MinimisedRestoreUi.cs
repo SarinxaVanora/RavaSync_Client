@@ -17,6 +17,7 @@ public sealed class MinimisedRestoreUi : WindowMediatorSubscriberBase
     private readonly UiSharedService _uiShared;
     private readonly MareConfigService _config;
     private bool _didDrag;
+    private bool _ignoreNextRestoredClose;
 
     private IDalamudTextureWrap? _iconTex;
     private Vector2? _spawnPos;
@@ -69,7 +70,16 @@ public sealed class MinimisedRestoreUi : WindowMediatorSubscriberBase
         });
 
 
-        Mediator.Subscribe<MainUiRestoredMessage>(this, (_) => IsOpen = false);
+        Mediator.Subscribe<MainUiRestoredMessage>(this, (_) =>
+        {
+            if (_ignoreNextRestoredClose)
+            {
+                _ignoreNextRestoredClose = false;
+                return;
+            }
+
+            IsOpen = false;
+        });
     }
 
     protected override void DrawInternal()
@@ -104,7 +114,7 @@ public sealed class MinimisedRestoreUi : WindowMediatorSubscriberBase
         var size = new Vector2(44f, 44f) * ImGuiHelpers.GlobalScale;
         var start = ImGui.GetCursorScreenPos();
 
-        ImGui.InvisibleButton("##restore", size);
+        ImGui.InvisibleButton("##restore", size, ImGuiButtonFlags.MouseButtonLeft);
 
         var dl = ImGui.GetWindowDrawList();
         var end = start + size;
@@ -145,21 +155,26 @@ public sealed class MinimisedRestoreUi : WindowMediatorSubscriberBase
             ImGui.SetWindowPos(ImGui.GetWindowPos() + delta, ImGuiCond.Always);
         }
 
-
         if (ImGui.IsItemDeactivated() && !_didDrag)
         {
-            var pos = ImGui.GetWindowPos();
-            Mediator.Publish(new RestoreMainUiAtPositionMessage(pos));
-
-            IsOpen = false;
+            if (!ImGui.IsMouseReleased(ImGuiMouseButton.Right))
+            {
+                var pos = ImGui.GetWindowPos();
+                Mediator.Publish(new RestoreMainUiAtPositionMessage(pos));
+                IsOpen = false;
+            }
         }
 
-
+        if (!_didDrag && ImGui.IsItemHovered() && ImGui.IsMouseReleased(ImGuiMouseButton.Right))
+        {
+            _ignoreNextRestoredClose = true;
+            Mediator.Publish(new UiToggleMessage(typeof(ToolsHubUi)));
+        }
 
         if (ImGui.IsItemHovered())
         {
             ImGui.BeginTooltip();
-            ImGui.TextUnformatted("Open RavaSync");
+            ImGui.TextUnformatted(_uiShared.L("UI.MinimisedRestoreUi.4936E024", "Left click: Open RavaSync\nRight click: Tools Hub"));
             ImGui.EndTooltip();
         }
     }

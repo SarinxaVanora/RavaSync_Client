@@ -49,7 +49,7 @@ public class SelectTagForPairUi
         }
 
         var name = PairName(_pair);
-        var popupName = $"Choose Groups for {name}";
+        var popupName = string.Format(_uiSharedService.L("UI.SelectTagForPairUi.04742ecd", "Choose Groups for {0}"), name);
         // Is the popup supposed to show but did not open yet? Open it
         if (_show)
         {
@@ -63,7 +63,7 @@ public class SelectTagForPairUi
             var childHeight = tags.Count != 0 ? tags.Count * 25 : 1;
             var childSize = new Vector2(0, childHeight > 100 ? 100 : childHeight) * ImGuiHelpers.GlobalScale;
 
-            ImGui.TextUnformatted($"Select the groups you want {name} to be in.");
+            ImGui.TextUnformatted(string.Format(_uiSharedService.L("UI.SelectTagForPairUi.cbb64e3e", "Select the groups you want {0} to be in."), name));
             if (ImGui.BeginChild(name + "##listGroups", childSize))
             {
                 foreach (var tag in tags)
@@ -74,13 +74,13 @@ public class SelectTagForPairUi
             }
 
             ImGui.Separator();
-            ImGui.TextUnformatted($"Create a new group for {name}.");
+            ImGui.TextUnformatted(string.Format(_uiSharedService.L("UI.SelectTagForPairUi.829d3667", "Create a new group for {0}."), name));
             if (_uiSharedService.IconButton(FontAwesomeIcon.Plus))
             {
                 HandleAddTag();
             }
             ImGui.SameLine();
-            ImGui.InputTextWithHint("##category_name", "New Group", ref _tagNameToAdd, 40);
+            ImGui.InputTextWithHint("##category_name", _uiSharedService.L("UI.SelectTagForPairUi.f35c20d3", "New Group"), ref _tagNameToAdd, 40);
             if (ImGui.IsKeyDown(ImGuiKey.Enter))
             {
                 HandleAddTag();

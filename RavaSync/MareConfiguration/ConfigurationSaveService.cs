@@ -10,8 +10,8 @@ namespace RavaSync.MareConfiguration;
 public class ConfigurationSaveService : IHostedService
 {
     private readonly HashSet<object> _configsToSave = [];
+    private readonly object _configsToSaveLock = new();
     private readonly ILogger<ConfigurationSaveService> _logger;
-    private readonly SemaphoreSlim _configSaveSemaphore = new(1, 1);
     private readonly CancellationTokenSource _configSaveCheckCts = new();
     public const string BackupFolder = "config_backup";
     private readonly MethodInfo _saveMethod;
@@ -30,9 +30,10 @@ public class ConfigurationSaveService : IHostedService
 
     private void OnConfigurationSave(object? sender, EventArgs e)
     {
-        _configSaveSemaphore.Wait();
-        _configsToSave.Add(sender!);
-        _configSaveSemaphore.Release();
+        lock (_configsToSaveLock)
+        {
+            _configsToSave.Add(sender!);
+        }
     }
 
     private async Task PeriodicSaveCheck(CancellationToken ct)
@@ -54,12 +55,15 @@ public class ConfigurationSaveService : IHostedService
 
     private async Task SaveConfigs()
     {
-        if (_configsToSave.Count == 0) return;
+        List<object> configList;
 
-        await _configSaveSemaphore.WaitAsync().ConfigureAwait(false);
-        var configList = _configsToSave.ToList();
-        _configsToSave.Clear();
-        _configSaveSemaphore.Release();
+        lock (_configsToSaveLock)
+        {
+            if (_configsToSave.Count == 0) return;
+
+            configList = _configsToSave.ToList();
+            _configsToSave.Clear();
+        }
 
         foreach (var config in configList)
         {

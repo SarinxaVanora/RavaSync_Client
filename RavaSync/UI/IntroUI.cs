@@ -24,7 +24,23 @@ public partial class IntroUi : WindowMediatorSubscriberBase
 {
     private readonly MareConfigService _configService;
     private readonly CacheMonitor _cacheMonitor;
-    private readonly Dictionary<string, string> _languages = new(StringComparer.Ordinal) { { "English", "en" }, { "Deutsch", "de" }, { "Français", "fr" } };
+    private readonly Dictionary<string, string> _languages = new(StringComparer.Ordinal)
+{
+    { "English", "en" },
+    { "Deutsch", "de" },
+    { "Français", "fr" },
+
+    { "Español", "es" },
+    { "العربية", "ar" },
+    { "日本語", "ja" },
+    { "中文", "zh" },
+    { "한국어", "ko" },
+    { "Русский", "ru" },
+
+    // funsies
+    { "Pirate", "pirate" },
+    { "Olde English", "olde" },
+};
     private readonly ServerConfigurationManager _serverConfigurationManager;
     private readonly DalamudUtilService _dalamudUtilService;
     private readonly UiSharedService _uiShared;
@@ -64,7 +80,11 @@ public partial class IntroUi : WindowMediatorSubscriberBase
             MaximumSize = new Vector2(600, 2000),
         };
 
-        GetToSLocalization();
+        var savedLang = _configService.Current.LanguageCode;
+        if (string.IsNullOrWhiteSpace(savedLang)) savedLang = "en";
+        var idx = _languages.Values.ToList().FindIndex(v => string.Equals(v, savedLang, StringComparison.OrdinalIgnoreCase));
+        _currentLanguage = idx >= 0 ? idx : 0;
+        GetToSLocalization(_currentLanguage);
 
         Mediator.Subscribe<SwitchToMainUiMessage>(this, (_) => IsOpen = false);
         Mediator.Subscribe<SwitchToIntroUiMessage>(this, (_) =>
@@ -84,16 +104,16 @@ public partial class IntroUi : WindowMediatorSubscriberBase
         {
             _uiShared.BigText("Welcome to RavaSync");
             ImGui.Separator();
-            UiSharedService.TextWrapped("RavaSync is a plugin that will replicate your full current character state including all Penumbra mods to other paired users. " +
+            UiSharedService.TextWrapped(_uiShared.L("UI.IntroUI.078f77a1", "RavaSync is a plugin that will replicate your full current character state including all Penumbra mods to other paired users. ") +
                               "Note that you will have to have Penumbra as well as Glamourer installed to use this plugin.");
-            UiSharedService.TextWrapped("We will have to setup a few things first before you can start using this plugin. Click on next to continue.");
+            UiSharedService.TextWrapped(_uiShared.L("UI.IntroUI.c7206414", "We will have to setup a few things first before you can start using this plugin. Click on next to continue."));
 
-            UiSharedService.ColorTextWrapped("Note: Any modifications you have applied through anything but Penumbra cannot be shared and your character state on other clients " +
+            UiSharedService.ColorTextWrapped(_uiShared.L("UI.IntroUI.681f133c", "Note: Any modifications you have applied through anything but Penumbra cannot be shared and your character state on other clients ") +
                                  "might look broken because of this or others players mods might not apply on your end altogether. " +
                                  "If you want to use this plugin you will have to move your mods to Penumbra.", ImGuiColors.DalamudYellow);
             if (!_uiShared.DrawOtherPluginState()) return;
             ImGui.Separator();
-            if (ImGui.Button("Next##toAgreement"))
+            if (ImGui.Button($"{_uiShared.L("UI.IntroUI.10AC3D04", "Next")}##toAgreement"))
             {
                 _readFirstPage = true;
 #if !DEBUG
@@ -169,29 +189,29 @@ public partial class IntroUi : WindowMediatorSubscriberBase
                      || !Directory.Exists(_configService.Current.CacheFolder)))
         {
             using (_uiShared.UidFont.Push())
-                ImGui.TextUnformatted("File Storage Setup");
+                ImGui.TextUnformatted(_uiShared.L("UI.IntroUI.e19b0c3e", "File Storage Setup"));
 
             ImGui.Separator();
 
             if (!_uiShared.HasValidPenumbraModPath)
             {
-                UiSharedService.ColorTextWrapped("You do not have a valid Penumbra path set. Open Penumbra and set up a valid path for the mod directory.", ImGuiColors.DalamudRed);
+                UiSharedService.ColorTextWrapped(_uiShared.L("UI.IntroUI.8ff78c5c", "You do not have a valid Penumbra path set. Open Penumbra and set up a valid path for the mod directory."), ImGuiColors.DalamudRed);
             }
             else
             {
-                UiSharedService.TextWrapped("To not unnecessary download files already present on your computer, RavaSync will have to scan your Penumbra mod directory. " +
+                UiSharedService.TextWrapped(_uiShared.L("UI.IntroUI.c59ddf7c", "To not unnecessary download files already present on your computer, RavaSync will have to scan your Penumbra mod directory. ") +
                                      "Additionally, a local storage folder must be set where RavaSync will download other character files to. " +
                                      "Once the storage folder is set and the scan complete, this page will automatically forward to registration at a service.");
-                UiSharedService.TextWrapped("Note: The initial scan, depending on the amount of mods you have, might take a while. Please wait until it is completed.");
-                UiSharedService.ColorTextWrapped("Warning: once past this step you should not delete the FileCache.csv of RavaSync in the Plugin Configurations folder of Dalamud. " +
+                UiSharedService.TextWrapped(_uiShared.L("UI.IntroUI.6126f05a", "Note: The initial scan, depending on the amount of mods you have, might take a while. Please wait until it is completed."));
+                UiSharedService.ColorTextWrapped(_uiShared.L("UI.IntroUI.0da4157b", "Warning: once past this step you should not delete the FileCache.csv of RavaSync in the Plugin Configurations folder of Dalamud. ") +
                                           "Otherwise on the next launch a full re-scan of the file cache database will be initiated.", ImGuiColors.DalamudYellow);
-                UiSharedService.ColorTextWrapped("Warning: if the scan is hanging and does nothing for a long time, chances are high your Penumbra folder is not set up properly.", ImGuiColors.DalamudYellow);
+                UiSharedService.ColorTextWrapped(_uiShared.L("UI.IntroUI.909f1477", "Warning: if the scan is hanging and does nothing for a long time, chances are high your Penumbra folder is not set up properly."), ImGuiColors.DalamudYellow);
                 _uiShared.DrawCacheDirectorySetting();
             }
 
             if (!_cacheMonitor.IsScanRunning && !string.IsNullOrEmpty(_configService.Current.CacheFolder) && _uiShared.HasValidPenumbraModPath && Directory.Exists(_configService.Current.CacheFolder))
             {
-                if (ImGui.Button("Start Scan##startScan"))
+                if (ImGui.Button($"{_uiShared.L("UI.IntroUI.9E4D6233", "Start Scan")}##startScan"))
                 {
                     _cacheMonitor.InvokeScan();
                 }
@@ -203,25 +223,25 @@ public partial class IntroUi : WindowMediatorSubscriberBase
             if (!_dalamudUtilService.IsWine)
             {
                 var useFileCompactor = _configService.Current.UseCompactor;
-                if (ImGui.Checkbox("Use File Compactor", ref useFileCompactor))
+                if (ImGui.Checkbox(_uiShared.L("UI.IntroUI.b4a7e07f", "Use File Compactor"), ref useFileCompactor))
                 {
                     _configService.Current.UseCompactor = useFileCompactor;
                     _configService.Save();
                 }
-                UiSharedService.ColorTextWrapped("The File Compactor can save a tremendeous amount of space on the hard disk for downloads. It will incur a minor CPU penalty on download but can speed up " +
+                UiSharedService.ColorTextWrapped(_uiShared.L("UI.IntroUI.29a09842", "The File Compactor can save a tremendeous amount of space on the hard disk for downloads. It will incur a minor CPU penalty on download but can speed up ") +
                     "loading of other characters. It is recommended to keep it enabled. You can change this setting later anytime in settings.", ImGuiColors.DalamudYellow);
             }
         }
         else if (!_uiShared.ApiController.ServerAlive)
         {
             using (_uiShared.UidFont.Push())
-                ImGui.TextUnformatted("Service Registration");
+                ImGui.TextUnformatted(_uiShared.L("UI.IntroUI.3a85076c", "Service Registration"));
             ImGui.Separator();
-            UiSharedService.TextWrapped("To be able to use RavaSync you will have to register an account.");
-            UiSharedService.TextWrapped("You will see a funny line of text - this is what you should paste into any secret key labled box.");
+            UiSharedService.TextWrapped(_uiShared.L("UI.IntroUI.4cfa8c88", "To be able to use RavaSync you will have to register an account."));
+            UiSharedService.TextWrapped(_uiShared.L("UI.IntroUI.946cbbca", "You will see a funny line of text - this is what you should paste into any secret key labled box."));
             UiSharedService.DistanceSeparator();
 
-            UiSharedService.TextWrapped("Once you have registered you can connect to the service using the tools provided below.");
+            UiSharedService.TextWrapped(_uiShared.L("UI.IntroUI.3f67db59", "Once you have registered you can connect to the service using the tools provided below."));
 
             int serverIdx = 0;
             var selectedServer = _serverConfigurationManager.GetServerByIndex(serverIdx);
@@ -240,7 +260,7 @@ public partial class IntroUi : WindowMediatorSubscriberBase
                     selectedServer = _serverConfigurationManager.GetServerByIndex(serverIdx);
                     _useLegacyLogin = true;
 
-                    //if (ImGui.Checkbox("Use Legacy Login with Secret Key", ref _useLegacyLogin))
+                    //if (ImGui.Checkbox(_uiShared.L("UI.IntroUI.8a52bb21", "Use Legacy Login with Secret Key"), ref _useLegacyLogin))
                     //{
                         _serverConfigurationManager.GetServerByIndex(serverIdx).UseOAuth2 = false;
                         _serverConfigurationManager.Save();
@@ -249,13 +269,13 @@ public partial class IntroUi : WindowMediatorSubscriberBase
             }
 
             UiSharedService.DistanceSeparator();
-            UiSharedService.TextWrapped("If you don’t have a secret yet, generate one here and copy it into the box below.");
+            UiSharedService.TextWrapped(_uiShared.L("UI.IntroUI.C63AC5A0", "If you donât have a secret yet, generate one here and copy it into the box below."));
 
             using (var row = ImRaii.Group())
             {
                 if (!_creatingSecret)
                 {
-                    if (ImGui.Button("Register"))
+                    if (ImGui.Button(_uiShared.L("UI.IntroUI.d672995a", "Register")))
                     {
                         _creatingSecret = true;
                         _regError = null;
@@ -304,7 +324,7 @@ public partial class IntroUi : WindowMediatorSubscriberBase
                 }
                 else
                 {
-                    UiSharedService.ColorTextWrapped("Creating account…", ImGuiColors.DalamudYellow);
+                    UiSharedService.ColorTextWrapped(_uiShared.L("UI.IntroUI.BDC7E887", "Creating account…"), ImGuiColors.DalamudYellow);
                 }
             }
 
@@ -318,15 +338,15 @@ public partial class IntroUi : WindowMediatorSubscriberBase
             if (_showSecret && !string.IsNullOrEmpty(_regSecret))
             {
                 UiSharedService.DistanceSeparator();
-                UiSharedService.TextWrapped("Your one-time secret key (copy & store safely):");
+                UiSharedService.TextWrapped(_uiShared.L("UI.IntroUI.522c36f2", "Your one-time secret key (copy & store safely):"));
                 ImGui.InputText("##reg-secret", ref _regSecret, 64, ImGuiInputTextFlags.ReadOnly);
                 ImGui.SameLine();
-                if (ImGui.Button("Copy")) ImGui.SetClipboardText(_regSecret);
+                if (ImGui.Button(_uiShared.L("UI.IntroUI.af74f7c5", "Copy"))) ImGui.SetClipboardText(_regSecret);
 
                 if (!string.IsNullOrEmpty(_regUid))
-                    UiSharedService.TextWrapped($"UID: {_regUid}");
+                    UiSharedService.TextWrapped(string.Format(_uiShared.L("UI.IntroUI.ad3a4f84", "UID: {0}"), _regUid));
 
-                UiSharedService.ColorTextWrapped("This box is here ONLY to make it easy to copy your key and save it somewhere. Please make sure you click Save below.", ImGuiColors.ParsedGreen);
+                UiSharedService.ColorTextWrapped(_uiShared.L("UI.IntroUI.f5ca7f29", "This box is here ONLY to make it easy to copy your key and save it somewhere. Please make sure you click Save below."), ImGuiColors.ParsedGreen);
             }
 
             if (_useLegacyLogin)
@@ -343,11 +363,11 @@ public partial class IntroUi : WindowMediatorSubscriberBase
                 ImGui.InputText("", ref _secretKey, 64);
                 if (_secretKey.Length > 0 && _secretKey.Length != 64)
                 {
-                    UiSharedService.ColorTextWrapped("Your secret key must be exactly 64 characters long. Don't enter your Lodestone auth here.", ImGuiColors.DalamudRed);
+                    UiSharedService.ColorTextWrapped(_uiShared.L("UI.IntroUI.54fd9f64", "Your secret key must be exactly 64 characters long. Don't enter your Lodestone auth here."), ImGuiColors.DalamudRed);
                 }
                 else if (_secretKey.Length == 64 && !HexRegex().IsMatch(_secretKey))
                 {
-                    UiSharedService.ColorTextWrapped("Your secret key can only contain ABCDEF and the numbers 0-9.", ImGuiColors.DalamudRed);
+                    UiSharedService.ColorTextWrapped(_uiShared.L("UI.IntroUI.463b0dba", "Your secret key can only contain ABCDEF and the numbers 0-9."), ImGuiColors.DalamudRed);
                 }
                 else if (_secretKey.Length == 64)
                 {
@@ -439,18 +459,17 @@ public partial class IntroUi : WindowMediatorSubscriberBase
             {
                 if (string.IsNullOrEmpty(selectedServer.OAuthToken))
                 {
-                    UiSharedService.TextWrapped("Press the button below to verify the server has OAuth2 capabilities. Afterwards, authenticate using Discord in the Browser window.");
+                    UiSharedService.TextWrapped(_uiShared.L("UI.IntroUI.cc73b96f", "Press the button below to verify the server has OAuth2 capabilities. Afterwards, authenticate using Discord in the Browser window."));
                     _uiShared.DrawOAuth(selectedServer);
                 }
                 else
                 {
-                    UiSharedService.ColorTextWrapped($"OAuth2 is connected. Linked to: Discord User {_serverConfigurationManager.GetDiscordUserFromToken(selectedServer)}", ImGuiColors.HealerGreen);
-                    UiSharedService.TextWrapped("Now press the update UIDs button to get a list of all of your UIDs on the server.");
+                    UiSharedService.ColorTextWrapped(string.Format(_uiShared.L("UI.IntroUI.2dc98235", "OAuth2 is connected. Linked to: Discord User {0}"), _serverConfigurationManager.GetDiscordUserFromToken(selectedServer)), ImGuiColors.HealerGreen);
+                    UiSharedService.TextWrapped(_uiShared.L("UI.IntroUI.680633e4", "Now press the update UIDs button to get a list of all of your UIDs on the server."));
                     _uiShared.DrawUpdateOAuthUIDsButton(selectedServer);
                     var playerName = _dalamudUtilService.GetPlayerName();
                     var playerWorld = _dalamudUtilService.GetHomeWorldId();
-                    UiSharedService.TextWrapped($"Once pressed, select the UID you want to use for your current character {_dalamudUtilService.GetPlayerName()}. If no UIDs are visible, make sure you are connected to the correct Discord account. " +
-                        $"If that is not the case, use the unlink button below (hold CTRL to unlink).");
+                    UiSharedService.TextWrapped(string.Format(_uiShared.L("UI.IntroUI.27ad229b", "Once pressed, select the UID you want to use for your current character {0}. If no UIDs are visible, make sure you are connected to the correct Discord account. If that is not the case, use the unlink button below (hold CTRL to unlink)."), _dalamudUtilService.GetPlayerName()));
                     _uiShared.DrawUnlinkOAuthButton(selectedServer);
 
                     var auth = selectedServer.Authentications.Find(a => string.Equals(a.CharacterName, playerName, StringComparison.Ordinal) && a.WorldId == playerWorld);
@@ -469,13 +488,13 @@ public partial class IntroUi : WindowMediatorSubscriberBase
 
                     using (ImRaii.Disabled(string.IsNullOrEmpty(auth.UID)))
                     {
-                        if (_uiShared.IconTextButton(Dalamud.Interface.FontAwesomeIcon.Link, "Connect to Service"))
+                        if (_uiShared.IconTextButton(Dalamud.Interface.FontAwesomeIcon.Link, _uiShared.L("UI.IntroUI.9249af5e", "Connect to Service")))
                         {
                             _ = Task.Run(() => _uiShared.ApiController.CreateConnectionsAsync());
                         }
                     }
                     if (string.IsNullOrEmpty(auth.UID))
-                        UiSharedService.AttachToolTip("Select a UID to be able to connect to the service");
+                        UiSharedService.AttachToolTip(_uiShared.L("UI.IntroUI.112b5c75", "Select a UID to be able to connect to the service"));
                 }
             }
         }
@@ -489,7 +508,11 @@ public partial class IntroUi : WindowMediatorSubscriberBase
     {
         if (changeLanguageTo != -1)
         {
-            _uiShared.LoadLocalization(_languages.ElementAt(changeLanguageTo).Value);
+            var code = _languages.ElementAt(changeLanguageTo).Value;
+            _uiShared.LoadLocalization(code);
+
+            _configService.Current.LanguageCode = code;
+            _configService.Save();
         }
 
         _tosParagraphs = [Strings.ToS.Paragraph1, Strings.ToS.Paragraph2, Strings.ToS.Paragraph3, Strings.ToS.Paragraph4, Strings.ToS.Paragraph5, Strings.ToS.Paragraph6];

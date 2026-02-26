@@ -16,19 +16,19 @@ internal sealed partial class CharaDataHubUi
         if (!_charaDataManager.BrioAvailable)
         {
             ImGuiHelpers.ScaledDummy(5);
-            UiSharedService.DrawGroupedCenteredColorText("BRIO IS MANDATORY FOR GPOSE TOGETHER.", ImGuiColors.DalamudRed);
+            UiSharedService.DrawGroupedCenteredColorText(_uiSharedService.L("UI.CharaDataHubUiGposeTogether.82380ea7", "BRIO IS MANDATORY FOR GPOSE TOGETHER."), ImGuiColors.DalamudRed);
             ImGuiHelpers.ScaledDummy(5);
         }
 
         if (!_uiSharedService.ApiController.IsConnected)
         {
             ImGuiHelpers.ScaledDummy(5);
-            UiSharedService.DrawGroupedCenteredColorText("CANNOT USE GPOSE TOGETHER WHILE DISCONNECTED FROM THE SERVER.", ImGuiColors.DalamudRed);
+            UiSharedService.DrawGroupedCenteredColorText(_uiSharedService.L("UI.CharaDataHubUiGposeTogether.cc5de7fc", "CANNOT USE GPOSE TOGETHER WHILE DISCONNECTED FROM THE SERVER."), ImGuiColors.DalamudRed);
             ImGuiHelpers.ScaledDummy(5);
         }
 
-        _uiSharedService.BigText("GPose Together");
-        DrawHelpFoldout("GPose together is a way to do multiplayer GPose sessions and collaborations." + UiSharedService.DoubleNewLine
+        _uiSharedService.BigText(_uiSharedService.L("UI.CharaDataHubUi.GposeTogether.d41d8cd9", ""));
+        DrawHelpFoldout(_uiSharedService.L("UI.CharaDataHubUi.GposeTogether.040e66ec", "GPose together is a way to do multiplayer GPose sessions and collaborations.") + UiSharedService.DoubleNewLine
             + "GPose together requires Brio to function. Only Brio is also supported for the actual posing interactions. Attempting to pose using other tools will lead to conflicts and exploding characters." + UiSharedService.DoubleNewLine
             + "To use GPose together you either create or join a GPose Together Lobby. After you and other people have joined, make sure that everyone is on the same map. "
             + "It is not required for you to be on the same server, DC or instance. Users that are on the same map will be drawn as moving purple wisps in the overworld, so you can easily find each other." + UiSharedService.DoubleNewLine
@@ -38,17 +38,17 @@ internal sealed partial class CharaDataHubUi
         using var disabled = ImRaii.Disabled(!_charaDataManager.BrioAvailable || !_uiSharedService.ApiController.IsConnected);
 
         UiSharedService.DistanceSeparator();
-        _uiSharedService.BigText("Lobby Controls");
+        _uiSharedService.BigText(_uiSharedService.L("UI.CharaDataHubUi.GposeTogether.d41d8cd9", ""));
         if (string.IsNullOrEmpty(_charaDataGposeTogetherManager.CurrentGPoseLobbyId))
         {
-            if (_uiSharedService.IconTextButton(FontAwesomeIcon.Plus, "Create New GPose Together Lobby"))
+            if (_uiSharedService.IconTextButton(FontAwesomeIcon.Plus, _uiSharedService.L("UI.CharaDataHubUi.GposeTogether.830d7887", "Create New GPose Together Lobby")))
             {
                 _charaDataGposeTogetherManager.CreateNewLobby();
             }
             ImGuiHelpers.ScaledDummy(5);
             UiSharedService.ScaledNextItemWidth(250);
-            ImGui.InputTextWithHint("##lobbyId", "GPose Lobby Id", ref _joinLobbyId, 30);
-            if (_uiSharedService.IconTextButton(FontAwesomeIcon.ArrowRight, "Join GPose Together Lobby"))
+            ImGui.InputTextWithHint("##lobbyId", _uiSharedService.L("UI.CharaDataHubUi.GposeTogether.8ef4bb6c", "GPose Lobby Id"), ref _joinLobbyId, 30);
+            if (_uiSharedService.IconTextButton(FontAwesomeIcon.ArrowRight, _uiSharedService.L("UI.CharaDataHubUi.GposeTogether.88796902", "Join GPose Together Lobby")))
             {
                 _charaDataGposeTogetherManager.JoinGPoseLobby(_joinLobbyId);
                 _joinLobbyId = string.Empty;
@@ -62,7 +62,7 @@ internal sealed partial class CharaDataHubUi
         else
         {
             ImGui.AlignTextToFramePadding();
-            ImGui.TextUnformatted("GPose Lobby");
+            ImGui.TextUnformatted(_uiSharedService.L("UI.CharaDataHubUiGposeTogether.70f6d396", "GPose Lobby"));
             ImGui.SameLine();
             UiSharedService.ColorTextWrapped(_charaDataGposeTogetherManager.CurrentGPoseLobbyId, ImGuiColors.ParsedGreen);
             ImGui.SameLine();
@@ -70,31 +70,31 @@ internal sealed partial class CharaDataHubUi
             {
                 ImGui.SetClipboardText(_charaDataGposeTogetherManager.CurrentGPoseLobbyId);
             }
-            UiSharedService.AttachToolTip("Copy Lobby ID to clipboard.");
+            UiSharedService.AttachToolTip(_uiSharedService.L("UI.CharaDataHubUiGposeTogether.202a4200", "Copy Lobby ID to clipboard."));
             using (ImRaii.Disabled(!UiSharedService.CtrlPressed()))
             {
-                if (_uiSharedService.IconTextButton(FontAwesomeIcon.ArrowLeft, "Leave GPose Lobby"))
+                if (_uiSharedService.IconTextButton(FontAwesomeIcon.ArrowLeft, _uiSharedService.L("UI.CharaDataHubUi.GposeTogether.fa70bfa0", "Leave GPose Lobby")))
                 {
                     _charaDataGposeTogetherManager.LeaveGPoseLobby();
                 }
             }
-            UiSharedService.AttachToolTip("Leave the current GPose lobby." + UiSharedService.TooltipSeparator + "Hold CTRL and click to leave.");
+            UiSharedService.AttachToolTip(_uiSharedService.L("UI.CharaDataHubUi.GposeTogether.6166fc8c", "Leave the current GPose lobby.") + UiSharedService.TooltipSeparator + _uiSharedService.L("UI.CharaDataHubUi.GposeTogether.958bb760", "Hold CTRL and click to leave."));
         }
         UiSharedService.DistanceSeparator();
         using (ImRaii.Disabled(string.IsNullOrEmpty(_charaDataGposeTogetherManager.CurrentGPoseLobbyId)))
         {
-            if (_uiSharedService.IconTextButton(FontAwesomeIcon.ArrowUp, "Send Updated Character Data"))
+            if (_uiSharedService.IconTextButton(FontAwesomeIcon.ArrowUp, _uiSharedService.L("UI.CharaDataHubUi.GposeTogether.2c8958de", "Send Updated Character Data")))
             {
                 _ = _charaDataGposeTogetherManager.PushCharacterDownloadDto();
             }
-            UiSharedService.AttachToolTip("This will send your current appearance, pose and world data to all users in the lobby.");
+            UiSharedService.AttachToolTip(_uiSharedService.L("UI.CharaDataHubUiGposeTogether.c17b5369", "This will send your current appearance, pose and world data to all users in the lobby."));
             if (!_uiSharedService.IsInGpose)
             {
                 ImGuiHelpers.ScaledDummy(5);
-                UiSharedService.DrawGroupedCenteredColorText("Assigning users to characters is only available in GPose.", ImGuiColors.DalamudYellow, 300);
+                UiSharedService.DrawGroupedCenteredColorText(_uiSharedService.L("UI.CharaDataHubUiGposeTogether.d9c68508", "Assigning users to characters is only available in GPose."), ImGuiColors.DalamudYellow, 300);
             }
             UiSharedService.DistanceSeparator();
-            ImGui.TextUnformatted("Users In Lobby");
+            ImGui.TextUnformatted(_uiSharedService.L("UI.CharaDataHubUiGposeTogether.ccc95b38", "Users In Lobby"));
             var gposeCharas = _dalamudUtilService.GetGposeCharactersFromObjectTable();
             var self = _dalamudUtilService.GetPlayerCharacter();
             gposeCharas = gposeCharas.Where(c => c != null && !string.Equals(c.Name.TextValue, self.Name.TextValue, StringComparison.Ordinal)).ToList();
@@ -105,7 +105,7 @@ internal sealed partial class CharaDataHubUi
 
                 if (!_charaDataGposeTogetherManager.UsersInLobby.Any() && !string.IsNullOrEmpty(_charaDataGposeTogetherManager.CurrentGPoseLobbyId))
                 {
-                    UiSharedService.DrawGroupedCenteredColorText("No other users in current GPose lobby", ImGuiColors.DalamudYellow);
+                    UiSharedService.DrawGroupedCenteredColorText(_uiSharedService.L("UI.CharaDataHubUiGposeTogether.c67d60f7", "No other users in current GPose lobby"), ImGuiColors.DalamudYellow);
                 }
                 else
                 {
@@ -144,7 +144,7 @@ internal sealed partial class CharaDataHubUi
                     _ = _charaDataGposeTogetherManager.ApplyCharaData(user);
                 }
             }
-            UiSharedService.AttachToolTip("Apply newly received character data to selected actor." + UiSharedService.TooltipSeparator + "Note: If the button is grayed out, the latest data has already been applied.");
+            UiSharedService.AttachToolTip(_uiSharedService.L("UI.CharaDataHubUi.GposeTogether.20674f8b", "Apply newly received character data to selected actor.") + UiSharedService.TooltipSeparator + _uiSharedService.L("UI.CharaDataHubUi.GposeTogether.6c2fa0b8", "Note: If the button is grayed out, the latest data has already been applied."));
             ImGui.SameLine();
             using (ImRaii.Disabled(!_uiSharedService.IsInGpose || user.CharaData == null || sameMapAndServer.SameEverything))
             {
@@ -153,13 +153,13 @@ internal sealed partial class CharaDataHubUi
                     _ = _charaDataGposeTogetherManager.SpawnAndApplyData(user);
                 }
             }
-            UiSharedService.AttachToolTip("Spawn new actor, apply character data and and assign it to this user." + UiSharedService.TooltipSeparator + "Note: If the button is grayed out, " +
+            UiSharedService.AttachToolTip(_uiSharedService.L("UI.CharaDataHubUi.GposeTogether.43e3d20d", "Spawn new actor, apply character data and and assign it to this user.") + UiSharedService.TooltipSeparator + _uiSharedService.L("UI.CharaDataHubUi.GposeTogether.83937628", "Note: If the button is grayed out, ") +
                 "the user has not sent any character data or you are on the same map, server and instance. If the latter is the case, join a group with that user and assign the character to them.");
 
 
             using (ImRaii.Group())
             {
-                UiSharedService.ColorText("Map Info", ImGuiColors.DalamudGrey);
+                UiSharedService.ColorText(_uiSharedService.L("UI.CharaDataHubUiGposeTogether.16848ba0", "Map Info"), ImGuiColors.DalamudGrey);
                 ImGui.SameLine();
                 _uiSharedService.IconText(FontAwesomeIcon.ExternalLinkSquareAlt, ImGuiColors.DalamudGrey);
             }
@@ -171,18 +171,18 @@ internal sealed partial class CharaDataHubUi
             {
                 _dalamudUtilService.SetMarkerAndOpenMap(new(user.WorldData.Value.PositionX, user.WorldData.Value.PositionY, user.WorldData.Value.PositionZ), user.Map);
             }
-            UiSharedService.AttachToolTip((sameMapAndServer.SameMap ? "You are on the same map." : "You are not on the same map.") + UiSharedService.TooltipSeparator
+            UiSharedService.AttachToolTip((sameMapAndServer.SameMap ? _uiSharedService.L("UI.CharaDataHubUi.GposeTogether.14ac35b0", "You are on the same map.") : _uiSharedService.L("UI.CharaDataHubUi.GposeTogether.d9cf6a82", "You are not on the same map.")) + UiSharedService.TooltipSeparator
                 + "Note: Click to open the users location on your map." + Environment.NewLine
                 + "Note: For GPose synchronization to work properly, you must be on the same map.");
 
             ImGui.SameLine();
             _uiSharedService.IconText(FontAwesomeIcon.Globe, sameMapAndServer.SameServer ? ImGuiColors.ParsedGreen : ImGuiColors.DalamudRed);
-            UiSharedService.AttachToolTip((sameMapAndServer.SameMap ? "You are on the same server." : "You are not on the same server.") + UiSharedService.TooltipSeparator
+            UiSharedService.AttachToolTip((sameMapAndServer.SameMap ? _uiSharedService.L("UI.CharaDataHubUi.GposeTogether.a8fbb820", "You are on the same server.") : _uiSharedService.L("UI.CharaDataHubUi.GposeTogether.e5292c6d", "You are not on the same server.")) + UiSharedService.TooltipSeparator
                 + "Note: GPose synchronization is not dependent on the current server, but you will have to spawn a character for the other lobby users.");
 
             ImGui.SameLine();
             _uiSharedService.IconText(FontAwesomeIcon.Running, sameMapAndServer.SameEverything ? ImGuiColors.ParsedGreen : ImGuiColors.DalamudRed);
-            UiSharedService.AttachToolTip(sameMapAndServer.SameEverything ? "You are in the same instanced area." : "You are not the same instanced area." + UiSharedService.TooltipSeparator +
+            UiSharedService.AttachToolTip(sameMapAndServer.SameEverything ? _uiSharedService.L("UI.CharaDataHubUi.GposeTogether.da856d28", "You are in the same instanced area.") : _uiSharedService.L("UI.CharaDataHubUi.GposeTogether.8b91e0f4", "You are not the same instanced area.") + UiSharedService.TooltipSeparator +
                 "Note: Users not in your instance, but on the same map, will be drawn as floating wisps." + Environment.NewLine
                 + "Note: GPose synchronization is not dependent on the current instance, but you will have to spawn a character for the other lobby users.");
 
@@ -214,12 +214,12 @@ internal sealed partial class CharaDataHubUi
                         user.Address = nint.Zero;
                     }
                 }
-                UiSharedService.AttachToolTip("Unassign Actor for this user");
+                UiSharedService.AttachToolTip(_uiSharedService.L("UI.CharaDataHubUiGposeTogether.19dc2310", "Unassign Actor for this user"));
                 if (_uiSharedService.IsInGpose && user.Address == nint.Zero)
                 {
                     ImGui.SameLine();
                     _uiSharedService.IconText(FontAwesomeIcon.ExclamationTriangle, ImGuiColors.DalamudRed);
-                    UiSharedService.AttachToolTip("No valid character assigned for this user. Pose data will not be applied.");
+                    UiSharedService.AttachToolTip(_uiSharedService.L("UI.CharaDataHubUiGposeTogether.a909a020", "No valid character assigned for this user. Pose data will not be applied."));
                 }
             }
         }, 5, width);

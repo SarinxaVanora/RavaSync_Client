@@ -46,23 +46,23 @@ public sealed class VanityUi : WindowMediatorSubscriberBase
     protected override void DrawInternal()
     {
         _uiShared.BigText("Set Account Vanity", ImGuiColors.ParsedGreen);
-        UiSharedService.TextWrapped("Set a friendly ID that others can use instead of your UID.");
+        UiSharedService.TextWrapped(_uiShared.L("UI.SettingsUi.2587f7ae", "Set a friendly ID that others can use instead of your UID."));
 
         ImGuiHelpers.ScaledDummy(5);
 
         ImGui.InputTextWithHint(
             "##alias_input",
-            "new-vanity (5–15 chars: A–Z, 0–9, _ or -)",
+            _uiShared.L("UI.VanityUi.1763019f", "new-vanity (5–15 chars: A–Z, 0–9, _ or -)"),
             ref _newUserAlias,
             32);
 
-        _uiShared.DrawHelpText("Allowed: letters, numbers, underscore and hyphen, 5–15 characters.");
+        _uiShared.DrawHelpText(_uiShared.L("UI.VanityUi.d9ab1382", "Allowed: letters, numbers, underscore and hyphen, 5–15 characters."));
 
         ImGuiHelpers.ScaledDummy(5);
 
         using (ImRaii.Disabled(string.IsNullOrWhiteSpace(_newUserAlias)))
         {
-            if (_uiShared.IconTextButton(FontAwesomeIcon.Tag, "Set Vanity"))
+            if (_uiShared.IconTextButton(FontAwesomeIcon.Tag, _uiShared.L("UI.VanityUi.fdec2c4c", "Set Vanity")))
             {
                 _vanityStatusMessage = "Submitting…";
                 _vanityStatusColor = ImGuiColors.DalamudYellow;
@@ -109,7 +109,7 @@ public sealed class VanityUi : WindowMediatorSubscriberBase
 
         ImGuiHelpers.ScaledDummy(5);
         ImGui.TextWrapped(
-            "You can share this Vanity with friends instead of your full UID. " +
+            _uiShared.L("UI.VanityUi.084542d5", "You can share this Vanity with friends instead of your full UID. ") +
             "If the name is taken or invalid, you'll see an error above.");
     }
 }

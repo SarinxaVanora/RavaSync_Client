@@ -28,17 +28,17 @@ public class BanUserPopupHandler : IPopupHandler
 
     public void DrawContent()
     {
-        UiSharedService.TextWrapped("User " + (_reportedPair.UserData.AliasOrUID) + " will be banned and removed from this Syncshell.");
-        ImGui.InputTextWithHint("##banreason", "Ban Reason", ref _banReason, 255);
+        UiSharedService.TextWrapped(_uiSharedService.L("UI.BanUserPopupHandler.5d28cd21", "User ") + (_reportedPair.UserData.AliasOrUID) + _uiSharedService.L("UI.BanUserPopupHandler.5818d7bd", " will be banned and removed from this Syncshell."));
+        ImGui.InputTextWithHint("##banreason", _uiSharedService.L("UI.BanUserPopupHandler.8178f0ff", "Ban Reason"), ref _banReason, 255);
 
-        if (_uiSharedService.IconTextButton(FontAwesomeIcon.UserSlash, "Ban User"))
+        if (_uiSharedService.IconTextButton(FontAwesomeIcon.UserSlash, _uiSharedService.L("UI.BanUserPopupHandler.82bb897f", "Ban User")))
         {
             ImGui.CloseCurrentPopup();
             var reason = _banReason;
             _ = _apiController.GroupBanUser(new GroupPairDto(_group.Group, _reportedPair.UserData), reason);
             _banReason = string.Empty;
         }
-        UiSharedService.TextWrapped("The reason will be displayed in the banlist. The current server-side alias if present (Vanity ID) will automatically be attached to the reason.");
+        UiSharedService.TextWrapped(_uiSharedService.L("UI.BanUserPopupHandler.3833f407", "The reason will be displayed in the banlist. The current server-side alias if present (Vanity ID) will automatically be attached to the reason."));
     }
 
     public void Open(OpenBanUserPopupMessage message)

@@ -24,6 +24,7 @@ public sealed class DtrEntry : IDisposable, IHostedService
     private readonly ILogger<DtrEntry> _logger;
     private readonly MareMediator _mareMediator;
     private readonly PairManager _pairManager;
+    private readonly UiSharedService _uiSharedService;
     private Task? _runTask;
     private string? _text;
     private string? _tooltip;
@@ -147,19 +148,22 @@ public sealed class DtrEntry : IDisposable, IHostedService
                         .Select(x => string.Format("{0}", _configService.Current.PreferNoteInDtrTooltip ? x.GetNote() ?? x.PlayerName : x.PlayerName));
                 }
 
-                tooltip = $"RavaSync: Connected{Environment.NewLine}----------{Environment.NewLine}{string.Join(Environment.NewLine, visiblePairs)}";
+                tooltip = string.Format(
+                    _uiSharedService.L("UI.DtrEntry.Connected.List", "RavaSync: Connected{0}----------{0}{1}"),
+                    Environment.NewLine,
+                    string.Join(Environment.NewLine, visiblePairs));
                 colors = _configService.Current.DtrColorsPairsInRange;
             }
             else
             {
-                tooltip = "RavaSync: Connected";
+                tooltip = _uiSharedService.L("UI.DtrEntry.Connected", "RavaSync: Connected");
                 colors = _configService.Current.DtrColorsDefault;
             }
         }
         else
         {
             text = "\uE0BC \uE04C";
-            tooltip = "RavaSync: Not Connected";
+            tooltip = _uiSharedService.L("UI.DtrEntry.NotConnected", "RavaSync: Not Connected");
             colors = _configService.Current.DtrColorsNotConnected;
         }
 

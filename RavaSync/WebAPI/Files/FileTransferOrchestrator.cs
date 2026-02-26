@@ -23,7 +23,7 @@ public class FileTransferOrchestrator : DisposableMediatorSubscriberBase
     private int _availableDownloadSlots;
     private SemaphoreSlim _downloadSemaphore;
     private int CurrentlyUsedDownloadSlots => _availableDownloadSlots - _downloadSemaphore.CurrentCount;
-
+    private static readonly double[] RetryDelaySeconds = [0.5, 1.0, 2.0, 4.0];
     public Uri? FilesCdnUri { private set; get; }
     public Uri? UploadCdnUri { private set; get; }
     public List<FileTransfer> ForbiddenTransfers { get; } = [];
@@ -60,17 +60,12 @@ public class FileTransferOrchestrator : DisposableMediatorSubscriberBase
 
     public void ClearDownloadRequest(Guid guid)
     {
-        _downloadReady.Remove(guid, out _);
+        _downloadReady.TryRemove(guid, out _);
     }
 
     public bool IsDownloadReady(Guid guid)
     {
-        if (_downloadReady.TryGetValue(guid, out bool isReady) && isReady)
-        {
-            return true;
-        }
-
-        return false;
+        return _downloadReady.TryGetValue(guid, out var isReady) && isReady;
     }
 
     public void ReleaseDownloadSlot()
@@ -86,22 +81,17 @@ public class FileTransferOrchestrator : DisposableMediatorSubscriberBase
         }
     }
 
-    public async Task<HttpResponseMessage> SendRequestAsync(
-        HttpMethod method, Uri uri,
-        CancellationToken? ct = null,
-        HttpCompletionOption httpCompletionOption = HttpCompletionOption.ResponseHeadersRead)
+    public async Task<HttpResponseMessage> SendRequestAsync(HttpMethod method, Uri uri,CancellationToken? ct = null,HttpCompletionOption httpCompletionOption = HttpCompletionOption.ResponseHeadersRead)
     {
-        var requestMessage = new HttpRequestMessage(method, uri);
-        var resp = await SendRequestInternalAsync(requestMessage, ct, httpCompletionOption).ConfigureAwait(false);
-        requestMessage.Dispose();
-        return resp;
+        using var requestMessage = new HttpRequestMessage(method, uri);
+        return await SendRequestInternalAsync(requestMessage, ct, httpCompletionOption).ConfigureAwait(false);
     }
 
 
     public async Task<HttpResponseMessage> SendRequestAsync<T>(HttpMethod method, Uri uri, T content, CancellationToken ct) where T : class
     {
         // DO NOT dispose the request prematurely; HttpClient owns the content stream lifecycle.
-        var requestMessage = new HttpRequestMessage(method, uri);
+        using var requestMessage = new HttpRequestMessage(method, uri);
 
         if (content is HttpContent httpContent)
         {
@@ -116,10 +106,8 @@ public class FileTransferOrchestrator : DisposableMediatorSubscriberBase
             var json = JsonSerializer.Serialize(content);
             requestMessage.Content = new StringContent(json, Encoding.UTF8, "application/json");
         }
-        var resp = await SendRequestInternalAsync(requestMessage, ct).ConfigureAwait(false);
 
-        requestMessage.Dispose();
-        return resp;
+        return await SendRequestInternalAsync(requestMessage, ct).ConfigureAwait(false);
     }
 
     public async Task WaitForDownloadSlotAsync(CancellationToken token)
@@ -161,25 +149,31 @@ public class FileTransferOrchestrator : DisposableMediatorSubscriberBase
 
     public long DownloadLimitPerSlot()
     {
-        var limit = _mareConfig.Current.DownloadSpeedLimitInBytes;
+        var cfg = _mareConfig.Current;
+
+        var limit = cfg.DownloadSpeedLimitInBytes;
         if (limit <= 0) return 0;
-        limit = _mareConfig.Current.DownloadSpeedType switch
+
+        limit = cfg.DownloadSpeedType switch
         {
             MareConfiguration.Models.DownloadSpeeds.Bps => limit,
             MareConfiguration.Models.DownloadSpeeds.KBps => limit * 1024,
             MareConfiguration.Models.DownloadSpeeds.MBps => limit * 1024 * 1024,
             _ => limit,
         };
+
         var currentUsedDlSlots = CurrentlyUsedDownloadSlots;
         var avaialble = _availableDownloadSlots;
         var currentCount = _downloadSemaphore.CurrentCount;
         var dividedLimit = limit / (currentUsedDlSlots == 0 ? 1 : currentUsedDlSlots);
+
         if (dividedLimit < 0)
         {
             Logger.LogWarning("Calculated Bandwidth Limit is negative, returning Infinity: {value}, CurrentlyUsedDownloadSlots is {currentSlots}, " +
                 "DownloadSpeedLimit is {limit}, available slots: {avail}, current count: {count}", dividedLimit, currentUsedDlSlots, limit, avaialble, currentCount);
             return long.MaxValue;
         }
+
         return Math.Clamp(dividedLimit, 1, long.MaxValue);
     }
 
@@ -249,10 +243,9 @@ public class FileTransferOrchestrator : DisposableMediatorSubscriberBase
         }
 
         // Replayable: transient retry with jitter
-        var delays = new[] { 0.5, 1.0, 2.0, 4.0 }; // seconds
-        var rng = new Random();
+        var rng = Random.Shared;
 
-        for (int attempt = 0; attempt <= delays.Length; attempt++)
+        for (int attempt = 0; attempt <= RetryDelaySeconds.Length; attempt++)
         {
             using var req = await BuildRequestAsync().ConfigureAwait(false);
 
@@ -271,13 +264,13 @@ public class FileTransferOrchestrator : DisposableMediatorSubscriberBase
             {
                 Logger.LogDebug(hre, "Transient HTTP error on {uri}", req.RequestUri);
             }
-            catch (Exception ex) when (attempt < delays.Length)
+            catch (Exception ex) when (attempt < RetryDelaySeconds.Length)
             {
                 Logger.LogDebug(ex, "Transient error on {uri}", req.RequestUri);
             }
 
-            if (attempt == delays.Length) break;
-            var delay = TimeSpan.FromSeconds(delays[attempt] * (1.0 + rng.NextDouble() * 0.25));
+            if (attempt == RetryDelaySeconds.Length) break;
+            var delay = TimeSpan.FromSeconds(RetryDelaySeconds[attempt] * (1.0 + rng.NextDouble() * 0.25));
             await Task.Delay(delay, ct ?? CancellationToken.None).ConfigureAwait(false);
         }
 

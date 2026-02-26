@@ -61,7 +61,7 @@ public class EditProfileUi : WindowMediatorSubscriberBase
 
     protected override void DrawInternal()
     {
-        _uiSharedService.BigText("Current Profile (as saved on server)");
+        _uiSharedService.BigText(_uiSharedService.L("UI.EditProfileUi.d41d8cd9", ""));
 
         var profile = _mareProfileManager.GetMareProfile(new UserData(_apiController.UID));
 
@@ -116,23 +116,17 @@ public class EditProfileUi : WindowMediatorSubscriberBase
 
         var nsfw = profile.IsNSFW;
         ImGui.BeginDisabled();
-        ImGui.Checkbox("Is NSFW", ref nsfw);
+        ImGui.Checkbox(_uiSharedService.L("UI.EditProfileUi.2b301f6d", "Is NSFW"), ref nsfw);
         ImGui.EndDisabled();
 
         ImGui.Separator();
-        _uiSharedService.BigText("Notes and Rules for Profiles");
+        _uiSharedService.BigText(_uiSharedService.L("UI.EditProfileUi.d41d8cd9", ""));
 
-        ImGui.TextWrapped($"- All users that are paired and unpaused with you will be able to see your profile picture and description.{Environment.NewLine}" +
-            $"- Other users have the possibility to report your profile for breaking the rules.{Environment.NewLine}" +
-            $"- !!! AVOID: anything as profile image that can be considered highly illegal or obscene (bestiality, anything that could be considered a sexual act with a minor (that includes Lalafells), etc.){Environment.NewLine}" +
-            $"- !!! AVOID: slurs of any kind in the description that can be considered highly offensive{Environment.NewLine}" +
-            $"- In case of valid reports from other users this can lead to disabling your profile forever or terminating your RavaSync account indefinitely.{Environment.NewLine}" +
-            $"- Judgement of your profile validity from reports through staff is not up to debate and the decisions to disable your profile/account permanent.{Environment.NewLine}" +
-            $"- If your profile picture or profile description could be considered NSFW, enable the toggle below.");
+        ImGui.TextWrapped(string.Format(_uiSharedService.L("UI.EditProfileUi.9cbb3e8f", "- All users that are paired and unpaused with you will be able to see your profile picture and description.{0}- Other users have the possibility to report your profile for breaking the rules.{1}- !!! AVOID: anything as profile image that can be considered highly illegal or obscene (bestiality, anything that could be considered a sexual act with a minor (that includes Lalafells), etc.){2}- !!! AVOID: slurs of any kind in the description that can be considered highly offensive{3}- In case of valid reports from other users this can lead to disabling your profile forever or terminating your RavaSync account indefinitely.{4}- Judgement of your profile validity from reports through staff is not up to debate and the decisions to disable your profile/account permanent.{5}- If your profile picture or profile description could be considered NSFW, enable the toggle below."), Environment.NewLine, Environment.NewLine, Environment.NewLine, Environment.NewLine, Environment.NewLine, Environment.NewLine));
         ImGui.Separator();
-        _uiSharedService.BigText("Profile Settings");
+        _uiSharedService.BigText(_uiSharedService.L("UI.EditProfileUi.d41d8cd9", ""));
 
-        if (_uiSharedService.IconTextButton(FontAwesomeIcon.FileUpload, "Upload new profile picture"))
+        if (_uiSharedService.IconTextButton(FontAwesomeIcon.FileUpload, _uiSharedService.L("UI.EditProfileUi.c9ab69c4", "Upload new profile picture")))
         {
             _fileDialogManager.OpenFileDialog("Select new Profile picture", ".png", (success, file) =>
             {
@@ -161,29 +155,29 @@ public class EditProfileUi : WindowMediatorSubscriberBase
                 });
             });
         }
-        UiSharedService.AttachToolTip("Select and upload a new profile picture");
+        UiSharedService.AttachToolTip(_uiSharedService.L("UI.EditProfileUi.e9fd1cfb", "Select and upload a new profile picture"));
         ImGui.SameLine();
-        if (_uiSharedService.IconTextButton(FontAwesomeIcon.Trash, "Clear uploaded profile picture"))
+        if (_uiSharedService.IconTextButton(FontAwesomeIcon.Trash, _uiSharedService.L("UI.EditProfileUi.25252649", "Clear uploaded profile picture")))
         {
             _ = _apiController.UserSetProfile(new UserProfileDto(new UserData(_apiController.UID), Disabled: false, IsNSFW: null, "", Description: null));
         }
-        UiSharedService.AttachToolTip("Clear your currently uploaded profile picture");
+        UiSharedService.AttachToolTip(_uiSharedService.L("UI.EditProfileUi.96a04658", "Clear your currently uploaded profile picture"));
         if (_showFileDialogError)
         {
-            UiSharedService.ColorTextWrapped("The profile picture must be a PNG file with a maximum height and width of 256px and 250KiB size", ImGuiColors.DalamudRed);
+            UiSharedService.ColorTextWrapped(_uiSharedService.L("UI.EditProfileUi.9125f2b4", "The profile picture must be a PNG file with a maximum height and width of 256px and 250KiB size"), ImGuiColors.DalamudRed);
         }
         var isNsfw = profile.IsNSFW;
-        if (ImGui.Checkbox("Profile is NSFW", ref isNsfw))
+        if (ImGui.Checkbox(_uiSharedService.L("UI.EditProfileUi.2ccd1904", "Profile is NSFW"), ref isNsfw))
         {
             _ = _apiController.UserSetProfile(new UserProfileDto(new UserData(_apiController.UID), Disabled: false, isNsfw, ProfilePictureBase64: null, Description: null));
         }
-        _uiSharedService.DrawHelpText("If your profile description or image can be considered NSFW, toggle this to ON");
+        _uiSharedService.DrawHelpText(_uiSharedService.L("UI.EditProfileUi.9648e52a", "If your profile description or image can be considered NSFW, toggle this to ON"));
         var widthTextBox = 400;
         var posX = ImGui.GetCursorPosX();
-        ImGui.TextUnformatted($"Description {_descriptionText.Length}/1500");
+        ImGui.TextUnformatted(string.Format(_uiSharedService.L("UI.EditProfileUi.7d0decaa", "Description {0}/1500"), _descriptionText.Length));
         ImGui.SetCursorPosX(posX);
         ImGuiHelpers.ScaledRelativeSameLine(widthTextBox, ImGui.GetStyle().ItemSpacing.X);
-        ImGui.TextUnformatted("Preview (approximate)");
+        ImGui.TextUnformatted(_uiSharedService.L("UI.EditProfileUi.5f3fda56", "Preview (approximate)"));
         using (_uiSharedService.GameFont.Push())
             ImGui.InputTextMultiline("##description", ref _descriptionText, 1500, ImGuiHelpers.ScaledVector2(widthTextBox, 200));
 
@@ -212,17 +206,17 @@ public class EditProfileUi : WindowMediatorSubscriberBase
             ImGui.EndChildFrame();
         }
 
-        if (_uiSharedService.IconTextButton(FontAwesomeIcon.Save, "Save Description"))
+        if (_uiSharedService.IconTextButton(FontAwesomeIcon.Save, _uiSharedService.L("UI.EditProfileUi.cf388f34", "Save Description")))
         {
             _ = _apiController.UserSetProfile(new UserProfileDto(new UserData(_apiController.UID), Disabled: false, IsNSFW: null, ProfilePictureBase64: null, _descriptionText));
         }
-        UiSharedService.AttachToolTip("Sets your profile description text");
+        UiSharedService.AttachToolTip(_uiSharedService.L("UI.EditProfileUi.297e73ba", "Sets your profile description text"));
         ImGui.SameLine();
-        if (_uiSharedService.IconTextButton(FontAwesomeIcon.Trash, "Clear Description"))
+        if (_uiSharedService.IconTextButton(FontAwesomeIcon.Trash, _uiSharedService.L("UI.EditProfileUi.d6b9fd92", "Clear Description")))
         {
             _ = _apiController.UserSetProfile(new UserProfileDto(new UserData(_apiController.UID), Disabled: false, IsNSFW: null, ProfilePictureBase64: null, ""));
         }
-        UiSharedService.AttachToolTip("Clears your profile description text");
+        UiSharedService.AttachToolTip(_uiSharedService.L("UI.EditProfileUi.9d027acf", "Clears your profile description text"));
     }
 
     protected override void Dispose(bool disposing)

@@ -1,13 +1,16 @@
 ﻿using Dalamud.Bindings.ImGui;
 using Dalamud.Interface;
 using Dalamud.Interface.Colors;
+using Dalamud.Interface.Utility;
 using Dalamud.Interface.Utility.Raii;
 using RavaSync.API.Dto.Group;
 using RavaSync.MareConfiguration;
 using RavaSync.PlayerData.Pairs;
 using RavaSync.Services.Mediator;
 using RavaSync.Services.ServerConfiguration;
+using RavaSync.UI;
 using RavaSync.WebAPI.Files.Models;
+using System.Numerics;
 
 namespace RavaSync.UI.Handlers;
 
@@ -16,6 +19,7 @@ public class IdDisplayHandler
     private readonly MareConfigService _mareConfigService;
     private readonly MareMediator _mediator;
     private readonly ServerConfigurationManager _serverManager;
+    private readonly UiSharedService _uiShared;
     private readonly Dictionary<string, bool> _showIdForEntry = new(StringComparer.Ordinal);
     private string _editComment = string.Empty;
     private string _editEntry = string.Empty;
@@ -24,11 +28,12 @@ public class IdDisplayHandler
     private bool _popupShown = false;
     private DateTime? _popupTime;
 
-    public IdDisplayHandler(MareMediator mediator, ServerConfigurationManager serverManager, MareConfigService mareConfigService)
+    public IdDisplayHandler(MareMediator mediator, ServerConfigurationManager serverManager, MareConfigService mareConfigService, UiSharedService uiShared)
     {
         _mediator = mediator;
         _serverManager = serverManager;
         _mareConfigService = mareConfigService;
+        _uiShared = uiShared;
     }
 
     public void DrawGroupText(string id, GroupFullInfoDto group, float textPosX, Func<float> editBoxWidth)
@@ -73,7 +78,7 @@ public class IdDisplayHandler
             ImGui.AlignTextToFramePadding();
 
             ImGui.SetNextItemWidth(editBoxWidth.Invoke());
-            if (ImGui.InputTextWithHint("", "Name/Notes", ref _editComment, 255, ImGuiInputTextFlags.EnterReturnsTrue))
+            if (ImGui.InputTextWithHint("", _uiShared.L("UI.IdDisplayHandler.965c6daa", "Name/Notes"), ref _editComment, 255, ImGuiInputTextFlags.EnterReturnsTrue))
             {
                 _serverManager.SetNoteForGid(group.GID, _editComment, save: true);
                 _editEntry = string.Empty;
@@ -83,7 +88,7 @@ public class IdDisplayHandler
             {
                 _editEntry = string.Empty;
             }
-            UiSharedService.AttachToolTip("Hit ENTER to save\nRight click to cancel");
+            UiSharedService.AttachToolTip(_uiShared.L("UI.IdDisplayHandler.868a0c06", "Hit ENTER to save\nRight click to cancel"));
         }
     }
 
@@ -173,7 +178,7 @@ public class IdDisplayHandler
                 }
                 else
                 {
-                    text = anyLoading ? "Loading files…" : "Downloading…";
+                    text = anyLoading ? "Loading files..." : "Downloading...";
                 }
 
                 ImGui.PushStyleColor(ImGuiCol.Text, anyLoading ? ImGuiColors.DalamudViolet : ImGuiColors.ParsedBlue);
@@ -183,12 +188,47 @@ public class IdDisplayHandler
             else if (pair.LastAppliedApproximateVRAMBytes >= 0)
             {
                 ImGui.PushStyleColor(ImGuiCol.Text, ImGuiColors.DalamudGrey);
-                ImGui.TextUnformatted($"VRAM use: {UiSharedService.ByteToString(pair.LastAppliedApproximateVRAMBytes, addSuffix: true)}");
+
+                var vramText = UiSharedService.ByteToString(pair.LastAppliedApproximateVRAMBytes, addSuffix: true);
+                var trisText = pair.LastAppliedDataTris > 0
+                    ? pair.LastAppliedDataTris.ToString("N0")
+                    : "—";
+
+                var line1 = $"VRAM: {vramText} | Tris: {trisText}";
+
+                float regionW = ImGui.GetContentRegionAvail().X;
+                float lineH = ImGui.GetTextLineHeight();
+                var start = ImGui.GetCursorScreenPos();
+
+                ImGui.InvisibleButton("##pair_stats_line", new Vector2(MathF.Max(1f, regionW), lineH));
+
+                float padX = 2f * ImGuiHelpers.GlobalScale;
+                float innerW = MathF.Max(1f, regionW - (padX * 2f));
+                float baseW = ImGui.CalcTextSize(line1).X;
+
+                // Keep it readable but allow compact shrink
+                float scale = baseW > 0f ? MathF.Min(1f, innerW / baseW) : 1f;
+                scale = MathF.Max(0.78f, scale);
+
+                var font = ImGui.GetFont();
+                float fontSize = ImGui.GetFontSize() * scale;
+                float drawW = baseW * scale;
+
+                float x = start.X + padX;
+                float y = start.Y + (lineH - fontSize) * 0.5f;
+
+                var dl1 = ImGui.GetWindowDrawList();
+                var rMin = start;
+                var rMax = start + new Vector2(regionW, lineH);
+
+                dl1.PushClipRect(rMin, rMax, true);
+                dl1.AddText(font, fontSize, new Vector2(x, y), ImGui.GetColorU32(ImGuiCol.Text), line1);
+                dl1.PopClipRect();
+
                 ImGui.PopStyleColor();
             }
             else
             {
-                // keep the second line empty but still take space
                 ImGui.Dummy(new(0, line));
             }
 
@@ -212,9 +252,9 @@ public class IdDisplayHandler
 
                 if (_popupTime > DateTime.UtcNow || !_mareConfigService.Current.ProfilesShow)
                 {
-                    ImGui.SetTooltip("Left click to switch between UID display and nick" + Environment.NewLine
+                    ImGui.SetTooltip(_uiShared.L("UI.IdDisplayHandler.c8d0f471", "Left click to switch between UID display and nick") + Environment.NewLine
                         + "Right click to change nick for " + pair.UserData.AliasOrUID + Environment.NewLine
-                        + "Middle Mouse Button to open their profile in a separate window");
+                        + _uiShared.L("UI.IdDisplayHandler.2f20db7a", "Middle Mouse Button to open their profile in a separate window"));
                 }
                 else if (_popupTime < DateTime.UtcNow && !_popupShown)
                 {
@@ -268,7 +308,7 @@ public class IdDisplayHandler
             ImGui.AlignTextToFramePadding();
 
             ImGui.SetNextItemWidth(editBoxWidth.Invoke());
-            if (ImGui.InputTextWithHint("##" + pair.UserData.UID, "Nick/Notes", ref _editComment, 255, ImGuiInputTextFlags.EnterReturnsTrue))
+            if (ImGui.InputTextWithHint("##" + pair.UserData.UID, _uiShared.L("UI.IdDisplayHandler.a3b5e868", "Nick/Notes"), ref _editComment, 255, ImGuiInputTextFlags.EnterReturnsTrue))
             {
                 _serverManager.SetNoteForUid(pair.UserData.UID, _editComment);
                 _serverManager.SaveNotes();
@@ -279,7 +319,7 @@ public class IdDisplayHandler
             {
                 _editEntry = string.Empty;
             }
-            UiSharedService.AttachToolTip("Hit ENTER to save\nRight click to cancel");
+            UiSharedService.AttachToolTip(_uiShared.L("UI.IdDisplayHandler.868a0c06", "Hit ENTER to save\nRight click to cancel"));
         }
     }
 

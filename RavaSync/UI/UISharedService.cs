@@ -10,6 +10,9 @@ using Dalamud.Interface.Utility.Raii;
 using Dalamud.Plugin;
 using Dalamud.Plugin.Services;
 using Dalamud.Utility;
+using Microsoft.Extensions.Logging;
+using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 using RavaSync.FileCache;
 using RavaSync.Fonts;
 using RavaSync.Interop.Ipc;
@@ -24,9 +27,9 @@ using RavaSync.Themes;
 using RavaSync.Utils;
 using RavaSync.WebAPI;
 using RavaSync.WebAPI.SignalR;
-using Microsoft.Extensions.Logging;
 using System.IdentityModel.Tokens.Jwt;
 using System.Numerics;
+using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -102,7 +105,9 @@ public partial class UiSharedService : DisposableMediatorSubscriberBase
         _tokenProvider = tokenProvider;
         _themeManager = themeManager;
         _fontManager = fontManager;
-        _localization.SetupWithLangCode("en");
+        var lang = _configService.Current.LanguageCode;
+        if (string.IsNullOrWhiteSpace(lang)) lang = "en";
+        LoadLocalization(lang);
 
         _isDirectoryWritable = IsDirectoryWritable(_configService.Current.CacheFolder);
         EnsureThemeBootstrapped();
@@ -567,16 +572,16 @@ public partial class UiSharedService : DisposableMediatorSubscriberBase
 
     public void DrawCacheDirectorySetting()
     {
-        ColorTextWrapped("Note: The storage folder should be somewhere close to root (i.e. C:\\RavaStorage) in a new empty folder. DO NOT point this to your game folder. DO NOT point this to your Penumbra folder.", ImGuiColors.DalamudYellow);
+        ColorTextWrapped(L("UI.UISharedService.fa2a1e62", "Note: The storage folder should be somewhere close to root (i.e. C:\\RavaStorage) in a new empty folder. DO NOT point this to your game folder. DO NOT point this to your Penumbra folder."), ImGuiColors.DalamudYellow);
         var cacheDirectory = _configService.Current.CacheFolder;
-        ImGui.InputText("Storage Folder##cache", ref cacheDirectory, 255, ImGuiInputTextFlags.ReadOnly);
+        ImGui.InputText($"{L("UI.UISharedService.743E5C4C", "Storage Folder")}##cache", ref cacheDirectory, 255, ImGuiInputTextFlags.ReadOnly);
 
         ImGui.SameLine();
         using (ImRaii.Disabled(_cacheMonitor.MareWatcher != null))
         {
             if (IconButton(FontAwesomeIcon.Folder))
             {
-                FileDialogManager.OpenFolderDialog("Pick RavaSync Storage Folder", (success, path) =>
+                FileDialogManager.OpenFolderDialog(L("UI.UISharedService.88e93242", "Pick RavaSync Storage Folder"), (success, path) =>
                 {
                     if (!success) return;
                     if (string.IsNullOrWhiteSpace(path)) return;
@@ -655,38 +660,38 @@ public partial class UiSharedService : DisposableMediatorSubscriberBase
         }
         if (_cacheMonitor.MareWatcher != null)
         {
-            AttachToolTip("Stop the Monitoring before changing the Storage folder. As long as monitoring is active, you cannot change the Storage folder location.");
+            AttachToolTip(L("UI.UISharedService.945f98ea", "Stop the Monitoring before changing the Storage folder. As long as monitoring is active, you cannot change the Storage folder location."));
         }
 
         if (_isPenumbraDirectory)
         {
-            ColorTextWrapped("Do not point the storage path directly to the Penumbra directory. If necessary, make a subfolder in it.", ImGuiColors.DalamudRed);
+            ColorTextWrapped(L("UI.UISharedService.4a400796", "Do not point the storage path directly to the Penumbra directory. If necessary, make a subfolder in it."), ImGuiColors.DalamudRed);
         }
         else if (_isOneDrive)
         {
-            ColorTextWrapped("Do not point the storage path to a folder in OneDrive. Do not use OneDrive folders for any Mod related functionality.", ImGuiColors.DalamudRed);
+            ColorTextWrapped(L("UI.UISharedService.974de3e8", "Do not point the storage path to a folder in OneDrive. Do not use OneDrive folders for any Mod related functionality."), ImGuiColors.DalamudRed);
         }
         else if (!_isDirectoryWritable)
         {
-            ColorTextWrapped("The folder you selected does not exist or cannot be written to. Please provide a valid path.", ImGuiColors.DalamudRed);
+            ColorTextWrapped(L("UI.UISharedService.b5e12f2c", "The folder you selected does not exist or cannot be written to. Please provide a valid path."), ImGuiColors.DalamudRed);
         }
         else if (_cacheDirectoryHasOtherFilesThanCache)
         {
-            ColorTextWrapped("Your selected directory has files or directories inside that are not RavaSync related. Use an empty directory or a previous RavaSync Storage directory only.", ImGuiColors.DalamudRed);
+            ColorTextWrapped(L("UI.UISharedService.78f98f45", "Your selected directory has files or directories inside that are not RavaSync related. Use an empty directory or a previous RavaSync Storage directory only."), ImGuiColors.DalamudRed);
         }
         else if (!_cacheDirectoryIsValidPath)
         {
-            ColorTextWrapped("Your selected directory contains illegal characters unreadable by FFXIV. " +
+            ColorTextWrapped(L("UI.UISharedService.f8942e27", "Your selected directory contains illegal characters unreadable by FFXIV. ") +
                              "Restrict yourself to latin letters (A-Z), underscores (_), dashes (-) and arabic numbers (0-9).", ImGuiColors.DalamudRed);
         }
 
         float maxCacheSize = (float)_configService.Current.MaxLocalCacheInGiB;
-        if (ImGui.SliderFloat("Maximum Storage Size in GiB", ref maxCacheSize, 1f, 200f, "%.2f GiB"))
+        if (ImGui.SliderFloat(L("UI.UISharedService.e07b77f5", "Maximum Storage Size in GiB"), ref maxCacheSize, 1f, 200f, "%.2f GiB"))
         {
             _configService.Current.MaxLocalCacheInGiB = maxCacheSize;
             _configService.Save();
         }
-        DrawHelpText("The storage is automatically governed by RavaSync. It will clear itself automatically once it reaches the set capacity by removing the oldest unused files. You typically do not need to clear it yourself.");
+        DrawHelpText(L("UI.UISharedService.f04633e6", "The storage is automatically governed by RavaSync. It will clear itself automatically once it reaches the set capacity by removing the oldest unused files. You typically do not need to clear it yourself."));
     }
 
     public T? DrawCombo<T>(string comboName, IEnumerable<T> comboItems, Func<T?, string> toName,
@@ -700,7 +705,7 @@ public partial class UiSharedService : DisposableMediatorSubscriberBase
             _selectedComboItems[comboName] = selectedItem;
         }
 
-        if (ImGui.BeginCombo(comboName, selectedItem == null ? "Unset Value" : toName((T?)selectedItem)))
+        if (ImGui.BeginCombo(comboName, selectedItem == null ? L("UI.UISharedService.1853a0f1", "Unset Value") : toName((T?)selectedItem)))
         {
             foreach (var item in comboItems)
             {
@@ -721,40 +726,38 @@ public partial class UiSharedService : DisposableMediatorSubscriberBase
     public void DrawFileScanState()
     {
         ImGui.AlignTextToFramePadding();
-        ImGui.TextUnformatted("File Scanner Status");
+        ImGui.TextUnformatted(L("UI.UISharedService.7844dbd3", "File Scanner Status"));
         ImGui.SameLine();
         if (_cacheMonitor.IsScanRunning)
         {
             ImGui.AlignTextToFramePadding();
 
-            ImGui.TextUnformatted("Scan is running");
-            ImGui.TextUnformatted("Current Progress:");
+            ImGui.TextUnformatted(L("UI.UISharedService.e45a0d1e", "Scan is running"));
+            ImGui.TextUnformatted(L("UI.UISharedService.7d4e5a9b", "Current Progress:"));
             ImGui.SameLine();
             ImGui.TextUnformatted(_cacheMonitor.TotalFiles == 1
-                ? "Collecting files"
-                : $"Processing {_cacheMonitor.CurrentFileProgress}/{_cacheMonitor.TotalFilesStorage} from storage ({_cacheMonitor.TotalFiles} scanned in)");
-            AttachToolTip("Note: it is possible to have more files in storage than scanned in, " +
-                "this is due to the scanner normally ignoring those files but the game loading them in and using them on your character, so they get " +
-                "added to the local storage.");
+                ? L("UI.UISharedService.c5f28e99", "Collecting files")
+                : string.Format(L("UI.UISharedService.0bf75abb", "Processing {0}/{1} from storage ({2} scanned in)"), _cacheMonitor.CurrentFileProgress, _cacheMonitor.TotalFilesStorage, _cacheMonitor.TotalFiles));
+            AttachToolTip(L("UI.UISharedService.689e2427", "Note: it is possible to have more files in storage than scanned in, this is due to the scanner normally ignoring those files but the game loading them in and using them on your character, so they get added to the local storage."));
         }
         else if (_cacheMonitor.HaltScanLocks.Any(f => f.Value > 0))
         {
             ImGui.AlignTextToFramePadding();
 
-            ImGui.TextUnformatted("Halted (" + string.Join(", ", _cacheMonitor.HaltScanLocks.Where(f => f.Value > 0).Select(locker => locker.Key + ": " + locker.Value + " halt requests")) + ")");
+            ImGui.TextUnformatted(L("UI.UISharedService.1077a6a1", "Halted (") + string.Join(", ", _cacheMonitor.HaltScanLocks.Where(f => f.Value > 0).Select(locker => locker.Key + ": " + locker.Value + L("UI.UISharedService.1f5f2ade", " halt requests"))) + ")");
             ImGui.SameLine();
-            if (ImGui.Button("Reset halt requests##clearlocks"))
+            if (ImGui.Button($"{L("UI.UISharedService.33BB6D1B", "Reset halt requests")}##clearlocks"))
             {
                 _cacheMonitor.ResetLocks();
             }
         }
         else
         {
-            ImGui.TextUnformatted("Idle");
+            ImGui.TextUnformatted(L("UI.UISharedService.cc1ebdd0", "Idle"));
             if (_configService.Current.InitialScanComplete)
             {
                 ImGui.SameLine();
-                if (IconTextButton(FontAwesomeIcon.Play, "Force rescan"))
+                if (IconTextButton(FontAwesomeIcon.Play, L("UI.UISharedService.86c47f2f", "Force rescan")))
                 {
                     _cacheMonitor.InvokeScan();
                 }
@@ -777,7 +780,7 @@ public partial class UiSharedService : DisposableMediatorSubscriberBase
         {
             if (_discordOAuthCheck == null)
             {
-                if (IconTextButton(FontAwesomeIcon.QuestionCircle, "Check if Server supports Discord OAuth2"))
+                if (IconTextButton(FontAwesomeIcon.QuestionCircle, L("UI.UISharedService.46def04e", "Check if Server supports Discord OAuth2")))
                 {
                     _discordOAuthCheck = _serverConfigurationManager.CheckDiscordOAuth(selectedServer.ServerUri);
                 }
@@ -786,31 +789,31 @@ public partial class UiSharedService : DisposableMediatorSubscriberBase
             {
                 if (!_discordOAuthCheck.IsCompleted)
                 {
-                    ColorTextWrapped($"Checking OAuth2 compatibility with {selectedServer.ServerUri}", ImGuiColors.DalamudYellow);
+                    ColorTextWrapped(string.Format(L("UI.UISharedService.fdc663c2", "Checking OAuth2 compatibility with {0}"), selectedServer.ServerUri), ImGuiColors.DalamudYellow);
                 }
                 else
                 {
                     if (_discordOAuthCheck.Result != null)
                     {
-                        ColorTextWrapped("Server is compatible with Discord OAuth2", ImGuiColors.HealerGreen);
+                        ColorTextWrapped(L("UI.UISharedService.9af27961", "Server is compatible with Discord OAuth2"), ImGuiColors.HealerGreen);
                     }
                     else
                     {
-                        ColorTextWrapped("Server is not compatible with Discord OAuth2", ImGuiColors.DalamudRed);
+                        ColorTextWrapped(L("UI.UISharedService.e76fe290", "Server is not compatible with Discord OAuth2"), ImGuiColors.DalamudRed);
                     }
                 }
             }
 
             if (_discordOAuthCheck != null && _discordOAuthCheck.IsCompleted)
             {
-                if (IconTextButton(FontAwesomeIcon.ArrowRight, "Authenticate with Server"))
+                if (IconTextButton(FontAwesomeIcon.ArrowRight, L("UI.UISharedService.3935ceab", "Authenticate with Server")))
                 {
                     _discordOAuthGetCode = _serverConfigurationManager.GetDiscordOAuthToken(_discordOAuthCheck.Result!, selectedServer.ServerUri, _discordOAuthGetCts.Token);
                 }
                 else if (_discordOAuthGetCode != null && !_discordOAuthGetCode.IsCompleted)
                 {
-                    TextWrapped("A browser window has been opened, follow it to authenticate. Click the button below if you accidentally closed the window and need to restart the authentication.");
-                    if (IconTextButton(FontAwesomeIcon.Ban, "Cancel Authentication"))
+                    TextWrapped(L("UI.UISharedService.678c2373", "A browser window has been opened, follow it to authenticate. Click the button below if you accidentally closed the window and need to restart the authentication."));
+                    if (IconTextButton(FontAwesomeIcon.Ban, L("UI.UISharedService.5a1987cb", "Cancel Authentication")))
                     {
                         _discordOAuthGetCts = _discordOAuthGetCts.CancelRecreate();
                         _discordOAuthGetCode = null;
@@ -818,18 +821,18 @@ public partial class UiSharedService : DisposableMediatorSubscriberBase
                 }
                 else if (_discordOAuthGetCode != null && _discordOAuthGetCode.IsCompleted)
                 {
-                    TextWrapped("Discord OAuth is completed, status: ");
+                    TextWrapped(L("UI.UISharedService.289442f1", "Discord OAuth is completed, status: "));
                     ImGui.SameLine();
                     if (_discordOAuthGetCode.Result != null)
                     {
                         selectedServer.OAuthToken = _discordOAuthGetCode.Result;
                         _discordOAuthGetCode = null;
                         _serverConfigurationManager.Save();
-                        ColorTextWrapped("Success", ImGuiColors.HealerGreen);
+                        ColorTextWrapped(L("UI.UISharedService.62e42cc4", "Success"), ImGuiColors.HealerGreen);
                     }
                     else
                     {
-                        ColorTextWrapped("Failed, please check /xllog for more information", ImGuiColors.DalamudRed);
+                        ColorTextWrapped(L("UI.UISharedService.ffad77e7", "Failed, please check /xllog for more information"), ImGuiColors.DalamudRed);
                     }
                 }
             }
@@ -855,21 +858,21 @@ public partial class UiSharedService : DisposableMediatorSubscriberBase
 
             if (tokenExpiry > DateTime.UtcNow)
             {
-                ColorTextWrapped($"OAuth2 is enabled, linked to: Discord User {_serverConfigurationManager.GetDiscordUserFromToken(selectedServer)}", ImGuiColors.HealerGreen);
-                TextWrapped($"The OAuth2 token will expire on {tokenExpiry:yyyy-MM-dd} and automatically renew itself during login on or after {(tokenExpiry - TimeSpan.FromDays(7)):yyyy-MM-dd}.");
+                ColorTextWrapped(string.Format(L("UI.UISharedService.bfac322d", "OAuth2 is enabled, linked to: Discord User {0}"), _serverConfigurationManager.GetDiscordUserFromToken(selectedServer)), ImGuiColors.HealerGreen);
+                TextWrapped(string.Format(L("UI.UISharedService.24916687", "The OAuth2 token will expire on {0:yyyy-MM-dd} and automatically renew itself during login on or after {1:yyyy-MM-dd}."), tokenExpiry, (tokenExpiry - TimeSpan.FromDays(7))));
                 using (ImRaii.Disabled(!CtrlPressed()))
                 {
-                    if (IconTextButton(FontAwesomeIcon.Exclamation, "Renew OAuth2 token manually") && CtrlPressed())
+                    if (IconTextButton(FontAwesomeIcon.Exclamation, L("UI.UISharedService.b4900dec", "Renew OAuth2 token manually")) && CtrlPressed())
                     {
                         _ = _tokenProvider.TryUpdateOAuth2LoginTokenAsync(selectedServer, forced: true)
                             .ContinueWith((_) => _apiController.CreateConnectionsAsync());
                     }
                 }
-                DrawHelpText("Hold CTRL to manually refresh your OAuth2 token. Normally you do not need to do this.");
+                DrawHelpText(L("UI.UISharedService.45df43a2", "Hold CTRL to manually refresh your OAuth2 token. Normally you do not need to do this."));
                 ImGuiHelpers.ScaledDummy(10f);
 
                 if ((_discordOAuthUIDs == null || _discordOAuthUIDs.IsCompleted)
-                    && IconTextButton(FontAwesomeIcon.Question, "Check Discord Connection"))
+                    && IconTextButton(FontAwesomeIcon.Question, L("UI.UISharedService.f64f7977", "Check Discord Connection")))
                 {
                     _discordOAuthUIDs = _serverConfigurationManager.GetUIDsWithDiscordToken(selectedServer.ServerUri, oauthToken);
                 }
@@ -877,7 +880,7 @@ public partial class UiSharedService : DisposableMediatorSubscriberBase
                 {
                     if (!_discordOAuthUIDs.IsCompleted)
                     {
-                        ColorTextWrapped("Checking UIDs on Server", ImGuiColors.DalamudYellow);
+                        ColorTextWrapped(L("UI.UISharedService.16b75398", "Checking UIDs on Server"), ImGuiColors.DalamudYellow);
                     }
                     else
                     {
@@ -886,20 +889,20 @@ public partial class UiSharedService : DisposableMediatorSubscriberBase
                         var vanity = string.IsNullOrEmpty(primaryUid.Value) ? "-" : primaryUid.Value;
                         if (foundUids > 0)
                         {
-                            ColorTextWrapped($"Found {foundUids} associated UIDs on the server, Primary UID: {primaryUid.Key} (Vanity UID: {vanity})",
+                            ColorTextWrapped(string.Format(L("UI.UISharedService.4bf10b0a", "Found {0} associated UIDs on the server, Primary UID: {1} (Vanity UID: {2})"), foundUids, primaryUid.Key, vanity),
                                 ImGuiColors.HealerGreen);
                         }
                         else
                         {
-                            ColorTextWrapped($"Found no UIDs associated to this linked OAuth2 account", ImGuiColors.DalamudRed);
+                            ColorTextWrapped(L("UI.UISharedService.7a05b968", "Found no UIDs associated to this linked OAuth2 account"), ImGuiColors.DalamudRed);
                         }
                     }
                 }
             }
             else
             {
-                ColorTextWrapped("The OAuth2 token is stale and expired. Please renew the OAuth2 connection.", ImGuiColors.DalamudRed);
-                if (IconTextButton(FontAwesomeIcon.Exclamation, "Renew OAuth2 connection"))
+                ColorTextWrapped(L("UI.UISharedService.a280d388", "The OAuth2 token is stale and expired. Please renew the OAuth2 connection."), ImGuiColors.DalamudRed);
+                if (IconTextButton(FontAwesomeIcon.Exclamation, L("UI.UISharedService.182d1d72", "Renew OAuth2 connection")))
                 {
                     selectedServer.OAuthToken = null;
                     _serverConfigurationManager.Save();
@@ -921,44 +924,44 @@ public partial class UiSharedService : DisposableMediatorSubscriberBase
 
     public bool DrawOtherPluginState()
     {
-        ImGui.TextUnformatted("Mandatory Plugins:");
+        ImGui.TextUnformatted(L("UI.UISharedService.0f1c0453", "Mandatory Plugins:"));
 
         ImGui.SameLine(150);
-        ColorText("Penumbra", GetBoolColor(_penumbraExists));
-        AttachToolTip($"Penumbra is " + (_penumbraExists ? "available and up to date." : "unavailable or not up to date."));
+        ColorText(L("UI.UISharedService.d2129b83", "Penumbra"), GetBoolColor(_penumbraExists));
+        AttachToolTip(L("UI.UISharedService.2d8b6db0", "Penumbra is ") + (_penumbraExists ? L("UI.UISharedService.9cd69517", "available and up to date.") : L("UI.UISharedService.50df3ed9", "unavailable or not up to date.")));
 
         ImGui.SameLine();
-        ColorText("Glamourer", GetBoolColor(_glamourerExists));
-        AttachToolTip($"Glamourer is " + (_glamourerExists ? "available and up to date." : "unavailable or not up to date."));
+        ColorText(L("UI.UISharedService.56519852", "Glamourer"), GetBoolColor(_glamourerExists));
+        AttachToolTip(L("UI.UISharedService.7115133c", "Glamourer is ") + (_glamourerExists ? L("UI.UISharedService.9cd69517", "available and up to date.") : L("UI.UISharedService.50df3ed9", "unavailable or not up to date.")));
 
-        ImGui.TextUnformatted("Optional Plugins:");
+        ImGui.TextUnformatted(L("UI.UISharedService.52f5707f", "Optional Plugins:"));
         ImGui.SameLine(150);
-        ColorText("SimpleHeels", GetBoolColor(_heelsExists));
-        AttachToolTip($"SimpleHeels is " + (_heelsExists ? "available and up to date." : "unavailable or not up to date."));
+        ColorText(L("UI.UISharedService.f9105374", "SimpleHeels"), GetBoolColor(_heelsExists));
+        AttachToolTip(L("UI.UISharedService.d34f1d6c", "SimpleHeels is ") + (_heelsExists ? L("UI.UISharedService.9cd69517", "available and up to date.") : L("UI.UISharedService.50df3ed9", "unavailable or not up to date.")));
 
         ImGui.SameLine();
-        ColorText("Customize+", GetBoolColor(_customizePlusExists));
-        AttachToolTip($"Customize+ is " + (_customizePlusExists ? "available and up to date." : "unavailable or not up to date."));
+        ColorText(L("UI.UISharedService.04d09974", "Customize+"), GetBoolColor(_customizePlusExists));
+        AttachToolTip(L("UI.UISharedService.34bdebff", "Customize+ is ") + (_customizePlusExists ? L("UI.UISharedService.9cd69517", "available and up to date.") : L("UI.UISharedService.50df3ed9", "unavailable or not up to date.")));
 
         ImGui.SameLine();
-        ColorText("Honorific", GetBoolColor(_honorificExists));
-        AttachToolTip($"Honorific is " + (_honorificExists ? "available and up to date." : "unavailable or not up to date."));
+        ColorText(L("UI.UISharedService.2ab5b71f", "Honorific"), GetBoolColor(_honorificExists));
+        AttachToolTip(L("UI.UISharedService.698dc824", "Honorific is ") + (_honorificExists ? L("UI.UISharedService.9cd69517", "available and up to date.") : L("UI.UISharedService.50df3ed9", "unavailable or not up to date.")));
 
         ImGui.SameLine();
-        ColorText("Moodles", GetBoolColor(_moodlesExists));
-        AttachToolTip($"Moodles is " + (_moodlesExists ? "available and up to date." : "unavailable or not up to date."));
+        ColorText(L("UI.UISharedService.3b39cf55", "Moodles"), GetBoolColor(_moodlesExists));
+        AttachToolTip(L("UI.UISharedService.4e9b8581", "Moodles is ") + (_moodlesExists ? L("UI.UISharedService.9cd69517", "available and up to date.") : L("UI.UISharedService.50df3ed9", "unavailable or not up to date.")));
 
         ImGui.SameLine();
-        ColorText("PetNicknames", GetBoolColor(_petNamesExists));
-        AttachToolTip($"PetNicknames is " + (_petNamesExists ? "available and up to date." : "unavailable or not up to date."));
+        ColorText(L("UI.UISharedService.1fd2d64f", "PetNicknames"), GetBoolColor(_petNamesExists));
+        AttachToolTip(L("UI.UISharedService.d388ba52", "PetNicknames is ") + (_petNamesExists ? L("UI.UISharedService.9cd69517", "available and up to date.") : L("UI.UISharedService.50df3ed9", "unavailable or not up to date.")));
 
         ImGui.SameLine();
-        ColorText("Brio", GetBoolColor(_brioExists));
-        AttachToolTip($"Brio is " + (_brioExists ? "available and up to date." : "unavailable or not up to date."));
+        ColorText(L("UI.UISharedService.6473040f", "Brio"), GetBoolColor(_brioExists));
+        AttachToolTip(L("UI.UISharedService.d3f2d22b", "Brio is ") + (_brioExists ? L("UI.UISharedService.9cd69517", "available and up to date.") : L("UI.UISharedService.50df3ed9", "unavailable or not up to date.")));
 
         if (!_penumbraExists || !_glamourerExists)
         {
-            ImGui.TextColored(ImGuiColors.DalamudRed, "You need to install both Penumbra and Glamourer and keep them up to date to use RavaSync.");
+            ImGui.TextColored(ImGuiColors.DalamudRed, L("UI.UISharedService.c325f773", "You need to install both Penumbra and Glamourer and keep them up to date to use RavaSync."));
             return false;
         }
 
@@ -982,7 +985,7 @@ public partial class UiSharedService : DisposableMediatorSubscriberBase
             if (string.Equals(_serverConfigurationManager.CurrentServer?.ServerName, comboEntries[i], StringComparison.OrdinalIgnoreCase))
                 comboEntries[i] += " [Current]";
         }
-        if (ImGui.BeginCombo("Select Service", comboEntries[_serverSelectionIndex]))
+        if (ImGui.BeginCombo(L("UI.UISharedService.a5f2b079", "Select Service"), comboEntries[_serverSelectionIndex]))
         {
             for (int i = 0; i < comboEntries.Length; i++)
             {
@@ -1017,13 +1020,13 @@ public partial class UiSharedService : DisposableMediatorSubscriberBase
             }
         }
 
-        if (ImGui.TreeNode("Add Custom Service"))
+        if (ImGui.TreeNode(L("UI.UISharedService.424a011c", "Add Custom Service")))
         {
             ImGui.SetNextItemWidth(250);
-            ImGui.InputText("Custom Service URI", ref _customServerUri, 255);
+            ImGui.InputText(L("UI.UISharedService.96953994", "Custom Service URI"), ref _customServerUri, 255);
             ImGui.SetNextItemWidth(250);
-            ImGui.InputText("Custom Service Name", ref _customServerName, 255);
-            if (IconTextButton(FontAwesomeIcon.Plus, "Add Custom Service")
+            ImGui.InputText(L("UI.UISharedService.d656c037", "Custom Service Name"), ref _customServerName, 255);
+            if (IconTextButton(FontAwesomeIcon.Plus, L("UI.UISharedService.decdc424", "Add Custom Service"))
                 && !string.IsNullOrEmpty(_customServerUri)
                 && !string.IsNullOrEmpty(_customServerName))
             {
@@ -1078,7 +1081,7 @@ public partial class UiSharedService : DisposableMediatorSubscriberBase
 
         if (_discordOAuthUIDs == null)
         {
-            AttachToolTip("Use the button above to update your UIDs from the service before you can assign UIDs to characters.");
+            AttachToolTip(L("UI.UISharedService.c1d6057f", "Use the button above to update your UIDs from the service before you can assign UIDs to characters."));
         }
     }
 
@@ -1086,14 +1089,14 @@ public partial class UiSharedService : DisposableMediatorSubscriberBase
     {
         using (ImRaii.Disabled(!CtrlPressed()))
         {
-            if (IconTextButton(FontAwesomeIcon.Trash, "Unlink OAuth2 Connection") && UiSharedService.CtrlPressed())
+            if (IconTextButton(FontAwesomeIcon.Trash, L("UI.UISharedService.003a8c79", "Unlink OAuth2 Connection")) && UiSharedService.CtrlPressed())
             {
                 selectedServer.OAuthToken = null;
                 _serverConfigurationManager.Save();
                 ResetOAuthTasksState();
             }
         }
-        DrawHelpText("Hold CTRL to unlink the current OAuth2 connection.");
+        DrawHelpText(L("UI.UISharedService.9bae9b62", "Hold CTRL to unlink the current OAuth2 connection."));
     }
 
     public void DrawUpdateOAuthUIDsButton(ServerStorage selectedServer)
@@ -1104,7 +1107,7 @@ public partial class UiSharedService : DisposableMediatorSubscriberBase
         using (ImRaii.Disabled(string.IsNullOrEmpty(selectedServer.OAuthToken)))
         {
             if ((_discordOAuthUIDs == null || _discordOAuthUIDs.IsCompleted)
-                && IconTextButton(FontAwesomeIcon.ArrowsSpin, "Update UIDs from Service")
+                && IconTextButton(FontAwesomeIcon.ArrowsSpin, L("UI.UISharedService.735f6a93", "Update UIDs from Service"))
                 && !string.IsNullOrEmpty(selectedServer.OAuthToken))
             {
                 _discordOAuthUIDs = _serverConfigurationManager.GetUIDsWithDiscordToken(selectedServer.ServerUri, selectedServer.OAuthToken);
@@ -1129,7 +1132,7 @@ public partial class UiSharedService : DisposableMediatorSubscriberBase
         }
         if (string.IsNullOrEmpty(selectedServer.OAuthToken) || tokenExpiry < DateTime.UtcNow)
         {
-            ColorTextWrapped("You have no OAuth token or the OAuth token is expired. Please use the Service Configuration to link your OAuth2 account or refresh the token.", ImGuiColors.DalamudRed);
+            ColorTextWrapped(L("UI.UISharedService.6764d997", "You have no OAuth token or the OAuth token is expired. Please use the Service Configuration to link your OAuth2 account or refresh the token."), ImGuiColors.DalamudRed);
         }
     }
 
@@ -1202,9 +1205,193 @@ public partial class UiSharedService : DisposableMediatorSubscriberBase
 
     public void LoadLocalization(string languageCode)
     {
-        _localization.SetupWithLangCode(languageCode);
-        Strings.ToS = new Strings.ToSStrings();
+        var code = (languageCode ?? "en").Trim();
+
+        if (string.IsNullOrWhiteSpace(code))
+            code = "en";
+        try
+        {
+            _localization.SetupWithFallbacks();
+
+            if (code.Equals("en", StringComparison.OrdinalIgnoreCase))
+            {
+                Strings.ToS = new Strings.ToSStrings();
+                return;
+            }
+
+            string? raw = null;
+
+            raw = TryReadEmbeddedLocalizationJson(code);
+
+            if (raw == null)
+            {
+                var asmDir = Path.GetDirectoryName(_pluginInterface.AssemblyLocation.FullName);
+                if (!string.IsNullOrEmpty(asmDir))
+                {
+                    var locDir = Path.Combine(asmDir, "Localization");
+                    var locPath = Path.Combine(locDir, $"{code}.json");
+                    if (File.Exists(locPath))
+                        raw = File.ReadAllText(locPath, Encoding.UTF8);
+                    else
+                        Logger.LogWarning("Localization file not found: {Path}. Falling back to English.", locPath);
+                }
+            }
+
+            if (raw == null)
+            {
+                Strings.ToS = new Strings.ToSStrings();
+                return;
+            }
+
+            var normalized = NormalizeToCheapLocSchema(raw);
+            SetupCheapLoc(normalized, typeof(UiSharedService).Assembly);
+            Strings.ToS = new Strings.ToSStrings();
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError(ex, "Failed to load localization '{Lang}'. Falling back to English.", code);
+            _localization.SetupWithFallbacks();
+            Strings.ToS = new Strings.ToSStrings();
+        }
     }
+
+    private string? TryReadEmbeddedLocalizationJson(string code)
+    {
+        try
+        {
+            var asm = typeof(UiSharedService).Assembly;
+            var names = asm.GetManifestResourceNames();
+
+            var wanted = names.FirstOrDefault(n =>
+                n.EndsWith($".Localization.{code}.json", StringComparison.OrdinalIgnoreCase) ||
+                n.EndsWith($".Localization.{code.ToLowerInvariant()}.json", StringComparison.OrdinalIgnoreCase));
+
+            if (wanted == null)
+            {
+                wanted = names.FirstOrDefault(n =>
+                    n.EndsWith($".{code}.json", StringComparison.OrdinalIgnoreCase));
+            }
+
+            if (wanted == null)
+            {
+                Logger.LogWarning("Embedded localization resource not found for '{Lang}'. Available: {Count}", code, names.Length);
+                return null;
+            }
+
+            using var stream = asm.GetManifestResourceStream(wanted);
+            if (stream == null) return null;
+
+            using var reader = new StreamReader(stream, Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
+            return reader.ReadToEnd();
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError(ex, "Failed to read embedded localization for '{Lang}'", code);
+            return null;
+        }
+    }
+
+    private static string NormalizeToCheapLocSchema(string rawJson)
+    {
+        var token = JToken.Parse(rawJson);
+
+        if (token is not JObject obj)
+            return rawJson;
+
+        var outObj = new JObject();
+
+        foreach (var prop in obj.Properties())
+        {
+            var v = prop.Value;
+
+            if (v.Type == JTokenType.String)
+            {
+                outObj[prop.Name] = new JObject
+                {
+                    ["message"] = v.Value<string>() ?? string.Empty,
+                    ["description"] = prop.Name,
+                };
+                continue;
+            }
+
+            if (v is JObject o)
+            {
+                var msg = o["message"]?.Value<string>()
+                          ?? o["Message"]?.Value<string>()
+                          ?? o["text"]?.Value<string>()
+                          ?? o["Text"]?.Value<string>();
+
+                outObj[prop.Name] = new JObject
+                {
+                    ["message"] = msg ?? string.Empty,
+                    ["description"] = o["description"]?.Value<string>() ?? o["Description"]?.Value<string>() ?? prop.Name,
+                };
+                continue;
+            }
+
+            outObj[prop.Name] = new JObject
+            {
+                ["message"] = v.ToString(Formatting.None),
+                ["description"] = prop.Name,
+            };
+        }
+
+        return outObj.ToString(Formatting.None);
+    }
+
+    private static void SetupCheapLoc(string normalizedJson, Assembly callingAssembly)
+    {
+        // CheapLoc is shipped with Dalamud; we call it via reflection so we don't need a direct dependency.
+        var cheapLocAsm = AppDomain.CurrentDomain
+            .GetAssemblies()
+            .FirstOrDefault(a => string.Equals(a.GetName().Name, "CheapLoc", StringComparison.OrdinalIgnoreCase));
+
+        if (cheapLocAsm == null)
+            throw new InvalidOperationException("CheapLoc assembly not found in AppDomain.");
+
+        var locType = cheapLocAsm.GetType("CheapLoc.Loc", throwOnError: true);
+        var setup = locType.GetMethod("Setup", new[] { typeof(string), typeof(Assembly) });
+
+        if (setup == null)
+            throw new MissingMethodException("CheapLoc.Loc.Setup(string, Assembly) not found.");
+
+        setup.Invoke(null, new object[] { normalizedJson, callingAssembly });
+    }
+
+    public string L(string key, string fallback)
+    {
+        if (string.IsNullOrWhiteSpace(key)) return fallback ?? string.Empty;
+
+        try
+        {
+            return CheapLoc.Loc.Localize(key, fallback ?? string.Empty);
+        }
+        catch
+        {
+            return fallback ?? string.Empty;
+        }
+    }
+
+    public string L(string key) => L(key, key);
+
+
+    /// <summary>
+    /// Localize then format (string.Format) with provided args. If formatting fails, returns the localized text unformatted.
+    /// </summary>
+    public string LF(string key, string fallback, params object[] args)
+    {
+        var s = L(key, fallback);
+        if (args == null || args.Length == 0) return s;
+        try
+        {
+            return string.Format(s, args);
+        }
+        catch
+        {
+            return s;
+        }
+    }
+
 
     internal static void DistanceSeparator()
     {

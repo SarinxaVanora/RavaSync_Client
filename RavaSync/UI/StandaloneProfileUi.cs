@@ -126,28 +126,28 @@ public class StandaloneProfileUi : WindowMediatorSubscriberBase
             }
             if (Pair.UserPair != null)
             {
-                ImGui.TextUnformatted("Directly paired");
+                ImGui.TextUnformatted(_uiSharedService.L("UI.PopoutProfileUi.4516126f", "Directly paired"));
                 if (Pair.UserPair.OwnPermissions.IsPaused())
                 {
                     ImGui.SameLine();
-                    UiSharedService.ColorText("You: paused", ImGuiColors.DalamudYellow);
+                    UiSharedService.ColorText(_uiSharedService.L("UI.PopoutProfileUi.19f99f7e", "You: paused"), ImGuiColors.DalamudYellow);
                 }
                 if (Pair.UserPair.OtherPermissions.IsPaused())
                 {
                     ImGui.SameLine();
-                    UiSharedService.ColorText("They: paused", ImGuiColors.DalamudYellow);
+                    UiSharedService.ColorText(_uiSharedService.L("UI.PopoutProfileUi.ed66e350", "They: paused"), ImGuiColors.DalamudYellow);
                 }
             }
 
             if (Pair.UserPair.Groups.Any())
             {
-                ImGui.TextUnformatted("Paired through Syncshells:");
+                ImGui.TextUnformatted(_uiSharedService.L("UI.PopoutProfileUi.f73db05d", "Paired through Syncshells:"));
                 foreach (var group in Pair.UserPair.Groups)
                 {
                     var groupNote = _serverManager.GetNoteForGid(group);
                     var groupName = _pairManager.GroupPairs.First(f => string.Equals(f.Key.GID, group, StringComparison.Ordinal)).Key.GroupAliasOrGID;
                     var groupString = string.IsNullOrEmpty(groupNote) ? groupName : $"{groupNote} ({groupName})";
-                    ImGui.TextUnformatted("- " + groupString);
+                    ImGui.TextUnformatted(_uiSharedService.L("UI.StandaloneProfileUi.ea82fc8d", "- ") + groupString);
                 }
             }
 

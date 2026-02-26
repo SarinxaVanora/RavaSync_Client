@@ -2,6 +2,7 @@
 using Dalamud.Interface.Utility;
 using RavaSync.PlayerData.Pairs;
 using RavaSync.UI.Handlers;
+using RavaSync.UI;
 
 using System.Numerics;
 
@@ -11,16 +12,18 @@ public class SelectPairForTagUi
 {
     private readonly TagHandler _tagHandler;
     private readonly IdDisplayHandler _uidDisplayHandler;
+    private readonly UiSharedService _uiShared;
     private string _filter = string.Empty;
     private bool _opened = false;
     private HashSet<string> _peopleInGroup = new(StringComparer.Ordinal);
     private bool _show = false;
     private string _tag = string.Empty;
 
-    public SelectPairForTagUi(TagHandler tagHandler, IdDisplayHandler uidDisplayHandler)
+    public SelectPairForTagUi(TagHandler tagHandler, IdDisplayHandler uidDisplayHandler, UiSharedService uiShared)
     {
         _tagHandler = tagHandler;
-        _uidDisplayHandler = uidDisplayHandler;
+                _uiShared = uiShared;
+_uidDisplayHandler = uidDisplayHandler;
     }
 
     public void Draw(List<Pair> pairs)
@@ -29,7 +32,7 @@ public class SelectPairForTagUi
         var minSize = new Vector2(300, workHeight < 400 ? workHeight : 400) * ImGuiHelpers.GlobalScale;
         var maxSize = new Vector2(300, 1000) * ImGuiHelpers.GlobalScale;
 
-        var popupName = $"Choose Users for Group {_tag}";
+        var popupName = string.Format(_uiShared.L("UI.SelectPairForTagUi.44996f2c", "Choose Users for Group {0}"), _tag);
 
         if (!_show)
         {
@@ -47,9 +50,9 @@ public class SelectPairForTagUi
         ImGui.SetNextWindowSizeConstraints(minSize, maxSize);
         if (ImGui.BeginPopupModal(popupName, ref _show, ImGuiWindowFlags.Popup | ImGuiWindowFlags.Modal))
         {
-            ImGui.TextUnformatted($"Select users for group {_tag}");
+            ImGui.TextUnformatted(string.Format(_uiShared.L("UI.SelectPairForTagUi.ce2a7607", "Select users for group {0}"), _tag));
 
-            ImGui.InputTextWithHint("##filter", "Filter", ref _filter, 255, ImGuiInputTextFlags.None);
+            ImGui.InputTextWithHint("##filter", _uiShared.L("UI.SelectPairForTagUi.748dba95", "Filter"), ref _filter, 255, ImGuiInputTextFlags.None);
             foreach (var item in pairs
                 .Where(p => string.IsNullOrEmpty(_filter) || PairName(p).Contains(_filter, StringComparison.OrdinalIgnoreCase))
                 .OrderBy(p => PairName(p), StringComparer.OrdinalIgnoreCase)

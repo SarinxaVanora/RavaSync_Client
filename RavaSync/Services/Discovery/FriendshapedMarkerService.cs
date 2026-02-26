@@ -2,16 +2,16 @@
 using Dalamud.Game.Gui.NamePlate;
 using Dalamud.Game.Text.SeStringHandling;
 using Dalamud.Plugin.Services;
+using Microsoft.Extensions.Logging;
 using RavaSync.MareConfiguration;
 using RavaSync.PlayerData.Pairs;
+using RavaSync.Services.Discovery;
 using RavaSync.Services.Mediator;
 using RavaSync.WebAPI;
 using RavaSync.WebAPI.SignalR.Utils;
-using Microsoft.Extensions.Logging;
 using System;
 using System.Collections.Concurrent;
-using RavaSync.Services.Discovery;
-
+using System.Collections.Generic;
 
 namespace RavaSync.Services;
 
@@ -24,14 +24,28 @@ public class FriendshapedMarkerService : DisposableMediatorSubscriberBase
     private readonly PairManager _pairManager;
     private readonly RavaDiscoveryService _discovery;
 
-    private sealed class OnlineCacheEntry
+    private readonly ConcurrentDictionary<nint, MarkerCacheEntry> _markerCache = new();
+
+    private static readonly TimeSpan MarkerCacheTtl = TimeSpan.FromSeconds(2);
+    private static readonly TimeSpan MarkerCacheCleanupInterval = TimeSpan.FromSeconds(2);
+    private static readonly TimeSpan MarkerCacheStaleTtl = TimeSpan.FromSeconds(10);
+    private DateTime _lastMarkerCacheCleanupUtc = DateTime.MinValue;
+
+    private sealed class MarkerCacheEntry
     {
-        public bool IsOnline { get; init; }
+        public bool ShouldMark { get; init; }
         public DateTime LastCheckedUtc { get; init; }
     }
 
-    public FriendshapedMarkerService(ILogger<FriendshapedMarkerService> logger,MareMediator mediator,INamePlateGui namePlateGui,DalamudUtilService dalamudUtil,
-        MareConfigService config,ApiController api,PairManager pairManager,RavaDiscoveryService discovery) : base(logger, mediator)
+    public FriendshapedMarkerService(
+        ILogger<FriendshapedMarkerService> logger,
+        MareMediator mediator,
+        INamePlateGui namePlateGui,
+        DalamudUtilService dalamudUtil,
+        MareConfigService config,
+        ApiController api,
+        PairManager pairManager,
+        RavaDiscoveryService discovery) : base(logger, mediator)
     {
         _namePlateGui = namePlateGui;
         _dalamudUtil = dalamudUtil;
@@ -42,7 +56,6 @@ public class FriendshapedMarkerService : DisposableMediatorSubscriberBase
 
         _namePlateGui.OnNamePlateUpdate += OnNamePlateUpdate;
         _namePlateGui.RequestRedraw();
-
     }
 
     protected override void Dispose(bool disposing)
@@ -50,60 +63,94 @@ public class FriendshapedMarkerService : DisposableMediatorSubscriberBase
         base.Dispose(disposing);
 
         _namePlateGui.OnNamePlateUpdate -= OnNamePlateUpdate;
+        _markerCache.Clear();
     }
 
-    private void OnNamePlateUpdate(INamePlateUpdateContext context,IReadOnlyList<INamePlateUpdateHandler> handlers)
+    private void OnNamePlateUpdate(INamePlateUpdateContext context, IReadOnlyList<INamePlateUpdateHandler> handlers)
     {
         try
         {
-            // cheap bails up front
-            if (!_config.Current.EnableRavaDiscoveryPresence) return;
-            if (!_config.Current.EnableRightClickMenus) return;
-            if (!_config.Current.ShowFriendshapedHeart) return;
+            // Cheap bails first
+            var cfg = _config.Current;
+            if (!cfg.EnableRavaDiscoveryPresence) return;
+            if (!cfg.EnableRightClickMenus) return;
+            if (!cfg.ShowFriendshapedHeart) return;
             if (_api.ServerState != ServerState.Connected) return;
 
+            var nowUtc = DateTime.UtcNow;
             var selfPtr = _dalamudUtil.GetPlayerPtr();
 
             foreach (var handler in handlers)
             {
-                var player = handler.PlayerCharacter as IPlayerCharacter;
-                if (player == null)
+                if (handler.PlayerCharacter is not IPlayerCharacter player)
                     continue;
 
-                // don't tag ourselves
-                if (selfPtr != IntPtr.Zero && selfPtr == player.Address)
+                var addr = player.Address;
+                if (addr == nint.Zero)
                     continue;
 
-                string? ident;
-                try
+                // Don’t tag ourselves
+                if (selfPtr != IntPtr.Zero && selfPtr == addr)
+                    continue;
+
+                // Cache marker eligibility for a short TTL
+                if (!_markerCache.TryGetValue(addr, out var cached) || (nowUtc - cached.LastCheckedUtc) > MarkerCacheTtl)
                 {
-                    ident = _dalamudUtil.GetIdentFromGameObject(player);
+                    string? ident = null;
+                    try
+                    {
+                        ident = _dalamudUtil.GetIdentFromGameObject(player);
+                    }
+                    catch
+                    {
+                        // Ignore per-player failures in the hot path
+                    }
+
+                    bool shouldMark = false;
+                    if (!string.IsNullOrEmpty(ident))
+                    {
+                        // Don’t mark directly paired users
+                        if (!_pairManager.IsIdentDirectlyPaired(ident))
+                        {
+                            // In-memory discovery check only
+                            shouldMark = _discovery.IsIdentKnownAsRavaUser(ident);
+                        }
+                    }
+
+                    cached = new MarkerCacheEntry
+                    {
+                        ShouldMark = shouldMark,
+                        LastCheckedUtc = nowUtc
+                    };
+
+                    _markerCache[addr] = cached;
                 }
-                catch (Exception ex)
-                {
-                    continue;
-                }
 
-                if (string.IsNullOrEmpty(ident))
+                if (!cached.ShouldMark)
                     continue;
 
-                // already directly paired? no friendshaped marker
-                if (_pairManager.IsIdentDirectlyPaired(ident))
-                    continue;
-
-                // purely in-memory check – no network here
-                if (!_discovery.IsIdentKnownAsRavaUser(ident))
-                    continue;
-
-                // already has a heart? don't touch it
+                // Avoid adding duplicate hearts
                 var currentName = handler.Name;
-                if (currentName.TextValue.Contains("♥"))
+                var textValue = currentName.TextValue;
+                if (!string.IsNullOrEmpty(textValue) && textValue.Contains("♥", StringComparison.Ordinal))
                     continue;
 
                 var builder = new SeStringBuilder();
                 builder.Append(currentName);
                 builder.AddText(" ♥");
                 handler.Name = builder.Build();
+            }
+
+            // Very light timed cleanup to stop cache growing forever
+            if ((nowUtc - _lastMarkerCacheCleanupUtc) > MarkerCacheCleanupInterval && _markerCache.Count > 256)
+            {
+                _lastMarkerCacheCleanupUtc = nowUtc;
+
+                foreach (var kvp in _markerCache)
+                {
+                    if ((nowUtc - kvp.Value.LastCheckedUtc) > MarkerCacheStaleTtl)
+                        _markerCache.TryRemove(kvp.Key, out _);
+                }
             }
         }
         catch (Exception ex)

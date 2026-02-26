@@ -503,32 +503,6 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
         if (!hasMappedKind && !IsTransientRecording)
             return;
 
-
-        // -------------------- AUTO RECORD TRIGGER --------------------
-        if (!IsTransientRecording
-            && hasMappedKind
-            && objectKind == ObjectKind.Player
-            && !_inCombatOrPerformingSnapshot
-            && ShouldAutoRecordVfxOnly(replacedGamePath))
-        {
-            GameObjectHandler? ownerForTrigger = null;
-            foreach (var ptr in _playerRelatedPointers)
-            {
-                if (ptr.Address == gameObjectAddress)
-                {
-                    ownerForTrigger = ptr;
-                    break;
-                }
-            }
-
-            if (ownerForTrigger != null)
-            {
-                var key = IsEmoteKeyPath(replacedGamePath) ? replacedGamePath : null;
-                var prefix = GetFilePrefix(filePath);
-                QueueAutoRecordTrigger(key, replacedGamePath, ownerForTrigger.Address, prefix, collection);
-            }
-        }
-
         if (IsTransientRecording)
         {
             if (!ShouldAutoRecordVfxOnly(replacedGamePath))
@@ -594,6 +568,32 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
         bool transientContains = transientResources.Contains(replacedGamePath);
 
         bool semiTransientContains = _semiTransientAll.Contains(replacedGamePath);
+
+        if (!IsTransientRecording
+            && hasMappedKind
+            && objectKind == ObjectKind.Player
+            && !_inCombatOrPerformingSnapshot
+            && ShouldAutoRecordVfxOnly(replacedGamePath)
+            && !transientContains
+            && !semiTransientContains)
+        {
+            GameObjectHandler? ownerForTrigger = null;
+            foreach (var ptr in _playerRelatedPointers)
+            {
+                if (ptr.Address == gameObjectAddress)
+                {
+                    ownerForTrigger = ptr;
+                    break;
+                }
+            }
+
+            if (ownerForTrigger != null)
+            {
+                var key = IsEmoteKeyPath(replacedGamePath) ? replacedGamePath : null;
+                var prefix = GetFilePrefix(filePath);
+                QueueAutoRecordTrigger(key, replacedGamePath, ownerForTrigger.Address, prefix, collection);
+            }
+        }
 
         if (transientContains || semiTransientContains)
         {

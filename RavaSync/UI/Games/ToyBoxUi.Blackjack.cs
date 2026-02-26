@@ -22,13 +22,13 @@ private void DrawBlackjack()
     {
         if (_activeGameId == Guid.Empty)
         {
-            ImGui.TextColored(ImGuiColors.DalamudGrey, "No active blackjack session selected.");
+            ImGui.TextColored(ImGuiColors.DalamudGrey, _uiSharedService.L("UI.ToyBoxUi.Blackjack.304ad345", "No active blackjack session selected."));
             return;
         }
 
         if (!_games.TryGetClientBlackjack(_activeGameId, out var view))
         {
-            ImGui.TextColored(ImGuiColors.DalamudGrey, "Waiting for state…");
+            ImGui.TextColored(ImGuiColors.DalamudGrey, _uiSharedService.L("UI.ToyBoxUi.Blackjack.31e6b175", "Waiting for state…"));
             return;
         }
 
@@ -37,7 +37,7 @@ private void DrawBlackjack()
 
         if (pub is null && priv is null)
         {
-            ImGui.TextColored(ImGuiColors.DalamudGrey, "Waiting for host…");
+            ImGui.TextColored(ImGuiColors.DalamudGrey, _uiSharedService.L("UI.ToyBoxUi.Blackjack.9d36327a", "Waiting for host…"));
             return;
         }
 
@@ -45,7 +45,7 @@ private void DrawBlackjack()
 
         using (ImRaii.PushStyle(ImGuiStyleVar.ItemSpacing, ImGui.GetStyle().ItemSpacing with { X = 10f * ImGuiHelpers.GlobalScale }))
         {
-            ImGui.TextUnformatted("Blackjack");
+            ImGui.TextUnformatted(_uiSharedService.L("UI.ToyBoxUiBlackjack.3f468208", "Blackjack"));
             ImGui.SameLine();
 
             DrawPill("Stage: " + stage, stage == BjStage.Playing ? ImGuiColors.ParsedOrange : ImGuiColors.DalamudGrey);
@@ -70,8 +70,8 @@ private void DrawBlackjack()
         using var bjLayoutTable = ImRaii.Table("bj_layout", 2, ImGuiTableFlags.SizingStretchProp);
         if (bjLayoutTable)
         {
-            ImGui.TableSetupColumn("Left", ImGuiTableColumnFlags.WidthStretch, 0.62f);
-            ImGui.TableSetupColumn("Right", ImGuiTableColumnFlags.WidthStretch, 0.38f);
+            ImGui.TableSetupColumn(_uiSharedService.L("UI.ToyBoxUiBlackjack.8ae1c34b", "Left"), ImGuiTableColumnFlags.WidthStretch, 0.62f);
+            ImGui.TableSetupColumn(_uiSharedService.L("UI.ToyBoxUiBlackjack.954daa8b", "Right"), ImGuiTableColumnFlags.WidthStretch, 0.38f);
 
             ImGui.TableNextRow();
 
@@ -87,7 +87,7 @@ private void DrawBlackjack()
                     DrawCardRow(pub.DealerCardsReveal.ToArray(), showAsHidden: false);
 
                     if (pub.Stage == BjStage.Results)
-                        ImGui.TextColored(ImGuiColors.DalamudGrey, "Total: " + pub.DealerTotalReveal);
+                        ImGui.TextColored(ImGuiColors.DalamudGrey, _uiSharedService.L("UI.ToyBoxUi.Blackjack.445185d3", "Total: ") + pub.DealerTotalReveal);
                 }
                 else
                 {
@@ -99,12 +99,12 @@ private void DrawBlackjack()
 
                 if (pub != null)
                 {
-                    if (ImGui.BeginTable("bj_table_players", 4, ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerV | ImGuiTableFlags.SizingStretchProp))
+                    if (ImGui.BeginTable(_uiSharedService.L("UI.ToyBoxUiBlackjack.c65e525f", "bj_table_players"), 4, ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerV | ImGuiTableFlags.SizingStretchProp))
                     {
-                        ImGui.TableSetupColumn("Player", ImGuiTableColumnFlags.WidthStretch);
-                        ImGui.TableSetupColumn("Bet", ImGuiTableColumnFlags.WidthFixed, 80 * ImGuiHelpers.GlobalScale);
-                        ImGui.TableSetupColumn("State", ImGuiTableColumnFlags.WidthFixed, 90 * ImGuiHelpers.GlobalScale);
-                        ImGui.TableSetupColumn("Ready", ImGuiTableColumnFlags.WidthFixed, 70 * ImGuiHelpers.GlobalScale);
+                        ImGui.TableSetupColumn(_uiSharedService.L("UI.ToyBoxUiBlackjack.e53407cf", "Player"), ImGuiTableColumnFlags.WidthStretch);
+                        ImGui.TableSetupColumn(_uiSharedService.L("UI.ToyBoxUiBlackjack.40880286", "Bet"), ImGuiTableColumnFlags.WidthFixed, 80 * ImGuiHelpers.GlobalScale);
+                        ImGui.TableSetupColumn(_uiSharedService.L("UI.ToyBoxUiBlackjack.a7250206", "State"), ImGuiTableColumnFlags.WidthFixed, 90 * ImGuiHelpers.GlobalScale);
+                        ImGui.TableSetupColumn(_uiSharedService.L("UI.ToyBoxUiBlackjack.20c7c552", "Ready"), ImGuiTableColumnFlags.WidthFixed, 70 * ImGuiHelpers.GlobalScale);
                         ImGui.TableHeadersRow();
 
                         foreach (var p in pub.Players)
@@ -127,8 +127,8 @@ private void DrawBlackjack()
                             else ImGui.TextColored(ImGuiColors.DalamudGrey, state);
 
                             ImGui.TableNextColumn();
-                            if (p.BetConfirmed) ImGui.TextColored(ImGuiColors.ParsedGreen, "Yes");
-                            else ImGui.TextColored(ImGuiColors.DalamudGrey, "No");
+                            if (p.BetConfirmed) ImGui.TextColored(ImGuiColors.ParsedGreen, _uiSharedService.L("UI.ToyBoxUi.Blackjack.acbdb129", "Yes"));
+                            else ImGui.TextColored(ImGuiColors.DalamudGrey, _uiSharedService.L("UI.ToyBoxUi.Blackjack.8fba29b9", "No"));
                         }
 
                         ImGui.EndTable();
@@ -136,7 +136,7 @@ private void DrawBlackjack()
                 }
                 else
                 {
-                    ImGui.TextColored(ImGuiColors.DalamudGrey, "No table state yet.");
+                    ImGui.TextColored(ImGuiColors.DalamudGrey, _uiSharedService.L("UI.ToyBoxUi.Blackjack.44fc9136", "No table state yet."));
                 }
 
                 if (pub != null && pub.Stage == BjStage.Results && pub.Results != null)
@@ -144,12 +144,12 @@ private void DrawBlackjack()
                     ImGuiHelpers.ScaledDummy(10);
                     DrawSectionHeader("Results");
 
-                    if (ImGui.BeginTable("bj_results", 4, ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerV | ImGuiTableFlags.SizingStretchProp))
+                    if (ImGui.BeginTable(_uiSharedService.L("UI.ToyBoxUiBlackjack.bcb389bc", "bj_results"), 4, ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerV | ImGuiTableFlags.SizingStretchProp))
                     {
-                        ImGui.TableSetupColumn("Player", ImGuiTableColumnFlags.WidthStretch);
-                        ImGui.TableSetupColumn("Outcome", ImGuiTableColumnFlags.WidthFixed, 90 * ImGuiHelpers.GlobalScale);
-                        ImGui.TableSetupColumn("Bet", ImGuiTableColumnFlags.WidthFixed, 80 * ImGuiHelpers.GlobalScale);
-                        ImGui.TableSetupColumn("Payout", ImGuiTableColumnFlags.WidthFixed, 90 * ImGuiHelpers.GlobalScale);
+                        ImGui.TableSetupColumn(_uiSharedService.L("UI.ToyBoxUiBlackjack.e53407cf", "Player"), ImGuiTableColumnFlags.WidthStretch);
+                        ImGui.TableSetupColumn(_uiSharedService.L("UI.ToyBoxUiBlackjack.d3f06106", "Outcome"), ImGuiTableColumnFlags.WidthFixed, 90 * ImGuiHelpers.GlobalScale);
+                        ImGui.TableSetupColumn(_uiSharedService.L("UI.ToyBoxUiBlackjack.40880286", "Bet"), ImGuiTableColumnFlags.WidthFixed, 80 * ImGuiHelpers.GlobalScale);
+                        ImGui.TableSetupColumn(_uiSharedService.L("UI.ToyBoxUiBlackjack.9bb39694", "Payout"), ImGuiTableColumnFlags.WidthFixed, 90 * ImGuiHelpers.GlobalScale);
                         ImGui.TableHeadersRow();
 
                         foreach (var r in pub.Results)
@@ -186,7 +186,7 @@ private void DrawBlackjack()
                 {
                     DrawSectionHeader("Host");
 
-                    ImGui.TextColored(ImGuiColors.DalamudGrey, "Dealer controls");
+                    ImGui.TextColored(ImGuiColors.DalamudGrey, _uiSharedService.L("UI.ToyBoxUi.Blackjack.1a7327d6", "Dealer controls"));
                     ImGuiHelpers.ScaledDummy(8);
 
                     bool canStartBetting = stage == BjStage.Lobby || stage == BjStage.Results;
@@ -203,7 +203,7 @@ private void DrawBlackjack()
                     {
                         using (ImRaii.Disabled(!canStartBetting))
                         {
-                            if (_uiSharedService.IconTextButton(FontAwesomeIcon.Coins, "Start Betting", -1, true))
+                            if (_uiSharedService.IconTextButton(FontAwesomeIcon.Coins, _uiSharedService.L("UI.ToyBoxUi.Blackjack.ed509afe", "Start Betting"), -1, true))
                                 _games.HostBlackjackStartBetting(_activeGameId);
                         }
 
@@ -219,9 +219,9 @@ private void DrawBlackjack()
                                     .ToArray();
 
                                 if (waiting.Length > 0)
-                                    ImGui.TextColored(ImGuiColors.DalamudGrey, "Waiting on: " + string.Join(", ", waiting));
+                                    ImGui.TextColored(ImGuiColors.DalamudGrey, _uiSharedService.L("UI.ToyBoxUi.Blackjack.cc277797", "Waiting on: ") + string.Join(", ", waiting));
                             }
-                            if (_uiSharedService.IconTextButton(FontAwesomeIcon.PlayCircle, "Deal & Play", -1, true))
+                            if (_uiSharedService.IconTextButton(FontAwesomeIcon.PlayCircle, _uiSharedService.L("UI.ToyBoxUi.Blackjack.1a36d28a", "Deal & Play"), -1, true))
                                 _games.HostBlackjackDealAndPlay(_activeGameId);
                         }
 
@@ -233,7 +233,7 @@ private void DrawBlackjack()
 
                         using (ImRaii.Disabled(!dealerTurn))
                         {
-                            if (_uiSharedService.IconTextButton(FontAwesomeIcon.Magic, "Draw dealer card", -1, true))
+                            if (_uiSharedService.IconTextButton(FontAwesomeIcon.Magic, _uiSharedService.L("UI.ToyBoxUi.Blackjack.b7f0120b", "Draw dealer card"), -1, true))
                                 _games.HostBlackjackDealerDraw(_activeGameId);
                         }
 
@@ -241,7 +241,7 @@ private void DrawBlackjack()
 
                         using (ImRaii.Disabled(!canNextRound))
                         {
-                            if (_uiSharedService.IconTextButton(FontAwesomeIcon.StepForward, "Next Round", -1, true))
+                            if (_uiSharedService.IconTextButton(FontAwesomeIcon.StepForward, _uiSharedService.L("UI.ToyBoxUi.Blackjack.b8cb97f5", "Next Round"), -1, true))
                                 _games.HostBlackjackNextRound(_activeGameId);
                         }
                     }
@@ -261,13 +261,13 @@ private void DrawBlackjack()
                     DrawCardRow(priv.YourCards.ToArray(), showAsHidden: false);
 
                     if (priv.YourBust)
-                        ImGui.TextColored(ImGuiColors.DalamudRed, "BUST (" + priv.YourTotal + ")");
+                        ImGui.TextColored(ImGuiColors.DalamudRed, _uiSharedService.L("UI.ToyBoxUi.Blackjack.f4152ff0", "BUST (") + priv.YourTotal + ")");
                     else
-                        ImGui.TextColored(ImGuiColors.DalamudGrey, "Total: " + priv.YourTotal + (priv.IsYourTurn ? "  |  Your turn" : ""));
+                        ImGui.TextColored(ImGuiColors.DalamudGrey, _uiSharedService.L("UI.ToyBoxUi.Blackjack.445185d3", "Total: ") + priv.YourTotal + (priv.IsYourTurn ? _uiSharedService.L("UI.ToyBoxUi.Blackjack.234979c8", "  |  Your turn") : ""));
                 }
                 else
                 {
-                    ImGui.TextColored(ImGuiColors.DalamudGrey, "No cards yet.");
+                    ImGui.TextColored(ImGuiColors.DalamudGrey, _uiSharedService.L("UI.ToyBoxUi.Blackjack.93ab21bd", "No cards yet."));
                 }
 
                 ImGuiHelpers.ScaledDummy(10);
@@ -291,7 +291,7 @@ private void DrawBlackjack()
 
                     using (ImRaii.PushStyle(ImGuiStyleVar.ItemSpacing, ImGui.GetStyle().ItemSpacing with { X = 10f * ImGuiHelpers.GlobalScale }))
                     {
-                        if (_uiSharedService.IconTextButton(FontAwesomeIcon.Check, "Confirm bet and play", -1, true))
+                        if (_uiSharedService.IconTextButton(FontAwesomeIcon.Check, _uiSharedService.L("UI.ToyBoxUi.Blackjack.1e7acc43", "Confirm bet and play"), -1, true))
                             _games.BlackjackConfirmBet(_activeGameId, Math.Max(0, _betAmount));
                     }
 
@@ -306,25 +306,25 @@ private void DrawBlackjack()
                     {
                         using (ImRaii.PushStyle(ImGuiStyleVar.ItemSpacing, ImGui.GetStyle().ItemSpacing with { X = 10f * ImGuiHelpers.GlobalScale }))
                         {
-                            if (_uiSharedService.IconTextButton(FontAwesomeIcon.Plus, "Hit", -1, true))
+                            if (_uiSharedService.IconTextButton(FontAwesomeIcon.Plus, _uiSharedService.L("UI.ToyBoxUi.Blackjack.b139714b", "Hit"), -1, true))
                                 _games.BlackjackAction(_activeGameId, BjActionKind.Hit);
 
                             ImGuiHelpers.ScaledDummy(6);
 
-                            if (_uiSharedService.IconTextButton(FontAwesomeIcon.HandPaper, "Stick", -1, true))
+                            if (_uiSharedService.IconTextButton(FontAwesomeIcon.HandPaper, _uiSharedService.L("UI.ToyBoxUi.Blackjack.b0247e6a", "Stick"), -1, true))
                                 _games.BlackjackAction(_activeGameId, BjActionKind.Stick);
                         }
                     }
                     else
                     {
-                        ImGui.TextColored(ImGuiColors.DalamudGrey, "Waiting for your turn…");
+                        ImGui.TextColored(ImGuiColors.DalamudGrey, _uiSharedService.L("UI.ToyBoxUi.Blackjack.bda02835", "Waiting for your turn…"));
                     }
                 }
 
                 if (stage == BjStage.Results)
                 {
                     DrawSectionHeader("Status");
-                    ImGui.TextColored(ImGuiColors.DalamudGrey, "Round complete. Host will start the next one.");
+                    ImGui.TextColored(ImGuiColors.DalamudGrey, _uiSharedService.L("UI.ToyBoxUi.Blackjack.d99b875f", "Round complete. Host will start the next one."));
                 }
             }
         }

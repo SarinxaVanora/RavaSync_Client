@@ -10,6 +10,7 @@ namespace RavaSync.MareConfiguration.Configurations;
 public class MareConfig : IMareConfiguration
 {
     public bool AcceptedAgreement { get; set; } = false;
+    public string LanguageCode { get; set; } = "en";
     public string CacheFolder { get; set; } = string.Empty;
     public bool DisableOptionalPluginWarnings { get; set; } = false;
     public bool EnableDtrEntry { get; set; } = false;
@@ -62,7 +63,7 @@ public class MareConfig : IMareConfiguration
     public bool UseCompactor { get; set; } = false;
     public bool DebugStopWhining { get; set; } = false;
     public bool AutoPopulateEmptyNotesFromCharaName { get; set; } = false;
-    public int Version { get; set; } = 2;
+    public int Version { get; set; } = 3;
     public NotificationLocation WarningNotification { get; set; } = NotificationLocation.Both;
     public bool UseFocusTarget { get; set; } = false;
     public bool SortPairsByVRAM { get; set; } = false;
@@ -91,6 +92,5 @@ public class MareConfig : IMareConfiguration
     public float GlobalTransferOverlayY { get; set; } = -1f;
     public float GlobalTransferOverlayScale { get; set; } = 1.0f;
     public bool GlobalTransferOverlayRowLayout { get; set; } = false;
-
-
+    public bool showTransferText { get; set; } = false;
 }

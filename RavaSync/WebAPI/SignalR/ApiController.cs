@@ -341,31 +341,47 @@ public sealed partial class ApiController : DisposableMediatorSubscriberBase, IM
     {
         CancellationTokenSource cts = new();
         cts.CancelAfter(TimeSpan.FromSeconds(5));
+
         _ = Task.Run(async () =>
         {
-            var pair = _pairManager.GetOnlineUserPairs().Single(p => p.UserPair != null && p.UserData == userData);
-            var perm = pair.UserPair!.OwnPermissions;
-            perm.SetPaused(paused: true);
-            await UserSetPairPermissions(new UserPermissionsDto(userData, perm)).ConfigureAwait(false);
-            //// wait until it's changed
-            while (pair.UserPair!.OwnPermissions != perm)
+            var pair = _pairManager.PairsWithGroups.Keys
+                .FirstOrDefault(p => string.Equals(p.UserData.UID, userData.UID, StringComparison.Ordinal));
+
+            if (pair == null)
             {
-                await Task.Delay(1000, cts.Token).ConfigureAwait(false);
-                Logger.LogTrace("Waiting for permissions change for {data}", userData);
+                Logger.LogInformation("{AliasorUID} — Not Found or offline, cycle pause failed", userData.AliasOrUID);
+                return;
             }
+
+            var perm = pair.UserPair!.OwnPermissions;
+
+            perm.SetPaused(paused: true);
+            await UserSetPairPermissions(new UserPermissionsDto(pair.UserData, perm)).ConfigureAwait(false);
+
+            await Task.Delay(150, cts.Token).ConfigureAwait(false);
+
             perm.SetPaused(paused: false);
-            await UserSetPairPermissions(new UserPermissionsDto(userData, perm)).ConfigureAwait(false);
-        }, cts.Token).ContinueWith((t) => cts.Dispose());
+            await UserSetPairPermissions(new UserPermissionsDto(pair.UserData, perm)).ConfigureAwait(false);
+
+        }, cts.Token).ContinueWith(_ => cts.Dispose());
 
         return Task.CompletedTask;
     }
 
     public async Task PauseAsync(UserData userData)
     {
-        var pair = _pairManager.GetOnlineUserPairs().Single(p => p.UserPair != null && p.UserData == userData);
+        var pair = _pairManager.PairsWithGroups.Keys
+            .FirstOrDefault(p => string.Equals(p.UserData.UID, userData.UID, StringComparison.Ordinal));
+
+        if (pair == null)
+        {
+            Logger.LogInformation("{AliasorUID} — Not Found or offline, pause failed", userData.AliasOrUID);
+            return;
+        }
+
         var perm = pair.UserPair!.OwnPermissions;
         perm.SetPaused(paused: true);
-        await UserSetPairPermissions(new UserPermissionsDto(userData, perm)).ConfigureAwait(false);
+        await UserSetPairPermissions(new UserPermissionsDto(pair.UserData, perm)).ConfigureAwait(false);
     }
 
     public async Task ResumeAsync(UserData userData)

@@ -105,13 +105,17 @@ internal sealed class TempLz4UploadFile : IAsyncDisposable
 
         public override ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default)
         {
-            if (buffer.Length > 0)
+            if (buffer.Length == 0)
+                return ValueTask.CompletedTask;
+
+            if (System.Runtime.InteropServices.MemoryMarshal.TryGetArray(buffer, out ArraySegment<byte> seg) && seg.Array != null)
             {
-                var arr = buffer.ToArray();
-                _hash.TransformBlock(arr, 0, arr.Length, null, 0);
-                return _inner.WriteAsync(arr, cancellationToken);
+                _hash.TransformBlock(seg.Array, seg.Offset, seg.Count, null, 0);
+                return _inner.WriteAsync(buffer, cancellationToken);
             }
-            return _inner.WriteAsync(buffer, cancellationToken);
+            var arr = buffer.ToArray();
+            _hash.TransformBlock(arr, 0, arr.Length, null, 0);
+            return _inner.WriteAsync(arr, cancellationToken);
         }
 
         public override bool CanRead => _inner.CanRead;

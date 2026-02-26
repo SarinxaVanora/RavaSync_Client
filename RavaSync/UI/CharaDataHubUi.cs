@@ -192,7 +192,7 @@ internal sealed partial class CharaDataHubUi : WindowMediatorSubscriberBase
         if (!_charaDataManager.BrioAvailable)
         {
             ImGuiHelpers.ScaledDummy(3);
-            UiSharedService.DrawGroupedCenteredColorText("To utilize any features related to posing or spawning characters you require to have Brio installed.", ImGuiColors.DalamudRed);
+            UiSharedService.DrawGroupedCenteredColorText(_uiSharedService.L("UI.CharaDataHubUi.8a2c11e3", "To utilize any features related to posing or spawning characters you require to have Brio installed."), ImGuiColors.DalamudRed);
             UiSharedService.DistanceSeparator();
         }
 
@@ -203,9 +203,9 @@ internal sealed partial class CharaDataHubUi : WindowMediatorSubscriberBase
             if (_charaDataManager.DataApplicationTask != null)
             {
                 ImGui.AlignTextToFramePadding();
-                ImGui.TextUnformatted("Applying Data to Actor");
+                ImGui.TextUnformatted(_uiSharedService.L("UI.CharaDataHubUi.3f7b0461", "Applying Data to Actor"));
                 ImGui.SameLine();
-                if (_uiSharedService.IconTextButton(FontAwesomeIcon.Ban, "Cancel Application"))
+                if (_uiSharedService.IconTextButton(FontAwesomeIcon.Ban, _uiSharedService.L("UI.CharaDataHubUi.94702627", "Cancel Application")))
                 {
                     _charaDataManager.CancelDataApplication();
                 }
@@ -216,7 +216,7 @@ internal sealed partial class CharaDataHubUi : WindowMediatorSubscriberBase
             }
             if (_charaDataManager.DataApplicationTask != null)
             {
-                UiSharedService.ColorTextWrapped("WARNING: During the data application avoid interacting with this actor to prevent potential crashes.", ImGuiColors.DalamudRed);
+                UiSharedService.ColorTextWrapped(_uiSharedService.L("UI.CharaDataHubUi.9187d951", "WARNING: During the data application avoid interacting with this actor to prevent potential crashes."), ImGuiColors.DalamudRed);
                 ImGuiHelpers.ScaledDummy(5);
                 ImGui.Separator();
             }
@@ -228,7 +228,7 @@ internal sealed partial class CharaDataHubUi : WindowMediatorSubscriberBase
         _isHandlingSelf = _charaDataManager.HandledCharaData.Any(c => c.IsSelf);
         if (_isHandlingSelf) _openMcdOnlineOnNextRun = false;
 
-        using (var gposeTogetherTabItem = ImRaii.TabItem("GPose Together"))
+        using (var gposeTogetherTabItem = ImRaii.TabItem(string.Concat(_uiSharedService.L("UI.CharaDataHubUi.77b8cc60", "GPose Together"), "##77b8cc60")))
         {
             if (gposeTogetherTabItem)
             {
@@ -238,7 +238,7 @@ internal sealed partial class CharaDataHubUi : WindowMediatorSubscriberBase
             }
         }
 
-        using (var applicationTabItem = ImRaii.TabItem("Data Application", _openDataApplicationShared ? ImGuiTabItemFlags.SetSelected : ImGuiTabItemFlags.None))
+        using (var applicationTabItem = ImRaii.TabItem(string.Concat(_uiSharedService.L("UI.CharaDataHubUi.107da271", "Data Application"), "##107da271"), _openDataApplicationShared ? ImGuiTabItemFlags.SetSelected : ImGuiTabItemFlags.None))
         {
             if (applicationTabItem)
             {
@@ -247,7 +247,7 @@ internal sealed partial class CharaDataHubUi : WindowMediatorSubscriberBase
 
                 using (ImRaii.Disabled(!_uiSharedService.IsInGpose))
                 {
-                    using (var gposeTabItem = ImRaii.TabItem("GPose Actors"))
+                    using (var gposeTabItem = ImRaii.TabItem(string.Concat(_uiSharedService.L("UI.CharaDataHubUi.98375fda", "GPose Actors"), "##98375fda")))
                     {
                         if (gposeTabItem)
                         {
@@ -257,9 +257,9 @@ internal sealed partial class CharaDataHubUi : WindowMediatorSubscriberBase
                     }
                 }
                 if (!_uiSharedService.IsInGpose)
-                    UiSharedService.AttachToolTip("Only available in GPose");
+                    UiSharedService.AttachToolTip(_uiSharedService.L("UI.CharaDataHubUi.920559d1", "Only available in GPose"));
 
-                using (var nearbyPosesTabItem = ImRaii.TabItem("Poses Nearby"))
+                using (var nearbyPosesTabItem = ImRaii.TabItem(string.Concat(_uiSharedService.L("UI.CharaDataHubUi.25cd30e0", "Poses Nearby"), "##25cd30e0")))
                 {
                     if (nearbyPosesTabItem)
                     {
@@ -274,7 +274,7 @@ internal sealed partial class CharaDataHubUi : WindowMediatorSubscriberBase
                     }
                 }
 
-                using (var gposeTabItem = ImRaii.TabItem("Apply Data", _openDataApplicationShared ? ImGuiTabItemFlags.SetSelected : ImGuiTabItemFlags.None))
+                using (var gposeTabItem = ImRaii.TabItem(string.Concat(_uiSharedService.L("UI.CharaDataHubUi.b083f054", "Apply Data"), "##b083f054"), _openDataApplicationShared ? ImGuiTabItemFlags.SetSelected : ImGuiTabItemFlags.None))
                 {
                     if (gposeTabItem)
                     {
@@ -299,7 +299,7 @@ internal sealed partial class CharaDataHubUi : WindowMediatorSubscriberBase
                 _openMcdOnlineOnNextRun = false;
             }
 
-            using (var creationTabItem = ImRaii.TabItem("Data Creation", flagsTopLevel))
+            using (var creationTabItem = ImRaii.TabItem(string.Concat(_uiSharedService.L("UI.CharaDataHubUi.c11c7aef", "Data Creation"), "##c11c7aef"), flagsTopLevel))
             {
                 if (creationTabItem)
                 {
@@ -311,7 +311,7 @@ internal sealed partial class CharaDataHubUi : WindowMediatorSubscriberBase
                         flags = ImGuiTabItemFlags.SetSelected;
                         _openMcdOnlineOnNextRun = false;
                     }
-                    using (var mcdOnlineTabItem = ImRaii.TabItem("MCD Online", flags))
+                    using (var mcdOnlineTabItem = ImRaii.TabItem(string.Concat(_uiSharedService.L("UI.CharaDataHubUi.3ea8ba98", "MCD Online"), "##3ea8ba98"), flags))
                     {
                         if (mcdOnlineTabItem)
                         {
@@ -320,7 +320,7 @@ internal sealed partial class CharaDataHubUi : WindowMediatorSubscriberBase
                         }
                     }
 
-                    using (var mcdfTabItem = ImRaii.TabItem("MCDF Export"))
+                    using (var mcdfTabItem = ImRaii.TabItem(string.Concat(_uiSharedService.L("UI.CharaDataHubUi.63e3bf20", "MCDF Export"), "##63e3bf20")))
                     {
                         if (mcdfTabItem)
                         {
@@ -333,10 +333,10 @@ internal sealed partial class CharaDataHubUi : WindowMediatorSubscriberBase
         }
         if (_isHandlingSelf)
         {
-            UiSharedService.AttachToolTip("Cannot use creation tools while having Character Data applied to self.");
+            UiSharedService.AttachToolTip(_uiSharedService.L("UI.CharaDataHubUi.a3a09d3b", "Cannot use creation tools while having Character Data applied to self."));
         }
 
-        using (var settingsTabItem = ImRaii.TabItem("Settings"))
+        using (var settingsTabItem = ImRaii.TabItem(string.Concat(_uiSharedService.L("UI.CharaDataHubUi.f4f70727", "Settings"), "##f4f70727")))
         {
             if (settingsTabItem)
             {
@@ -372,7 +372,7 @@ internal sealed partial class CharaDataHubUi : WindowMediatorSubscriberBase
         else
         {
             _uiSharedService.IconText(FontAwesomeIcon.Star, ImGuiColors.DalamudGrey);
-            UiSharedService.AttachToolTip("Click to add to Favorites");
+            UiSharedService.AttachToolTip(_uiSharedService.L("UI.CharaDataHubUi.c9fbbae8", "Click to add to Favorites"));
         }
         if (ImGui.IsItemClicked(ImGuiMouseButton.Left))
         {
@@ -384,7 +384,7 @@ internal sealed partial class CharaDataHubUi : WindowMediatorSubscriberBase
 
     private void DrawGposeControls()
     {
-        _uiSharedService.BigText("GPose Actors");
+        _uiSharedService.BigText(_uiSharedService.L("UI.CharaDataHubUi.d41d8cd9", ""));
         ImGuiHelpers.ScaledDummy(5);
         using var indent = ImRaii.PushIndent(10f);
 
@@ -416,7 +416,7 @@ internal sealed partial class CharaDataHubUi : WindowMediatorSubscriberBase
                 {
                     _uiSharedService.IconText(FontAwesomeIcon.InfoCircle);
                     var id = string.IsNullOrEmpty(handled?.MetaInfo.Uploader.UID) ? handled?.MetaInfo.Id : handled.MetaInfo.FullId;
-                    UiSharedService.AttachToolTip($"Applied Data: {id ?? "No data applied"}");
+                    UiSharedService.AttachToolTip($"Applied Data: {id ?? _uiSharedService.L("UI.CharaDataHubUi.fac9bd39", "No data applied")}");
 
                     ImGui.SameLine();
                     // maybe do this better, check with brio for handled charas or sth
@@ -445,13 +445,13 @@ internal sealed partial class CharaDataHubUi : WindowMediatorSubscriberBase
 
     private void DrawDataApplication()
     {
-        _uiSharedService.BigText("Apply Character Appearance");
+        _uiSharedService.BigText(_uiSharedService.L("UI.CharaDataHubUi.d41d8cd9", ""));
 
         ImGuiHelpers.ScaledDummy(5);
 
         if (_uiSharedService.IsInGpose)
         {
-            ImGui.TextUnformatted("GPose Target");
+            ImGui.TextUnformatted(_uiSharedService.L("UI.CharaDataHubUi.f9ae69ac", "GPose Target"));
             ImGui.SameLine(200);
             UiSharedService.ColorText(CharaName(_gposeTarget), UiSharedService.GetBoolColor(_hasValidGposeTarget));
         }
@@ -459,14 +459,14 @@ internal sealed partial class CharaDataHubUi : WindowMediatorSubscriberBase
         if (!_hasValidGposeTarget)
         {
             ImGuiHelpers.ScaledDummy(3);
-            UiSharedService.DrawGroupedCenteredColorText("Applying data is only available in GPose with a valid selected GPose target.", ImGuiColors.DalamudYellow, 350);
+            UiSharedService.DrawGroupedCenteredColorText(_uiSharedService.L("UI.CharaDataHubUi.67118bc8", "Applying data is only available in GPose with a valid selected GPose target."), ImGuiColors.DalamudYellow, 350);
         }
 
         ImGuiHelpers.ScaledDummy(10);
 
         using var tabs = ImRaii.TabBar("Tabs");
 
-        using (var byFavoriteTabItem = ImRaii.TabItem("Favorites"))
+        using (var byFavoriteTabItem = ImRaii.TabItem(string.Concat(_uiSharedService.L("UI.CharaDataHubUi.d7898694", "Favorites"), "##d7898694")))
         {
             if (byFavoriteTabItem)
             {
@@ -475,16 +475,16 @@ internal sealed partial class CharaDataHubUi : WindowMediatorSubscriberBase
                 ImGuiHelpers.ScaledDummy(5);
 
                 var max = ImGui.GetWindowContentRegionMax();
-                UiSharedService.DrawTree("Filters", () =>
+                UiSharedService.DrawTree(_uiSharedService.L("UI.CharaDataHubUi.96e57821", "Filters"), () =>
                 {
                     var maxIndent = ImGui.GetWindowContentRegionMax();
                     ImGui.SetNextItemWidth(maxIndent.X - ImGui.GetCursorPosX());
-                    ImGui.InputTextWithHint("##ownFilter", "Code/Owner Filter", ref _filterCodeNote, 100);
+                    ImGui.InputTextWithHint("##ownFilter", _uiSharedService.L("UI.CharaDataHubUi.57da4cf5", "Code/Owner Filter"), ref _filterCodeNote, 100);
                     ImGui.SetNextItemWidth(maxIndent.X - ImGui.GetCursorPosX());
-                    ImGui.InputTextWithHint("##descFilter", "Custom Description Filter", ref _filterDescription, 100);
-                    ImGui.Checkbox("Only show entries with pose data", ref _filterPoseOnly);
-                    ImGui.Checkbox("Only show entries with world data", ref _filterWorldOnly);
-                    if (_uiSharedService.IconTextButton(FontAwesomeIcon.Ban, "Reset Filter"))
+                    ImGui.InputTextWithHint("##descFilter", _uiSharedService.L("UI.CharaDataHubUi.c530ebef", "Custom Description Filter"), ref _filterDescription, 100);
+                    ImGui.Checkbox(_uiSharedService.L("UI.CharaDataHubUi.411e1ab0", "Only show entries with pose data"), ref _filterPoseOnly);
+                    ImGui.Checkbox(_uiSharedService.L("UI.CharaDataHubUi.998e7086", "Only show entries with world data"), ref _filterWorldOnly);
+                    if (_uiSharedService.IconTextButton(FontAwesomeIcon.Ban, _uiSharedService.L("UI.CharaDataHubUi.632c5980", "Reset Filter")))
                     {
                         _filterCodeNote = string.Empty;
                         _filterDescription = string.Empty;
@@ -533,21 +533,21 @@ internal sealed partial class CharaDataHubUi : WindowMediatorSubscriberBase
                             _uiSharedService.BooleanToColoredIcon(metaInfo != null, false);
                             if (metaInfo != null)
                             {
-                                UiSharedService.AttachToolTip("Metainfo present" + UiSharedService.TooltipSeparator
+                                UiSharedService.AttachToolTip(_uiSharedService.L("UI.CharaDataHubUi.66414ef6", "Metainfo present") + UiSharedService.TooltipSeparator
                                     + $"Last Updated: {metaInfo!.UpdatedDate}" + Environment.NewLine
                                     + $"Description: {metaInfo!.Description}" + Environment.NewLine
                                     + $"Poses: {metaInfo!.PoseData.Count}");
                             }
                             else
                             {
-                                UiSharedService.AttachToolTip("Metainfo could not be downloaded." + UiSharedService.TooltipSeparator
+                                UiSharedService.AttachToolTip(_uiSharedService.L("UI.CharaDataHubUi.2f7e74ea", "Metainfo could not be downloaded.") + UiSharedService.TooltipSeparator
                                     + "The data associated with the code is either not present on the server anymore or you have no access to it");
                             }
                         }
                         else
                         {
                             _uiSharedService.IconText(FontAwesomeIcon.QuestionCircle, ImGuiColors.DalamudGrey);
-                            UiSharedService.AttachToolTip("Unknown accessibility state. Click the button on the right to refresh.");
+                            UiSharedService.AttachToolTip(_uiSharedService.L("UI.CharaDataHubUi.d7740ec8", "Unknown accessibility state. Click the button on the right to refresh."));
                         }
 
                         ImGui.SameLine();
@@ -560,7 +560,7 @@ internal sealed partial class CharaDataHubUi : WindowMediatorSubscriberBase
                                 UpdateFilteredItems();
                             }
                         }
-                        UiSharedService.AttachToolTip(isInTimeout ? "Timeout for refreshing active, please wait before refreshing again."
+                        UiSharedService.AttachToolTip(isInTimeout ? _uiSharedService.L("UI.CharaDataHubUi.579105eb", "Timeout for refreshing active, please wait before refreshing again.")
                             : "Refresh data for this entry from the Server.");
 
                         ImGui.SameLine();
@@ -598,13 +598,13 @@ internal sealed partial class CharaDataHubUi : WindowMediatorSubscriberBase
                         }
                         ImGui.TextUnformatted(uidText);
 
-                        ImGui.TextUnformatted("Last Use: ");
+                        ImGui.TextUnformatted(_uiSharedService.L("UI.CharaDataHubUi.1b4cff4e", "Last Use: "));
                         ImGui.SameLine();
-                        ImGui.TextUnformatted(favorite.Value.Favorite.LastDownloaded == DateTime.MaxValue ? "Never" : favorite.Value.Favorite.LastDownloaded.ToString());
+                        ImGui.TextUnformatted(favorite.Value.Favorite.LastDownloaded == DateTime.MaxValue ? _uiSharedService.L("UI.CharaDataHubUi.ef6da99b", "Never") : favorite.Value.Favorite.LastDownloaded.ToString());
 
                         var desc = favorite.Value.Favorite.CustomDescription;
                         ImGui.SetNextItemWidth(maxPos - xPos);
-                        if (ImGui.InputTextWithHint("##desc", "Custom Description for Favorite", ref desc, 100))
+                        if (ImGui.InputTextWithHint("##desc", _uiSharedService.L("UI.CharaDataHubUi.927a93eb", "Custom Description for Favorite"), ref desc, 100))
                         {
                             favorite.Value.Favorite.CustomDescription = desc;
                             _configService.Save();
@@ -618,18 +618,18 @@ internal sealed partial class CharaDataHubUi : WindowMediatorSubscriberBase
 
                 if (_configService.Current.FavoriteCodes.Count == 0)
                 {
-                    UiSharedService.ColorTextWrapped("You have no favorites added. Add Favorites through the other tabs before you can use this tab.", ImGuiColors.DalamudYellow);
+                    UiSharedService.ColorTextWrapped(_uiSharedService.L("UI.CharaDataHubUi.75a5f4d4", "You have no favorites added. Add Favorites through the other tabs before you can use this tab."), ImGuiColors.DalamudYellow);
                 }
             }
         }
 
-        using (var byCodeTabItem = ImRaii.TabItem("Code"))
+        using (var byCodeTabItem = ImRaii.TabItem(string.Concat(_uiSharedService.L("UI.CharaDataHubUi.ca0dbad9", "Code"), "##ca0dbad9")))
         {
             using var id = ImRaii.PushId("byCodeTab");
             if (byCodeTabItem)
             {
                 using var child = ImRaii.Child("sharedWithYouByCode", new(0, 0), false, ImGuiWindowFlags.AlwaysAutoResize);
-                DrawHelpFoldout("You can apply character data you have a code for in this tab. Provide the code in it's given format \"OwnerUID:DataId\" into the field below and click on " +
+                DrawHelpFoldout(_uiSharedService.L("UI.CharaDataHubUi.da29db2a", "You can apply character data you have a code for in this tab. Provide the code in it's given format \"OwnerUID:DataId\" into the field below and click on ") +
                                 "\"Get Info from Code\". This will provide you basic information about the data behind the code. Afterwards select an actor in GPose and press on \"Download and apply to <actor>\"." + Environment.NewLine + Environment.NewLine
                                 + "Description: as set by the owner of the code to give you more or additional information of what this code may contain." + Environment.NewLine
                                 + "Last Update: the date and time the owner of the code has last updated the data." + Environment.NewLine
@@ -637,17 +637,17 @@ internal sealed partial class CharaDataHubUi : WindowMediatorSubscriberBase
                                 + "To download a code the code requires correct access permissions to be set by the owner. If getting info from the code fails, contact the owner to make sure they set their Access Permissions for the code correctly.");
 
                 ImGuiHelpers.ScaledDummy(5);
-                ImGui.InputTextWithHint("##importCode", "Enter Data Code", ref _importCode, 100);
+                ImGui.InputTextWithHint("##importCode", _uiSharedService.L("UI.CharaDataHubUi.031f6026", "Enter Data Code"), ref _importCode, 100);
                 using (ImRaii.Disabled(string.IsNullOrEmpty(_importCode)))
                 {
-                    if (_uiSharedService.IconTextButton(FontAwesomeIcon.ArrowCircleDown, "Get Info from Code"))
+                    if (_uiSharedService.IconTextButton(FontAwesomeIcon.ArrowCircleDown, _uiSharedService.L("UI.CharaDataHubUi.619e6241", "Get Info from Code")))
                     {
                         _charaDataManager.DownloadMetaInfo(_importCode);
                     }
                 }
                 GposeMetaInfoAction((meta) =>
                 {
-                    if (_uiSharedService.IconTextButton(FontAwesomeIcon.ArrowRight, $"Download and Apply"))
+                    if (_uiSharedService.IconTextButton(FontAwesomeIcon.ArrowRight, _uiSharedService.L("UI.CharaDataHubUi.6660381b", "Download and Apply")))
                     {
                         _ = _charaDataManager.ApplyCharaDataToGposeTarget(meta!);
                     }
@@ -655,7 +655,7 @@ internal sealed partial class CharaDataHubUi : WindowMediatorSubscriberBase
                 ImGui.SameLine();
                 GposeMetaInfoAction((meta) =>
                 {
-                    if (_uiSharedService.IconTextButton(FontAwesomeIcon.Plus, $"Download and Spawn"))
+                    if (_uiSharedService.IconTextButton(FontAwesomeIcon.Plus, _uiSharedService.L("UI.CharaDataHubUi.0e4df61d", "Download and Spawn")))
                     {
                         _ = _charaDataManager.SpawnAndApplyData(meta!);
                     }
@@ -667,7 +667,7 @@ internal sealed partial class CharaDataHubUi : WindowMediatorSubscriberBase
                 ImGui.NewLine();
                 if (!_charaDataManager.DownloadMetaInfoTask?.IsCompleted ?? false)
                 {
-                    UiSharedService.ColorTextWrapped("Downloading meta info. Please wait.", ImGuiColors.DalamudYellow);
+                    UiSharedService.ColorTextWrapped(_uiSharedService.L("UI.CharaDataHubUi.971f6cce", "Downloading meta info. Please wait."), ImGuiColors.DalamudYellow);
                 }
                 if ((_charaDataManager.DownloadMetaInfoTask?.IsCompleted ?? false) && !_charaDataManager.DownloadMetaInfoTask.Result.Success)
                 {
@@ -678,16 +678,16 @@ internal sealed partial class CharaDataHubUi : WindowMediatorSubscriberBase
                 {
                     ImGuiHelpers.ScaledDummy(5);
                     var metaInfo = _charaDataManager.LastDownloadedMetaInfo;
-                    ImGui.TextUnformatted("Description");
+                    ImGui.TextUnformatted(_uiSharedService.L("UI.CharaDataHubUi.55f8ebc8", "Description"));
                     ImGui.SameLine(150);
                     UiSharedService.TextWrapped(string.IsNullOrEmpty(metaInfo?.Description) ? "-" : metaInfo.Description);
-                    ImGui.TextUnformatted("Last Update");
+                    ImGui.TextUnformatted(_uiSharedService.L("UI.CharaDataHubUi.8351ebe5", "Last Update"));
                     ImGui.SameLine(150);
                     ImGui.TextUnformatted(metaInfo?.UpdatedDate.ToLocalTime().ToString() ?? "-");
-                    ImGui.TextUnformatted("Is Downloadable");
+                    ImGui.TextUnformatted(_uiSharedService.L("UI.CharaDataHubUi.9acc1998", "Is Downloadable"));
                     ImGui.SameLine(150);
                     _uiSharedService.BooleanToColoredIcon(metaInfo?.CanBeDownloaded ?? false, inline: false);
-                    ImGui.TextUnformatted("Poses");
+                    ImGui.TextUnformatted(_uiSharedService.L("UI.CharaDataHubUi.bcddeb26", "Poses"));
                     ImGui.SameLine(150);
                     if (metaInfo?.HasPoses ?? false)
                         DrawPoseData(metaInfo, _gposeTarget, _hasValidGposeTarget);
@@ -697,12 +697,12 @@ internal sealed partial class CharaDataHubUi : WindowMediatorSubscriberBase
             }
         }
 
-        using (var yourOwnTabItem = ImRaii.TabItem("Your Own"))
+        using (var yourOwnTabItem = ImRaii.TabItem(string.Concat(_uiSharedService.L("UI.CharaDataHubUi.48b29a8b", "Your Own"), "##48b29a8b")))
         {
             using var id = ImRaii.PushId("yourOwnTab");
             if (yourOwnTabItem)
             {
-                DrawHelpFoldout("You can apply character data you created yourself in this tab. If the list is not populated press on \"Download your Character Data\"." + Environment.NewLine + Environment.NewLine
+                DrawHelpFoldout(_uiSharedService.L("UI.CharaDataHubUi.4f4a4cce", "You can apply character data you created yourself in this tab. If the list is not populated press on \"Download your Character Data\".") + Environment.NewLine + Environment.NewLine
                                  + "To create new and edit your existing character data use the \"MCD Online\" tab.");
 
                 ImGuiHelpers.ScaledDummy(5);
@@ -710,14 +710,14 @@ internal sealed partial class CharaDataHubUi : WindowMediatorSubscriberBase
                 using (ImRaii.Disabled(_charaDataManager.GetAllDataTask != null
                     || (_charaDataManager.DataGetTimeoutTask != null && !_charaDataManager.DataGetTimeoutTask.IsCompleted)))
                 {
-                    if (_uiSharedService.IconTextButton(FontAwesomeIcon.ArrowCircleDown, "Download your Character Data"))
+                    if (_uiSharedService.IconTextButton(FontAwesomeIcon.ArrowCircleDown, _uiSharedService.L("UI.CharaDataHubUi.45fc7e65", "Download your Character Data")))
                     {
                         _ = _charaDataManager.GetAllData(_disposalCts.Token);
                     }
                 }
                 if (_charaDataManager.DataGetTimeoutTask != null && !_charaDataManager.DataGetTimeoutTask.IsCompleted)
                 {
-                    UiSharedService.AttachToolTip("You can only refresh all character data from server every minute. Please wait.");
+                    UiSharedService.AttachToolTip(_uiSharedService.L("UI.CharaDataHubUi.dfcf2e8f", "You can only refresh all character data from server every minute. Please wait."));
                 }
 
                 ImGuiHelpers.ScaledDummy(5);
@@ -736,12 +736,12 @@ internal sealed partial class CharaDataHubUi : WindowMediatorSubscriberBase
             }
         }
 
-        using (var sharedWithYouTabItem = ImRaii.TabItem("Shared With You", _openDataApplicationShared ? ImGuiTabItemFlags.SetSelected : ImGuiTabItemFlags.None))
+        using (var sharedWithYouTabItem = ImRaii.TabItem(string.Concat(_uiSharedService.L("UI.CharaDataHubUi.49df8a1c", "Shared With You"), "##49df8a1c"), _openDataApplicationShared ? ImGuiTabItemFlags.SetSelected : ImGuiTabItemFlags.None))
         {
             using var id = ImRaii.PushId("sharedWithYouTab");
             if (sharedWithYouTabItem)
             {
-                DrawHelpFoldout("You can apply character data shared with you implicitly in this tab. Shared Character Data are Character Data entries that have \"Sharing\" set to \"Shared\" and you have access through those by meeting the access restrictions, " +
+                DrawHelpFoldout(_uiSharedService.L("UI.CharaDataHubUi.eba823ad", "You can apply character data shared with you implicitly in this tab. Shared Character Data are Character Data entries that have \"Sharing\" set to \"Shared\" and you have access through those by meeting the access restrictions, ") +
                                 "i.e. you were specified by your UID to gain access or are paired with the other user according to the Access Restrictions setting." + Environment.NewLine + Environment.NewLine
                                 + "Filter if needed to find a specific entry, then just press on \"Apply to <actor>\" and it will download and apply the Character Data to the currently targeted GPose actor." + Environment.NewLine + Environment.NewLine
                                 + "Note: Shared Data of Pairs you have paused will not be shown here.");
@@ -759,16 +759,16 @@ internal sealed partial class CharaDataHubUi : WindowMediatorSubscriberBase
                 {
                     var filterWidth = ImGui.GetWindowContentRegionMax().X - ImGui.GetWindowContentRegionMin().X;
                     ImGui.SetNextItemWidth(filterWidth);
-                    if (ImGui.InputTextWithHint("##filter", "Filter by UID/Note", ref _sharedWithYouOwnerFilter, 30))
+                    if (ImGui.InputTextWithHint("##filter", _uiSharedService.L("UI.CharaDataHubUi.fb4c9fe9", "Filter by UID/Note"), ref _sharedWithYouOwnerFilter, 30))
                     {
                         UpdateFilteredItems();
                     }
                     ImGui.SetNextItemWidth(filterWidth);
-                    if (ImGui.InputTextWithHint("##filterDesc", "Filter by Description", ref _sharedWithYouDescriptionFilter, 50))
+                    if (ImGui.InputTextWithHint("##filterDesc", _uiSharedService.L("UI.CharaDataHubUi.1cd5caa6", "Filter by Description"), ref _sharedWithYouDescriptionFilter, 50))
                     {
                         UpdateFilteredItems();
                     }
-                    if (ImGui.Checkbox("Only show downloadable", ref _sharedWithYouDownloadableFilter))
+                    if (ImGui.Checkbox(_uiSharedService.L("UI.CharaDataHubUi.45a334f8", "Only show downloadable"), ref _sharedWithYouDownloadableFilter))
                     {
                         UpdateFilteredItems();
                     }
@@ -811,13 +811,13 @@ internal sealed partial class CharaDataHubUi : WindowMediatorSubscriberBase
             }
         }
 
-        using (var mcdfTabItem = ImRaii.TabItem("From MCDF"))
+        using (var mcdfTabItem = ImRaii.TabItem(string.Concat(_uiSharedService.L("UI.CharaDataHubUi.0f66acd6", "From MCDF"), "##0f66acd6")))
         {
             using var id = ImRaii.PushId("applyMcdfTab");
             if (mcdfTabItem)
             {
                 using var child = ImRaii.Child("applyMcdf", new(0, 0), false, ImGuiWindowFlags.AlwaysAutoResize);
-                DrawHelpFoldout("You can apply character data shared with you using a MCDF file in this tab." + Environment.NewLine + Environment.NewLine
+                DrawHelpFoldout(_uiSharedService.L("UI.CharaDataHubUi.6276b58a", "You can apply character data shared with you using a MCDF file in this tab.") + Environment.NewLine + Environment.NewLine
                                 + "Load the MCDF first via the \"Load MCDF\" button which will give you the basic description that the owner has set during export." + Environment.NewLine
                                 + "You can then apply it to any handled GPose actor." + Environment.NewLine + Environment.NewLine
                                 + "MCDF to share with others can be generated using the \"MCDF Export\" tab at the top.");
@@ -826,7 +826,7 @@ internal sealed partial class CharaDataHubUi : WindowMediatorSubscriberBase
 
                 if (_charaDataManager.LoadedMcdfHeader == null || _charaDataManager.LoadedMcdfHeader.IsCompleted)
                 {
-                    if (_uiSharedService.IconTextButton(FontAwesomeIcon.FolderOpen, "Load MCDF"))
+                    if (_uiSharedService.IconTextButton(FontAwesomeIcon.FolderOpen, _uiSharedService.L("UI.CharaDataHubUi.d3aa08f9", "Load MCDF")))
                     {
                         _fileDialogManager.OpenFileDialog("Pick MCDF file", ".mcdf", (success, paths) =>
                         {
@@ -839,13 +839,13 @@ internal sealed partial class CharaDataHubUi : WindowMediatorSubscriberBase
                             _charaDataManager.LoadMcdf(path);
                         }, 1, Directory.Exists(_configService.Current.LastSavedCharaDataLocation) ? _configService.Current.LastSavedCharaDataLocation : null);
                     }
-                    UiSharedService.AttachToolTip("Load MCDF Metadata into memory");
+                    UiSharedService.AttachToolTip(_uiSharedService.L("UI.CharaDataHubUi.b650f711", "Load MCDF Metadata into memory"));
                     if ((_charaDataManager.LoadedMcdfHeader?.IsCompleted ?? false))
                     {
-                        ImGui.TextUnformatted("Loaded file");
+                        ImGui.TextUnformatted(_uiSharedService.L("UI.CharaDataHubUi.66880ae2", "Loaded file"));
                         ImGui.SameLine(200);
                         UiSharedService.TextWrapped(_charaDataManager.LoadedMcdfHeader.Result.LoadedFile.FilePath);
-                        ImGui.Text("Description");
+                        ImGui.Text(_uiSharedService.L("UI.CharaDataHubUi.55f8ebc8", "Description"));
                         ImGui.SameLine(200);
                         UiSharedService.TextWrapped(_charaDataManager.LoadedMcdfHeader.Result.LoadedFile.CharaFileData.Description);
 
@@ -853,7 +853,7 @@ internal sealed partial class CharaDataHubUi : WindowMediatorSubscriberBase
 
                         using (ImRaii.Disabled(!_hasValidGposeTarget))
                         {
-                            if (_uiSharedService.IconTextButton(FontAwesomeIcon.ArrowRight, "Apply"))
+                            if (_uiSharedService.IconTextButton(FontAwesomeIcon.ArrowRight, _uiSharedService.L("UI.CharaDataHubUi.6e2c0c7b", "Apply")))
                             {
                                 _ = _charaDataManager.McdfApplyToGposeTarget();
                             }
@@ -861,7 +861,7 @@ internal sealed partial class CharaDataHubUi : WindowMediatorSubscriberBase
                             ImGui.SameLine();
                             using (ImRaii.Disabled(!_charaDataManager.BrioAvailable))
                             {
-                                if (_uiSharedService.IconTextButton(FontAwesomeIcon.Plus, "Spawn Actor and Apply"))
+                                if (_uiSharedService.IconTextButton(FontAwesomeIcon.Plus, _uiSharedService.L("UI.CharaDataHubUi.74272e7a", "Spawn Actor and Apply")))
                                 {
                                     _charaDataManager.McdfSpawnApplyToGposeTarget();
                                 }
@@ -870,15 +870,15 @@ internal sealed partial class CharaDataHubUi : WindowMediatorSubscriberBase
                     }
                     if ((_charaDataManager.LoadedMcdfHeader?.IsFaulted ?? false) || (_charaDataManager.McdfApplicationTask?.IsFaulted ?? false))
                     {
-                        UiSharedService.ColorTextWrapped("Failure to read MCDF file. MCDF file is possibly corrupt. Re-export the MCDF file and try again.",
+                        UiSharedService.ColorTextWrapped(_uiSharedService.L("UI.CharaDataHubUi.779a0287", "Failure to read MCDF file. MCDF file is possibly corrupt. Re-export the MCDF file and try again."),
                             ImGuiColors.DalamudRed);
-                        UiSharedService.ColorTextWrapped("Note: if this is your MCDF, try redrawing yourself, wait and re-export the file. " +
+                        UiSharedService.ColorTextWrapped(_uiSharedService.L("UI.CharaDataHubUi.6c34d0ee", "Note: if this is your MCDF, try redrawing yourself, wait and re-export the file. ") +
                             "If you received it from someone else have them do the same.", ImGuiColors.DalamudYellow);
                     }
                 }
                 else
                 {
-                    UiSharedService.ColorTextWrapped("Loading Character...", ImGuiColors.DalamudYellow);
+                    UiSharedService.ColorTextWrapped(_uiSharedService.L("UI.CharaDataHubUi.b1b92bb8", "Loading Character..."), ImGuiColors.DalamudYellow);
                 }
             }
         }
@@ -886,28 +886,28 @@ internal sealed partial class CharaDataHubUi : WindowMediatorSubscriberBase
 
     private void DrawMcdfExport()
     {
-        _uiSharedService.BigText("RavaSync Character Data File Export");
+        _uiSharedService.BigText(_uiSharedService.L("UI.CharaDataHubUi.d41d8cd9", ""));
 
-        DrawHelpFoldout("This feature allows you to pack your character into a MCDF file and manually send it to other people. MCDF files can officially only be imported during GPose through RavaSync. " +
+        DrawHelpFoldout(_uiSharedService.L("UI.CharaDataHubUi.ab3e695b", "This feature allows you to pack your character into a MCDF file and manually send it to other people. MCDF files can officially only be imported during GPose through RavaSync. ") +
             "Be aware that the possibility exists that people write unofficial custom exporters to extract the containing data.");
 
         ImGuiHelpers.ScaledDummy(5);
 
         ImGui.Checkbox("##readExport", ref _readExport);
         ImGui.SameLine();
-        UiSharedService.TextWrapped("I understand that by exporting my character data into a file and sending it to other people I am giving away my current character appearance irrevocably. People I am sharing my data with have the ability to share it with other people without limitations.");
+        UiSharedService.TextWrapped(_uiSharedService.L("UI.CharaDataHubUi.945ec0ce", "I understand that by exporting my character data into a file and sending it to other people I am giving away my current character appearance irrevocably. People I am sharing my data with have the ability to share it with other people without limitations."));
 
         if (_readExport)
         {
             ImGui.Indent();
 
-            ImGui.InputTextWithHint("Export Descriptor", "This description will be shown on loading the data", ref _exportDescription, 255);
-            if (_uiSharedService.IconTextButton(FontAwesomeIcon.Save, "Export Character as MCDF"))
+            ImGui.InputTextWithHint(_uiSharedService.L("UI.CharaDataHubUi.f1fd7fc4", "Export Descriptor"), _uiSharedService.L("UI.CharaDataHubUi.372d743d", "This description will be shown on loading the data"), ref _exportDescription, 255);
+            if (_uiSharedService.IconTextButton(FontAwesomeIcon.Save, _uiSharedService.L("UI.CharaDataHubUi.f1542345", "Export Character as MCDF")))
             {
                 string defaultFileName = string.IsNullOrEmpty(_exportDescription)
                     ? "export.mcdf"
                     : string.Join('_', $"{_exportDescription}.mcdf".Split(Path.GetInvalidFileNameChars()));
-                _uiSharedService.FileDialogManager.SaveFileDialog("Export Character to file", ".mcdf", defaultFileName, ".mcdf", (success, path) =>
+                _uiSharedService.FileDialogManager.SaveFileDialog(_uiSharedService.L("UI.CharaDataHubUi.5fa0a39d", "Export Character to file"), ".mcdf", defaultFileName, ".mcdf", (success, path) =>
                 {
                     if (!success) return;
 
@@ -918,7 +918,7 @@ internal sealed partial class CharaDataHubUi : WindowMediatorSubscriberBase
                     _exportDescription = string.Empty;
                 }, Directory.Exists(_configService.Current.LastSavedCharaDataLocation) ? _configService.Current.LastSavedCharaDataLocation : null);
             }
-            UiSharedService.ColorTextWrapped("Note: For best results make sure you have everything you want to be shared as well as the correct character appearance" +
+            UiSharedService.ColorTextWrapped(_uiSharedService.L("UI.CharaDataHubUi.4d350818", "Note: For best results make sure you have everything you want to be shared as well as the correct character appearance") +
                 " equipped and redraw your character before exporting.", ImGuiColors.DalamudYellow);
 
             ImGui.Unindent();
@@ -944,7 +944,7 @@ internal sealed partial class CharaDataHubUi : WindowMediatorSubscriberBase
             UiSharedService.ColorText(data.FullId, UiSharedService.GetBoolColor(data.CanBeDownloaded));
             if (!data.CanBeDownloaded)
             {
-                UiSharedService.AttachToolTip("This data is incomplete on the server and cannot be downloaded. Contact the owner so they can fix it. If you are the owner, review the data in the MCD Online tab.");
+                UiSharedService.AttachToolTip(_uiSharedService.L("UI.CharaDataHubUi.02631642", "This data is incomplete on the server and cannot be downloaded. Contact the owner so they can fix it. If you are the owner, review the data in the MCD Online tab."));
             }
 
             var offsetFromRight = availableWidth - _uiSharedService.GetIconSize(FontAwesomeIcon.Calendar).X - _uiSharedService.GetIconButtonSize(FontAwesomeIcon.ArrowRight).X
@@ -978,7 +978,7 @@ internal sealed partial class CharaDataHubUi : WindowMediatorSubscriberBase
             {
                 using (ImRaii.Disabled(_isHandlingSelf))
                 {
-                    if (_uiSharedService.IconTextButton(FontAwesomeIcon.Edit, "Open in MCD Online Editor"))
+                    if (_uiSharedService.IconTextButton(FontAwesomeIcon.Edit, _uiSharedService.L("UI.CharaDataHubUi.0268f6c4", "Open in MCD Online Editor")))
                     {
                         SelectedDtoId = data.Id;
                         _openMcdOnlineOnNextRun = true;
@@ -986,13 +986,13 @@ internal sealed partial class CharaDataHubUi : WindowMediatorSubscriberBase
                 }
                 if (_isHandlingSelf)
                 {
-                    UiSharedService.AttachToolTip("Cannot use MCD Online while having Character Data applied to self.");
+                    UiSharedService.AttachToolTip(_uiSharedService.L("UI.CharaDataHubUi.c48e4bd5", "Cannot use MCD Online while having Character Data applied to self."));
                 }
             }
 
             if (string.IsNullOrEmpty(data.Description))
             {
-                UiSharedService.ColorTextWrapped("No description set", ImGuiColors.DalamudGrey, availableWidth);
+                UiSharedService.ColorTextWrapped(_uiSharedService.L("UI.CharaDataHubUi.7083bf94", "No description set"), ImGuiColors.DalamudGrey, availableWidth);
             }
             else
             {
@@ -1037,7 +1037,7 @@ internal sealed partial class CharaDataHubUi : WindowMediatorSubscriberBase
             if (!isInGpose)
             {
                 start = DrawIcon(start);
-                UiSharedService.AttachToolTip(tooltip + UiSharedService.TooltipSeparator + (item.HasWorldData ? GetWorldDataTooltipText(item) + UiSharedService.TooltipSeparator + "Click to show on Map" : string.Empty));
+                UiSharedService.AttachToolTip(tooltip + UiSharedService.TooltipSeparator + (item.HasWorldData ? GetWorldDataTooltipText(item) + UiSharedService.TooltipSeparator + _uiSharedService.L("UI.CharaDataHubUi.b9ce1d42", "Click to show on Map") : string.Empty));
                 if (item.HasWorldData && ImGui.IsItemClicked(ImGuiMouseButton.Left))
                 {
                     _dalamudUtilService.SetMarkerAndOpenMap(item.Position, item.Map);
@@ -1047,7 +1047,7 @@ internal sealed partial class CharaDataHubUi : WindowMediatorSubscriberBase
             {
                 tooltip += UiSharedService.TooltipSeparator + $"Left Click: Apply this pose to {CharaName(actor)}";
                 if (item.HasWorldData) tooltip += Environment.NewLine + $"CTRL+Right Click: Apply world position to {CharaName(actor)}."
-                        + UiSharedService.TooltipSeparator + "!!! CAUTION: Applying world position will likely yeet this actor into nirvana. Use at your own risk !!!";
+                        + UiSharedService.TooltipSeparator + _uiSharedService.L("UI.CharaDataHubUi.f61fc177", "!!! CAUTION: Applying world position will likely yeet this actor into nirvana. Use at your own risk !!!");
                 GposePoseAction(() =>
                 {
                     start = DrawIcon(start);
@@ -1069,44 +1069,44 @@ internal sealed partial class CharaDataHubUi : WindowMediatorSubscriberBase
     private void DrawSettings()
     {
         ImGuiHelpers.ScaledDummy(5);
-        _uiSharedService.BigText("Settings");
+        _uiSharedService.BigText(_uiSharedService.L("UI.CharaDataHubUi.d41d8cd9", ""));
         ImGuiHelpers.ScaledDummy(5);
         bool openInGpose = _configService.Current.OpenMareHubOnGposeStart;
-        if (ImGui.Checkbox("Open Character Data Hub when GPose loads", ref openInGpose))
+        if (ImGui.Checkbox(_uiSharedService.L("UI.CharaDataHubUi.d9779bc0", "Open Character Data Hub when GPose loads"), ref openInGpose))
         {
             _configService.Current.OpenMareHubOnGposeStart = openInGpose;
             _configService.Save();
         }
-        _uiSharedService.DrawHelpText("This will automatically open the import menu when loading into Gpose. If unchecked you can open the menu manually with /RavaSync gpose");
+        _uiSharedService.DrawHelpText(_uiSharedService.L("UI.CharaDataHubUi.fd16f86b", "This will automatically open the import menu when loading into Gpose. If unchecked you can open the menu manually with /RavaSync gpose"));
         bool downloadDataOnConnection = _configService.Current.DownloadMcdDataOnConnection;
-        if (ImGui.Checkbox("Download MCD Online Data on connecting", ref downloadDataOnConnection))
+        if (ImGui.Checkbox(_uiSharedService.L("UI.CharaDataHubUi.27422801", "Download MCD Online Data on connecting"), ref downloadDataOnConnection))
         {
             _configService.Current.DownloadMcdDataOnConnection = downloadDataOnConnection;
             _configService.Save();
         }
-        _uiSharedService.DrawHelpText("This will automatically download MCD Online data (Your Own and Shared with You) once a connection is established to the server.");
+        _uiSharedService.DrawHelpText(_uiSharedService.L("UI.CharaDataHubUi.e20e37d7", "This will automatically download MCD Online data (Your Own and Shared with You) once a connection is established to the server."));
 
         bool showHelpTexts = _configService.Current.ShowHelpTexts;
-        if (ImGui.Checkbox("Show \"What is this? (Explanation / Help)\" foldouts", ref showHelpTexts))
+        if (ImGui.Checkbox(_uiSharedService.L("UI.CharaDataHubUi.72439A74", "Show \"What is this? (Explanation / Help)\" foldouts"), ref showHelpTexts))
         {
             _configService.Current.ShowHelpTexts = showHelpTexts;
             _configService.Save();
         }
 
-        ImGui.Checkbox("Abbreviate Chara Names", ref _abbreviateCharaName);
-        _uiSharedService.DrawHelpText("This setting will abbreviate displayed names. This setting is not persistent and will reset between restarts.");
+        ImGui.Checkbox(_uiSharedService.L("UI.CharaDataHubUi.4786b3a0", "Abbreviate Chara Names"), ref _abbreviateCharaName);
+        _uiSharedService.DrawHelpText(_uiSharedService.L("UI.CharaDataHubUi.46f92295", "This setting will abbreviate displayed names. This setting is not persistent and will reset between restarts."));
 
         ImGui.AlignTextToFramePadding();
-        ImGui.TextUnformatted("Last Export Folder");
+        ImGui.TextUnformatted(_uiSharedService.L("UI.CharaDataHubUi.2611d028", "Last Export Folder"));
         ImGui.SameLine(300);
         ImGui.AlignTextToFramePadding();
-        ImGui.TextUnformatted(string.IsNullOrEmpty(_configService.Current.LastSavedCharaDataLocation) ? "Not set" : _configService.Current.LastSavedCharaDataLocation);
-        if (_uiSharedService.IconTextButton(FontAwesomeIcon.Ban, "Clear Last Export Folder"))
+        ImGui.TextUnformatted(string.IsNullOrEmpty(_configService.Current.LastSavedCharaDataLocation) ? _uiSharedService.L("UI.CharaDataHubUi.3f340fae", "Not set") : _configService.Current.LastSavedCharaDataLocation);
+        if (_uiSharedService.IconTextButton(FontAwesomeIcon.Ban, _uiSharedService.L("UI.CharaDataHubUi.a821324a", "Clear Last Export Folder")))
         {
             _configService.Current.LastSavedCharaDataLocation = string.Empty;
             _configService.Save();
         }
-        _uiSharedService.DrawHelpText("Use this if the Load or Save MCDF file dialog does not open");
+        _uiSharedService.DrawHelpText(_uiSharedService.L("UI.CharaDataHubUi.6d06b111", "Use this if the Load or Save MCDF file dialog does not open"));
     }
 
     private void DrawHelpFoldout(string text)
@@ -1114,7 +1114,7 @@ internal sealed partial class CharaDataHubUi : WindowMediatorSubscriberBase
         if (_configService.Current.ShowHelpTexts)
         {
             ImGuiHelpers.ScaledDummy(5);
-            UiSharedService.DrawTree("What is this? (Explanation / Help)", () =>
+            UiSharedService.DrawTree(_uiSharedService.L("UI.CharaDataHubUi.843fc806", "What is this? (Explanation / Help)"), () =>
             {
                 UiSharedService.TextWrapped(text);
             });

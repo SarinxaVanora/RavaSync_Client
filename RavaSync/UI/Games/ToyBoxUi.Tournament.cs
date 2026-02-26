@@ -18,13 +18,13 @@ public sealed partial class ToyBoxUi
     {
         if (_activeGameId == Guid.Empty)
         {
-            ImGui.TextColored(ImGuiColors.DalamudGrey, "No active tournament session selected.");
+            ImGui.TextColored(ImGuiColors.DalamudGrey, _uiSharedService.L("UI.ToyBoxUi.Tournament.cf00f8f5", "No active tournament session selected."));
             return;
         }
 
         if (!_games.TryGetClientTournament(_activeGameId, out var view))
         {
-            ImGui.TextColored(ImGuiColors.DalamudGrey, "Waiting for state…");
+            ImGui.TextColored(ImGuiColors.DalamudGrey, _uiSharedService.L("UI.ToyBoxUi.Tournament.7c73e92d", "Waiting for state…"));
             return;
         }
 
@@ -33,7 +33,7 @@ public sealed partial class ToyBoxUi
 
         if (pub is null && priv is null)
         {
-            ImGui.TextColored(ImGuiColors.DalamudGrey, "Waiting for host…");
+            ImGui.TextColored(ImGuiColors.DalamudGrey, _uiSharedService.L("UI.ToyBoxUi.Tournament.781103f8", "Waiting for host…"));
             return;
         }
 
@@ -43,7 +43,7 @@ public sealed partial class ToyBoxUi
 
         using (ImRaii.PushStyle(ImGuiStyleVar.ItemSpacing, ImGui.GetStyle().ItemSpacing with { X = 10f * ImGuiHelpers.GlobalScale }))
         {
-            ImGui.TextUnformatted("Combat Tournament");
+            ImGui.TextUnformatted(_uiSharedService.L("UI.ToyBoxUiTournament.f333b626", "Combat Tournament"));
             ImGui.SameLine();
             DrawPill("Stage: " + stage, stage == TournamentStage.InProgress ? ImGuiColors.ParsedOrange : ImGuiColors.DalamudGrey);
 
@@ -76,8 +76,8 @@ public sealed partial class ToyBoxUi
         using var layout = ImRaii.Table("tournament_layout", 2, ImGuiTableFlags.SizingStretchProp);
         if (!layout) return;
 
-        ImGui.TableSetupColumn("Left", ImGuiTableColumnFlags.WidthStretch, 0.72f);
-        ImGui.TableSetupColumn("Right", ImGuiTableColumnFlags.WidthStretch, 0.28f);
+        ImGui.TableSetupColumn(_uiSharedService.L("UI.ToyBoxUiBlackjack.8ae1c34b", "Left"), ImGuiTableColumnFlags.WidthStretch, 0.72f);
+        ImGui.TableSetupColumn(_uiSharedService.L("UI.ToyBoxUiBlackjack.954daa8b", "Right"), ImGuiTableColumnFlags.WidthStretch, 0.28f);
         ImGui.TableNextRow();
 
         ImGui.TableNextColumn();
@@ -97,20 +97,20 @@ public sealed partial class ToyBoxUi
     {
         if (pub == null)
         {
-            ImGui.TextColored(ImGuiColors.DalamudGrey, "Waiting for bracket…");
+            ImGui.TextColored(ImGuiColors.DalamudGrey, _uiSharedService.L("UI.ToyBoxUi.Tournament.89684b84", "Waiting for bracket…"));
             return;
         }
 
         if (pub.MatchInProgress && !string.IsNullOrEmpty(pub.ActiveFighterASessionId) && !string.IsNullOrEmpty(pub.ActiveFighterBSessionId))
         {
-            ImGui.TextUnformatted("Active Match");
+            ImGui.TextUnformatted(_uiSharedService.L("UI.ToyBoxUiTournament.a3949425", "Active Match"));
             ImGui.Separator();
-            ImGui.TextUnformatted($"{pub.ActiveFighterAName} vs {pub.ActiveFighterBName}");
+            ImGui.TextUnformatted(string.Format(_uiSharedService.L("UI.ToyBoxUi.Tournament.a5eae148", "{0} vs {1}"), pub.ActiveFighterAName, pub.ActiveFighterBName));
             ImGui.TextColored(ImGuiColors.DalamudGrey, $"HP: {pub.ActiveFighterAHp}/{pub.MaxHp}  -  {pub.ActiveFighterBHp}/{pub.MaxHp}");
             ImGuiHelpers.ScaledDummy(10);
         }
 
-        ImGui.TextUnformatted("Bracket");
+        ImGui.TextUnformatted(_uiSharedService.L("UI.ToyBoxUiTournament.e42a1e70", "Bracket"));
         ImGui.Separator();
 
         using var canvas = ImRaii.Child("tournament_bracket_tree_canvas",
@@ -129,7 +129,7 @@ public sealed partial class ToyBoxUi
         var rounds = pub.Rounds;
         if (rounds == null || rounds.Count == 0 || rounds[0].Matches.Count == 0)
         {
-            ImGui.TextColored(ImGuiColors.DalamudGrey, "No bracket yet.");
+            ImGui.TextColored(ImGuiColors.DalamudGrey, _uiSharedService.L("UI.ToyBoxUi.Tournament.d47a91a8", "No bracket yet."));
             return;
         }
 
@@ -322,30 +322,30 @@ public sealed partial class ToyBoxUi
 
         if (isHost)
         {
-            ImGui.TextUnformatted("Host Controls");
+            ImGui.TextUnformatted(_uiSharedService.L("UI.ToyBoxUiTournament.339257f8", "Host Controls"));
             ImGui.Separator();
 
-            if (_uiSharedService.IconTextButton(FontAwesomeIcon.UserNinja, "Join as Fighter", 220 * ImGuiHelpers.GlobalScale, true))
+            if (_uiSharedService.IconTextButton(FontAwesomeIcon.UserNinja, _uiSharedService.L("UI.ToyBoxUi.Tournament.dcbf77d4", "Join as Fighter"), 220 * ImGuiHelpers.GlobalScale, true))
                 _games.JoinTournament(_activeGameId, TournamentRole.Fighter);
 
-            if (_uiSharedService.IconTextButton(FontAwesomeIcon.Eye, "Join as Spectator", 220 * ImGuiHelpers.GlobalScale, true))
+            if (_uiSharedService.IconTextButton(FontAwesomeIcon.Eye, _uiSharedService.L("UI.ToyBoxUi.Tournament.cc26e391", "Join as Spectator"), 220 * ImGuiHelpers.GlobalScale, true))
                 _games.JoinTournament(_activeGameId, TournamentRole.Spectator);
 
             ImGuiHelpers.ScaledDummy(8);
 
-            if (_uiSharedService.IconTextButton(FontAwesomeIcon.Random, "Randomize fighters", 220 * ImGuiHelpers.GlobalScale, true))
+            if (_uiSharedService.IconTextButton(FontAwesomeIcon.Random, _uiSharedService.L("UI.ToyBoxUi.Tournament.9b4e8994", "Randomize fighters"), 220 * ImGuiHelpers.GlobalScale, true))
                 _games.HostTournamentRandomizeFighters(_activeGameId);
 
-            if (_uiSharedService.IconTextButton(FontAwesomeIcon.ProjectDiagram, "Build bracket", 220 * ImGuiHelpers.GlobalScale, true))
+            if (_uiSharedService.IconTextButton(FontAwesomeIcon.ProjectDiagram, _uiSharedService.L("UI.ToyBoxUi.Tournament.ee8b75ce", "Build bracket"), 220 * ImGuiHelpers.GlobalScale, true))
                 _games.HostTournamentBuildBracket(_activeGameId);
 
-            if (_uiSharedService.IconTextButton(FontAwesomeIcon.Play, "Start next match", 220 * ImGuiHelpers.GlobalScale, true))
+            if (_uiSharedService.IconTextButton(FontAwesomeIcon.Play, _uiSharedService.L("UI.ToyBoxUi.Tournament.7cc3dd19", "Start next match"), 220 * ImGuiHelpers.GlobalScale, true))
                 _games.HostTournamentStartNextMatch(_activeGameId);
 
             if (pub != null && pub.MatchInProgress)
             {
                 ImGuiHelpers.ScaledDummy(6);
-                ImGui.TextUnformatted("Force win");
+                ImGui.TextUnformatted(_uiSharedService.L("UI.ToyBoxUiTournament.63d265c2", "Force win"));
                 ImGui.Separator();
 
                 if (!string.IsNullOrEmpty(pub.ActiveFighterASessionId))
@@ -362,7 +362,7 @@ public sealed partial class ToyBoxUi
             }
 
             ImGuiHelpers.ScaledDummy(12);
-            ImGui.TextUnformatted("Fighters (order = bracket seeding)");
+            ImGui.TextUnformatted(_uiSharedService.L("UI.ToyBoxUiTournament.0cd691bd", "Fighters (order = bracket seeding)"));
             ImGui.Separator();
 
             if (pub != null)
@@ -379,23 +379,23 @@ public sealed partial class ToyBoxUi
 
                     ImGui.SameLine();
 
-                    if (ImGui.SmallButton("▲") && i > 0)
+                    if (ImGui.SmallButton(_uiSharedService.L("UI.ToyBoxUi.Tournament.7234F32B", "â²")) && i > 0)
                         _games.HostTournamentMoveFighter(_activeGameId, i, -1);
 
                     ImGui.SameLine();
 
-                    if (ImGui.SmallButton("▼") && i < pub.Fighters.Count - 1)
+                    if (ImGui.SmallButton(_uiSharedService.L("UI.ToyBoxUi.Tournament.D0E738A7", "â¼")) && i < pub.Fighters.Count - 1)
                         _games.HostTournamentMoveFighter(_activeGameId, i, +1);
 
                     ImGui.SameLine();
 
                     if (!canEditRoles)
                     {
-                        ImGui.TextColored(ImGuiColors.DalamudGrey, "(locked)");
+                        ImGui.TextColored(ImGuiColors.DalamudGrey, _uiSharedService.L("UI.ToyBoxUi.Tournament.f8e91ea5", "(locked)"));
                     }
                     else
                     {
-                        if (ImGui.SmallButton("Spectate"))
+                        if (ImGui.SmallButton(_uiSharedService.L("UI.ToyBoxUiTournament.15016cea", "Spectate")))
                             _games.HostTournamentMoveFighterToSpectator(_activeGameId, f.SessionId, f.Name);
                     }
                 }
@@ -404,15 +404,15 @@ public sealed partial class ToyBoxUi
             return;
         }
 
-        ImGui.TextUnformatted("Your Panel");
+        ImGui.TextUnformatted(_uiSharedService.L("UI.ToyBoxUiTournament.774982bd", "Your Panel"));
         ImGui.Separator();
 
         if (priv != null && priv.Role == TournamentRole.Spectator)
         {
-            ImGui.TextColored(ImGuiColors.DalamudGrey, "Spectating. Rolls are only counted for the two active fighters.");
+            ImGui.TextColored(ImGuiColors.DalamudGrey, _uiSharedService.L("UI.ToyBoxUi.Tournament.8ddf0d1a", "Spectating. Rolls are only counted for the two active fighters."));
             return;
         }
 
-        ImGui.TextColored(ImGuiColors.DalamudGrey, "Fighters: roll /random or /dice. Only active match rolls count.");
+        ImGui.TextColored(ImGuiColors.DalamudGrey, _uiSharedService.L("UI.ToyBoxUi.Tournament.804f5ace", "Fighters: roll /random or /dice. Only active match rolls count."));
     }
 }

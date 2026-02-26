@@ -51,17 +51,46 @@ public class DrawEntityFactory
         Dictionary<Pair, List<GroupFullInfoDto>> filteredPairs,
         IImmutableList<Pair> allPairs)
     {
-        return new DrawFolderGroup(groupFullInfoDto.Group.GID, groupFullInfoDto, _apiController,
-            filteredPairs.Select(p => CreateDrawPair(groupFullInfoDto.Group.GID + p.Key.UserData.UID, p.Key, p.Value, groupFullInfoDto)).ToImmutableList(),
-            allPairs, _tagHandler, _uidDisplayHandler, _mediator, _uiSharedService,_pairManager);
+        var drawPairs = ImmutableList.CreateBuilder<DrawUserPair>();
+
+        foreach (var p in filteredPairs)
+        {
+            drawPairs.Add(CreateDrawPair(groupFullInfoDto.Group.GID + p.Key.UserData.UID, p.Key, p.Value, groupFullInfoDto));
+        }
+
+        return new DrawFolderGroup(
+            groupFullInfoDto.Group.GID,
+            groupFullInfoDto,
+            _apiController,
+            drawPairs.ToImmutable(),
+            allPairs,
+            _tagHandler,
+            _uidDisplayHandler,
+            _mediator,
+            _uiSharedService,
+            _pairManager);
     }
 
     public DrawFolderTag CreateDrawTagFolder(string tag,
         Dictionary<Pair, List<GroupFullInfoDto>> filteredPairs,
         IImmutableList<Pair> allPairs)
     {
-        return new(tag, filteredPairs.Select(u => CreateDrawPair(tag, u.Key, u.Value, null)).ToImmutableList(),
-            allPairs, _tagHandler, _apiController, _selectPairForTagUi, _uiSharedService,_pairManager);
+        var drawPairs = ImmutableList.CreateBuilder<DrawUserPair>();
+
+        foreach (var u in filteredPairs)
+        {
+            drawPairs.Add(CreateDrawPair(tag, u.Key, u.Value, null));
+        }
+
+        return new DrawFolderTag(
+            tag,
+            drawPairs.ToImmutable(),
+            allPairs,
+            _tagHandler,
+            _apiController,
+            _selectPairForTagUi,
+            _uiSharedService,
+            _pairManager);
     }
 
     public DrawUserPair CreateDrawPair(string id, Pair user, List<GroupFullInfoDto> groups, GroupFullInfoDto? currentGroup)

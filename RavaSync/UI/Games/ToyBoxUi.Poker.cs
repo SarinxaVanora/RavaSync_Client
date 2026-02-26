@@ -33,13 +33,13 @@ public sealed partial class ToyBoxUi
         
         if (_activeGameId == Guid.Empty)
         {
-            ImGui.TextColored(ImGuiColors.DalamudGrey, "No active poker session selected.");
+            ImGui.TextColored(ImGuiColors.DalamudGrey, _uiSharedService.L("UI.ToyBoxUi.Poker.7d79d433", "No active poker session selected."));
             return;
         }
 
         if (!_games.TryGetClientPoker(_activeGameId, out var view))
         {
-            ImGui.TextColored(ImGuiColors.DalamudGrey, "Waiting for state…");
+            ImGui.TextColored(ImGuiColors.DalamudGrey, _uiSharedService.L("UI.ToyBoxUi.Poker.b44cb939", "Waiting for state…"));
             return;
         }
 
@@ -49,7 +49,7 @@ public sealed partial class ToyBoxUi
 
         if (pub is null && priv is null)
         {
-            ImGui.TextColored(ImGuiColors.DalamudGrey, "Waiting for host…");
+            ImGui.TextColored(ImGuiColors.DalamudGrey, _uiSharedService.L("UI.ToyBoxUi.Poker.4144fb23", "Waiting for host…"));
             return;
         }
 
@@ -59,7 +59,7 @@ public sealed partial class ToyBoxUi
         // Header row (phase, blinds, buy-in, leave)
         using (ImRaii.PushStyle(ImGuiStyleVar.ItemSpacing, ImGui.GetStyle().ItemSpacing with { X = 10f * scale }))
         {
-            ImGui.TextUnformatted("Poker");
+            ImGui.TextUnformatted(_uiSharedService.L("UI.ToyBoxUiPoker.725c36a8", "Poker"));
             ImGui.SameLine();
 
             DrawPill("Phase: " + PokerPhaseLabel(stage),
@@ -105,12 +105,12 @@ public sealed partial class ToyBoxUi
 
         float sideW = 420f * scale;
 
-        if (ImGui.BeginTable("poker_layout", 2, ImGuiTableFlags.SizingStretchProp))
+        if (ImGui.BeginTable(_uiSharedService.L("UI.ToyBoxUiPoker.d1869049", "poker_layout"), 2, ImGuiTableFlags.SizingStretchProp))
         {
             try
             {
-                ImGui.TableSetupColumn("Table", ImGuiTableColumnFlags.WidthStretch);
-                ImGui.TableSetupColumn("Side", ImGuiTableColumnFlags.WidthFixed, sideW);
+                ImGui.TableSetupColumn(_uiSharedService.L("UI.ToyBoxUiPoker.0424f6e7", "Table"), ImGuiTableColumnFlags.WidthStretch);
+                ImGui.TableSetupColumn(_uiSharedService.L("UI.ToyBoxUiPoker.26528381", "Side"), ImGuiTableColumnFlags.WidthFixed, sideW);
 
                 ImGui.TableNextRow();
 
@@ -136,7 +136,7 @@ public sealed partial class ToyBoxUi
                         float availX = ImGui.GetContentRegionAvail().X;
                         float availY = ImGui.GetContentRegionAvail().Y;
 
-                        float lineH = ImGui.CalcTextSize("Ay").Y;
+                        float lineH = ImGui.CalcTextSize(_uiSharedService.L("UI.ToyBoxUiPoker.80088ff0", "Ay")).Y;
                         float innerPadY = 8f * scale;
                         float lineGap = 4f * scale;
                         float seatHMin = (innerPadY * 2f) + (lineH * 3f) + (lineGap * 2f);
@@ -265,25 +265,25 @@ public sealed partial class ToyBoxUi
                         DrawSectionHeader("Host");
 
                         ImGui.SetNextItemWidth(-1);
-                        ImGui.InputInt("Table buy-in", ref _pokerHostBuyIn);
+                        ImGui.InputInt(_uiSharedService.L("UI.ToyBoxUiPoker.1fc0e7c8", "Table buy-in"), ref _pokerHostBuyIn);
                         if (_pokerHostBuyIn < 1) _pokerHostBuyIn = 1;
 
                         ImGui.SetNextItemWidth(-1);
-                        ImGui.InputInt("Small blind", ref _pokerHostSmallBlind);
+                        ImGui.InputInt(_uiSharedService.L("UI.ToyBoxUi.de73f5f1", "Small blind"), ref _pokerHostSmallBlind);
                         if (_pokerHostSmallBlind < 1) _pokerHostSmallBlind = 1;
 
                         ImGui.SetNextItemWidth(-1);
-                        ImGui.InputInt("Big blind", ref _pokerHostBigBlind);
+                        ImGui.InputInt(_uiSharedService.L("UI.ToyBoxUi.6440af3f", "Big blind"), ref _pokerHostBigBlind);
                         if (_pokerHostBigBlind < _pokerHostSmallBlind) _pokerHostBigBlind = _pokerHostSmallBlind;
 
                         using (ImRaii.PushStyle(ImGuiStyleVar.ItemSpacing, ImGui.GetStyle().ItemSpacing with { Y = 6f * scale }))
                         {
-                            if (_uiSharedService.IconTextButton(FontAwesomeIcon.Save, "Apply table settings", -1, true))
+                            if (_uiSharedService.IconTextButton(FontAwesomeIcon.Save, _uiSharedService.L("UI.ToyBoxUi.Poker.4a25782c", "Apply table settings"), -1, true))
                             {
                                 _games.HostPokerConfigure(_activeGameId, _pokerHostBuyIn, _pokerHostSmallBlind, _pokerHostBigBlind);
                             }
 
-                            if (_uiSharedService.IconTextButton(FontAwesomeIcon.PlayCircle, "Start hand", -1, true))
+                            if (_uiSharedService.IconTextButton(FontAwesomeIcon.PlayCircle, _uiSharedService.L("UI.ToyBoxUi.Poker.0d9d27ca", "Start hand"), -1, true))
                             {
                                 _games.HostPokerConfigure(_activeGameId, _pokerHostBuyIn, _pokerHostSmallBlind, _pokerHostBigBlind);
                                 _games.HostPokerStartHand(_activeGameId, _pokerHostBuyIn);
@@ -305,7 +305,7 @@ public sealed partial class ToyBoxUi
                     }
                     else
                     {
-                        ImGui.TextColored(ImGuiColors.DalamudGrey, stage == PokerStage.Lobby ? "Waiting for the host to deal…" : "No hand yet.");
+                        ImGui.TextColored(ImGuiColors.DalamudGrey, stage == PokerStage.Lobby ? _uiSharedService.L("UI.ToyBoxUi.Poker.a640ea51", "Waiting for the host to deal…") : _uiSharedService.L("UI.ToyBoxUi.Poker.83998a4b", "No hand yet."));
                     }
 
                     if (pub != null)
@@ -320,7 +320,7 @@ public sealed partial class ToyBoxUi
 
                     if (priv == null)
                     {
-                        ImGui.TextColored(ImGuiColors.DalamudGrey, "Waiting for host…");
+                        ImGui.TextColored(ImGuiColors.DalamudGrey, _uiSharedService.L("UI.ToyBoxUi.Poker.4144fb23", "Waiting for host…"));
                         return;
                     }
 
@@ -329,7 +329,7 @@ public sealed partial class ToyBoxUi
                     {
                         if (priv.YourHoleCards != null && priv.YourHoleCards.Count == 2)
                         {
-                            if (_uiSharedService.IconTextButton(FontAwesomeIcon.Eye, "Reveal your hand", -1, true))
+                            if (_uiSharedService.IconTextButton(FontAwesomeIcon.Eye, _uiSharedService.L("UI.ToyBoxUi.Poker.7040a3a9", "Reveal your hand"), -1, true))
                                 _games.PokerReveal(_activeGameId, priv.YourHoleCards);
 
                             ImGuiHelpers.ScaledDummy(6);
@@ -340,7 +340,7 @@ public sealed partial class ToyBoxUi
                     {
                         ImGui.Spacing();
                         ImGui.Separator();
-                        ImGui.TextUnformatted("Hand complete");
+                        ImGui.TextUnformatted(_uiSharedService.L("UI.ToyBoxUiPoker.5fb611b5", "Hand complete"));
 
                         var top = pub.LastHandResults?.FirstOrDefault();
                         if (top != null)
@@ -351,7 +351,7 @@ public sealed partial class ToyBoxUi
                         }
                         else
                         {
-                            ImGui.TextDisabled("Hand complete.");
+                            ImGui.TextDisabled(_uiSharedService.L("UI.ToyBoxUiPoker.ae243c6a", "Hand complete."));
                         }
 
                         ImGui.Spacing();
@@ -360,12 +360,12 @@ public sealed partial class ToyBoxUi
                         {
                             int buyIn = Math.Max(1, pub.TableBuyIn > 0 ? pub.TableBuyIn : _pokerHostBuyIn);
 
-                            if (ImGui.Button("Start next hand", new Vector2(-1, 0)))
+                            if (ImGui.Button(_uiSharedService.L("UI.ToyBoxUiPoker.ef49f192", "Start next hand"), new Vector2(-1, 0)))
                                 _games.HostPokerStartHand(_activeGameId, buyIn);
                         }
                         else
                         {
-                            ImGui.TextDisabled("Waiting for the host to start the next hand...");
+                            ImGui.TextDisabled(_uiSharedService.L("UI.ToyBoxUiPoker.75221a90", "Waiting for the host to start the next hand..."));
                         }
 
                         return;
@@ -374,7 +374,7 @@ public sealed partial class ToyBoxUi
 
                     if (!priv.IsYourTurn)
                     {
-                        ImGui.TextColored(ImGuiColors.DalamudGrey, "Waiting…");
+                        ImGui.TextColored(ImGuiColors.DalamudGrey, _uiSharedService.L("UI.ToyBoxUi.Poker.b04f145c", "Waiting…"));
                         return;
                     }
 
@@ -384,7 +384,7 @@ public sealed partial class ToyBoxUi
                     {
                         if (allowed.Contains(PokerActionKind.Fold))
                         {
-                            if (_uiSharedService.IconTextButton(FontAwesomeIcon.Times, "Fold", -1, true))
+                            if (_uiSharedService.IconTextButton(FontAwesomeIcon.Times, _uiSharedService.L("UI.ToyBoxUi.Poker.227cd66b", "Fold"), -1, true))
                             {
                                 _games.PokerAction(_activeGameId, PokerActionKind.Fold);
                                 return;
@@ -393,7 +393,7 @@ public sealed partial class ToyBoxUi
 
                         if (allowed.Contains(PokerActionKind.Check))
                         {
-                            if (_uiSharedService.IconTextButton(FontAwesomeIcon.Check, "Check", -1, true))
+                            if (_uiSharedService.IconTextButton(FontAwesomeIcon.Check, _uiSharedService.L("UI.ToyBoxUi.Poker.4b0bef0f", "Check"), -1, true))
                             {
                                 _games.PokerAction(_activeGameId, PokerActionKind.Check);
                                 return;
@@ -442,7 +442,7 @@ public sealed partial class ToyBoxUi
 
                             ImGui.TextDisabled($"→ Raise to: {raiseTo}");
 
-                            if (_uiSharedService.IconTextButton(FontAwesomeIcon.LevelUpAlt, "Raise", -1, true))
+                            if (_uiSharedService.IconTextButton(FontAwesomeIcon.LevelUpAlt, _uiSharedService.L("UI.ToyBoxUi.Poker.0873bb30", "Raise"), -1, true))
                             {
                                 _games.PokerAction(_activeGameId, PokerActionKind.Raise, raiseTo);
                                 return;
@@ -458,7 +458,7 @@ public sealed partial class ToyBoxUi
 
                         if (allowed.Contains(PokerActionKind.AllIn))
                         {
-                            if (_uiSharedService.IconTextButton(FontAwesomeIcon.Bomb, "All-in", -1, true))
+                            if (_uiSharedService.IconTextButton(FontAwesomeIcon.Bomb, _uiSharedService.L("UI.ToyBoxUi.Poker.30bcd469", "All-in"), -1, true))
                             {
                                 _games.PokerAction(_activeGameId, PokerActionKind.AllIn);
                                 return;
@@ -468,11 +468,11 @@ public sealed partial class ToyBoxUi
                         if (pub.Stage == PokerStage.RoundOver && pub.LastHandResults != null && pub.LastHandResults.Count > 0)
                         {
                             ImGui.Separator();
-                            ImGui.TextUnformatted("Hand result");
+                            ImGui.TextUnformatted(_uiSharedService.L("UI.ToyBoxUiPoker.77998b2d", "Hand result"));
 
                             foreach (var r in pub.LastHandResults)
                             {
-                                ImGui.TextUnformatted($"{r.Name} won {r.WonAmount}  ({r.HandLabel})");
+                                ImGui.TextUnformatted(string.Format(_uiSharedService.L("UI.ToyBoxUi.Poker.232fc4ce", "{0} won {1}  ({2})"), r.Name, r.WonAmount, r.HandLabel));
                             }
                         }
                     }

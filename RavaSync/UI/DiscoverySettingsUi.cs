@@ -41,18 +41,13 @@ public sealed class DiscoverySettingsUi : WindowMediatorSubscriberBase
     {
         _uiShared.BigText("Discovery & Presence", ImGuiColors.DalamudViolet);
 
-        UiSharedService.TextWrapped(
-            "Discovery is entirely opt-in. When you turn it on, other RavaSync users who have also opted in " +
-            "can see that you're on RavaSync (with a little ♥) and can right-click you to send a pair request — " +
-            "and you can do the same to them. If you leave it off, you're effectively invisible: no hearts, no " +
-            "right-click pair option, and people will need your UID to pair with you."
-        );
+        UiSharedService.TextWrapped(_uiShared.L("UI.DiscoverySettingsUi.3ebc5831", "Discovery is entirely opt-in. When you turn it on, other RavaSync users who have also opted in can see that you're on RavaSync (with a little ♥) and can right-click you to send a pair request — and you can do the same to them. If you leave it off, you're effectively invisible: no hearts, no right-click pair option, and people will need your UID to pair with you."));
 
         ImGui.Separator();
         ImGuiHelpers.ScaledDummy(5);
 
         bool discoveryPresence = _configService.Current.EnableRavaDiscoveryPresence;
-        if (ImGui.Checkbox("Show RavaSync presence to other RavaSync users?", ref discoveryPresence))
+        if (ImGui.Checkbox(_uiShared.L("UI.DiscoverySettingsUi.e6c3b6f6", "Show RavaSync presence to other RavaSync users?"), ref discoveryPresence))
         {
             _configService.Current.EnableRavaDiscoveryPresence = discoveryPresence;
             _configService.Save();
@@ -68,7 +63,7 @@ public sealed class DiscoverySettingsUi : WindowMediatorSubscriberBase
         bool enablePairRequestMenu = _configService.Current.EnableSendPairRequestContextMenu;
         using (ImRaii.Disabled(!discoveryPresence))
         {
-            if (ImGui.Checkbox("Show \"Send pair request\" in right-click menu", ref enablePairRequestMenu))
+            if (ImGui.Checkbox(_uiShared.L("UI.DiscoverySettingsUi.EE0E6297", "Show \"Send pair request\" in right-click menu"), ref enablePairRequestMenu))
             {
                 _configService.Current.EnableSendPairRequestContextMenu = enablePairRequestMenu;
                 _configService.Save();
@@ -82,7 +77,7 @@ public sealed class DiscoverySettingsUi : WindowMediatorSubscriberBase
         ImGuiHelpers.ScaledDummy(5);
 
         bool autoDecline = _configService.Current.AutoDeclineIncomingPairRequests;
-        if (ImGui.Checkbox("Automatically decline incoming pair requests", ref autoDecline))
+        if (ImGui.Checkbox(_uiShared.L("UI.DiscoverySettingsUi.3bb79ae6", "Automatically decline incoming pair requests"), ref autoDecline))
         {
             _configService.Current.AutoDeclineIncomingPairRequests = autoDecline;
             _configService.Save();
@@ -97,7 +92,7 @@ public sealed class DiscoverySettingsUi : WindowMediatorSubscriberBase
         bool showHeart = _configService.Current.ShowFriendshapedHeart;
         using (ImRaii.Disabled(!discoveryPresence))
         {
-            if (ImGui.Checkbox("Show ♥ on RavaSync users not yet paired", ref showHeart))
+            if (ImGui.Checkbox(_uiShared.L("UI.DiscoverySettingsUi.FFF66944", "Show â¥ on RavaSync users not yet paired"), ref showHeart))
             {
                 _configService.Current.ShowFriendshapedHeart = showHeart;
                 _configService.Save();

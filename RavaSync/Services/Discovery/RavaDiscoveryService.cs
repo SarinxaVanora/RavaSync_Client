@@ -11,6 +11,7 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using System;
 using System.Collections.Concurrent;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -49,6 +50,14 @@ public sealed class RavaDiscoveryService
     private int _roundRobinStartIndex = 0;
     private bool _isMeshListening = false;
 
+    private sealed record ObjectSessionCacheEntry(
+        string SessionId,
+        DateTime LastSeenUtc);
+
+    private readonly ConcurrentDictionary<nint, ObjectSessionCacheEntry> _objectSessionCache = new();
+    private static readonly TimeSpan ObjectSessionCacheTtl = TimeSpan.FromSeconds(10);
+    private static readonly TimeSpan ObjectSessionCachePruneInterval = TimeSpan.FromSeconds(5);
+    private DateTime _lastObjectSessionPruneUtc = DateTime.MinValue;
 
     public sealed record RavaPeerInfo(
         string SessionId,
@@ -57,7 +66,15 @@ public sealed class RavaDiscoveryService
         DateTime LastSeenUtc
     );
 
-    public RavaDiscoveryService(ILogger<RavaDiscoveryService> logger,IObjectTable objectTable,IClientState clientState,IRavaMesh mesh,MareMediator mediator,DalamudUtilService dalamudUtil, ApiController api, MareConfigService configService) : base(logger, mediator)
+    public RavaDiscoveryService(
+        ILogger<RavaDiscoveryService> logger,
+        IObjectTable objectTable,
+        IClientState clientState,
+        IRavaMesh mesh,
+        MareMediator mediator,
+        DalamudUtilService dalamudUtil,
+        ApiController api,
+        MareConfigService configService) : base(logger, mediator)
     {
         _logger = logger;
         _objects = objectTable;
@@ -74,6 +91,7 @@ public sealed class RavaDiscoveryService
         {
             _ownUser = msg.Connection.User;
         });
+
         _mediator.Subscribe<DisconnectedMessage>(this, _ =>
         {
             ResetMeshListener();
@@ -107,8 +125,8 @@ public sealed class RavaDiscoveryService
         _isMeshListening = false;
         _knownPeers.Clear();
         _lastHelloSentUtc.Clear();
+        _objectSessionCache.Clear();
     }
-
 
     public Task StartAsync(CancellationToken cancellationToken)
     {
@@ -119,9 +137,10 @@ public sealed class RavaDiscoveryService
     public Task StopAsync(CancellationToken cancellationToken)
     {
         _logger.LogInformation("RavaDiscoveryService stopping");
+
+        ResetMeshListener();
         _mediator.UnsubscribeAll(this);
-        _knownPeers.Clear();
-        _lastHelloSentUtc.Clear();
+
         return Task.CompletedTask;
     }
 
@@ -180,17 +199,10 @@ public sealed class RavaDiscoveryService
 
         if (!discoveryEnabled && _lastDiscoveryPresence)
         {
-            if (!_knownPeers.IsEmpty)
-            {
-                foreach (var peer in _knownPeers.Values)
-                {
-                    var goodbye = new RavaGoodbye(_mySessionId, _myPeerKey);
-                    _ = _mesh.SendAsync(peer.SessionId, goodbye);
-                }
-            }
-
+            SendGoodbyeToAll();
             _knownPeers.Clear();
             _lastHelloSentUtc.Clear();
+            _objectSessionCache.Clear();
 
             _logger.LogDebug("RavaDiscovery: discovery disabled, sent goodbyes to all known peers");
         }
@@ -202,6 +214,7 @@ public sealed class RavaDiscoveryService
 
         var now = DateTime.UtcNow;
         PrunePeers(now);
+        PruneObjectSessionCache(now);
 
         if (now < _nextHelloScanUtc) return;
         _nextHelloScanUtc = now + HelloScanInterval;
@@ -222,19 +235,8 @@ public sealed class RavaDiscoveryService
             if (pc.Address == IntPtr.Zero) continue;
             if (_clientState.LocalPlayer!.Address == pc.Address) continue;
 
-            string ident;
-            try
-            {
-                ident = _dalamudUtil.GetIdentFromGameObject(pc) ?? string.Empty;
-            }
-            catch
-            {
+            if (!TryGetSessionIdForPlayer(pc, now, out var sessionId))
                 continue;
-            }
-
-            if (string.IsNullOrEmpty(ident)) continue;
-
-            var sessionId = RavaSessionId.FromIdent(ident);
 
             if (_lastHelloSentUtc.TryGetValue(sessionId, out var last) &&
                 (now - last) < HelloInterval)
@@ -294,8 +296,6 @@ public sealed class RavaDiscoveryService
         return Task.CompletedTask;
     }
 
-
-
     private void HandleHello(string transportSessionId, RavaHello hello)
     {
         if (_mySessionId == null) return;
@@ -304,13 +304,15 @@ public sealed class RavaDiscoveryService
         if (string.IsNullOrWhiteSpace(from))
             return;
 
+        var now = DateTime.UtcNow;
+
         var info = new RavaPeerInfo(
             SessionId: from,
             PeerKey: hello.FromPeerKey ?? Array.Empty<byte>(),
-            FirstSeenUtc: DateTime.UtcNow,
-            LastSeenUtc: DateTime.UtcNow);
+            FirstSeenUtc: now,
+            LastSeenUtc: now);
 
-        _knownPeers.AddOrUpdate(from, info, (_, existing) => existing with { LastSeenUtc = DateTime.UtcNow });
+        _knownPeers.AddOrUpdate(from, info, (_, existing) => existing with { LastSeenUtc = now });
 
         var ack = new RavaHelloAck(_mySessionId, _myPeerKey);
         _ = _mesh.SendAsync(from, ack);
@@ -322,20 +324,19 @@ public sealed class RavaDiscoveryService
         if (string.IsNullOrWhiteSpace(from))
             return;
 
+        var now = DateTime.UtcNow;
+
         var info = new RavaPeerInfo(
             SessionId: from,
             PeerKey: ack.FromPeerKey ?? Array.Empty<byte>(),
-            FirstSeenUtc: DateTime.UtcNow,
-            LastSeenUtc: DateTime.UtcNow);
+            FirstSeenUtc: now,
+            LastSeenUtc: now);
 
-        _knownPeers.AddOrUpdate(from, info, (_, existing) => existing with { LastSeenUtc = DateTime.UtcNow });
+        _knownPeers.AddOrUpdate(from, info, (_, existing) => existing with { LastSeenUtc = now });
     }
-
-
 
     private void HandlePairRequest(string localSessionId, RavaPairRequest pr)
     {
-
         Mediator.Publish(new PairRequestReceivedMessage(pr.Request));
     }
 
@@ -343,11 +344,12 @@ public sealed class RavaDiscoveryService
     {
         if (_knownPeers.TryRemove(bye.FromSessionId, out _))
         {
+            _lastHelloSentUtc.TryRemove(bye.FromSessionId, out _);
             _logger.LogDebug("RavaDiscovery: received goodbye");
         }
     }
 
-   private void HandleTerritoryChange()
+    private void HandleTerritoryChange()
     {
         var territory = _dalamudUtil.CurrentTerritoryId;
 
@@ -366,20 +368,80 @@ public sealed class RavaDiscoveryService
 
         _knownPeers.Clear();
         _lastHelloSentUtc.Clear();
+        _objectSessionCache.Clear();
 
         _mySessionId = null;
 
         if (!string.IsNullOrEmpty(oldSession))
         {
-            _mesh.Unlisten(oldSession);
+            try
+            {
+                _mesh.Unlisten(oldSession);
+            }
+            catch
+            {
+                // ignore
+            }
+
             _isMeshListening = false;
         }
-
-
 
         _lastTerritoryId = territory;
     }
 
+    private void PruneObjectSessionCache(DateTime nowUtc)
+    {
+        if ((nowUtc - _lastObjectSessionPruneUtc) < ObjectSessionCachePruneInterval)
+            return;
+
+        _lastObjectSessionPruneUtc = nowUtc;
+
+        foreach (var kvp in _objectSessionCache)
+        {
+            if ((nowUtc - kvp.Value.LastSeenUtc) > ObjectSessionCacheTtl)
+                _objectSessionCache.TryRemove(kvp.Key, out _);
+        }
+    }
+
+    private bool TryGetSessionIdForPlayer(IPlayerCharacter pc, DateTime nowUtc, out string sessionId)
+    {
+        sessionId = string.Empty;
+
+        var addr = pc.Address;
+        if (addr == IntPtr.Zero)
+            return false;
+
+        if (_objectSessionCache.TryGetValue(addr, out var cached))
+        {
+            if ((nowUtc - cached.LastSeenUtc) <= ObjectSessionCacheTtl)
+            {
+                // refresh timestamp cheaply
+                _objectSessionCache[addr] = cached with { LastSeenUtc = nowUtc };
+                sessionId = cached.SessionId;
+                return !string.IsNullOrEmpty(sessionId);
+            }
+        }
+
+        string ident;
+        try
+        {
+            ident = _dalamudUtil.GetIdentFromGameObject(pc) ?? string.Empty;
+        }
+        catch
+        {
+            return false;
+        }
+
+        if (string.IsNullOrEmpty(ident))
+            return false;
+
+        sessionId = RavaSessionId.FromIdent(ident);
+        if (string.IsNullOrEmpty(sessionId))
+            return false;
+
+        _objectSessionCache[addr] = new ObjectSessionCacheEntry(sessionId, nowUtc);
+        return true;
+    }
 
     private void PrunePeers(DateTime nowUtc)
     {
@@ -411,6 +473,4 @@ public sealed class RavaDiscoveryService
             _ = _mesh.SendAsync(peerSessionId, new RavaGoodbye(_mySessionId, _myPeerKey));
         }
     }
-
-
 }

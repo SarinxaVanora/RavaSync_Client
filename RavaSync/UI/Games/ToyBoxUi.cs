@@ -80,7 +80,7 @@ public sealed partial class ToyBoxUi : WindowMediatorSubscriberBase
     {
 
         using (_uiSharedService.UidFont.Push())
-            ImGui.TextUnformatted("Toy Box Games");
+            ImGui.TextUnformatted(_uiSharedService.L("UI.ToyBoxUi.60eae331", "Toy Box Games"));
 
         ImGui.Separator();
 
@@ -89,14 +89,14 @@ public sealed partial class ToyBoxUi : WindowMediatorSubscriberBase
 
         // Force-select Host tab right after hosting
         var hostFlags = _selectHostTab ? ImGuiTabItemFlags.SetSelected : ImGuiTabItemFlags.None;
-        using (var hostTab = ImRaii.TabItem("Host", hostFlags))
+        using (var hostTab = ImRaii.TabItem(string.Concat(_uiSharedService.L("UI.ToyBoxUi.c2ca16d0", "Host"), "##c2ca16d0"), hostFlags))
         {
             if (hostTab)
                 DrawHost();
         }
 
         var lobbiesFlags = _selectLobbiesTab ? ImGuiTabItemFlags.SetSelected : ImGuiTabItemFlags.None;
-        using (var invitesTab = ImRaii.TabItem("Lobbies", lobbiesFlags))
+        using (var invitesTab = ImRaii.TabItem(string.Concat(_uiSharedService.L("UI.ToyBoxUi.e7b7865c", "Lobbies"), "##e7b7865c"), lobbiesFlags))
         {
             if (invitesTab)
                 DrawInvites();
@@ -104,26 +104,26 @@ public sealed partial class ToyBoxUi : WindowMediatorSubscriberBase
 
         // Force-select Blackjack tab right after accepting an invite/joining
         var bjFlags = _selectBlackjackTab ? ImGuiTabItemFlags.SetSelected : ImGuiTabItemFlags.None;
-        using (var blackjackTab = ImRaii.TabItem("Blackjack", bjFlags))
+        using (var blackjackTab = ImRaii.TabItem(string.Concat(_uiSharedService.L("UI.ToyBoxUi.c997a483", "Blackjack"), "##c997a483"), bjFlags))
         {
             if (blackjackTab)
                 DrawBlackjack();
         }
 
         var pokerFlags = _selectPokerTab ? ImGuiTabItemFlags.SetSelected : ImGuiTabItemFlags.None;
-        using (var pokerTab = ImRaii.TabItem("Poker", pokerFlags))
+        using (var pokerTab = ImRaii.TabItem(string.Concat(_uiSharedService.L("UI.ToyBoxUi.cea3a438", "Poker"), "##cea3a438"), pokerFlags))
         {
             if (pokerTab)
                 DrawPoker();
         }
         var bingoFlags = _selectBingoTab ? ImGuiTabItemFlags.SetSelected : ImGuiTabItemFlags.None;
-        using (var bingoTab = ImRaii.TabItem("Bingo", bingoFlags))
+        using (var bingoTab = ImRaii.TabItem(string.Concat(_uiSharedService.L("UI.ToyBoxUi.6b99fc04", "Bingo"), "##6b99fc04"), bingoFlags))
         {
             if (bingoTab)
                 DrawBingo();
         }
         var tFlags = _selectTournamentTab ? ImGuiTabItemFlags.SetSelected : ImGuiTabItemFlags.None;
-        using (var tournamentTab = ImRaii.TabItem("Tournament", tFlags))
+        using (var tournamentTab = ImRaii.TabItem(string.Concat(_uiSharedService.L("UI.ToyBoxUi.4f4dc29d", "Tournament"), "##4f4dc29d"), tFlags))
         {
             if (tournamentTab)
                 DrawTournament();
@@ -142,7 +142,7 @@ public sealed partial class ToyBoxUi : WindowMediatorSubscriberBase
     {
         string[] kinds = ["Blackjack", "Poker (Texas Hold 'em)", "Bingo", "Combat Tournament"];
         ImGui.SetNextItemWidth(250 * ImGuiHelpers.GlobalScale);
-        ImGui.Combo("Game Type", ref _hostGameKind, kinds, kinds.Length);
+        ImGui.Combo(_uiSharedService.L("UI.ToyBoxUi.848e35ab", "Game Type"), ref _hostGameKind, kinds, kinds.Length);
 
         ImGuiHelpers.ScaledDummy(8);
 
@@ -150,14 +150,14 @@ public sealed partial class ToyBoxUi : WindowMediatorSubscriberBase
 
         // Row: Name [ ]   Max Players [ ] (0 = unlimited)   Password protect? [x]
         ImGui.AlignTextToFramePadding();
-        ImGui.TextUnformatted("Name:");
+        ImGui.TextUnformatted(_uiSharedService.L("UI.ToyBoxUi.71dd2eff", "Name:"));
         ImGui.SameLine();
         ImGui.SetNextItemWidth(260 * scale);
         ImGui.InputText("##toybox_lobby_name", ref _hostLobbyName, 48);
 
         ImGui.SameLine();
         ImGui.AlignTextToFramePadding();
-        ImGui.TextUnformatted("Max Players");
+        ImGui.TextUnformatted(_uiSharedService.L("UI.ToyBoxUi.77c39686", "Max Players"));
         ImGui.SameLine();
         ImGui.SetNextItemWidth(100 * scale);
         ImGui.InputInt("##toybox_max_players", ref _hostMaxPlayers);
@@ -165,16 +165,16 @@ public sealed partial class ToyBoxUi : WindowMediatorSubscriberBase
 
         ImGui.SameLine();
         ImGui.AlignTextToFramePadding();
-        ImGui.TextColored(ImGuiColors.DalamudGrey, "(0 = unlimited)");
+        ImGui.TextColored(ImGuiColors.DalamudGrey, _uiSharedService.L("UI.ToyBoxUi.3d502279", "(0 = unlimited)"));
 
         ImGui.SameLine();
-        ImGui.Checkbox("Password protect?##toybox_pw_toggle", ref _hostUsePassword);
+        ImGui.Checkbox($"{_uiSharedService.L("UI.ToyBoxUi.6B1FB909", "Password protect?")}##toybox_pw_toggle", ref _hostUsePassword);
 
         if (_hostUsePassword)
         {
             ImGuiHelpers.ScaledDummy(6);
             ImGui.AlignTextToFramePadding();
-            ImGui.TextUnformatted("Password:");
+            ImGui.TextUnformatted(_uiSharedService.L("UI.ToyBoxUi.be81ab98", "Password:"));
             ImGui.SameLine();
             ImGui.SetNextItemWidth(260 * scale);
             ImGui.InputText("##toybox_lobby_pw", ref _hostPassword, 128, ImGuiInputTextFlags.Password);
@@ -192,21 +192,21 @@ public sealed partial class ToyBoxUi : WindowMediatorSubscriberBase
 
             // Row: Buy-in [ ]   Small Blind [ ]   Big Blind [ ]
             ImGui.AlignTextToFramePadding();
-            ImGui.TextUnformatted("Buy-in");
+            ImGui.TextUnformatted(_uiSharedService.L("UI.ToyBoxUi.eaabb70b", "Buy-in"));
             ImGui.SameLine();
             ImGui.SetNextItemWidth(110 * scale2);
             ImGui.InputInt("##toybox_poker_buyin", ref _pokerHostBuyIn);
 
             ImGui.SameLine();
             ImGui.AlignTextToFramePadding();
-            ImGui.TextUnformatted("Small blind");
+            ImGui.TextUnformatted(_uiSharedService.L("UI.ToyBoxUi.de73f5f1", "Small blind"));
             ImGui.SameLine();
             ImGui.SetNextItemWidth(90 * scale2);
             ImGui.InputInt("##toybox_poker_sb", ref _pokerHostSmallBlind);
 
             ImGui.SameLine();
             ImGui.AlignTextToFramePadding();
-            ImGui.TextUnformatted("Big blind");
+            ImGui.TextUnformatted(_uiSharedService.L("UI.ToyBoxUi.6440af3f", "Big blind"));
             ImGui.SameLine();
             ImGui.SetNextItemWidth(90 * scale2);
             ImGui.InputInt("##toybox_poker_bb", ref _pokerHostBigBlind);
@@ -216,7 +216,7 @@ public sealed partial class ToyBoxUi : WindowMediatorSubscriberBase
             if (_pokerHostBigBlind < _pokerHostSmallBlind) _pokerHostBigBlind = _pokerHostSmallBlind;
 
             if (!pokerBuyInValid)
-                ImGui.TextColored(ImGuiColors.DalamudRed, "Buy-in must be set before hosting Poker.");
+                ImGui.TextColored(ImGuiColors.DalamudRed, _uiSharedService.L("UI.ToyBoxUi.13ccda9a", "Buy-in must be set before hosting Poker."));
         }
 
         bool tournamentSelected = _hostGameKind == 3;
@@ -225,7 +225,7 @@ public sealed partial class ToyBoxUi : WindowMediatorSubscriberBase
             ImGuiHelpers.ScaledDummy(6);
 
             ImGui.AlignTextToFramePadding();
-            ImGui.TextUnformatted("Max HP");
+            ImGui.TextUnformatted(_uiSharedService.L("UI.ToyBoxUi.37cd02a6", "Max HP"));
             ImGui.SameLine();
             ImGui.SetNextItemWidth(110 * ImGuiHelpers.GlobalScale);
             ImGui.InputInt("##toybox_tour_maxhp", ref _tournamentHostMaxHp);
@@ -236,7 +236,7 @@ public sealed partial class ToyBoxUi : WindowMediatorSubscriberBase
         bool disableHost = pokerSelected && !pokerBuyInValid;
 
         ImGui.BeginDisabled(disableHost);
-        if (_uiSharedService.IconTextButton(FontAwesomeIcon.Play, "Host game", 200 * ImGuiHelpers.GlobalScale, true))
+        if (_uiSharedService.IconTextButton(FontAwesomeIcon.Play, _uiSharedService.L("UI.ToyBoxUi.59db3882", "Host game"), 200 * ImGuiHelpers.GlobalScale, true))
         {
             var pw = _hostUsePassword ? _hostPassword : null;
 
@@ -273,7 +273,7 @@ public sealed partial class ToyBoxUi : WindowMediatorSubscriberBase
         // Direct (right-click) invites
         if (!_games.DirectInvites.IsEmpty)
         {
-            ImGui.TextUnformatted("Direct Invites");
+            ImGui.TextUnformatted(_uiSharedService.L("UI.ToyBoxUi.ff02a76a", "Direct Invites"));
             ImGui.Separator();
 
             foreach (var inv in _games.DirectInvites.Values.OrderByDescending(v => v.ReceivedTicks))
@@ -287,7 +287,7 @@ public sealed partial class ToyBoxUi : WindowMediatorSubscriberBase
                 ImGui.TextUnformatted(title);
                 if (inv.Kind == SyncshellGameKind.Tournament)
                 {
-                    if (_uiSharedService.IconTextButton(FontAwesomeIcon.UserNinja, "Join as Fighter", 170 * ImGuiHelpers.GlobalScale, true))
+                    if (_uiSharedService.IconTextButton(FontAwesomeIcon.UserNinja, _uiSharedService.L("UI.ToyBoxUi.8f876eb9", "Join as Fighter"), 170 * ImGuiHelpers.GlobalScale, true))
                     {
                         _activeGameId = inv.GameId;
                         _games.JoinTournament(inv.GameId, TournamentRole.Fighter, null, fromDirectInvite: true);
@@ -296,14 +296,14 @@ public sealed partial class ToyBoxUi : WindowMediatorSubscriberBase
 
                     ImGui.SameLine();
 
-                    if (_uiSharedService.IconTextButton(FontAwesomeIcon.Eye, "Join as Spectator", 170 * ImGuiHelpers.GlobalScale, true))
+                    if (_uiSharedService.IconTextButton(FontAwesomeIcon.Eye, _uiSharedService.L("UI.ToyBoxUi.ab467794", "Join as Spectator"), 170 * ImGuiHelpers.GlobalScale, true))
                     {
                         _activeGameId = inv.GameId;
                         _games.JoinTournament(inv.GameId, TournamentRole.Spectator, null, fromDirectInvite: true);
                         _selectTournamentTab = true;
                     }
                 }
-                else if (_uiSharedService.IconTextButton(FontAwesomeIcon.Check, "Accept invite", 170 * ImGuiHelpers.GlobalScale, true))
+                else if (_uiSharedService.IconTextButton(FontAwesomeIcon.Check, _uiSharedService.L("UI.ToyBoxUi.57700df3", "Accept invite"), 170 * ImGuiHelpers.GlobalScale, true))
                 {
                     _activeGameId = inv.GameId;
 
@@ -327,12 +327,12 @@ public sealed partial class ToyBoxUi : WindowMediatorSubscriberBase
         }
 
         // Lobbies (broadcast)
-        ImGui.TextUnformatted("Lobbies");
+        ImGui.TextUnformatted(_uiSharedService.L("UI.ToyBoxUi.8b5695be", "Lobbies"));
         ImGui.Separator();
 
         if (_games.Invites.IsEmpty)
         {
-            ImGui.TextColored(ImGuiColors.DalamudGrey, "No lobbies nearby.");
+            ImGui.TextColored(ImGuiColors.DalamudGrey, _uiSharedService.L("UI.ToyBoxUi.bd924eff", "No lobbies nearby."));
             DrawJoinPasswordPopup();
             return;
         }
@@ -364,7 +364,7 @@ public sealed partial class ToyBoxUi : WindowMediatorSubscriberBase
             }
             if (inv.Kind == SyncshellGameKind.Tournament)
             {
-                if (_uiSharedService.IconTextButton(FontAwesomeIcon.UserNinja, inv.PasswordProtected ? "Fighter (pw)" : "Join Fighter", 170 * ImGuiHelpers.GlobalScale, true))
+                if (_uiSharedService.IconTextButton(FontAwesomeIcon.UserNinja, inv.PasswordProtected ? _uiSharedService.L("UI.ToyBoxUi.d92c58ab", "Fighter (pw)") : _uiSharedService.L("UI.ToyBoxUi.0dcd1a23", "Join Fighter"), 170 * ImGuiHelpers.GlobalScale, true))
                 {
                     if (inv.PasswordProtected)
                     {
@@ -383,7 +383,7 @@ public sealed partial class ToyBoxUi : WindowMediatorSubscriberBase
 
                 ImGui.SameLine();
 
-                if (_uiSharedService.IconTextButton(FontAwesomeIcon.Eye, inv.PasswordProtected ? "Spectator (pw)" : "Join Spectator", 170 * ImGuiHelpers.GlobalScale, true))
+                if (_uiSharedService.IconTextButton(FontAwesomeIcon.Eye, inv.PasswordProtected ? _uiSharedService.L("UI.ToyBoxUi.aadf06c6", "Spectator (pw)") : _uiSharedService.L("UI.ToyBoxUi.721b6b1e", "Join Spectator"), 170 * ImGuiHelpers.GlobalScale, true))
                 {
                     if (inv.PasswordProtected)
                     {
@@ -404,7 +404,7 @@ public sealed partial class ToyBoxUi : WindowMediatorSubscriberBase
                 continue;
             }
 
-            if (_uiSharedService.IconTextButton(FontAwesomeIcon.SignInAlt, inv.PasswordProtected ? "Join (password)" : "Join", 170 * ImGuiHelpers.GlobalScale, true))
+            if (_uiSharedService.IconTextButton(FontAwesomeIcon.SignInAlt, inv.PasswordProtected ? _uiSharedService.L("UI.ToyBoxUi.1c9469de", "Join (password)") : _uiSharedService.L("UI.ToyBoxUi.dbb1f8fb", "Join"), 170 * ImGuiHelpers.GlobalScale, true))
             {
                 if (inv.PasswordProtected)
                 {
@@ -441,23 +441,23 @@ public sealed partial class ToyBoxUi : WindowMediatorSubscriberBase
     {
         if (_openJoinPasswordPopup)
         {
-            ImGui.OpenPopup("Join lobby##toybox_pw");
+            ImGui.OpenPopup($"{_uiSharedService.L("UI.ToyBoxUi.B24383BC", "Join lobby")}##toybox_pw");
             _openJoinPasswordPopup = false;
         }
 
         bool open = true;
-        if (!ImGui.BeginPopupModal("Join lobby##toybox_pw", ref open, ImGuiWindowFlags.AlwaysAutoResize))
+        if (!ImGui.BeginPopupModal($"{_uiSharedService.L("UI.ToyBoxUi.B24383BC", "Join lobby")}##toybox_pw", ref open, ImGuiWindowFlags.AlwaysAutoResize))
             return;
 
-        ImGui.TextUnformatted("This lobby is password protected.");
+        ImGui.TextUnformatted(_uiSharedService.L("UI.ToyBoxUi.fa899a21", "This lobby is password protected."));
         ImGuiHelpers.ScaledDummy(4);
 
         ImGui.SetNextItemWidth(260 * ImGuiHelpers.GlobalScale);
-        ImGui.InputText("Password", ref _pendingJoinPassword, 128, ImGuiInputTextFlags.Password);
+        ImGui.InputText(_uiSharedService.L("UI.ToyBoxUi.8be3c943", "Password"), ref _pendingJoinPassword, 128, ImGuiInputTextFlags.Password);
 
         ImGuiHelpers.ScaledDummy(8);
 
-        if (_uiSharedService.IconTextButton(FontAwesomeIcon.SignInAlt, "Join", 120 * ImGuiHelpers.GlobalScale, true))
+        if (_uiSharedService.IconTextButton(FontAwesomeIcon.SignInAlt, _uiSharedService.L("UI.ToyBoxUi.dbb1f8fb", "Join"), 120 * ImGuiHelpers.GlobalScale, true))
         {
             if (_games.Invites.TryGetValue(_pendingJoinGameId, out var inv))
             {
@@ -488,7 +488,7 @@ public sealed partial class ToyBoxUi : WindowMediatorSubscriberBase
         }
 
         ImGui.SameLine();
-        if (ImGui.Button("Cancel", new Vector2(80 * ImGuiHelpers.GlobalScale, 0)))
+        if (ImGui.Button(_uiSharedService.L("UI.VenueRegistrationUi.77dfd213", "Cancel"), new Vector2(80 * ImGuiHelpers.GlobalScale, 0)))
         {
             _pendingJoinPassword = string.Empty;
             _pendingJoinGameId = Guid.Empty;

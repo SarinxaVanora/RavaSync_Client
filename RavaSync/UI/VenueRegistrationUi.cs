@@ -150,7 +150,7 @@ public sealed class VenueRegistrationUi : WindowMediatorSubscriberBase
 
     protected override void DrawInternal()
     {
-        ImGui.TextWrapped("Link this plot to one of your Syncshells.");
+        ImGui.TextWrapped(_uiSharedService.L("UI.VenueRegistrationUi.a6a95932", "Link this plot to one of your Syncshells."));
         ImGui.Spacing();
 
         ImGui.TextDisabled($"Location Key: {_canonicalKey}");
@@ -158,12 +158,12 @@ public sealed class VenueRegistrationUi : WindowMediatorSubscriberBase
 
         using (ImRaii.Disabled(_ownedShells.Length == 0))
         {
-            ImGui.Text("Shell:");
+            ImGui.Text(_uiSharedService.L("UI.VenueRegistrationUi.3ea1c6f6", "Shell:"));
             ImGui.SameLine(140);
 
             if (_ownedShells.Length == 0)
             {
-                ImGui.TextDisabled("No eligible shells");
+                ImGui.TextDisabled(_uiSharedService.L("UI.VenueRegistrationUi.0648c4f2", "No eligible shells"));
             }
             else
             {
@@ -181,14 +181,14 @@ public sealed class VenueRegistrationUi : WindowMediatorSubscriberBase
                 }
             }
 
-            ImGui.Text("Venue Name:");
+            ImGui.Text(_uiSharedService.L("UI.VenueRegistrationUi.567b566d", "Venue Name:"));
             ImGui.SameLine(140);
             ImGui.SetNextItemWidth(300);
             ImGui.InputText("##venuename", ref _venueName, 128);
         }
 
         ImGui.Spacing();
-        ImGui.Checkbox("Never ask again for this location", ref _neverAskAgain);
+        ImGui.Checkbox(_uiSharedService.L("UI.VenueRegistrationUi.472d3b0f", "Never ask again for this location"), ref _neverAskAgain);
 
         if (!string.IsNullOrEmpty(_status))
         {
@@ -201,13 +201,13 @@ public sealed class VenueRegistrationUi : WindowMediatorSubscriberBase
         {
             using (ImRaii.Disabled(_ownedShells.Length == 0 || string.IsNullOrWhiteSpace(_venueName)))
             {
-                if (ImGui.Button("Register", new Vector2(120, 28)))
+                if (ImGui.Button(_uiSharedService.L("UI.IntroUI.d672995a", "Register"), new Vector2(120, 28)))
                     _ = DoRegisterAsync();
             }
 
             ImGui.SameLine();
 
-            if (ImGui.Button("Cancel", new Vector2(120, 28)))
+            if (ImGui.Button(_uiSharedService.L("UI.VenueRegistrationUi.77dfd213", "Cancel"), new Vector2(120, 28)))
             {
                 if (_neverAskAgain && !string.IsNullOrEmpty(_canonicalKey))
                 {

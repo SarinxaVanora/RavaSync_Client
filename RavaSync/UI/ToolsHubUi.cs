@@ -36,11 +36,11 @@ public sealed class ToolsHubUi : WindowMediatorSubscriberBase
 
     protected override void DrawInternal()
     {
-        ImGui.TextUnformatted("RavaSync tools");
+        ImGui.TextUnformatted(_uiSharedService.L("UI.ToolsHubUi.0cd0e2a9", "RavaSync tools"));
         ImGui.Separator();
         ImGui.Spacing();
 
-        ImGui.Columns(2, "tools-top-cols", false);
+        ImGui.Columns(2, _uiSharedService.L("UI.ToolsHubUi.39885219", "tools-top-cols"), false);
 
         void ToolButton(FontAwesomeIcon icon, string label, string tooltip, Action? onClick = null)
         {
@@ -57,30 +57,34 @@ public sealed class ToolsHubUi : WindowMediatorSubscriberBase
             ImGui.Spacing();
         }
 
-        ToolButton(FontAwesomeIcon.Running, "Character data hub",
+        ToolButton(FontAwesomeIcon.Gamepad, _uiSharedService.L("UI.ToolsHubUi.c9f13def", "Toy Box Games"),
+            "Open Toy Box Games Hub",
+            () => Mediator.Publish(new UiToggleMessage(typeof(ToyBoxUi))));
+
+        ToolButton(FontAwesomeIcon.Running, _uiSharedService.L("UI.ToolsHubUi.1827fadc", "Character data hub"),
             "Open Character Data Hub",
             () => Mediator.Publish(new UiToggleMessage(typeof(CharaDataHubUi))));
 
-        ToolButton(FontAwesomeIcon.Search, "Character analysis",
+        ToolButton(FontAwesomeIcon.Search, _uiSharedService.L("UI.ToolsHubUi.4009533a", "Character analysis"),
             "Open Character Analysis",
             () => Mediator.Publish(new UiToggleMessage(typeof(DataAnalysisUi))));
 
-        ToolButton(FontAwesomeIcon.UserCircle, "RavaSync profile",
+        ToolButton(FontAwesomeIcon.UserCircle, _uiSharedService.L("UI.ToolsHubUi.870ba999", "RavaSync profile"),
             "Edit RavaSync Profile",
             () => Mediator.Publish(new UiToggleMessage(typeof(EditProfileUi))));
 
 
         ImGui.NextColumn();
 
-        ToolButton(FontAwesomeIcon.Users, "Join venue shell",
+        ToolButton(FontAwesomeIcon.Users, _uiSharedService.L("UI.ToolsHubUi.66504896", "Join venue shell"),
             "Join the shell in your current location if one has been linked.",
             () => Mediator.Publish(new UiToggleMessage(typeof(VenueJoinUi))));
         
-        ToolButton(FontAwesomeIcon.Users, "Set or edit Vanity",
+        ToolButton(FontAwesomeIcon.Users, _uiSharedService.L("UI.ToolsHubUi.f10cda67", "Set or edit Vanity"),
             "Setup Vanity (custom ID) here!",
             () => Mediator.Publish(new UiToggleMessage(typeof(VanityUi))));
         
-        ToolButton(FontAwesomeIcon.Users, "Discovery Settings",
+        ToolButton(FontAwesomeIcon.Users, _uiSharedService.L("UI.ToolsHubUi.592ae45b", "Discovery Settings"),
             "Change settings relating to the Discovery Service.",
             () => Mediator.Publish(new UiToggleMessage(typeof(DiscoverySettingsUi))));
 
@@ -89,11 +93,11 @@ public sealed class ToolsHubUi : WindowMediatorSubscriberBase
         ImGui.Separator();
         ImGui.Spacing();
 
-        ImGui.TextUnformatted("General shortcuts");
+        ImGui.TextUnformatted(_uiSharedService.L("UI.ToolsHubUi.b6315143", "General shortcuts"));
         ImGui.Separator();
         ImGui.Spacing();
 
-        ImGui.Columns(2, "tools-bottom-cols", false);
+        ImGui.Columns(2, _uiSharedService.L("UI.ToolsHubUi.ea7fe44d", "tools-bottom-cols"), false);
 
         void CommandTool(FontAwesomeIcon icon, string label, string tooltip, string command)
             => ToolButton(icon, label, tooltip, () => _commandManager.ProcessCommand(command));

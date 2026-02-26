@@ -98,7 +98,7 @@ public class TopTabMenu
                     xAfter with { Y = xAfter.Y + buttonSize.Y + spacing.Y, X = xAfter.X - spacing.X },
                     underlineColor, 2);
         }
-        UiSharedService.AttachToolTip("Individual Pair Menu");
+        UiSharedService.AttachToolTip(_uiSharedService.L("UI.TopTabMenu.f40c3d02", "Individual Pair Menu"));
 
         // --- Syncshell tab ---
         using (ImRaii.PushFont(UiBuilder.IconFont))
@@ -115,7 +115,7 @@ public class TopTabMenu
                     xAfter with { Y = xAfter.Y + buttonSize.Y + spacing.Y, X = xAfter.X - spacing.X },
                     underlineColor, 2);
         }
-        UiSharedService.AttachToolTip("Syncshell Menu");
+        UiSharedService.AttachToolTip(_uiSharedService.L("UI.TopTabMenu.7c296cba", "Syncshell Menu"));
 
         ImGui.SameLine();
         using (ImRaii.PushFont(UiBuilder.IconFont))
@@ -125,7 +125,7 @@ public class TopTabMenu
                 _mareMediator.Publish(new UiToggleMessage(typeof(ToyBoxUi)));
             }
         }
-        UiSharedService.AttachToolTip("Toy Box");
+        UiSharedService.AttachToolTip(_uiSharedService.L("UI.TopTabMenu.70fb6522", "Toy Box"));
 
 
         ImGui.SameLine();
@@ -136,7 +136,7 @@ public class TopTabMenu
                 _mareMediator.Publish(new UiToggleMessage(typeof(ToolsHubUi)));
             }
         }
-        UiSharedService.AttachToolTip("Tools Hub");
+        UiSharedService.AttachToolTip(_uiSharedService.L("UI.TopTabMenu.2601204c", "Tools Hub"));
 
         // --- Below-tab content ---
         ImGuiHelpers.ScaledDummy(spacing);
@@ -163,34 +163,34 @@ public class TopTabMenu
 
     private void DrawAddPair(float availableXWidth, float spacingX)
     {
-        var buttonSize = _uiSharedService.GetIconTextButtonSize(FontAwesomeIcon.UserPlus, "Add");
+        var buttonSize = _uiSharedService.GetIconTextButtonSize(FontAwesomeIcon.UserPlus, _uiSharedService.L("UI.TopTabMenu.41aa5c46", "Add"));
         ImGui.SetNextItemWidth(availableXWidth - buttonSize - spacingX);
-        ImGui.InputTextWithHint("##otheruid", "Other players UID/Alias", ref _pairToAdd, 20);
+        ImGui.InputTextWithHint("##otheruid", _uiSharedService.L("UI.TopTabMenu.54da3e1d", "Other players UID/Alias"), ref _pairToAdd, 20);
         ImGui.SameLine();
         var alreadyExisting = _pairManager.DirectPairs.Exists(p => string.Equals(p.UserData.UID, _pairToAdd, StringComparison.Ordinal) || string.Equals(p.UserData.Alias, _pairToAdd, StringComparison.Ordinal));
         using (ImRaii.Disabled(alreadyExisting || string.IsNullOrEmpty(_pairToAdd)))
         {
-            if (_uiSharedService.IconTextButton(FontAwesomeIcon.UserPlus, "Add"))
+            if (_uiSharedService.IconTextButton(FontAwesomeIcon.UserPlus, _uiSharedService.L("UI.TopTabMenu.41aa5c46", "Add")))
             {
                 _ = _apiController.UserAddPair(new(new(_pairToAdd)));
                 _pairToAdd = string.Empty;
             }
         }
-        UiSharedService.AttachToolTip("Pair with " + (_pairToAdd.IsNullOrEmpty() ? "other user" : _pairToAdd));
+        UiSharedService.AttachToolTip(_uiSharedService.L("UI.TopTabMenu.d01905d0", "Pair with ") + (_pairToAdd.IsNullOrEmpty() ? _uiSharedService.L("UI.TopTabMenu.abe36a34", "other user") : _pairToAdd));
     }
 
     private void DrawFilter(float availableWidth, float spacingX)
     {
-        var buttonSize = _uiSharedService.GetIconTextButtonSize(FontAwesomeIcon.Ban, "Clear");
+        var buttonSize = _uiSharedService.GetIconTextButtonSize(FontAwesomeIcon.Ban, _uiSharedService.L("UI.TopTabMenu.0bffa490", "Clear"));
         ImGui.SetNextItemWidth(availableWidth - buttonSize - spacingX);
         string filter = Filter;
-        if (ImGui.InputTextWithHint("##filter", "Filter for UID/notes", ref filter, 255))
+        if (ImGui.InputTextWithHint("##filter", _uiSharedService.L("UI.TopTabMenu.6bbcecd5", "Filter for UID/notes"), ref filter, 255))
         {
             Filter = filter;
         }
         ImGui.SameLine();
         using var disabled = ImRaii.Disabled(string.IsNullOrEmpty(Filter));
-        if (_uiSharedService.IconTextButton(FontAwesomeIcon.Ban, "Clear"))
+        if (_uiSharedService.IconTextButton(FontAwesomeIcon.Ban, _uiSharedService.L("UI.TopTabMenu.0bffa490", "Clear")))
         {
             Filter = string.Empty;
         }
@@ -208,11 +208,11 @@ public class TopTabMenu
 
             if (ImGui.Button(FontAwesomeIcon.Pause.ToIconString(), buttonSize))
             {
-                ImGui.OpenPopup("Individual Pause");
+                ImGui.OpenPopup(_uiSharedService.L("UI.TopTabMenu.8bf5382e", "Individual Pause"));
             }
         }
-        UiSharedService.AttachToolTip("Globally resume or pause all individual pairs." + UiSharedService.TooltipSeparator
-            + (_globalControlCountdown > 0 ? UiSharedService.TooltipSeparator + "Available again in " + _globalControlCountdown + " seconds." : string.Empty));
+        UiSharedService.AttachToolTip(_uiSharedService.L("UI.TopTabMenu.b32d6f48", "Globally resume or pause all individual pairs.") + UiSharedService.TooltipSeparator
+            + (_globalControlCountdown > 0 ? UiSharedService.TooltipSeparator + _uiSharedService.L("UI.TopTabMenu.6ca7dd20", "Available again in ") + _globalControlCountdown + _uiSharedService.L("UI.TopTabMenu.e662bb05", " seconds.") : string.Empty));
 
         ImGui.SameLine();
         using (ImRaii.PushFont(UiBuilder.IconFont))
@@ -221,11 +221,11 @@ public class TopTabMenu
 
             if (ImGui.Button(FontAwesomeIcon.VolumeUp.ToIconString(), buttonSize))
             {
-                ImGui.OpenPopup("Individual Sounds");
+                ImGui.OpenPopup(_uiSharedService.L("UI.TopTabMenu.1d298ce4", "Individual Sounds"));
             }
         }
-        UiSharedService.AttachToolTip("Globally enable or disable sound sync with all individual pairs."
-            + (_globalControlCountdown > 0 ? UiSharedService.TooltipSeparator + "Available again in " + _globalControlCountdown + " seconds." : string.Empty));
+        UiSharedService.AttachToolTip(_uiSharedService.L("UI.TopTabMenu.8d25fb14", "Globally enable or disable sound sync with all individual pairs.")
+            + (_globalControlCountdown > 0 ? UiSharedService.TooltipSeparator + _uiSharedService.L("UI.TopTabMenu.6ca7dd20", "Available again in ") + _globalControlCountdown + _uiSharedService.L("UI.TopTabMenu.e662bb05", " seconds.") : string.Empty));
 
         ImGui.SameLine();
         using (ImRaii.PushFont(UiBuilder.IconFont))
@@ -234,11 +234,11 @@ public class TopTabMenu
 
             if (ImGui.Button(FontAwesomeIcon.Running.ToIconString(), buttonSize))
             {
-                ImGui.OpenPopup("Individual Animations");
+                ImGui.OpenPopup(_uiSharedService.L("UI.TopTabMenu.d6930507", "Individual Animations"));
             }
         }
-        UiSharedService.AttachToolTip("Globally enable or disable animation sync with all individual pairs." + UiSharedService.TooltipSeparator
-            + (_globalControlCountdown > 0 ? UiSharedService.TooltipSeparator + "Available again in " + _globalControlCountdown + " seconds." : string.Empty));
+        UiSharedService.AttachToolTip(_uiSharedService.L("UI.TopTabMenu.9cb4c07d", "Globally enable or disable animation sync with all individual pairs.") + UiSharedService.TooltipSeparator
+            + (_globalControlCountdown > 0 ? UiSharedService.TooltipSeparator + _uiSharedService.L("UI.TopTabMenu.6ca7dd20", "Available again in ") + _globalControlCountdown + _uiSharedService.L("UI.TopTabMenu.e662bb05", " seconds.") : string.Empty));
 
         ImGui.SameLine();
         using (ImRaii.PushFont(UiBuilder.IconFont))
@@ -247,11 +247,11 @@ public class TopTabMenu
 
             if (ImGui.Button(FontAwesomeIcon.Sun.ToIconString(), buttonSize))
             {
-                ImGui.OpenPopup("Individual VFX");
+                ImGui.OpenPopup(_uiSharedService.L("UI.TopTabMenu.45fedc4f", "Individual VFX"));
             }
         }
-        UiSharedService.AttachToolTip("Globally enable or disable VFX sync with all individual pairs." + UiSharedService.TooltipSeparator
-            + (_globalControlCountdown > 0 ? UiSharedService.TooltipSeparator + "Available again in " + _globalControlCountdown + " seconds." : string.Empty));
+        UiSharedService.AttachToolTip(_uiSharedService.L("UI.TopTabMenu.abb42414", "Globally enable or disable VFX sync with all individual pairs.") + UiSharedService.TooltipSeparator
+            + (_globalControlCountdown > 0 ? UiSharedService.TooltipSeparator + _uiSharedService.L("UI.TopTabMenu.6ca7dd20", "Available again in ") + _globalControlCountdown + _uiSharedService.L("UI.TopTabMenu.e662bb05", " seconds.") : string.Empty));
 
 
         PopupIndividualSetting("Individual Pause", "Unpause all individuals", "Pause all individuals",
@@ -316,12 +316,12 @@ public class TopTabMenu
 
             if (ImGui.Button(FontAwesomeIcon.Pause.ToIconString(), buttonSize))
             {
-                ImGui.OpenPopup("Syncshell Pause");
+                ImGui.OpenPopup(_uiSharedService.L("UI.TopTabMenu.150a8196", "Syncshell Pause"));
             }
         }
-        UiSharedService.AttachToolTip("Globally resume or pause all syncshells." + UiSharedService.TooltipSeparator
+        UiSharedService.AttachToolTip(_uiSharedService.L("UI.TopTabMenu.29eb617e", "Globally resume or pause all syncshells.") + UiSharedService.TooltipSeparator
                         + "Note: This will not affect users with preferred permissions in syncshells."
-            + (_globalControlCountdown > 0 ? UiSharedService.TooltipSeparator + "Available again in " + _globalControlCountdown + " seconds." : string.Empty));
+            + (_globalControlCountdown > 0 ? UiSharedService.TooltipSeparator + _uiSharedService.L("UI.TopTabMenu.6ca7dd20", "Available again in ") + _globalControlCountdown + _uiSharedService.L("UI.TopTabMenu.e662bb05", " seconds.") : string.Empty));
 
         ImGui.SameLine();
         using (ImRaii.PushFont(UiBuilder.IconFont))
@@ -330,12 +330,12 @@ public class TopTabMenu
 
             if (ImGui.Button(FontAwesomeIcon.VolumeUp.ToIconString(), buttonSize))
             {
-                ImGui.OpenPopup("Syncshell Sounds");
+                ImGui.OpenPopup(_uiSharedService.L("UI.TopTabMenu.2281b51d", "Syncshell Sounds"));
             }
         }
-        UiSharedService.AttachToolTip("Globally enable or disable sound sync with all syncshells." + UiSharedService.TooltipSeparator
+        UiSharedService.AttachToolTip(_uiSharedService.L("UI.TopTabMenu.faa8a140", "Globally enable or disable sound sync with all syncshells.") + UiSharedService.TooltipSeparator
                         + "Note: This will not affect users with preferred permissions in syncshells."
-                        + (_globalControlCountdown > 0 ? UiSharedService.TooltipSeparator + "Available again in " + _globalControlCountdown + " seconds." : string.Empty));
+                        + (_globalControlCountdown > 0 ? UiSharedService.TooltipSeparator + _uiSharedService.L("UI.TopTabMenu.6ca7dd20", "Available again in ") + _globalControlCountdown + _uiSharedService.L("UI.TopTabMenu.e662bb05", " seconds.") : string.Empty));
 
         ImGui.SameLine();
         using (ImRaii.PushFont(UiBuilder.IconFont))
@@ -344,12 +344,12 @@ public class TopTabMenu
 
             if (ImGui.Button(FontAwesomeIcon.Running.ToIconString(), buttonSize))
             {
-                ImGui.OpenPopup("Syncshell Animations");
+                ImGui.OpenPopup(_uiSharedService.L("UI.TopTabMenu.e26258eb", "Syncshell Animations"));
             }
         }
-        UiSharedService.AttachToolTip("Globally enable or disable animation sync with all syncshells." + UiSharedService.TooltipSeparator
+        UiSharedService.AttachToolTip(_uiSharedService.L("UI.TopTabMenu.803c8ef0", "Globally enable or disable animation sync with all syncshells.") + UiSharedService.TooltipSeparator
                         + "Note: This will not affect users with preferred permissions in syncshells."
-            + (_globalControlCountdown > 0 ? UiSharedService.TooltipSeparator + "Available again in " + _globalControlCountdown + " seconds." : string.Empty));
+            + (_globalControlCountdown > 0 ? UiSharedService.TooltipSeparator + _uiSharedService.L("UI.TopTabMenu.6ca7dd20", "Available again in ") + _globalControlCountdown + _uiSharedService.L("UI.TopTabMenu.e662bb05", " seconds.") : string.Empty));
 
         ImGui.SameLine();
         using (ImRaii.PushFont(UiBuilder.IconFont))
@@ -358,12 +358,12 @@ public class TopTabMenu
 
             if (ImGui.Button(FontAwesomeIcon.Sun.ToIconString(), buttonSize))
             {
-                ImGui.OpenPopup("Syncshell VFX");
+                ImGui.OpenPopup(_uiSharedService.L("UI.TopTabMenu.2d84a7ce", "Syncshell VFX"));
             }
         }
-        UiSharedService.AttachToolTip("Globally enable or disable VFX sync with all syncshells." + UiSharedService.TooltipSeparator
+        UiSharedService.AttachToolTip(_uiSharedService.L("UI.TopTabMenu.d0e520a6", "Globally enable or disable VFX sync with all syncshells.") + UiSharedService.TooltipSeparator
                         + "Note: This will not affect users with preferred permissions in syncshells."
-            + (_globalControlCountdown > 0 ? UiSharedService.TooltipSeparator + "Available again in " + _globalControlCountdown + " seconds." : string.Empty));
+            + (_globalControlCountdown > 0 ? UiSharedService.TooltipSeparator + _uiSharedService.L("UI.TopTabMenu.6ca7dd20", "Available again in ") + _globalControlCountdown + _uiSharedService.L("UI.TopTabMenu.e662bb05", " seconds.") : string.Empty));
 
 
         PopupSyncshellSetting("Syncshell Pause", "Unpause all syncshells", "Pause all syncshells",
@@ -436,12 +436,12 @@ public class TopTabMenu
                 _ = _apiController.SetBulkPermissions(new(new(StringComparer.Ordinal), bulkSyncshells)).ConfigureAwait(false);
             }
         }
-        UiSharedService.AttachToolTip("Globally align syncshell permissions to suggested syncshell permissions." + UiSharedService.TooltipSeparator
+        UiSharedService.AttachToolTip(_uiSharedService.L("UI.TopTabMenu.5d5c21a9", "Globally align syncshell permissions to suggested syncshell permissions.") + UiSharedService.TooltipSeparator
             + "Note: This will not affect users with preferred permissions in syncshells." + Environment.NewLine
             + "Note: If multiple users share one syncshell the permissions to that user will be set to " + Environment.NewLine
-            + "the ones of the last applied syncshell in alphabetical order." + UiSharedService.TooltipSeparator
+            + _uiSharedService.L("UI.TopTabMenu.513247ef", "the ones of the last applied syncshell in alphabetical order.") + UiSharedService.TooltipSeparator
             + "Hold CTRL to enable this button"
-            + (_globalControlCountdown > 0 ? UiSharedService.TooltipSeparator + "Available again in " + _globalControlCountdown + " seconds." : string.Empty));
+            + (_globalControlCountdown > 0 ? UiSharedService.TooltipSeparator + _uiSharedService.L("UI.TopTabMenu.6ca7dd20", "Available again in ") + _globalControlCountdown + _uiSharedService.L("UI.TopTabMenu.e662bb05", " seconds.") : string.Empty));
     }
 
     private void DrawSyncshellMenu(float availableWidth, float spacingX)
@@ -451,7 +451,7 @@ public class TopTabMenu
         using (ImRaii.Disabled(_pairManager.GroupPairs.Select(k => k.Key).Distinct()
             .Count(g => string.Equals(g.OwnerUID, _apiController.UID, StringComparison.Ordinal)) >= _apiController.ServerInfo.MaxGroupsCreatedByUser))
         {
-            if (_uiSharedService.IconTextButton(FontAwesomeIcon.Plus, "Create new Syncshell", buttonX))
+            if (_uiSharedService.IconTextButton(FontAwesomeIcon.Plus, _uiSharedService.L("UI.TopTabMenu.5ae20a32", "Create new Syncshell"), buttonX))
             {
                 _mareMediator.Publish(new UiToggleMessage(typeof(CreateSyncshellUI)));
             }
@@ -460,7 +460,7 @@ public class TopTabMenu
 
         using (ImRaii.Disabled(_pairManager.GroupPairs.Select(k => k.Key).Distinct().Count() >= _apiController.ServerInfo.MaxGroupsJoinedByUser))
         {
-            if (_uiSharedService.IconTextButton(FontAwesomeIcon.Users, "Join existing Syncshell", buttonX))
+            if (_uiSharedService.IconTextButton(FontAwesomeIcon.Users, _uiSharedService.L("UI.TopTabMenu.715a4626", "Join existing Syncshell"), buttonX))
             {
                 _mareMediator.Publish(new UiToggleMessage(typeof(JoinSyncshellUI)));
             }
@@ -470,18 +470,18 @@ public class TopTabMenu
     private void DrawUserConfig(float availableWidth, float spacingX)
     {
         var buttonX = (availableWidth - spacingX) / 2f;
-        if (_uiSharedService.IconTextButton(FontAwesomeIcon.UserCircle, "Edit RavaSync Profile", buttonX))
+        if (_uiSharedService.IconTextButton(FontAwesomeIcon.UserCircle, _uiSharedService.L("UI.TopTabMenu.5b95ba72", "Edit RavaSync Profile"), buttonX))
         {
             _mareMediator.Publish(new UiToggleMessage(typeof(EditProfileUi)));
         }
-        UiSharedService.AttachToolTip("Edit your RavaSync Profile");
+        UiSharedService.AttachToolTip(_uiSharedService.L("UI.TopTabMenu.72f86d63", "Edit your RavaSync Profile"));
         ImGui.SameLine();
-        if (_uiSharedService.IconTextButton(FontAwesomeIcon.PersonCircleQuestion, "Chara Data Analysis", buttonX))
+        if (_uiSharedService.IconTextButton(FontAwesomeIcon.PersonCircleQuestion, _uiSharedService.L("UI.TopTabMenu.1cbc9a22", "Chara Data Analysis"), buttonX))
         {
             _mareMediator.Publish(new UiToggleMessage(typeof(DataAnalysisUi)));
         }
-        UiSharedService.AttachToolTip("View and analyze your generated character data");
-        if (_uiSharedService.IconTextButton(FontAwesomeIcon.Running, "Character Data Hub", availableWidth))
+        UiSharedService.AttachToolTip(_uiSharedService.L("UI.TopTabMenu.27f1edcb", "View and analyze your generated character data"));
+        if (_uiSharedService.IconTextButton(FontAwesomeIcon.Running, _uiSharedService.L("UI.TopTabMenu.6e510566", "Character Data Hub"), availableWidth))
         {
             _mareMediator.Publish(new UiToggleMessage(typeof(CharaDataHubUi)));
         }

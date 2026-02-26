@@ -38,7 +38,8 @@ public abstract class DrawFolderBase : IDrawFolder
 
         using var id = ImRaii.PushId("folder_" + _id);
         var color = ImRaii.PushColor(ImGuiCol.ChildBg, ImGui.GetColorU32(ImGuiCol.FrameBgHovered), _wasHovered);
-        using (ImRaii.Child("folder__" + _id, new System.Numerics.Vector2(UiSharedService.GetWindowContentRegionWidth() - ImGui.GetCursorPosX(), ImGui.GetFrameHeight())))
+        var contentWidth = UiSharedService.GetWindowContentRegionWidth();
+        using (ImRaii.Child("folder__" + _id, new System.Numerics.Vector2(contentWidth - ImGui.GetCursorPosX(), ImGui.GetFrameHeight())))
         {
             // draw opener
             var icon = _tagHandler.IsTagOpen(_id) ? FontAwesomeIcon.CaretDown : FontAwesomeIcon.CaretRight;
@@ -81,7 +82,7 @@ public abstract class DrawFolderBase : IDrawFolder
             }
             else
             {
-                ImGui.TextUnformatted("No users (online)");
+                ImGui.TextUnformatted(_uiSharedService.L("UI.DrawFolderBase.2a3f7724", "No users (online)"));
             }
 
             ImGui.Separator();
@@ -110,12 +111,12 @@ public abstract class DrawFolderBase : IDrawFolder
             ImGui.SameLine(windowEndX - barButtonSize.X);
             if (_uiSharedService.IconButton(FontAwesomeIcon.EllipsisV))
             {
-                ImGui.OpenPopup("User Flyout Menu");
+                ImGui.OpenPopup(_uiSharedService.L("UI.DrawFolderBase.d24cd894", "User Flyout Menu"));
             }
-            if (ImGui.BeginPopup("User Flyout Menu"))
+            if (ImGui.BeginPopup(_uiSharedService.L("UI.DrawFolderBase.d24cd894", "User Flyout Menu")))
             {
-                using (ImRaii.PushId($"buttons-{_id}")) DrawMenu(_menuWidth);
                 _menuWidth = ImGui.GetWindowContentRegionMax().X - ImGui.GetWindowContentRegionMin().X;
+                using (ImRaii.PushId($"buttons-{_id}")) DrawMenu(_menuWidth);
                 ImGui.EndPopup();
             }
             else

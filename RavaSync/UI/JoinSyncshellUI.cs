@@ -53,30 +53,27 @@ internal class JoinSyncshellUI : WindowMediatorSubscriberBase
     protected override void DrawInternal()
     {
         using (_uiSharedService.UidFont.Push())
-            ImGui.TextUnformatted(_groupJoinInfo == null || !_groupJoinInfo.Success ? "Join Syncshell" : "Finalize join Syncshell " + _groupJoinInfo.GroupAliasOrGID);
+            ImGui.TextUnformatted(_groupJoinInfo == null || !_groupJoinInfo.Success ? _uiSharedService.L("UI.JoinSyncshellUI.682d6f9a", "Join Syncshell") : _uiSharedService.L("UI.JoinSyncshellUI.89109084", "Finalize join Syncshell ") + _groupJoinInfo.GroupAliasOrGID);
         ImGui.Separator();
 
         if (_groupJoinInfo == null || !_groupJoinInfo.Success)
         {
-            UiSharedService.TextWrapped("Here you can join existing Syncshells. " +
-                "Please keep in mind that you cannot join more than " + _apiController.ServerInfo.MaxGroupsJoinedByUser + " syncshells on this server." + Environment.NewLine +
-                "Joining a Syncshell will pair you implicitly with all existing users in the Syncshell." + Environment.NewLine +
-                "All permissions to all users in the Syncshell will be set to the preferred Syncshell permissions on joining, excluding prior set preferred permissions.");
+            UiSharedService.TextWrapped(string.Format(_uiSharedService.L("UI.JoinSyncshellUI.5af1f55d", "Here you can join existing Syncshells.\nPlease keep in mind that you cannot join more than {0} syncshells on this server.\nJoining a Syncshell will pair you implicitly with all existing users in the Syncshell.\nAll permissions to all users in the Syncshell will be set to the preferred Syncshell permissions on joining, excluding prior set preferred permissions."), _apiController.ServerInfo.MaxGroupsJoinedByUser));
             ImGui.Separator();
-            ImGui.TextUnformatted("Note: Syncshell ID and Password are case sensitive. MSS- is part of Syncshell IDs, unless using Vanity IDs.");
+            ImGui.TextUnformatted(_uiSharedService.L("UI.JoinSyncshellUI.ca57735f", "Note: Syncshell ID and Password are case sensitive. MSS- is part of Syncshell IDs, unless using Vanity IDs."));
 
             ImGui.AlignTextToFramePadding();
-            ImGui.TextUnformatted("Syncshell ID");
+            ImGui.TextUnformatted(_uiSharedService.L("UI.JoinSyncshellUI.e7eb13c6", "Syncshell ID"));
             ImGui.SameLine(200);
-            ImGui.InputTextWithHint("##syncshellId", "Full Syncshell ID", ref _desiredSyncshellToJoin, 20);
+            ImGui.InputTextWithHint("##syncshellId", _uiSharedService.L("UI.JoinSyncshellUI.af334a24", "Full Syncshell ID"), ref _desiredSyncshellToJoin, 20);
 
             ImGui.AlignTextToFramePadding();
-            ImGui.TextUnformatted("Syncshell Password");
+            ImGui.TextUnformatted(_uiSharedService.L("UI.JoinSyncshellUI.0e1d1d1c", "Syncshell Password"));
             ImGui.SameLine(200);
-            ImGui.InputTextWithHint("##syncshellpw", "Password", ref _syncshellPassword, 50, ImGuiInputTextFlags.Password);
+            ImGui.InputTextWithHint("##syncshellpw", _uiSharedService.L("UI.JoinSyncshellUI.f08ec9d2", "Password"), ref _syncshellPassword, 50, ImGuiInputTextFlags.Password);
             using (ImRaii.Disabled(string.IsNullOrEmpty(_desiredSyncshellToJoin) || string.IsNullOrEmpty(_syncshellPassword)))
             {
-                if (_uiSharedService.IconTextButton(Dalamud.Interface.FontAwesomeIcon.Plus, "Join Syncshell"))
+                if (_uiSharedService.IconTextButton(Dalamud.Interface.FontAwesomeIcon.Plus, _uiSharedService.L("UI.JoinSyncshellUI.682d6f9a", "Join Syncshell")))
                 {
                     _groupJoinInfo = _apiController.GroupJoin(new GroupPasswordDto(new API.Data.GroupData(_desiredSyncshellToJoin), _syncshellPassword)).Result;
                     _previousPassword = _syncshellPassword;
@@ -85,25 +82,22 @@ internal class JoinSyncshellUI : WindowMediatorSubscriberBase
             }
             if (_groupJoinInfo != null && !_groupJoinInfo.Success)
             {
-                UiSharedService.ColorTextWrapped("Failed to join the Syncshell. This is due to one of following reasons:" + Environment.NewLine +
-                    "- The Syncshell does not exist or the password is incorrect" + Environment.NewLine +
-                    "- You are already in that Syncshell or are banned from that Syncshell" + Environment.NewLine +
-                    "- The Syncshell is at capacity or has invites disabled" + Environment.NewLine, ImGuiColors.DalamudYellow);
+                UiSharedService.ColorTextWrapped(_uiSharedService.L("UI.JoinSyncshellUI.7b2a7065", "Failed to join the Syncshell. This is due to one of following reasons:\n- The Syncshell does not exist or the password is incorrect\n- You are already in that Syncshell or are banned from that Syncshell\n- The Syncshell is at capacity or has invites disabled\n"), ImGuiColors.DalamudYellow);
             }
         }
         else
         {
-            ImGui.TextUnformatted("You are about to join the Syncshell " + _groupJoinInfo.GroupAliasOrGID + " by " + _groupJoinInfo.OwnerAliasOrUID);
+            ImGui.TextUnformatted(_uiSharedService.L("UI.JoinSyncshellUI.22dcef49", "You are about to join the Syncshell ") + _groupJoinInfo.GroupAliasOrGID + _uiSharedService.L("UI.JoinSyncshellUI.d20eeb48", " by ") + _groupJoinInfo.OwnerAliasOrUID);
             ImGuiHelpers.ScaledDummy(2f);
-            ImGui.TextUnformatted("This Syncshell staff has set the following suggested Syncshell permissions:");
+            ImGui.TextUnformatted(_uiSharedService.L("UI.JoinSyncshellUI.834e3e0d", "This Syncshell staff has set the following suggested Syncshell permissions:"));
             ImGui.AlignTextToFramePadding();
-            ImGui.TextUnformatted("- Sounds ");
+            ImGui.TextUnformatted(_uiSharedService.L("UI.JoinSyncshellUI.e658c42d", "- Sounds "));
             _uiSharedService.BooleanToColoredIcon(!_groupJoinInfo.GroupPermissions.IsPreferDisableSounds());
             ImGui.AlignTextToFramePadding();
-            ImGui.TextUnformatted("- Animations");
+            ImGui.TextUnformatted(_uiSharedService.L("UI.CreateSyncshellUI.269f0654", "- Animations"));
             _uiSharedService.BooleanToColoredIcon(!_groupJoinInfo.GroupPermissions.IsPreferDisableAnimations());
             ImGui.AlignTextToFramePadding();
-            ImGui.TextUnformatted("- VFX");
+            ImGui.TextUnformatted(_uiSharedService.L("UI.CreateSyncshellUI.b3942667", "- VFX"));
             _uiSharedService.BooleanToColoredIcon(!_groupJoinInfo.GroupPermissions.IsPreferDisableVFX());
 
             if (_groupJoinInfo.GroupPermissions.IsPreferDisableSounds() != _ownPermissions.DisableGroupSounds
@@ -111,19 +105,19 @@ internal class JoinSyncshellUI : WindowMediatorSubscriberBase
                 || _groupJoinInfo.GroupPermissions.IsPreferDisableAnimations() != _ownPermissions.DisableGroupAnimations)
             {
                 ImGuiHelpers.ScaledDummy(2f);
-                UiSharedService.ColorText("Your current preferred default Syncshell permissions deviate from the suggested permissions:", ImGuiColors.DalamudYellow);
+                UiSharedService.ColorText(_uiSharedService.L("UI.JoinSyncshellUI.5f08c0ab", "Your current preferred default Syncshell permissions deviate from the suggested permissions:"), ImGuiColors.DalamudYellow);
                 if (_groupJoinInfo.GroupPermissions.IsPreferDisableSounds() != _ownPermissions.DisableGroupSounds)
                 {
                     ImGui.AlignTextToFramePadding();
-                    ImGui.TextUnformatted("- Sounds");
+                    ImGui.TextUnformatted(_uiSharedService.L("UI.CreateSyncshellUI.cc79adf2", "- Sounds"));
                     _uiSharedService.BooleanToColoredIcon(!_ownPermissions.DisableGroupSounds);
                     ImGui.SameLine(200);
                     ImGui.AlignTextToFramePadding();
-                    ImGui.TextUnformatted("Suggested");
+                    ImGui.TextUnformatted(_uiSharedService.L("UI.JoinSyncshellUI.7fcd8d44", "Suggested"));
                     _uiSharedService.BooleanToColoredIcon(!_groupJoinInfo.GroupPermissions.IsPreferDisableSounds());
                     ImGui.SameLine();
                     using var id = ImRaii.PushId("suggestedSounds");
-                    if (_uiSharedService.IconTextButton(Dalamud.Interface.FontAwesomeIcon.ArrowRight, "Apply suggested"))
+                    if (_uiSharedService.IconTextButton(Dalamud.Interface.FontAwesomeIcon.ArrowRight, _uiSharedService.L("UI.JoinSyncshellUI.4a99fb58", "Apply suggested")))
                     {
                         _ownPermissions.DisableGroupSounds = _groupJoinInfo.GroupPermissions.IsPreferDisableSounds();
                     }
@@ -131,15 +125,15 @@ internal class JoinSyncshellUI : WindowMediatorSubscriberBase
                 if (_groupJoinInfo.GroupPermissions.IsPreferDisableAnimations() != _ownPermissions.DisableGroupAnimations)
                 {
                     ImGui.AlignTextToFramePadding();
-                    ImGui.TextUnformatted("- Animations");
+                    ImGui.TextUnformatted(_uiSharedService.L("UI.CreateSyncshellUI.269f0654", "- Animations"));
                     _uiSharedService.BooleanToColoredIcon(!_ownPermissions.DisableGroupAnimations);
                     ImGui.SameLine(200);
                     ImGui.AlignTextToFramePadding();
-                    ImGui.TextUnformatted("Suggested");
+                    ImGui.TextUnformatted(_uiSharedService.L("UI.JoinSyncshellUI.7fcd8d44", "Suggested"));
                     _uiSharedService.BooleanToColoredIcon(!_groupJoinInfo.GroupPermissions.IsPreferDisableAnimations());
                     ImGui.SameLine();
                     using var id = ImRaii.PushId("suggestedAnims");
-                    if (_uiSharedService.IconTextButton(Dalamud.Interface.FontAwesomeIcon.ArrowRight, "Apply suggested"))
+                    if (_uiSharedService.IconTextButton(Dalamud.Interface.FontAwesomeIcon.ArrowRight, _uiSharedService.L("UI.JoinSyncshellUI.4a99fb58", "Apply suggested")))
                     {
                         _ownPermissions.DisableGroupAnimations = _groupJoinInfo.GroupPermissions.IsPreferDisableAnimations();
                     }
@@ -147,27 +141,27 @@ internal class JoinSyncshellUI : WindowMediatorSubscriberBase
                 if (_groupJoinInfo.GroupPermissions.IsPreferDisableVFX() != _ownPermissions.DisableGroupVFX)
                 {
                     ImGui.AlignTextToFramePadding();
-                    ImGui.TextUnformatted("- VFX");
+                    ImGui.TextUnformatted(_uiSharedService.L("UI.CreateSyncshellUI.b3942667", "- VFX"));
                     _uiSharedService.BooleanToColoredIcon(!_ownPermissions.DisableGroupVFX);
                     ImGui.SameLine(200);
                     ImGui.AlignTextToFramePadding();
-                    ImGui.TextUnformatted("Suggested");
+                    ImGui.TextUnformatted(_uiSharedService.L("UI.JoinSyncshellUI.7fcd8d44", "Suggested"));
                     _uiSharedService.BooleanToColoredIcon(!_groupJoinInfo.GroupPermissions.IsPreferDisableVFX());
                     ImGui.SameLine();
                     using var id = ImRaii.PushId("suggestedVfx");
-                    if (_uiSharedService.IconTextButton(Dalamud.Interface.FontAwesomeIcon.ArrowRight, "Apply suggested"))
+                    if (_uiSharedService.IconTextButton(Dalamud.Interface.FontAwesomeIcon.ArrowRight, _uiSharedService.L("UI.JoinSyncshellUI.4a99fb58", "Apply suggested")))
                     {
                         _ownPermissions.DisableGroupVFX = _groupJoinInfo.GroupPermissions.IsPreferDisableVFX();
                     }
                 }
-                UiSharedService.TextWrapped("Note: you do not need to apply the suggested Syncshell permissions, they are solely suggestions by the staff of the Syncshell.");
+                UiSharedService.TextWrapped(_uiSharedService.L("UI.JoinSyncshellUI.a78db077", "Note: you do not need to apply the suggested Syncshell permissions, they are solely suggestions by the staff of the Syncshell."));
             }
             else
             {
-                UiSharedService.TextWrapped("Your default syncshell permissions on joining are in line with the suggested Syncshell permissions through the owner.");
+                UiSharedService.TextWrapped(_uiSharedService.L("UI.JoinSyncshellUI.ac29fe42", "Your default syncshell permissions on joining are in line with the suggested Syncshell permissions through the owner."));
             }
             ImGuiHelpers.ScaledDummy(2f);
-            if (_uiSharedService.IconTextButton(Dalamud.Interface.FontAwesomeIcon.Plus, "Finalize and join " + _groupJoinInfo.GroupAliasOrGID))
+            if (_uiSharedService.IconTextButton(Dalamud.Interface.FontAwesomeIcon.Plus, _uiSharedService.L("UI.JoinSyncshellUI.f8f230da", "Finalize and join ") + _groupJoinInfo.GroupAliasOrGID))
             {
                 GroupUserPreferredPermissions joinPermissions = GroupUserPreferredPermissions.NoneSet;
                 joinPermissions.SetDisableSounds(_ownPermissions.DisableGroupSounds);

@@ -58,7 +58,7 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
 
     public bool CancelUpload()
     {
-        if (CurrentUploads.Any())
+        if (CurrentUploads.Count > 0)
         {
             Logger.LogDebug("Cancelling current upload");
             _uploadCancellationTokenSource?.Cancel();
@@ -295,6 +295,23 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
 
                 if (failed.Any())
                 {
+                    var recovered = await RecheckFailedUploadsAsync(failed, uploadToken).ConfigureAwait(false);
+
+                    if (recovered.Count > 0)
+                    {
+                        failed = failed
+                            .Except(recovered, StringComparer.Ordinal)
+                            .ToList();
+
+                        Logger.LogWarning(
+                            "Recovered {count} upload(s) after failure via server recheck: {list}",
+                            recovered.Count,
+                            string.Join(", ", recovered.Take(20)));
+                    }
+                }
+
+                if (failed.Any())
+                {
                     Logger.LogWarning("Upload batch incomplete ({count} failed): {list}", failed.Count, string.Join(", ", failed.Take(20)));
                     return (data, false, $"{failed.Count} upload(s) failed");
                 }
@@ -432,11 +449,78 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
         _verifiedUploadedHashes.Clear();
     }
 
+
+    private async Task<List<string>> RecheckFailedUploadsAsync(IEnumerable<string> failedHashes, CancellationToken ct)
+    {
+        if (!_orchestrator.IsInitialized) return [];
+
+        var recovered = new List<string>();
+        var now = DateTime.UtcNow;
+
+        int checkedCount = 0;
+
+        foreach (var hash in failedHashes.Distinct(StringComparer.Ordinal))
+        {
+            ct.ThrowIfCancellationRequested();
+
+            if (checkedCount >= MaxCdnExistenceChecks)
+                break;
+
+            checkedCount++;
+
+            try
+            {
+                var cache = _fileDbManager.GetFileCacheByHash(hash);
+                if (cache == null || string.IsNullOrWhiteSpace(cache.ResolvedFilepath) || !File.Exists(cache.ResolvedFilepath))
+                    continue;
+
+                var fileSize = new FileInfo(cache.ResolvedFilepath).Length;
+
+                var ticketUri = MareFiles.ServerFilesUploadTicketFullPath(_orchestrator.UploadCdnUri!, hash);
+                var ticketReq = new UploadTicketRequestDto(fileSize, _mareConfigService.Current.UseAlternativeFileUpload, 0);
+
+                using var ticketResp = await _orchestrator
+                    .SendRequestAsync(HttpMethod.Post, ticketUri, ticketReq, ct)
+                    .ConfigureAwait(false);
+
+                if (!ticketResp.IsSuccessStatusCode)
+                    continue;
+
+                var ticketJson = await ticketResp.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+                var ticket = JsonSerializer.Deserialize<UploadTicketResponseDto>(
+                    ticketJson,
+                    new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+
+                if (ticket == null)
+                    continue;
+                if (!ticket.UploadRequired)
+                {
+                    _verifiedUploadedHashes[hash] = now;
+                    recovered.Add(hash);
+
+                    Logger.LogDebug("[{hash}] Recheck recovered upload (server reports UploadRequired=false)", hash);
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                Logger.LogDebug(ex, "[{hash}] Recheck failed (ignored)", hash);
+            }
+        }
+
+        return recovered;
+    }
     private async Task UploadUnverifiedFiles(HashSet<string> unverifiedUploadHashes, List<UserData> visiblePlayers, CancellationToken uploadToken)
     {
-        unverifiedUploadHashes = unverifiedUploadHashes
-            .Where(h => _fileDbManager.GetFileCacheByHash(h) != null)
-            .ToHashSet(StringComparer.Ordinal);
+        var localPathByHash = unverifiedUploadHashes
+            .Select(h => new { Hash = h, Cache = _fileDbManager.GetFileCacheByHash(h) })
+            .Where(x => x.Cache != null)
+            .ToDictionary(x => x.Hash, x => x.Cache!.ResolvedFilepath, StringComparer.Ordinal);
+
+        unverifiedUploadHashes = localPathByHash.Keys.ToHashSet(StringComparer.Ordinal);
 
         Logger.LogDebug("Verifying {count} files", unverifiedUploadHashes.Count);
 
@@ -452,7 +536,7 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
             {
                 _orchestrator.ForbiddenTransfers.Add(new UploadFileTransfer(f)
                 {
-                    LocalFile = _fileDbManager.GetFileCacheByHash(f.Hash)?.ResolvedFilepath ?? string.Empty,
+                    LocalFile = localPathByHash.TryGetValue(f.Hash, out var localPath) ? localPath : string.Empty,
                 });
             }
             _verifiedUploadedHashes[f.Hash] = DateTime.UtcNow;
@@ -480,9 +564,19 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
     {
         var token = ct;
 
+        try
+        {
+
+            // Cache local paths once for this batch (reduces repeated cache/db lookups)
+            var localPathByHash = inputHashes
+            .Distinct(StringComparer.Ordinal)
+            .Select(h => new { Hash = h, Cache = _fileDbManager.GetFileCacheByHash(h) })
+            .Where(x => x.Cache != null)
+            .ToDictionary(x => x.Hash, x => x.Cache!.ResolvedFilepath, StringComparer.Ordinal);
+
         // ---- Local presence check ----
         var present = inputHashes
-            .Where(h => _fileDbManager.GetFileCacheByHash(h) != null)
+            .Where(h => localPathByHash.ContainsKey(h))
             .ToHashSet(StringComparer.Ordinal);
 
         var missingLocal = inputHashes.Except(present, StringComparer.Ordinal).ToList();
@@ -506,7 +600,7 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
                 {
                     _orchestrator.ForbiddenTransfers.Add(new UploadFileTransfer(f)
                     {
-                        LocalFile = _fileDbManager.GetFileCacheByHash(f.Hash)?.ResolvedFilepath ?? string.Empty,
+                        LocalFile = localPathByHash.TryGetValue(f.Hash, out var localPath) ? localPath : string.Empty,
                     });
                 }
 
@@ -530,22 +624,36 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
         // ---- UI bookkeeping ----
         var sizeByHash = new Dictionary<string, long>(StringComparer.Ordinal);
 
+        var uploadEntryByHash = new System.Collections.Concurrent.ConcurrentDictionary<string, UploadFileTransfer>(StringComparer.Ordinal);
+
+        foreach (var existing in CurrentUploads)
+        {
+            if (existing is UploadFileTransfer upload && !string.IsNullOrEmpty(upload.Hash))
+                uploadEntryByHash[upload.Hash] = upload;
+        }
+
         foreach (var h in allowedHashes)
         {
             try
             {
-                if (!CurrentUploads.Any(u => string.Equals(u.Hash, h, StringComparison.Ordinal)))
+                if (!uploadEntryByHash.TryGetValue(h, out var entry))
                 {
-                    var cacheEntry = _fileDbManager.GetFileCacheByHash(h);
-                    if (cacheEntry == null) continue;
+                    if (!localPathByHash.TryGetValue(h, out var localPath)) continue;
 
-                    var size = new FileInfo(cacheEntry.ResolvedFilepath).Length;
+                    var size = new FileInfo(localPath).Length;
                     sizeByHash[h] = size;
 
-                    CurrentUploads.Add(new UploadFileTransfer(new UploadFileDto { Hash = h })
+                    entry = new UploadFileTransfer(new UploadFileDto { Hash = h })
                     {
                         Total = size,
-                    });
+                    };
+
+                    CurrentUploads.Add(entry);
+                    uploadEntryByHash[h] = entry;
+                }
+                else if (!sizeByHash.ContainsKey(h) && localPathByHash.TryGetValue(h, out var localPath))
+                {
+                    sizeByHash[h] = new FileInfo(localPath).Length;
                 }
             }
             catch
@@ -556,68 +664,76 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
 
         const int MaxUploadAttempts = 3;
 
-        // fixed if user explicitly configured, adaptive only for Auto (0)
-        var configured = _mareConfigService.Current.ParallelUploads;
-        var cpuAuto = GetCpuAutoParallelUploads();
-        var isAuto = configured <= 0;
+            // fixed if user explicitly configured, adaptive only for Auto (0)
+            var configured = _mareConfigService.Current.ParallelUploads;
+            var cpuAuto = GetCpuAutoParallelUploads();
+            var isAuto = configured <= 0;
 
-        var desiredParallel = isAuto ? 1 : Math.Clamp(configured, 1, 10);
-        var maxParallel = isAuto ? Math.Clamp(cpuAuto, 1, 10) : desiredParallel;
+            var maxParallel = isAuto ? Math.Clamp(cpuAuto, 1, 10) : Math.Clamp(configured, 1, 10);
 
-        if (isAuto && allowedHashes.Count >= 4 && sizeByHash.Count > 0)
-        {
-            var small = 0;
-            foreach (var s in sizeByHash.Values)
-                if (s <= 256 * 1024) small++;
+            var desiredParallel = isAuto ? 1 : maxParallel;
 
-            if (small >= (sizeByHash.Count * 3 / 4))
-                desiredParallel = Math.Min(maxParallel, 4);
-        }
+            if (isAuto && allowedHashes.Count >= 4 && sizeByHash.Count > 0)
+            {
+                var small = 0;
+                foreach (var s in sizeByHash.Values)
+                    if (s <= 256 * 1024) small++;
 
-        var bytesSinceSample = 0L;
-        var lastUploadedByHash = new System.Collections.Concurrent.ConcurrentDictionary<string, long>(StringComparer.Ordinal);
+                if (small >= (sizeByHash.Count * 3 / 4))
+                    desiredParallel = Math.Min(maxParallel, Math.Max(desiredParallel, 4));
+            }
 
-        var sw = System.Diagnostics.Stopwatch.StartNew();
-        var lastSampleAt = TimeSpan.Zero;
-        double ewmaBps = 0;
+            var bytesSinceSample = 0L;
+            var lastUploadedByHash = new System.Collections.Concurrent.ConcurrentDictionary<string, long>(StringComparer.Ordinal);
 
-        // hysteresis so we don’t flap
-        int pendingDesired = desiredParallel;
-        int pendingHits = 0;
+            var lastTraceBucketByHash = new System.Collections.Concurrent.ConcurrentDictionary<string, int>(StringComparer.Ordinal);
 
-        bool fastStartUsed = false;
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            var lastSampleAt = TimeSpan.Zero;
 
-        double SampleBpsIfReady()
-        {
-            var now = sw.Elapsed;
-            if (now - lastSampleAt < TimeSpan.FromSeconds(2))
-                return -1;
+            double ewmaBps = 0;
 
-            var dt = (now - lastSampleAt).TotalSeconds;
-            lastSampleAt = now;
+            // hysteresis so we don’t flap
+            int pendingDesired = desiredParallel;
+            int pendingHits = 0;
 
-            var bytes = Interlocked.Exchange(ref bytesSinceSample, 0);
-            var instant = dt > 0 ? bytes / dt : 0;
+            bool fastStartUsed = false;
 
-            // EWMA smoothing
-            ewmaBps = ewmaBps <= 0 ? instant : (ewmaBps * 0.70) + (instant * 0.30);
-            return ewmaBps;
-        }
+            double SampleBpsIfReady()
+            {
+                var now = sw.Elapsed;
 
-        int ComputeDesiredFromBps(double bps)
-        {
-            // One “slot” per ~128 KiB/s of sustained throughput, rounded, clamped.
-            const double slot = 128 * 1024;
+                var minSampleInterval = now < TimeSpan.FromSeconds(8)
+                    ? TimeSpan.FromSeconds(1)
+                    : TimeSpan.FromSeconds(2);
 
-            if (bps <= 0) return 1;
+                if (now - lastSampleAt < minSampleInterval)
+                    return -1;
 
-            var bySpeed = (int)Math.Round(bps / slot, MidpointRounding.AwayFromZero);
-            bySpeed = Math.Clamp(bySpeed, 1, maxParallel);
+                var dt = (now - lastSampleAt).TotalSeconds;
+                lastSampleAt = now;
 
-            return bySpeed;
-        }
+                var bytes = Interlocked.Exchange(ref bytesSinceSample, 0);
+                var instant = dt > 0 ? bytes / dt : 0;
 
-        var queue = new System.Collections.Concurrent.ConcurrentQueue<string>(allowedHashes);
+                // EWMA smoothing
+                ewmaBps = ewmaBps <= 0 ? instant : (ewmaBps * 0.70) + (instant * 0.30);
+                return ewmaBps;
+            }
+
+            int ComputeDesiredFromBps(double bps)
+            {
+                const double slot = 256 * 1024;
+
+                if (bps <= 0) return 1;
+
+                var bySpeed = (int)Math.Round(bps / slot, MidpointRounding.AwayFromZero);
+                bySpeed = Math.Clamp(bySpeed, 1, maxParallel);
+
+                return bySpeed;
+            }
+
+            var queue = new System.Collections.Concurrent.ConcurrentQueue<string>(allowedHashes);
         var running = new List<Task>(Math.Min(allowedHashes.Count, maxParallel));
         var succeeded = new System.Collections.Concurrent.ConcurrentDictionary<string, byte>(StringComparer.Ordinal);
         int idx = 0;
@@ -639,19 +755,30 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
                 {
                     var next = ComputeDesiredFromBps(bps);
 
-                    // ---- Fast-start boost (one-time jump) ----
-                    const double fastStartBps = 2 * 1024 * 1024; // 2 MiB/s
-                    if (!fastStartUsed && desiredParallel == 1 && bps >= fastStartBps)
-                    {
-                        desiredParallel = Math.Min(maxParallel, 4);
-                        pendingHits = 0;
-                        pendingDesired = desiredParallel;
-                        fastStartUsed = true;
-                    }
-                    else
-                    {
-                        // hysteresis: require 2 consecutive samples before changing,
-                        // and only step by 1 each time.
+                        // ---- Fast-start boost (one-time jump) ----
+                        if (!fastStartUsed && desiredParallel <= 2)
+                        {
+                            if (bps >= 8 * 1024 * 1024) // 8 MiB/s+
+                            {
+                                desiredParallel = Math.Min(maxParallel, 6);
+                                pendingHits = 0;
+                                pendingDesired = desiredParallel;
+                                fastStartUsed = true;
+                                Interlocked.Exchange(ref bytesSinceSample, 0);
+                                lastSampleAt = sw.Elapsed;
+
+                            }
+                            else if (bps >= 2 * 1024 * 1024) // 2 MiB/s+
+                            {
+                                desiredParallel = Math.Min(maxParallel, 4);
+                                pendingHits = 0;
+                                pendingDesired = desiredParallel;
+                                fastStartUsed = true;
+                                Interlocked.Exchange(ref bytesSinceSample, 0);
+                                lastSampleAt = sw.Elapsed;
+                            }
+                        }
+
                         if (next != desiredParallel)
                         {
                             if (pendingDesired != next)
@@ -672,7 +799,6 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
                             pendingDesired = desiredParallel;
                         }
                     }
-                }
             }
 
             if (running.Count == 0)
@@ -691,47 +817,57 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
             {
                 try
                 {
-                    var cache = _fileDbManager.GetFileCacheByHash(hash);
-                    if (cache is null)
+                    if (!localPathByHash.TryGetValue(hash, out var filePath))
                     {
                         Logger.LogWarning("[{hash}] Upload skipped: cache entry disappeared", hash);
                         return;
                     }
 
-                    var filePath = cache.ResolvedFilepath;
                     var origSize = sizeByHash.TryGetValue(hash, out var s) ? s : new FileInfo(filePath).Length;
 
                     var prog = new Progress<UploadProgress>(up =>
                     {
                         try
                         {
-                            // Update UI entry
-                            var entry = CurrentUploads.FirstOrDefault(u => string.Equals(u.Hash, hash, StringComparison.Ordinal));
-                            if (entry != null)
+                            // Update UI entry (O(1) lookup)
+                            if (uploadEntryByHash.TryGetValue(hash, out var entry))
                             {
                                 entry.Total = up.Size;
                                 entry.Transferred = up.Uploaded;
                             }
 
+                            long delta = 0;
+                            lastUploadedByHash.AddOrUpdate(hash,
+                                up.Uploaded,
+                                (_, old) =>
+                                {
+                                    delta = up.Uploaded - old;
+                                    return up.Uploaded;
+                                });
 
-                                long delta = 0;
-                                lastUploadedByHash.AddOrUpdate(hash,
-                                    up.Uploaded,
-                                    (_, old) =>
-                                    {
-                                        delta = up.Uploaded - old;
-                                        return up.Uploaded;
-                                    });
+                            if (delta > 0)
+                                Interlocked.Add(ref bytesSinceSample, delta);
 
-                                if (delta > 0)
-                                    Interlocked.Add(ref bytesSinceSample, delta);
-                            
-
-                            // light trace
+                            // light trace (log each bucket once)
                             var pct = up.Size > 0 ? (int)(100L * up.Uploaded / up.Size) : 0;
-                            if (pct % 25 == 0)
-                                Logger.LogTrace("[{idx}] {file}: {pct}% (attempt {attempt}/{max})",
-                                    localIdx, Path.GetFileName(filePath), pct, attempt, MaxUploadAttempts);
+                            var bucket = (pct / 25) * 25;
+
+                            if (bucket is 25 or 50 or 75 or 100)
+                            {
+                                var traceKey = hash + "|" + attempt.ToString(System.Globalization.CultureInfo.InvariantCulture);
+
+                                var shouldLog = true;
+                                if (lastTraceBucketByHash.TryGetValue(traceKey, out var lastBucket) && lastBucket == bucket)
+                                    shouldLog = false;
+
+                                if (shouldLog)
+                                {
+                                    lastTraceBucketByHash[traceKey] = bucket;
+
+                                    Logger.LogTrace("[{idx}] {file}: {pct}% (attempt {attempt}/{max})",
+                                        localIdx, Path.GetFileName(filePath), bucket, attempt, MaxUploadAttempts);
+                                }
+                            }
                         }
                         catch
                         {
@@ -739,7 +875,7 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
                         }
                     });
 
-                    IProgress<UploadProgress> throttledProg = new ThrottledProgress<UploadProgress>(prog, TimeSpan.FromMilliseconds(100));
+                    IProgress<UploadProgress> throttledProg = new ThrottledProgress<UploadProgress>(prog, TimeSpan.FromMilliseconds(150));
 
                     var buf = ChooseUploadStreamBufferSize(ewmaBps);
 
@@ -755,8 +891,8 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
                     _verifiedUploadedHashes[hash] = DateTime.UtcNow;
                     succeeded[hash] = 1;
 
-                    var finalEntry = CurrentUploads.FirstOrDefault(u => string.Equals(u.Hash, hash, StringComparison.Ordinal));
-                    if (finalEntry != null) finalEntry.Transferred = finalEntry.Total;
+                    if (uploadEntryByHash.TryGetValue(hash, out var finalEntry))
+                        finalEntry.Transferred = finalEntry.Total;
 
                     return; // success
                 }
@@ -780,25 +916,31 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
                         await Task.Delay(200, tokenInner).ConfigureAwait(false);
                     }
                 }
-                finally
-                {
-                    lastUploadedByHash.TryRemove(hash, out _);
+                    finally
+                    {
+                        lastUploadedByHash.TryRemove(hash, out _);
+
+                        var traceKey = hash + "|" + attempt.ToString(System.Globalization.CultureInfo.InvariantCulture);
+                        lastTraceBucketByHash.TryRemove(traceKey, out _);
+                    }
                 }
-            }
         }
 
-        // ---- UI: never leave "Uploading..." stuck once this batch is done ----
-        CurrentUploads.Clear();
-        progress?.Report("No uploads in progress");
+            // ---- Result classification ----
+            var failed = allowedHashes
+                .Where(h => !succeeded.ContainsKey(h))
+                .Concat(forbidden)
+                .Distinct(StringComparer.Ordinal)
+                .ToList();
 
-        // ---- Result classification ----
-        var failed = allowedHashes
-            .Where(h => !succeeded.ContainsKey(h))
-            .Concat(forbidden)
-            .Distinct(StringComparer.Ordinal)
-            .ToList();
-
-        return failed;
+            return failed;
+        }
+        finally
+        {
+            // ---- UI: never leave "Uploading..." stuck once this batch is done/cancelled/faulted ----
+            CurrentUploads.Clear();
+            progress?.Report("No uploads in progress");
+        }
     }
 
     private sealed class ThrottledProgress<T> : IProgress<T>
@@ -884,9 +1026,10 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
 
     private static int ChooseUploadStreamBufferSize(double ewmaBps)
     {
-        if (ewmaBps > 0 && ewmaBps < 128 * 1024) return 64 * 1024;     // <128 KiB/s
-        if (ewmaBps > 0 && ewmaBps < 1024 * 1024) return 256 * 1024;  // <1 MiB/s
-        return 1024 * 1024;                                           // default
+        if (ewmaBps > 0 && ewmaBps < 128 * 1024) return 64 * 1024;         // <128 KiB/s
+        if (ewmaBps > 0 && ewmaBps < 1024 * 1024) return 256 * 1024;       // <1 MiB/s
+        if (ewmaBps > 0 && ewmaBps < 8 * 1024 * 1024) return 1024 * 1024;  // <8 MiB/s
+        return 2 * 1024 * 1024;                                             // fast links
     }
     private sealed class ProgressReadStream : Stream
     {

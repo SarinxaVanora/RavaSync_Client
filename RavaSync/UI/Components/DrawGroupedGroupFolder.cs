@@ -54,13 +54,13 @@ public class DrawGroupedGroupFolder : IDrawFolder
             {
                 ImGui.SameLine();
                 ImGui.AlignTextToFramePadding();
-                ImGui.TextUnformatted("[" + OnlinePairs.ToString() + "]");
+                ImGui.TextUnformatted(_uiSharedService.L("UI.DrawGroupedGroupFolder.81541726", "[") + OnlinePairs.ToString() + "]");
             }
-            UiSharedService.AttachToolTip(OnlinePairs + " online in all of your joined syncshells" + Environment.NewLine +
+            UiSharedService.AttachToolTip(OnlinePairs + _uiSharedService.L("UI.DrawGroupedGroupFolder.2c60a982", " online in all of your joined syncshells") + Environment.NewLine +
                 TotalPairs + " pairs combined in all of your joined syncshells");
             ImGui.SameLine();
             ImGui.AlignTextToFramePadding();
-            ImGui.TextUnformatted("All Syncshells");
+            ImGui.TextUnformatted(_uiSharedService.L("UI.DrawGroupedGroupFolder.2c2def9f", "All Syncshells"));
         }
         color.Dispose();
         _wasHovered = ImGui.IsItemHovered();

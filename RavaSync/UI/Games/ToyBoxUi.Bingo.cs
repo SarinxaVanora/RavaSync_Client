@@ -40,13 +40,13 @@ public sealed partial class ToyBoxUi
     {
         if (_activeGameId == Guid.Empty)
         {
-            ImGui.TextColored(ImGuiColors.DalamudGrey, "No active bingo session selected.");
+            ImGui.TextColored(ImGuiColors.DalamudGrey, _uiSharedService.L("UI.ToyBoxUi.Bingo.9fefca68", "No active bingo session selected."));
             return;
         }
 
         if (!_games.TryGetClientBingo(_activeGameId, out var view))
         {
-            ImGui.TextColored(ImGuiColors.DalamudGrey, "Waiting for state...");
+            ImGui.TextColored(ImGuiColors.DalamudGrey, _uiSharedService.L("UI.ToyBoxUi.Bingo.69af3ce1", "Waiting for state..."));
             return;
         }
 
@@ -55,7 +55,7 @@ public sealed partial class ToyBoxUi
 
         if (pub is null && priv is null)
         {
-            ImGui.TextColored(ImGuiColors.DalamudGrey, "Waiting for host...");
+            ImGui.TextColored(ImGuiColors.DalamudGrey, _uiSharedService.L("UI.ToyBoxUi.Bingo.2945ada3", "Waiting for host..."));
             return;
         }
 
@@ -67,7 +67,7 @@ public sealed partial class ToyBoxUi
         // Header row
         using (ImRaii.PushStyle(ImGuiStyleVar.ItemSpacing, ImGui.GetStyle().ItemSpacing with { X = 10f * scale }))
         {
-            ImGui.TextUnformatted("Bingo");
+            ImGui.TextUnformatted(_uiSharedService.L("UI.ToyBoxUiBingo.f4427847", "Bingo"));
             ImGui.SameLine();
 
             DrawPill("Phase: " + BingoPhaseLabel(phase), PhaseColor(phase));
@@ -92,7 +92,7 @@ public sealed partial class ToyBoxUi
             {
                 ImGui.SameLine();
                 ImGui.AlignTextToFramePadding();
-                ImGui.TextUnformatted("Marker Colour");
+                ImGui.TextUnformatted(_uiSharedService.L("UI.ToyBoxUiBingo.9c46f82b", "Marker Colour"));
                 ImGui.SameLine();
 
                 _bingoMarkerColor = UnpackArgb(priv.MarkerColorArgb);
@@ -217,7 +217,7 @@ public sealed partial class ToyBoxUi
         using (ImRaii.Child("bingo_called_panel", new Vector2(0, 56f * scale), true))
         {
             ImGui.AlignTextToFramePadding();
-            ImGui.TextColored(ImGuiColors.DalamudGrey, "Called:");
+            ImGui.TextColored(ImGuiColors.DalamudGrey, _uiSharedService.L("UI.ToyBoxUi.Bingo.918482bd", "Called:"));
             ImGui.SameLine();
 
             if (pub?.CalledNumbers == null || pub.CalledNumbers.Count == 0)
@@ -238,7 +238,7 @@ public sealed partial class ToyBoxUi
         var priv = view.Private;
         if (pub is null || priv is null)
         {
-            ImGui.TextColored(ImGuiColors.DalamudGrey, "Waiting for state...");
+            ImGui.TextColored(ImGuiColors.DalamudGrey, _uiSharedService.L("UI.ToyBoxUi.Bingo.69af3ce1", "Waiting for state..."));
             return;
         }
 
@@ -299,7 +299,7 @@ public sealed partial class ToyBoxUi
         var pub = view.Public;
         if (pub is null)
         {
-            ImGui.TextColored(ImGuiColors.DalamudGrey, "Waiting for state...");
+            ImGui.TextColored(ImGuiColors.DalamudGrey, _uiSharedService.L("UI.ToyBoxUi.Bingo.69af3ce1", "Waiting for state..."));
             return;
         }
 
@@ -337,13 +337,13 @@ public sealed partial class ToyBoxUi
             _bingoHostPhase = (int)pub.Phase;
 
             ImGui.SetNextItemWidth(220f * scale);
-            if (ImGui.Combo("Phase", ref _bingoHostPhase, phaseLabels, phaseLabels.Length))
+            if (ImGui.Combo(_uiSharedService.L("UI.ToyBoxUiBingo.f6371a49", "Phase"), ref _bingoHostPhase, phaseLabels, phaseLabels.Length))
                 _games.HostBingoSetPhase(view.GameId, (BingoPhase)_bingoHostPhase);
 
             bool canAdvance = pub.Phase != BingoPhase.FullHouse && pub.Winners != null && pub.Winners.Any(w => w.Phase == pub.Phase);
             ImGui.SameLine();
             ImGui.BeginDisabled(!canAdvance);
-            if (_uiSharedService.IconTextButton(FontAwesomeIcon.StepForward, "Next phase", 120f * scale, true))
+            if (_uiSharedService.IconTextButton(FontAwesomeIcon.StepForward, _uiSharedService.L("UI.ToyBoxUi.Bingo.d97da077", "Next phase"), 120f * scale, true))
                 _games.HostBingoAdvancePhase(view.GameId);
             ImGui.EndDisabled();
 
@@ -368,17 +368,17 @@ public sealed partial class ToyBoxUi
             }
 
             ImGui.SetNextItemWidth(120f * scale);
-            ImGui.InputInt("One line", ref _bingoPotOneLine);
+            ImGui.InputInt(_uiSharedService.L("UI.ToyBoxUiBingo.57f6dced", "One line"), ref _bingoPotOneLine);
             ImGui.SetNextItemWidth(120f * scale);
-            ImGui.InputInt("Two lines", ref _bingoPotTwoLines);
+            ImGui.InputInt(_uiSharedService.L("UI.ToyBoxUiBingo.6da105e7", "Two lines"), ref _bingoPotTwoLines);
             ImGui.SetNextItemWidth(120f * scale);
-            ImGui.InputInt("Full house", ref _bingoPotFullHouse);
+            ImGui.InputInt(_uiSharedService.L("UI.ToyBoxUiBingo.dbe8641c", "Full house"), ref _bingoPotFullHouse);
 
             _bingoPotOneLine = Math.Max(0, _bingoPotOneLine);
             _bingoPotTwoLines = Math.Max(0, _bingoPotTwoLines);
             _bingoPotFullHouse = Math.Max(0, _bingoPotFullHouse);
 
-            if (_uiSharedService.IconTextButton(FontAwesomeIcon.Save, "Apply pots", 140f * scale, true))
+            if (_uiSharedService.IconTextButton(FontAwesomeIcon.Save, _uiSharedService.L("UI.ToyBoxUi.Bingo.2607985f", "Apply pots"), 140f * scale, true))
             {
                 _games.HostBingoSetPots(view.GameId, _bingoPotOneLine, _bingoPotTwoLines, _bingoPotFullHouse);
                 _bingoPotLastOneLine = _bingoPotOneLine;
@@ -388,7 +388,7 @@ public sealed partial class ToyBoxUi
 
             ImGuiHelpers.ScaledDummy(8);
 
-            if (_uiSharedService.IconTextButton(FontAwesomeIcon.Dice, "Roll next number", 180f * scale, true))
+            if (_uiSharedService.IconTextButton(FontAwesomeIcon.Dice, _uiSharedService.L("UI.ToyBoxUi.Bingo.b13b8cb3", "Roll next number"), 180f * scale, true))
                 _games.HostBingoRollRandom(view.GameId);
         }
 
@@ -404,11 +404,11 @@ public sealed partial class ToyBoxUi
                 ImGui.TextColored(ImGuiColors.DalamudGrey, $"{sel.Name} — {BingoPhaseLabel(sel.Phase)}");
                 ImGuiHelpers.ScaledDummy(4);
 
-                if (_uiSharedService.IconTextButton(FontAwesomeIcon.Check, "Approve", 120f * scale, true))
+                if (_uiSharedService.IconTextButton(FontAwesomeIcon.Check, _uiSharedService.L("UI.ToyBoxUi.Bingo.414f5ee4", "Approve"), 120f * scale, true))
                     _games.HostBingoApproveClaim(view.GameId, sel.SessionId, sel.Phase);
 
                 ImGui.SameLine();
-                if (_uiSharedService.IconTextButton(FontAwesomeIcon.Times, "Deny", 120f * scale, true))
+                if (_uiSharedService.IconTextButton(FontAwesomeIcon.Times, _uiSharedService.L("UI.ToyBoxUi.Bingo.2ab6b3b2", "Deny"), 120f * scale, true))
                     _games.HostBingoDenyClaim(view.GameId, sel.SessionId, "Not valid for this phase.");
 
                 ImGuiHelpers.ScaledDummy(3);
@@ -428,7 +428,7 @@ public sealed partial class ToyBoxUi
                 }
                 else
                 {
-                    ImGui.TextColored(ImGuiColors.DalamudGrey, "Waiting for preview...");
+                    ImGui.TextColored(ImGuiColors.DalamudGrey, _uiSharedService.L("UI.ToyBoxUi.Bingo.3318f3ad", "Waiting for preview..."));
                 }
             }
         }
@@ -451,7 +451,7 @@ public sealed partial class ToyBoxUi
                 _bingoHostDesiredCards[p.SessionId] = desired;
 
             ImGui.SameLine();
-            if (_uiSharedService.IconTextButton(FontAwesomeIcon.Magic, "Deal", 90f * scale, true))
+            if (_uiSharedService.IconTextButton(FontAwesomeIcon.Magic, _uiSharedService.L("UI.ToyBoxUi.Bingo.d10df362", "Deal"), 90f * scale, true))
                 _games.HostBingoSetPlayerCards(view.GameId, p.SessionId, desired);
 
             ImGui.SameLine();
@@ -478,7 +478,7 @@ public sealed partial class ToyBoxUi
 
         if (pub is null || priv is null)
         {
-            ImGui.TextColored(ImGuiColors.DalamudGrey, "Waiting for state...");
+            ImGui.TextColored(ImGuiColors.DalamudGrey, _uiSharedService.L("UI.ToyBoxUi.Bingo.69af3ce1", "Waiting for state..."));
             return;
         }
 
@@ -509,7 +509,7 @@ public sealed partial class ToyBoxUi
         float scale = ImGuiHelpers.GlobalScale;
         if (card?.Numbers == null || card.Numbers.Count != 25)
         {
-            ImGui.TextColored(ImGuiColors.DalamudGrey, "Invalid card.");
+            ImGui.TextColored(ImGuiColors.DalamudGrey, _uiSharedService.L("UI.ToyBoxUi.Bingo.251d890f", "Invalid card."));
             return;
         }
 

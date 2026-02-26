@@ -54,8 +54,8 @@ public class DrawFolderTag : DrawFolderBase
         TagHandler.CustomVisibleTag => false,
         TagHandler.CustomAllTag => false,
         TagHandler.CustomOfflineSyncshellTag => false,
-        _ => true,
-    } && _allPairs.Any();
+        _ => _allPairs.Count > 0,
+    };
 
     private bool RenderCount => _id switch
     {
@@ -86,14 +86,18 @@ public class DrawFolderTag : DrawFolderBase
 
         if (RenderCount)
         {
-            using (ImRaii.PushStyle(ImGuiStyleVar.ItemSpacing, ImGui.GetStyle().ItemSpacing with { X = ImGui.GetStyle().ItemSpacing.X / 2f }))
+            var style = ImGui.GetStyle();
+            var onlinePairs = OnlinePairs;
+            var totalPairs = TotalPairs;
+
+            using (ImRaii.PushStyle(ImGuiStyleVar.ItemSpacing, style.ItemSpacing with { X = style.ItemSpacing.X / 2f }))
             {
                 ImGui.SameLine();
                 ImGui.AlignTextToFramePadding();
-
-                ImGui.TextUnformatted("[" + OnlinePairs.ToString() + "]");
+                ImGui.TextUnformatted($"[{onlinePairs}]");
             }
-            UiSharedService.AttachToolTip(OnlinePairs + " online" + Environment.NewLine + TotalPairs + " total");
+
+            UiSharedService.AttachToolTip($"{onlinePairs} online{Environment.NewLine}{totalPairs} total");
         }
         ImGui.SameLine();
         return ImGui.GetCursorPosX();
@@ -101,17 +105,17 @@ public class DrawFolderTag : DrawFolderBase
 
     protected override void DrawMenu(float menuWidth)
     {
-        ImGui.TextUnformatted("Group Menu");
-        if (_uiSharedService.IconTextButton(FontAwesomeIcon.Users, "Select Pairs", menuWidth, true))
+        ImGui.TextUnformatted(_uiSharedService.L("UI.DrawFolderTag.60c393ce", "Group Menu"));
+        if (_uiSharedService.IconTextButton(FontAwesomeIcon.Users, _uiSharedService.L("UI.DrawFolderTag.8eda6a72", "Select Pairs"), menuWidth, true))
         {
             _selectPairForTagUi.Open(_id);
         }
-        UiSharedService.AttachToolTip("Select Individual Pairs for this Pair Group");
-        if (_uiSharedService.IconTextButton(FontAwesomeIcon.Trash, "Delete Pair Group", menuWidth, true) && UiSharedService.CtrlPressed())
+        UiSharedService.AttachToolTip(_uiSharedService.L("UI.DrawFolderTag.f08bedd9", "Select Individual Pairs for this Pair Group"));
+        if (_uiSharedService.IconTextButton(FontAwesomeIcon.Trash, _uiSharedService.L("UI.DrawFolderTag.2e09993a", "Delete Pair Group"), menuWidth, true) && UiSharedService.CtrlPressed())
         {
             _tagHandler.RemoveTag(_id);
         }
-        UiSharedService.AttachToolTip("Hold CTRL to remove this Group permanently." + Environment.NewLine +
+        UiSharedService.AttachToolTip(_uiSharedService.L("UI.DrawFolderTag.f060823b", "Hold CTRL to remove this Group permanently.") + Environment.NewLine +
             "Note: this will not unpair with users in this Group.");
     }
 
@@ -137,7 +141,16 @@ public class DrawFolderTag : DrawFolderBase
     {
         if (!RenderPause) return currentRightSideX;
 
-        var allArePaused = _allPairs.All(pair => pair.UserPair!.OwnPermissions.IsPaused());
+        bool allArePaused = true;
+        for (int i = 0; i < _allPairs.Count; i++)
+        {
+            if (!_allPairs[i].UserPair!.OwnPermissions.IsPaused())
+            {
+                allArePaused = false;
+                break;
+            }
+        }
+
         var pauseButton = allArePaused ? FontAwesomeIcon.Play : FontAwesomeIcon.Pause;
         var pauseButtonX = _uiSharedService.GetIconButtonSize(pauseButton).X;
 
@@ -168,25 +181,33 @@ public class DrawFolderTag : DrawFolderBase
 
     private void PauseRemainingPairs(IEnumerable<Pair> availablePairs)
     {
-        _ = _apiController.SetBulkPermissions(new(availablePairs
-            .ToDictionary(g => g.UserData.UID, g =>
+        var pairs = availablePairs as ICollection<Pair> ?? availablePairs.ToList();
+        var dict = new Dictionary<string, RavaSync.API.Data.Enum.UserPermissions>(pairs.Count, StringComparer.Ordinal);
+
+        foreach (var g in pairs)
         {
             var perm = g.UserPair.OwnPermissions;
             perm.SetPaused(paused: true);
-            return perm;
-        }, StringComparer.Ordinal), new(StringComparer.Ordinal)))
+            dict[g.UserData.UID] = perm;
+        }
+
+        _ = _apiController.SetBulkPermissions(new(dict, new(StringComparer.Ordinal)))
             .ConfigureAwait(false);
     }
 
     private void ResumeAllPairs(IEnumerable<Pair> availablePairs)
     {
-        _ = _apiController.SetBulkPermissions(new(availablePairs
-            .ToDictionary(g => g.UserData.UID, g =>
-            {
-                var perm = g.UserPair.OwnPermissions;
-                perm.SetPaused(paused: false);
-                return perm;
-            }, StringComparer.Ordinal), new(StringComparer.Ordinal)))
+        var pairs = availablePairs as ICollection<Pair> ?? availablePairs.ToList();
+        var dict = new Dictionary<string, RavaSync.API.Data.Enum.UserPermissions>(pairs.Count, StringComparer.Ordinal);
+
+        foreach (var g in pairs)
+        {
+            var perm = g.UserPair.OwnPermissions;
+            perm.SetPaused(paused: false);
+            dict[g.UserData.UID] = perm;
+        }
+
+        _ = _apiController.SetBulkPermissions(new(dict, new(StringComparer.Ordinal)))
             .ConfigureAwait(false);
     }
 }

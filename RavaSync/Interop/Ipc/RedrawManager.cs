@@ -8,18 +8,21 @@ using System.Collections.Concurrent;
 
 namespace RavaSync.Interop.Ipc;
 
-public class RedrawManager
+public class RedrawManager : IMediatorSubscriber
 {
     private readonly MareMediator _mareMediator;
     private readonly DalamudUtilService _dalamudUtil;
     private readonly ConcurrentDictionary<nint, bool> _penumbraRedrawRequests = [];
     private readonly ConcurrentDictionary<nint, RedrawQueue> _redrawQueues = new();
+    private readonly ConcurrentDictionary<nint, WeakReference<GameObjectHandler>> _handlersByAddress = new();
     private CancellationTokenSource _disposalCts = new();
+
 
     private sealed class RedrawQueue
     {
         public readonly ConcurrentQueue<WorkItem> Items = new();
-        public int RunnerActive;
+        public int RunnerActive; public SemaphoreSlim RedrawSemaphore { get; init; } = new(2, 2);
+
     }
 
     private sealed class WorkItem
@@ -32,15 +35,78 @@ public class RedrawManager
         public required CancellationToken Token;
     }
 
-
-
+    public MareMediator Mediator => _mareMediator;
     public SemaphoreSlim RedrawSemaphore { get; init; } = new(2, 2);
 
     public RedrawManager(MareMediator mareMediator, DalamudUtilService dalamudUtil)
     {
         _mareMediator = mareMediator;
         _dalamudUtil = dalamudUtil;
+
+        _mareMediator.Subscribe<GameObjectHandlerCreatedMessage>(this, msg =>
+        {
+            var h = msg.GameObjectHandler;
+            if (h.Address != nint.Zero)
+                _handlersByAddress[h.Address] = new WeakReference<GameObjectHandler>(h);
+        });
+
+        _mareMediator.Subscribe<GameObjectHandlerDestroyedMessage>(this, msg =>
+        {
+            var h = msg.GameObjectHandler;
+            if (h.Address != nint.Zero)
+                _handlersByAddress.TryRemove(h.Address, out _);
+        });
     }
+
+    public bool TryGetHandler(nint address, out GameObjectHandler handler)
+    {
+        handler = null!;
+
+        if (address == nint.Zero)
+            return false;
+
+        if (_handlersByAddress.TryGetValue(address, out var weak)
+            && weak.TryGetTarget(out var h)
+            && h != null
+            && h.Address == address)
+        {
+            handler = h;
+            return true;
+        }
+
+        return false;
+    }
+
+    public async Task ExternalPenumbraRedrawAsync(ILogger logger, ICharacter character, Guid applicationId, Action<ICharacter> action, CancellationToken token)
+    {
+        if (character == null) return;
+
+        var addr = character.Address;
+        if (addr == nint.Zero) return;
+
+        if (TryGetHandler(addr, out var handler))
+        {
+            await PenumbraRedrawInternalAsync(logger, handler, applicationId, action, token).ConfigureAwait(false);
+            return;
+        }
+        await _dalamudUtil.RunOnFrameworkThread(() =>
+        {
+            try
+            {
+                action(character);
+            }
+            catch (Exception ex)
+            {
+                logger.LogDebug(ex, "[{appid}] External redraw fallback failed for addr {addr}", applicationId, addr);
+            }
+
+            return 0;
+        }).ConfigureAwait(false);
+    }
+
+    public Task PenumbraAfterGPoseAsync(ILogger logger, ICharacter character, Guid applicationId, Action<ICharacter> action, CancellationToken token)
+        => ExternalPenumbraRedrawAsync(logger, character, applicationId, action, token);
+
 
     public async Task PenumbraRedrawInternalAsync(ILogger logger, GameObjectHandler handler, Guid applicationId, Action<ICharacter> action, CancellationToken token)
     {

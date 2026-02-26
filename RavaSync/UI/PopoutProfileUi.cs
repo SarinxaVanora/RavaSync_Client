@@ -131,27 +131,27 @@ public class PopoutProfileUi : WindowMediatorSubscriberBase
             }
             if (_pair.UserPair.IndividualPairStatus == API.Data.Enum.IndividualPairStatus.Bidirectional)
             {
-                ImGui.TextUnformatted("Directly paired");
+                ImGui.TextUnformatted(_uiSharedService.L("UI.PopoutProfileUi.4516126f", "Directly paired"));
                 if (_pair.UserPair.OwnPermissions.IsPaused())
                 {
                     ImGui.SameLine();
-                    UiSharedService.ColorText("You: paused", ImGuiColors.DalamudYellow);
+                    UiSharedService.ColorText(_uiSharedService.L("UI.PopoutProfileUi.19f99f7e", "You: paused"), ImGuiColors.DalamudYellow);
                 }
                 if (_pair.UserPair.OtherPermissions.IsPaused())
                 {
                     ImGui.SameLine();
-                    UiSharedService.ColorText("They: paused", ImGuiColors.DalamudYellow);
+                    UiSharedService.ColorText(_uiSharedService.L("UI.PopoutProfileUi.ed66e350", "They: paused"), ImGuiColors.DalamudYellow);
                 }
             }
             if (_pair.UserPair.Groups.Any())
             {
-                ImGui.TextUnformatted("Paired through Syncshells:");
+                ImGui.TextUnformatted(_uiSharedService.L("UI.PopoutProfileUi.f73db05d", "Paired through Syncshells:"));
                 foreach (var group in _pair.UserPair.Groups)
                 {
                     var groupNote = _serverManager.GetNoteForGid(group);
                     var groupName = _pairManager.GroupPairs.First(f => string.Equals(f.Key.GID, group, StringComparison.Ordinal)).Key.GroupAliasOrGID;
                     var groupString = string.IsNullOrEmpty(groupNote) ? groupName : $"{groupNote} ({groupName})";
-                    ImGui.TextUnformatted("- " + groupString);
+                    ImGui.TextUnformatted(_uiSharedService.L("UI.PopoutProfileUi.ea82fc8d", "- ") + groupString);
                 }
             }
 
@@ -164,9 +164,9 @@ public class PopoutProfileUi : WindowMediatorSubscriberBase
             while (textSize.Y > remaining && descText.Contains(' '))
             {
                 descText = descText[..descText.LastIndexOf(' ')].TrimEnd();
-                textSize = ImGui.CalcTextSize(descText + $"...{Environment.NewLine}[Open Full Profile for complete description]", wrapWidth: 256f * ImGuiHelpers.GlobalScale);
+                textSize = ImGui.CalcTextSize(descText + $"...{Environment.NewLine}{_uiSharedService.L("UI.PopoutProfileUi.1caf1640", "[Open Full Profile for complete description]")}", wrapWidth: 256f * ImGuiHelpers.GlobalScale);
             }
-            UiSharedService.TextWrapped(trimmed ? descText + $"...{Environment.NewLine}[Open Full Profile for complete description]" : mareProfile.Description);
+            UiSharedService.TextWrapped(trimmed ? descText + $"...{Environment.NewLine}{_uiSharedService.L("UI.PopoutProfileUi.1caf1640", "[Open Full Profile for complete description]")}" : mareProfile.Description);
             font.Dispose();
 
             var padding = ImGui.GetStyle().WindowPadding.X / 2;

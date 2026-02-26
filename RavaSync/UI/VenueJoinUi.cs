@@ -110,12 +110,12 @@ public sealed class VenueJoinUi : WindowMediatorSubscriberBase
         // ─────────────────────────────────────────────────────────────────────────────
         if (_askJoinFirst)
         {
-            UiSharedService.TextWrapped("Would you like to join this venue's public shell?");
+            UiSharedService.TextWrapped(_uiSharedService.L("UI.VenueJoinUi.18c5a737", "Would you like to join this venue's public shell?"));
             ImGuiHelpers.ScaledDummy(6f);
 
             using (ImRaii.Group())
             {
-                if (_uiSharedService.IconTextButton(Dalamud.Interface.FontAwesomeIcon.PlusCircle, "Yes"))
+                if (_uiSharedService.IconTextButton(Dalamud.Interface.FontAwesomeIcon.PlusCircle, _uiSharedService.L("UI.VenueJoinUi.d05f5d3c", "Yes")))
                 {
                     // Mirror JoinSyncshellUI "Join" click
                     try
@@ -135,7 +135,7 @@ public sealed class VenueJoinUi : WindowMediatorSubscriberBase
 
                 ImGui.SameLine();
 
-                if (_uiSharedService.IconTextButton(Dalamud.Interface.FontAwesomeIcon.TimesCircle, "No"))
+                if (_uiSharedService.IconTextButton(Dalamud.Interface.FontAwesomeIcon.TimesCircle, _uiSharedService.L("UI.VenueJoinUi.ca53aaf1", "No")))
                 {
                     IsOpen = false;
                 }
@@ -149,15 +149,11 @@ public sealed class VenueJoinUi : WindowMediatorSubscriberBase
         // ─────────────────────────────────────────────────────────────────────────────
         if (_groupJoinInfo == null || !_groupJoinInfo.Success)
         {
-            UiSharedService.TextWrapped(
-                "Failed to join the Syncshell. This is due to one of the following reasons:" + Environment.NewLine +
-                "- You are already in that Syncshell or are banned from that Syncshell" + Environment.NewLine +
-                "- The Syncshell is at capacity or has invites disabled" + Environment.NewLine +
-                "- The Syncshell could not be found" + Environment.NewLine);
+            UiSharedService.TextWrapped(_uiSharedService.L("UI.VenueJoinUi.4ad67727", "Failed to join the Syncshell. This is due to one of the following reasons:\n- You are already in that Syncshell or are banned from that Syncshell\n- The Syncshell is at capacity or has invites disabled\n- The Syncshell could not be found\n"));
             ImGuiHelpers.ScaledDummy(2f);
             using (ImRaii.Disabled(false))
             {
-                if (_uiSharedService.IconTextButton(Dalamud.Interface.FontAwesomeIcon.TimesCircle, "Close"))
+                if (_uiSharedService.IconTextButton(Dalamud.Interface.FontAwesomeIcon.TimesCircle, _uiSharedService.L("UI.VenueJoinUi.18e44fdd", "Close")))
                     IsOpen = false;
             }
             return;
@@ -166,17 +162,17 @@ public sealed class VenueJoinUi : WindowMediatorSubscriberBase
         // ─────────────────────────────────────────────────────────────────────────────
         // STEP 2: Finalize
         // ─────────────────────────────────────────────────────────────────────────────
-        ImGui.TextUnformatted("You are about to join the Syncshell " + _groupJoinInfo.GroupAliasOrGID + " by " + _groupJoinInfo.OwnerAliasOrUID);
+        ImGui.TextUnformatted(_uiSharedService.L("UI.VenueJoinUi.203c2e3c", "You are about to join the Syncshell ") + _groupJoinInfo.GroupAliasOrGID + _uiSharedService.L("UI.VenueJoinUi.5287faf1", " by ") + _groupJoinInfo.OwnerAliasOrUID);
         ImGuiHelpers.ScaledDummy(2f);
-        ImGui.TextUnformatted("This Syncshell staff has set the following suggested Syncshell permissions:");
+        ImGui.TextUnformatted(_uiSharedService.L("UI.JoinSyncshellUI.834e3e0d", "This Syncshell staff has set the following suggested Syncshell permissions:"));
         ImGui.AlignTextToFramePadding();
-        ImGui.TextUnformatted("- Sounds ");
+        ImGui.TextUnformatted(_uiSharedService.L("UI.JoinSyncshellUI.e658c42d", "- Sounds "));
         _uiSharedService.BooleanToColoredIcon(!_groupJoinInfo.GroupPermissions.IsPreferDisableSounds());
         ImGui.AlignTextToFramePadding();
-        ImGui.TextUnformatted("- Animations");
+        ImGui.TextUnformatted(_uiSharedService.L("UI.CreateSyncshellUI.269f0654", "- Animations"));
         _uiSharedService.BooleanToColoredIcon(!_groupJoinInfo.GroupPermissions.IsPreferDisableAnimations());
         ImGui.AlignTextToFramePadding();
-        ImGui.TextUnformatted("- VFX");
+        ImGui.TextUnformatted(_uiSharedService.L("UI.CreateSyncshellUI.b3942667", "- VFX"));
         _uiSharedService.BooleanToColoredIcon(!_groupJoinInfo.GroupPermissions.IsPreferDisableVFX());
 
         if (_groupJoinInfo.GroupPermissions.IsPreferDisableSounds() != _ownPermissions.DisableGroupSounds
@@ -184,19 +180,19 @@ public sealed class VenueJoinUi : WindowMediatorSubscriberBase
             || _groupJoinInfo.GroupPermissions.IsPreferDisableAnimations() != _ownPermissions.DisableGroupAnimations)
         {
             ImGuiHelpers.ScaledDummy(2f);
-            UiSharedService.ColorText("Your current preferred default Syncshell permissions deviate from the suggested permissions:", ImGuiColors.DalamudYellow);
+            UiSharedService.ColorText(_uiSharedService.L("UI.JoinSyncshellUI.5f08c0ab", "Your current preferred default Syncshell permissions deviate from the suggested permissions:"), ImGuiColors.DalamudYellow);
             if (_groupJoinInfo.GroupPermissions.IsPreferDisableSounds() != _ownPermissions.DisableGroupSounds)
             {
                 ImGui.AlignTextToFramePadding();
-                ImGui.TextUnformatted("- Sounds");
+                ImGui.TextUnformatted(_uiSharedService.L("UI.CreateSyncshellUI.cc79adf2", "- Sounds"));
                 _uiSharedService.BooleanToColoredIcon(!_ownPermissions.DisableGroupSounds);
                 ImGui.SameLine(200);
                 ImGui.AlignTextToFramePadding();
-                ImGui.TextUnformatted("Suggested");
+                ImGui.TextUnformatted(_uiSharedService.L("UI.JoinSyncshellUI.7fcd8d44", "Suggested"));
                 _uiSharedService.BooleanToColoredIcon(!_groupJoinInfo.GroupPermissions.IsPreferDisableSounds());
                 ImGui.SameLine();
                 using var id = ImRaii.PushId("suggestedSounds");
-                if (_uiSharedService.IconTextButton(Dalamud.Interface.FontAwesomeIcon.ArrowRight, "Apply suggested"))
+                if (_uiSharedService.IconTextButton(Dalamud.Interface.FontAwesomeIcon.ArrowRight, _uiSharedService.L("UI.VenueJoinUi.68db1a22", "Apply suggested")))
                 {
                     _ownPermissions.DisableGroupSounds = _groupJoinInfo.GroupPermissions.IsPreferDisableSounds();
                 }
@@ -204,15 +200,15 @@ public sealed class VenueJoinUi : WindowMediatorSubscriberBase
             if (_groupJoinInfo.GroupPermissions.IsPreferDisableAnimations() != _ownPermissions.DisableGroupAnimations)
             {
                 ImGui.AlignTextToFramePadding();
-                ImGui.TextUnformatted("- Animations");
+                ImGui.TextUnformatted(_uiSharedService.L("UI.CreateSyncshellUI.269f0654", "- Animations"));
                 _uiSharedService.BooleanToColoredIcon(!_ownPermissions.DisableGroupAnimations);
                 ImGui.SameLine(200);
                 ImGui.AlignTextToFramePadding();
-                ImGui.TextUnformatted("Suggested");
+                ImGui.TextUnformatted(_uiSharedService.L("UI.JoinSyncshellUI.7fcd8d44", "Suggested"));
                 _uiSharedService.BooleanToColoredIcon(!_groupJoinInfo.GroupPermissions.IsPreferDisableAnimations());
                 ImGui.SameLine();
                 using var id = ImRaii.PushId("suggestedAnims");
-                if (_uiSharedService.IconTextButton(Dalamud.Interface.FontAwesomeIcon.ArrowRight, "Apply suggested"))
+                if (_uiSharedService.IconTextButton(Dalamud.Interface.FontAwesomeIcon.ArrowRight, _uiSharedService.L("UI.VenueJoinUi.68db1a22", "Apply suggested")))
                 {
                     _ownPermissions.DisableGroupAnimations = _groupJoinInfo.GroupPermissions.IsPreferDisableAnimations();
                 }
@@ -220,28 +216,28 @@ public sealed class VenueJoinUi : WindowMediatorSubscriberBase
             if (_groupJoinInfo.GroupPermissions.IsPreferDisableVFX() != _ownPermissions.DisableGroupVFX)
             {
                 ImGui.AlignTextToFramePadding();
-                ImGui.TextUnformatted("- VFX");
+                ImGui.TextUnformatted(_uiSharedService.L("UI.CreateSyncshellUI.b3942667", "- VFX"));
                 _uiSharedService.BooleanToColoredIcon(!_ownPermissions.DisableGroupVFX);
                 ImGui.SameLine(200);
                 ImGui.AlignTextToFramePadding();
-                ImGui.TextUnformatted("Suggested");
+                ImGui.TextUnformatted(_uiSharedService.L("UI.JoinSyncshellUI.7fcd8d44", "Suggested"));
                 _uiSharedService.BooleanToColoredIcon(!_groupJoinInfo.GroupPermissions.IsPreferDisableVFX());
                 ImGui.SameLine();
                 using var id = ImRaii.PushId("suggestedVfx");
-                if (_uiSharedService.IconTextButton(Dalamud.Interface.FontAwesomeIcon.ArrowRight, "Apply suggested"))
+                if (_uiSharedService.IconTextButton(Dalamud.Interface.FontAwesomeIcon.ArrowRight, _uiSharedService.L("UI.VenueJoinUi.68db1a22", "Apply suggested")))
                 {
                     _ownPermissions.DisableGroupVFX = _groupJoinInfo.GroupPermissions.IsPreferDisableVFX();
                 }
             }
-            UiSharedService.TextWrapped("Note: you do not need to apply the suggested Syncshell permissions, they are solely suggestions by the staff.");
+            UiSharedService.TextWrapped(_uiSharedService.L("UI.VenueJoinUi.f4e3a220", "Note: you do not need to apply the suggested Syncshell permissions, they are solely suggestions by the staff."));
         }
         else
         {
-            UiSharedService.TextWrapped("Your default syncshell permissions on joining are in line with the suggested Syncshell permissions through the owner.");
+            UiSharedService.TextWrapped(_uiSharedService.L("UI.JoinSyncshellUI.ac29fe42", "Your default syncshell permissions on joining are in line with the suggested Syncshell permissions through the owner."));
         }
 
         ImGuiHelpers.ScaledDummy(2f);
-        if (_uiSharedService.IconTextButton(Dalamud.Interface.FontAwesomeIcon.Plus, "Finalize and join " + _groupJoinInfo.GroupAliasOrGID))
+        if (_uiSharedService.IconTextButton(Dalamud.Interface.FontAwesomeIcon.Plus, _uiSharedService.L("UI.VenueJoinUi.4b7b8469", "Finalize and join ") + _groupJoinInfo.GroupAliasOrGID))
         {
             GroupUserPreferredPermissions joinPermissions = GroupUserPreferredPermissions.NoneSet;
             joinPermissions.SetDisableSounds(_ownPermissions.DisableGroupSounds);

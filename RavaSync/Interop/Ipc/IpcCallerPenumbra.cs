@@ -109,12 +109,15 @@ public sealed class IpcCallerPenumbra : DisposableMediatorSubscriberBase, IIpcCa
 
         Mediator.Subscribe<PenumbraRedrawCharacterMessage>(this, (msg) =>
         {
-            _ = SafeIpc.TryRun(Logger, "Penumbra.Redraw.AfterGPose", TimeSpan.FromSeconds(2), ct =>
+            _ = SafeIpc.TryRun(Logger, "Penumbra.Redraw.Coalesced", TimeSpan.FromSeconds(2), ct =>
             {
-                _penumbraRedraw.Invoke(msg.Character.ObjectIndex, RedrawType.AfterGPose);
-                return Task.CompletedTask;
+                return _redrawManager.ExternalPenumbraRedrawAsync(Logger, msg.Character, Guid.NewGuid(), c =>
+                {
+                    _penumbraRedraw.Invoke(c.ObjectIndex, RedrawType.Redraw);
+                }, ct);
             });
         });
+
 
         Mediator.Subscribe<DalamudLoginMessage>(this, (msg) => _shownPenumbraUnavailable = false);
     }
@@ -399,15 +402,8 @@ public sealed class IpcCallerPenumbra : DisposableMediatorSubscriberBase, IIpcCa
             {
                 // Clear pending for this run.
                 Interlocked.Exchange(ref gate.Pending, 0);
-
-                var semaphore = _redrawManager.RedrawSemaphore;
-                var entered = false;
-
                 try
                 {
-                    await semaphore.WaitAsync(token).ConfigureAwait(false);
-                    entered = true;
-
                     await _redrawManager.PenumbraRedrawInternalAsync(logger, handler, applicationId, chara =>
                     {
                         logger.LogDebug("[{appid}] Calling on IPC: PenumbraRedraw", applicationId);
@@ -427,11 +423,6 @@ public sealed class IpcCallerPenumbra : DisposableMediatorSubscriberBase, IIpcCa
                 {
                     logger.LogDebug("[{appid}] Penumbra redraw cancelled for {name}", applicationId, handler.Name);
                     break;
-                }
-                finally
-                {
-                    if (entered)
-                        semaphore.Release();
                 }
 
                 if (Interlocked.CompareExchange(ref gate.Pending, 0, 0) != 1)

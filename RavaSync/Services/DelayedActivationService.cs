@@ -1,14 +1,15 @@
 ﻿using Dalamud.Game.ClientState.Objects.SubKinds;
 using Dalamud.Plugin.Services;
+using Microsoft.Extensions.Logging;
 using RavaSync.FileCache;
 using RavaSync.Interop.Ipc;
 using RavaSync.MareConfiguration;
 using RavaSync.Services;
 using RavaSync.Services.Mediator;
-using Microsoft.Extensions.Logging;
-using System.Collections.Concurrent;
 using RavaSync.Utils;
 using System.Buffers;
+using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Security.Cryptography;
 
 namespace RavaSync.WebAPI.Files
@@ -24,11 +25,26 @@ namespace RavaSync.WebAPI.Files
         private readonly MareMediator _mareMediator;
         private readonly DalamudUtilService _dalamudUtil;
         private readonly IObjectTable _objectTable;
-        private const int MaxFilesPerFrame = 6;
+        private const int MaxFilesPerFrame = 2;
         private readonly List<PendingFile> _pendingDrain = new(MaxFilesPerFrame);
         private readonly List<PendingFile> _pendingBatch = new(MaxFilesPerFrame);
 
         private readonly ConcurrentDictionary<string, byte> _pendingHashes = new(StringComparer.OrdinalIgnoreCase);
+
+        private sealed record ApplyResult(PendingFile File, ApplyOutcome Outcome, string? Error = null);
+
+        private enum ApplyOutcome
+        {
+            Success,
+            Requeue,
+            Fail
+        }
+
+        private readonly ConcurrentQueue<PendingFile> _applyWorkQueue = new();
+        private readonly ConcurrentQueue<ApplyResult> _applyCompletedQueue = new();
+        private readonly SemaphoreSlim _applySignal = new(0, int.MaxValue);
+        private readonly CancellationTokenSource _applyCts = new();
+        private readonly Task _applyWorker;
 
         private sealed class ActorRedrawState
         {
@@ -76,6 +92,7 @@ namespace RavaSync.WebAPI.Files
             RecoverQuarantineOrphans();
 
             _framework.Update += OnFrameworkUpdate;
+            _applyWorker = Task.Run(() => ApplyWorkerLoop(_applyCts.Token));
         }
 
         public void Initialize(ICondition condition)
@@ -132,19 +149,203 @@ namespace RavaSync.WebAPI.Files
                 TouchActor(addr);
         }
 
+        private async Task ApplyWorkerLoop(CancellationToken ct)
+        {
+            try
+            {
+                while (!ct.IsCancellationRequested)
+                {
+                    await _applySignal.WaitAsync(ct).ConfigureAwait(false);
 
+                    while (_applyWorkQueue.TryDequeue(out var f))
+                    {
+                        if (ct.IsCancellationRequested) break;
+
+                        ApplyResult result;
+                        try
+                        {
+                            result = ApplyOneFileWorker(f);
+                        }
+                        catch (Exception ex)
+                        {
+                            result = new ApplyResult(f, ApplyOutcome.Fail, ex.ToString());
+                        }
+
+                        _applyCompletedQueue.Enqueue(result);
+
+                        // Keep the worker cooperative; avoids long uninterrupted bursts on one thread.
+                        await Task.Yield();
+                    }
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                // normal shutdown
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "DelayedActivatorService apply worker crashed");
+            }
+        }
+
+        private ApplyResult ApplyOneFileWorker(PendingFile f)
+        {
+            // Everything heavy happens here: validate, copy, timestamp randomization, cache registration, cleanup
+            // Framework tick only drains results + schedules redraws.
+
+            try
+            {
+                if (!File.Exists(f.QuarantinePath))
+                {
+                    if (File.Exists(f.FinalPath) && DestinationIsExpectedHash(f.FinalPath, f.FileHash))
+                    {
+                        // Already applied by someone else; just treat as success.
+                        try { _fileDbManager.UnstageFile(f.FileHash); } catch { /* best effort */ }
+                        return new ApplyResult(f, ApplyOutcome.Success);
+                    }
+
+                    _fileDbManager.UnstageFile(f.FileHash);
+                    return new ApplyResult(f, ApplyOutcome.Fail, "Quarantine missing");
+                }
+
+                if (!DestinationIsExpectedHash(f.QuarantinePath, f.FileHash))
+                {
+                    try { File.Delete(f.QuarantinePath); } catch { /* best effort */ }
+                    _fileDbManager.UnstageFile(f.FileHash);
+                    return new ApplyResult(f, ApplyOutcome.Fail, "Quarantine failed hash validation");
+                }
+
+                try
+                {
+                    CopyFileBuffered(f.QuarantinePath, f.FinalPath);
+                }
+                catch (Exception ex) when (IsFileInUse(ex))
+                {
+                    // If final already correct, succeed; otherwise requeue
+                    if (File.Exists(f.FinalPath) && DestinationIsExpectedHash(f.FinalPath, f.FileHash))
+                    {
+                        try { File.Delete(f.QuarantinePath); } catch { /* best effort */ }
+                        _fileDbManager.UnstageFile(f.FileHash);
+                        return new ApplyResult(f, ApplyOutcome.Success);
+                    }
+
+                    return new ApplyResult(f, ApplyOutcome.Requeue);
+                }
+
+                // Best-effort timestamp randomization
+                try
+                {
+                    var fi = new FileInfo(f.FinalPath);
+                    DateTime start = new(1995, 1, 1, 1, 1, 1, DateTimeKind.Local);
+                    int range = (DateTime.Today - start).Days;
+                    fi.CreationTime = start.AddDays(_rng.Next(range));
+                    fi.LastAccessTime = DateTime.Today;
+                    fi.LastWriteTime = start.AddDays(_rng.Next(range));
+                }
+                catch { /* best effort */ }
+
+                try
+                {
+                    var entry = _fileDbManager.CreateCacheEntry(f.FinalPath);
+                    if (entry != null && !string.Equals(entry.Hash, f.FileHash, StringComparison.OrdinalIgnoreCase))
+                    {
+                        _logger.LogError(
+                            "Hash mismatch after delayed apply; expected {expected}, got {actual} → {path}",
+                            f.FileHash, entry.Hash, f.FinalPath);
+
+                        try { File.Delete(f.FinalPath); } catch { /* best effort */ }
+                        try { _fileDbManager.RemoveHashedFile(entry.Hash, entry.PrefixedFilePath); } catch { /* best effort */ }
+                        _fileDbManager.UnstageFile(f.FileHash);
+
+                        return new ApplyResult(f, ApplyOutcome.Fail, "Cache registration hash mismatch");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    if (IsFileInUse(ex))
+                        return new ApplyResult(f, ApplyOutcome.Requeue);
+
+                    _logger.LogWarning(ex, "Cache registration error for delayed file {path}", f.FinalPath);
+                    _fileDbManager.UnstageFile(f.FileHash);
+                    return new ApplyResult(f, ApplyOutcome.Fail, "Cache registration error");
+                }
+
+                // Cleanup quarantine + unstage
+                try { File.Delete(f.QuarantinePath); } catch { /* best effort */ }
+                try { _fileDbManager.UnstageFile(f.FileHash); } catch { /* best effort */ }
+
+                return new ApplyResult(f, ApplyOutcome.Success);
+            }
+            catch (Exception ex)
+            {
+                try { _fileDbManager.UnstageFile(f.FileHash); } catch { /* best effort */ }
+                return new ApplyResult(f, ApplyOutcome.Fail, ex.ToString());
+            }
+        }
 
         private void OnFrameworkUpdate(IFramework framework)
         {
             try
             {
-                if (_gate == null) return;
+                const int MaxCompletedPerFrame = 64;
+                for (int i = 0; i < MaxCompletedPerFrame && _applyCompletedQueue.TryDequeue(out var r); i++)
+                {
+                    var f = r.File;
+
+                    switch (r.Outcome)
+                    {
+                        case ApplyOutcome.Success:
+                            {
+                                // Worker already did unstage + cleanup; just clear tracking and schedule redraw if needed
+                                _pendingHashes.TryRemove(f.FileHash, out _);
+
+                                if (IsRedrawCriticalFinalPath(f.FinalPath))
+                                {
+                                    if (f.ActorAddress is nint addr && addr != nint.Zero)
+                                        TouchActor(addr);
+                                    else
+                                        _logger.LogDebug("Redraw-critical finalize without actor address: {path} ({hash})", f.FinalPath, f.FileHash);
+                                }
+
+                                break;
+                            }
+
+                        case ApplyOutcome.Requeue:
+                            {
+                                // File was in use - try later, keep hash pending
+                                _pending.Enqueue(f);
+                                break;
+                            }
+
+                        case ApplyOutcome.Fail:
+                        default:
+                            {
+                                _logger.LogWarning("Failed to apply delayed file {path} ({hash}): {err}", f.FinalPath, f.FileHash, r.Error);
+                                _pendingHashes.TryRemove(f.FileHash, out _);
+                                break;
+                            }
+                    }
+                }
+
+                if (_gate == null)
+                {
+                    TryDoRedrawPass();
+                    return;
+                }
 
                 var cfg = _cfgSvc.Current;
-                if (!cfg.DelayActivationEnabled && _pending.IsEmpty && _actorRedrawStates.IsEmpty)
-                    return;
 
-                if (!_gate.SafeNow(cfg.SafeIdleSeconds, cfg.ApplyOnlyOnZoneChange)) return;
+                if (!cfg.DelayActivationEnabled && _pending.IsEmpty && _actorRedrawStates.IsEmpty)
+                {
+                    TryDoRedrawPass();
+                    return;
+                }
+
+                if (!_gate.SafeNow(cfg.SafeIdleSeconds, cfg.ApplyOnlyOnZoneChange))
+                {
+                    TryDoRedrawPass();
+                    return;
+                }
 
                 var drained = _pendingDrain;
                 drained.Clear();
@@ -164,6 +365,7 @@ namespace RavaSync.WebAPI.Files
                 var batch = _pendingBatch;
                 batch.Clear();
                 if (batch.Capacity < drained.Count) batch.Capacity = drained.Count;
+
                 foreach (var f in drained)
                 {
                     if (f.HardDelay ||
@@ -186,101 +388,8 @@ namespace RavaSync.WebAPI.Files
 
                 foreach (var f in batch)
                 {
-                    try
-                    {
-                        if (!File.Exists(f.QuarantinePath))
-                        {
-                            if (File.Exists(f.FinalPath) && DestinationIsExpectedHash(f.FinalPath, f.FileHash))
-                            {
-                                FinalizeSuccess(f, deleteQuarantine: false);
-                                continue;
-                            }
-
-                            _logger.LogWarning("Quarantine missing: {file}", f.QuarantinePath);
-                            _fileDbManager.UnstageFile(f.FileHash);
-                            _pendingHashes.TryRemove(f.FileHash, out _);
-                            continue;
-                        }
-
-                        try
-                        {
-                            if (!DestinationIsExpectedHash(f.QuarantinePath, f.FileHash))
-                            {
-                                _logger.LogError(
-                                    "Quarantine failed hash validation; expected {expected} → {path}",
-                                    f.FileHash,
-                                    f.QuarantinePath);
-
-                                try { File.Delete(f.QuarantinePath); } catch { /* best effort */ }
-                                _fileDbManager.UnstageFile(f.FileHash);
-                                _pendingHashes.TryRemove(f.FileHash, out _);
-                                continue;
-                            }
-
-                            CopyFileBuffered(f.QuarantinePath, f.FinalPath);
-                        }
-                        catch (Exception ex) when (IsFileInUse(ex))
-                        {
-                            if (File.Exists(f.FinalPath) && DestinationIsExpectedHash(f.FinalPath, f.FileHash))
-                            {
-                                FinalizeSuccess(f, deleteQuarantine: true);
-                                continue;
-                            }
-
-                            _pending.Enqueue(f);
-                            continue;
-                        }
-
-                        try
-                        {
-                            var fi = new FileInfo(f.FinalPath);
-                            DateTime start = new(1995, 1, 1, 1, 1, 1, DateTimeKind.Local);
-                            int range = (DateTime.Today - start).Days;
-                            fi.CreationTime = start.AddDays(_rng.Next(range));
-                            fi.LastAccessTime = DateTime.Today;
-                            fi.LastWriteTime = start.AddDays(_rng.Next(range));
-                        }
-                        catch { /* best effort */ }
-
-                        try
-                        {
-                            var entry = _fileDbManager.CreateCacheEntry(f.FinalPath);
-                            if (entry != null && !string.Equals(entry.Hash, f.FileHash, StringComparison.OrdinalIgnoreCase))
-                            {
-                                _logger.LogError(
-                                    "Hash mismatch after delayed apply; expected {expected}, got {actual} → {path}",
-                                    f.FileHash, entry.Hash, f.FinalPath);
-
-                                File.Delete(f.FinalPath);
-                                _fileDbManager.RemoveHashedFile(entry.Hash, entry.PrefixedFilePath);
-                                _fileDbManager.UnstageFile(f.FileHash);
-
-                                _pendingHashes.TryRemove(f.FileHash, out _);
-                                continue;
-                            }
-                        }
-                        catch (Exception ex)
-                        {
-                            if (IsFileInUse(ex))
-                            {
-                                _pending.Enqueue(f);
-                                continue;
-                            }
-
-                            _logger.LogWarning(ex, "Cache registration error for delayed file {path}", f.FinalPath);
-                            _fileDbManager.UnstageFile(f.FileHash);
-                            _pendingHashes.TryRemove(f.FileHash, out _);
-                            continue;
-                        }
-
-                        FinalizeSuccess(f, deleteQuarantine: true);
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.LogError(ex, "Failed to apply delayed file {file}", f.FinalPath);
-                        _fileDbManager.UnstageFile(f.FileHash);
-                        _pendingHashes.TryRemove(f.FileHash, out _);
-                    }
+                    _applyWorkQueue.Enqueue(f);
+                    _applySignal.Release();
                 }
 
                 TryDoRedrawPass();
@@ -310,11 +419,6 @@ namespace RavaSync.WebAPI.Files
             }
 
         }
-
-        //private DateTime _globalDueUtc = DateTime.MinValue;
-        //private const int GlobalCoalesceDelayMs = 350;
-        //private const int GlobalMinIntervalMs = 1000;
-
         private void TryDoRedrawPass()
         {
             try
@@ -417,9 +521,21 @@ namespace RavaSync.WebAPI.Files
                 using (var dst = new FileStream(tmpPath, dstOpts))
                 {
                     int read;
+                    const int YieldEveryBytes = 2 * 1024 * 1024; // 2MB
+                    var sinceYield = 0;
+
                     while ((read = src.Read(buffer, 0, buffer.Length)) > 0)
+                    {
                         dst.Write(buffer, 0, read);
-                    dst.Flush(true);
+                        sinceYield += read;
+
+                        // Cooperative scheduling: avoid long uninterrupted file-copy bursts on the game update.
+                        if (sinceYield >= YieldEveryBytes)
+                        {
+                            sinceYield = 0;
+                            Thread.Yield();
+                        }
+                    }
                 }
 
                 File.Move(tmpPath, dstPath, overwrite: true);
@@ -573,7 +689,19 @@ namespace RavaSync.WebAPI.Files
         public void Dispose()
         {
             _framework.Update -= OnFrameworkUpdate;
-            _gate?.Dispose();
+
+            try
+            {
+                _applyCts.Cancel();
+                _applySignal.Release(); 
+                _applyWorker.Wait(500);
+            }
+            catch { /* best effort */ }
+            finally
+            {
+                _applyCts.Dispose();
+                _applySignal.Dispose();
+            }
         }
     }
 }

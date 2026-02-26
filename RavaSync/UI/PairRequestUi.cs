@@ -72,7 +72,7 @@ public sealed class PairRequestUi : WindowMediatorSubscriberBase
     {
         if (_currentRequest is null)
         {
-            ImGui.TextWrapped("No active pair request.");
+            ImGui.TextWrapped(_uiShared.L("UI.PairRequestUi.ae8d20c2", "No active pair request."));
             return;
         }
 
@@ -85,23 +85,23 @@ public sealed class PairRequestUi : WindowMediatorSubscriberBase
         var oldItemSpacing = style.ItemSpacing;
         ImGui.PushStyleVar(ImGuiStyleVar.ItemSpacing, new Vector2(oldItemSpacing.X, 4f));
 
-        ImGui.TextWrapped($"{displayName} wants to pair with you.");
+        ImGui.TextWrapped(string.Format(_uiShared.L("UI.PairRequestUi.a2b4f9cd", "{0} wants to pair with you."), displayName));
 
         ImGui.Spacing();
-        ImGui.Text("Do you accept?");
+        ImGui.Text(_uiShared.L("UI.PairRequestUi.81dd371d", "Do you accept?"));
 
         ImGui.Spacing();
 
         using (ImRaii.Group())
         {
-            if (ImGui.Button("Yes", new Vector2(90, 24)))
+            if (ImGui.Button(_uiShared.L("UI.PairRequestUi.5397e058", "Yes"), new Vector2(90, 24)))
             {
                 _ = RespondAsync(true);
             }
 
             ImGui.SameLine();
 
-            if (ImGui.Button("No", new Vector2(90, 24)))
+            if (ImGui.Button(_uiShared.L("UI.PairRequestUi.816c52fd", "No"), new Vector2(90, 24)))
             {
                 _ = RespondAsync(false);
             }

@@ -195,6 +195,16 @@
     <Content Include="Fonts\VT323-Regular.ttf">
       <CopyToOutputDirectory>Always</CopyToOutputDirectory>
     </Content>
+    <EmbeddedResource Include="Localization\ru.json" />
+    <EmbeddedResource Include="Localization\it.json" />
+    <EmbeddedResource Include="Localization\en.json" />
+    <EmbeddedResource Include="Localization\ar.json" />
+    <EmbeddedResource Include="Localization\es.json" />
+    <EmbeddedResource Include="Localization\ja.json" />
+    <EmbeddedResource Include="Localization\ko.json" />
+    <EmbeddedResource Include="Localization\olde.json" />
+    <EmbeddedResource Include="Localization\pirate.json" />
+    <EmbeddedResource Include="Localization\zh.json" />
     <EmbeddedResource Include="Resources\icon.png" />
     <EmbeddedResource Include="Resources\aether_fill_blue.png" />
     <EmbeddedResource Include="Resources\aether_fill_green.png" />
