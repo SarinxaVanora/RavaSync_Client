@@ -97,7 +97,7 @@ public class DrawFolderTag : DrawFolderBase
                 ImGui.TextUnformatted($"[{onlinePairs}]");
             }
 
-            UiSharedService.AttachToolTip($"{onlinePairs} online{Environment.NewLine}{totalPairs} total");
+            UiSharedService.AttachToolTip(string.Format(_uiSharedService.L("UI.DrawFolderTag.Tooltip.PairCounts", "{0} online\n{1} total"), onlinePairs, totalPairs));
         }
         ImGui.SameLine();
         return ImGui.GetCursorPosX();
@@ -169,11 +169,11 @@ public class DrawFolderTag : DrawFolderBase
         }
         if (allArePaused)
         {
-            UiSharedService.AttachToolTip($"Resume pairing with all pairs in {_id}");
+            UiSharedService.AttachToolTip(string.Format(_uiSharedService.L("UI.DrawFolderTag.Tooltip.ResumeAll", "Resume pairing with all pairs in {0}"), _id));
         }
         else
         {
-            UiSharedService.AttachToolTip($"Pause pairing with all pairs in {_id}");
+            UiSharedService.AttachToolTip(string.Format(_uiSharedService.L("UI.DrawFolderTag.Tooltip.PauseAll", "Pause pairing with all pairs in {0}"), _id));
         }
 
         return currentRightSideX;

@@ -366,8 +366,8 @@ internal sealed partial class CharaDataHubUi : WindowMediatorSubscriberBase
         if (_configService.Current.FavoriteCodes.ContainsKey(id))
         {
             _uiSharedService.IconText(FontAwesomeIcon.Star, ImGuiColors.ParsedGold);
-            UiSharedService.AttachToolTip($"Custom Description: {favorite?.CustomDescription ?? string.Empty}" + UiSharedService.TooltipSeparator
-                + "Click to remove from Favorites");
+            UiSharedService.AttachToolTip(string.Format(_uiSharedService.L("UI.CharaDataHubUi.Favorites.Tooltip.CustomDescription", "Custom Description: {0}"), favorite?.CustomDescription ?? string.Empty) + UiSharedService.TooltipSeparator
+                + _uiSharedService.L("UI.CharaDataHubUi.Favorites.Tooltip.Remove", "Click to remove from Favorites"));
         }
         else
         {
@@ -402,7 +402,7 @@ internal sealed partial class CharaDataHubUi : WindowMediatorSubscriberBase
                     }
                 }
                 ImGui.SameLine();
-                UiSharedService.AttachToolTip($"Target the GPose Character {CharaName(actor.Name.TextValue)}");
+                UiSharedService.AttachToolTip(string.Format(_uiSharedService.L("UI.CharaDataHubUi.Gpose.Tooltip.Target", "Target the GPose Character {0}"), CharaName(actor.Name.TextValue)));
                 ImGui.AlignTextToFramePadding();
                 var pos = ImGui.GetCursorPosX();
                 using (ImRaii.PushColor(ImGuiCol.Text, ImGuiColors.HealerGreen, _hasValidGposeTarget && string.Equals(actor.Name.TextValue, _gposeTarget, StringComparison.Ordinal)))
@@ -426,14 +426,14 @@ internal sealed partial class CharaDataHubUi : WindowMediatorSubscriberBase
                         {
                             _charaDataManager.RemoveChara(actor.Name.TextValue);
                         }
-                        UiSharedService.AttachToolTip($"Remove character {CharaName(actor.Name.TextValue)}");
+                        UiSharedService.AttachToolTip(string.Format(_uiSharedService.L("UI.CharaDataHubUi.Gpose.Tooltip.RemoveCharacter", "Remove character {0}"), CharaName(actor.Name.TextValue)));
                     }
                     ImGui.SameLine();
                     if (_uiSharedService.IconButton(FontAwesomeIcon.Undo))
                     {
                         _charaDataManager.RevertChara(handled);
                     }
-                    UiSharedService.AttachToolTip($"Revert applied data from {CharaName(actor.Name.TextValue)}");
+                    UiSharedService.AttachToolTip(string.Format(_uiSharedService.L("UI.CharaDataHubUi.Gpose.Tooltip.Revert", "Revert applied data from {0}"), CharaName(actor.Name.TextValue)));
                     ImGui.SetCursorPosX(pos);
                     DrawPoseData(handled?.MetaInfo, actor.Name.TextValue, true);
                 }
@@ -857,7 +857,7 @@ internal sealed partial class CharaDataHubUi : WindowMediatorSubscriberBase
                             {
                                 _ = _charaDataManager.McdfApplyToGposeTarget();
                             }
-                            UiSharedService.AttachToolTip($"Apply to {_gposeTarget}");
+                                                        UiSharedService.AttachToolTip(string.Format(_uiSharedService.L("UI.CharaDataHubUi.Tooltip.ApplyTo", "Apply to {0}"), _gposeTarget));
                             ImGui.SameLine();
                             using (ImRaii.Disabled(!_charaDataManager.BrioAvailable))
                             {
@@ -953,7 +953,7 @@ internal sealed partial class CharaDataHubUi : WindowMediatorSubscriberBase
             ImGui.SameLine();
             ImGui.SetCursorPosX(offsetFromRight);
             _uiSharedService.IconText(FontAwesomeIcon.Calendar);
-            UiSharedService.AttachToolTip($"Last Update: {data.UpdatedDate}");
+            UiSharedService.AttachToolTip(string.Format(_uiSharedService.L("UI.CharaDataHubUi.Tooltip.LastUpdate", "Last Update: {0}"), data.UpdatedDate));
 
             ImGui.SameLine();
             GposeMetaInfoAction((meta) =>

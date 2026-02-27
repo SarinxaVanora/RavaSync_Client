@@ -52,13 +52,8 @@ public sealed class DiscoverySettingsUi : WindowMediatorSubscriberBase
             _configService.Current.EnableRavaDiscoveryPresence = discoveryPresence;
             _configService.Save();
         }
-        _uiShared.DrawHelpText(
-            "When enabled: you and other RavaSync users who also opted in can see each other's ♥ " +
-            "and use the right-click \"Send pair request\" option. When disabled: you don't participate " +
-            "in discovery at all and stay hidden."
-        );
-
-        ImGuiHelpers.ScaledDummy(5);
+        _uiShared.DrawHelpText(_uiShared.L("UI.DiscoverySettingsUi.Presence.Help", "When enabled: you and other RavaSync users who also opted in can see each other's ♥ and use the right-click 'Send pair request' option. When disabled: you don't participate in discovery at all and stay hidden."));
+ImGuiHelpers.ScaledDummy(5);
 
         bool enablePairRequestMenu = _configService.Current.EnableSendPairRequestContextMenu;
         using (ImRaii.Disabled(!discoveryPresence))
@@ -69,10 +64,7 @@ public sealed class DiscoverySettingsUi : WindowMediatorSubscriberBase
                 _configService.Save();
             }
         }
-        _uiShared.DrawHelpText(
-            "Adds a \"Send pair request\" option to the right-click menu for RavaSync users " +
-            "that you're not already paired with. Requires discovery to be enabled."
-        );
+        _uiShared.DrawHelpText(_uiShared.L("UI.DiscoverySettingsUi.SendPairRequest.Help", "Adds a 'Send pair request' option to the right-click menu for RavaSync users that you're not already paired with. Requires discovery to be enabled."));
 
         ImGuiHelpers.ScaledDummy(5);
 
@@ -82,12 +74,8 @@ public sealed class DiscoverySettingsUi : WindowMediatorSubscriberBase
             _configService.Current.AutoDeclineIncomingPairRequests = autoDecline;
             _configService.Save();
         }
-        _uiShared.DrawHelpText(
-            "Exactly what it says on the tin. If you don't want randoms sending you pair requests, " +
-            "turn this on and they'll be politely told no."
-        );
-
-        ImGuiHelpers.ScaledDummy(5);
+        _uiShared.DrawHelpText(_uiShared.L("UI.DiscoverySettingsUi.AutoDecline.Help", "Exactly what it says on the tin. If you don't want randoms sending you pair requests, turn this on and they'll be politely told no."));
+ImGuiHelpers.ScaledDummy(5);
 
         bool showHeart = _configService.Current.ShowFriendshapedHeart;
         using (ImRaii.Disabled(!discoveryPresence))
@@ -98,9 +86,6 @@ public sealed class DiscoverySettingsUi : WindowMediatorSubscriberBase
                 _configService.Save();
             }
         }
-        _uiShared.DrawHelpText(
-            "Controls the little ♥ on nameplates for other RavaSync users that you're not paired with yet. " +
-            "Purely cosmetic and only relevant when discovery is turned on."
-        );
-    }
+        _uiShared.DrawHelpText(_uiShared.L("UI.DiscoverySettingsUi.ShowHeart.Help", "Controls the little ♥ on nameplates for other RavaSync users that you're not paired with yet. Purely cosmetic and only relevant when discovery is turned on."));
+}
 }

@@ -321,11 +321,15 @@ public class SettingsUi : WindowMediatorSubscriberBase
             _configService.Current.ShowTransferWindow = showTransferWindow;
             _configService.Save();
         }
-        _uiShared.DrawHelpText($"The download window will show the current progress of outstanding downloads.{Environment.NewLine}{Environment.NewLine}" +
-            $"What do W/Q/P/D stand for?{Environment.NewLine}W = Waiting for Slot (see Maximum Parallel Downloads){Environment.NewLine}" +
-            $"Q = Queued on Server, waiting for queue ready signal{Environment.NewLine}" +
-            $"P = Processing download (aka downloading){Environment.NewLine}" +
-            $"D = Decompressing download");
+        _uiShared.DrawHelpText(_uiShared.L(
+            "UI.SettingsUi.TransferWindow.Help",
+            "The download window will show the current progress of outstanding downloads.\n\n" +
+            "What do W/Q/P/D stand for?\n" +
+            "W = Waiting for Slot (see Maximum Parallel Downloads)\n" +
+            "Q = Queued on Server, waiting for queue ready signal\n" +
+            "P = Processing download (aka downloading)\n" +
+            "D = Decompressing download"));
+
         if (!_configService.Current.ShowTransferWindow) ImGui.BeginDisabled();
         ImGui.Indent();
         bool editTransferWindowPosition = _uiShared.EditTrackerPosition;
@@ -346,7 +350,9 @@ public class SettingsUi : WindowMediatorSubscriberBase
         ImGui.SameLine();
 
         var isEditingGlobal = _configService.Current.EditGlobalTransferOverlay;
-        var editLabel = isEditingGlobal ? "Done editing global bars##editGlobalTransfers" : "Edit global bars location##editGlobalTransfers";
+        var editLabel = isEditingGlobal
+            ? _uiShared.L("UI.SettingsUi.GlobalBars.Edit.Done", "Done editing global bars") + "##editGlobalTransfers"
+            : _uiShared.L("UI.SettingsUi.GlobalBars.Edit.Start", "Edit global bars location") + "##editGlobalTransfers";
         if (ImGui.SmallButton(editLabel))
         {
             _configService.Current.EditGlobalTransferOverlay = !isEditingGlobal;
@@ -361,8 +367,7 @@ public class SettingsUi : WindowMediatorSubscriberBase
             _configService.Current.ShowUploadProgress = showUploadProgress;
             _configService.Save();
         }
-        _uiShared.DrawHelpText($"Shows a global upload bar when uploads are active.{Environment.NewLine}" + 
-            "Use this if you want individual download bars but still want to see your own upload progress");
+        _uiShared.DrawHelpText(_uiShared.L("UI.SettingsUi.UploadProgress.Help", "Shows a global upload bar when uploads are active.\nUse this if you want individual download bars but still want to see your own upload progress"));
 
         bool showTransferText = _configService.Current.showTransferText;
         if (ImGui.Checkbox(_uiShared.L("UI.SettingsUi.6344c308", "Show transfers in main UI"), ref showTransferText))
@@ -737,7 +742,7 @@ public class SettingsUi : WindowMediatorSubscriberBase
         _uiShared.BigText("Storage");
 
         UiSharedService.TextWrapped(_uiShared.L("UI.SettingsUi.d842e127", "RavaSync Stores downloaded files from paired people permanently. This is to improve loading performance and requiring less downloads. ") +
-            "The storage governs itself by clearing data beyond the set storage size. Please set the storage size accordingly. It is not necessary to manually clear the storage.");
+            _uiShared.L("UI.SettingsUi.Storage.SelfClearing", "The storage governs itself by clearing data beyond the set storage size. Please set the storage size accordingly. It is not necessary to manually clear the storage."));
 
         _uiShared.DrawFileScanState();
         ImGui.AlignTextToFramePadding();
@@ -848,8 +853,8 @@ public class SettingsUi : WindowMediatorSubscriberBase
 
         ImGui.Separator();
         UiSharedService.TextWrapped(_uiShared.L("UI.SettingsUi.fd6ad6de", "File Storage validation can make sure that all files in your local RavaSync Storage are valid. ") +
-            "Run the validation before you clear the Storage for no reason. " + Environment.NewLine +
-            "This operation, depending on how many files you have in your storage, can take a while and will be CPU and drive intensive.");
+            _uiShared.L("UI.SettingsUi.StorageValidation.Warn", "Run the validation before you clear the Storage for no reason.") + Environment.NewLine +
+            _uiShared.L("UI.SettingsUi.StorageValidation.Intensive", "This operation, depending on how many files you have in your storage, can take a while and will be CPU and drive intensive."));
         using (ImRaii.Disabled(_validationTask != null && !_validationTask.IsCompleted))
         {
             if (_uiShared.IconTextButton(FontAwesomeIcon.Check, _uiShared.L("UI.SettingsUi.1499a5d0", "Start File Storage Validation")))
@@ -896,8 +901,8 @@ public class SettingsUi : WindowMediatorSubscriberBase
         ImGui.Checkbox("##readClearCache", ref _readClearCache);
         ImGui.SameLine();
         UiSharedService.TextWrapped(_uiShared.L("UI.SettingsUi.6847ff7d", "I understand that: ") + Environment.NewLine + _uiShared.L("UI.SettingsUi.fe67c5fb", "- By clearing the local storage I put the file servers of my connected service under extra strain by having to redownload all data.")
-            + Environment.NewLine + "- This is not a step to try to fix sync issues."
-            + Environment.NewLine + "- This can make the situation of not getting other players data worse in situations of heavy file server load.");
+            + Environment.NewLine + _uiShared.L("UI.SettingsUi.ClearStorage.Disclaimer.NotFixSync", "- This is not a step to try to fix sync issues.")
+            + Environment.NewLine + _uiShared.L("UI.SettingsUi.ClearStorage.Disclaimer.WorseUnderLoad", "- This can make the situation of not getting other players data worse in situations of heavy file server load."));
         if (!_readClearCache)
             ImGui.BeginDisabled();
         if (_uiShared.IconTextButton(FontAwesomeIcon.Trash, _uiShared.L("UI.SettingsUi.79ee78eb", "Clear local storage")) && UiSharedService.CtrlPressed() && _readClearCache)
@@ -911,9 +916,9 @@ public class SettingsUi : WindowMediatorSubscriberBase
             });
         }
         UiSharedService.AttachToolTip(_uiShared.L("UI.SettingsUi.b56e57a1", "You normally do not need to do this. THIS IS NOT SOMETHING YOU SHOULD BE DOING TO TRY TO FIX SYNC ISSUES.") + Environment.NewLine
-            + "This will solely remove all downloaded data from all players and will require you to re-download everything again." + Environment.NewLine
-            + "Rava's storage is self-clearing and will not surpass the limit you have set it to." + Environment.NewLine
-            + "If you still think you need to do this hold CTRL while pressing the button.");
+            + _uiShared.L("UI.SettingsUi.ClearStorage.Tooltip.Redownload", "This will solely remove all downloaded data from all players and will require you to re-download everything again.") + Environment.NewLine
+            + _uiShared.L("UI.SettingsUi.ClearStorage.Tooltip.SelfClearing", "Rava's storage is self-clearing and will not surpass the limit you have set it to.") + Environment.NewLine
+            + _uiShared.L("UI.SettingsUi.ClearStorage.Tooltip.HoldCtrl", "If you still think you need to do this hold CTRL while pressing the button."));
         if (!_readClearCache)
             ImGui.EndDisabled();
         ImGui.Unindent();
@@ -1449,7 +1454,7 @@ public class SettingsUi : WindowMediatorSubscriberBase
         _lastTab = "Service Settings";
         if (ApiController.ServerAlive)
         {
-            _uiShared.BigText("Service Actions");
+            _uiShared.BigText(_uiShared.L("UI.SettingsUi.ServiceActions.Title", "Service Actions"));
             ImGuiHelpers.ScaledDummy(new Vector2(5, 5));
             if (ImGui.Button(_uiShared.L("UI.SettingsUi.2bc27379", "Delete all my files")))
             {
@@ -1525,7 +1530,7 @@ public class SettingsUi : WindowMediatorSubscriberBase
             ImGui.Separator();
         }
 
-        _uiShared.BigText("Service & Character Settings");
+        _uiShared.BigText(_uiShared.L("UI.SettingsUi.ServiceCharacterSettings.Title", "Service & Character Settings"));
         ImGuiHelpers.ScaledDummy(new Vector2(5, 5));
         var sendCensus = _serverConfigurationManager.SendCensusData;
         if (ImGui.Checkbox(_uiShared.L("UI.SettingsUi.47b68200", "Send Statistical Census Data"), ref sendCensus))
@@ -1568,7 +1573,7 @@ public class SettingsUi : WindowMediatorSubscriberBase
                 if (selectedServer.SecretKeys.Any() || useOauth)
                 {
                     UiSharedService.ColorTextWrapped(_uiShared.L("UI.SettingsUi.f4a771d5", "Characters listed here will automatically connect to the selected RavaSync Service with the settings as provided below.") +
-                        " Make sure to enter the character names correctly or use the 'Add current character' button at the bottom.", ImGuiColors.DalamudYellow);
+                        " " + _uiShared.L("UI.SettingsUi.CharacterManagement.Help.AddCurrent", "Make sure to enter the character names correctly or use the 'Add current character' button at the bottom."), ImGuiColors.DalamudYellow);
                     int i = 0;
                     _uiShared.DrawUpdateOAuthUIDsButton(selectedServer);
 
@@ -1621,7 +1626,7 @@ public class SettingsUi : WindowMediatorSubscriberBase
                     ImGui.Separator();
 
                     // === Account Vanity (Alias) ===
-                    _uiShared.BigText("Set Account Vanity", ImGuiColors.ParsedGreen);
+                    _uiShared.BigText(_uiShared.L("UI.SettingsUi.AccountVanity.Title", "Set Account Vanity"), ImGuiColors.ParsedGreen);
                     UiSharedService.TextWrapped(_uiShared.L("UI.SettingsUi.2587f7ae", "Set a friendly ID that others can use instead of your UID."));
 
                     ImGui.InputTextWithHint("##alias_input", _uiShared.L("UI.SettingsUi.ee2a2426", "new-vanity (5–15 chars: A–Z, 0–9, _ or -)"), ref _newUserAlias, 32);
@@ -1684,7 +1689,7 @@ public class SettingsUi : WindowMediatorSubscriberBase
                     ulong youCid = _dalamudUtilService.GetCID();
                     if (!selectedServer.Authentications.Exists(a => string.Equals(a.CharacterName, youName, StringComparison.Ordinal) && a.WorldId == youWorld))
                     {
-                        _uiShared.BigText("Your Character is not Configured", ImGuiColors.DalamudRed);
+                        _uiShared.BigText(_uiShared.L("UI.SettingsUi.YourCharacterNotConfigured.Title", "Your Character is not Configured"), ImGuiColors.DalamudRed);
                         UiSharedService.ColorTextWrapped(_uiShared.L("UI.SettingsUi.ee62041a", "You have currently no character configured that corresponds to your current name and world."), ImGuiColors.DalamudRed);
                         var authWithCid = selectedServer.Authentications.Find(f => f.LastSeenCID == youCid);
                         if (authWithCid != null)
@@ -1747,16 +1752,16 @@ public class SettingsUi : WindowMediatorSubscriberBase
                             misManaged = true;
                         }
                         Vector4 color = ImGuiColors.ParsedGreen;
-                        string text = thisIsYou ? "Your Current Character" : string.Empty;
+                        string text = thisIsYou ? _uiShared.L("UI.SettingsUi.CurrentCharacter.Title", "Your Current Character") : string.Empty;
                         if (misManaged)
                         {
-                            text += " [MISMANAGED (" + (selectedServer.UseOAuth2 ? "No UID Set" : "No Secret Key Set") + ")]";
+                            text += " [" + _uiShared.L("UI.SettingsUi.Label.Mismanaged", "MISMANAGED") + " (" + (selectedServer.UseOAuth2 ? _uiShared.L("UI.SettingsUi.Label.NoUidSet", "No UID Set") : _uiShared.L("UI.SettingsUi.Label.NoSecretKeySet", "No Secret Key Set")) + ")]";
                             color = ImGuiColors.DalamudRed;
                         }
                         if (selectedServer.Authentications.Where(e => e != item).Any(e => string.Equals(e.CharacterName, item.CharacterName, StringComparison.Ordinal)
                             && e.WorldId == item.WorldId))
                         {
-                            text += " [DUPLICATE]";
+                            text += " [" + _uiShared.L("UI.SettingsUi.Label.Duplicate", "DUPLICATE") + "]";
                             color = ImGuiColors.DalamudRed;
                         }
 
@@ -2244,7 +2249,7 @@ public class SettingsUi : WindowMediatorSubscriberBase
         }
 
         // Theme dropdown (with "No theme" entry)
-        var currentLabel = _themeSelectedIndex >= 0 ? themes[_themeSelectedIndex].Name : "No theme (default UI)";
+        var currentLabel = _themeSelectedIndex >= 0 ? themes[_themeSelectedIndex].Name : _uiShared.L("UI.SettingsUi.Theme.NoneLabel", "No theme (default UI)");
         ImGui.SetNextItemWidth(240f * ImGuiHelpers.GlobalScale);
         if (ImGui.BeginCombo(_uiShared.L("UI.SettingsUi.a797e309", "Theme"), currentLabel))
         {
@@ -2415,13 +2420,13 @@ public class SettingsUi : WindowMediatorSubscriberBase
                 }
 
                 // Show only the practical colors users actually see
-                Swatch("Background (Window)", selectedTheme.Colors.Background);
-                Swatch("Tabs and controls", selectedTheme.Colors.Surface);
+                Swatch(_uiShared.L("UI.SettingsUi.Theme.Label.BackgroundWindow", "Background (Window)"), selectedTheme.Colors.Background);
+                Swatch(_uiShared.L("UI.SettingsUi.Theme.Label.TabsControls", "Tabs and controls"), selectedTheme.Colors.Surface);
                 Swatch("Text (Primary)", selectedTheme.Colors.Text);
                 Swatch("hints and previews", selectedTheme.Colors.MutedText);
                 Swatch(_uiShared.L("UI.SettingsUi.bd2d600b", "Buttons"), selectedTheme.Colors.Primary);
-                Swatch("Highlight (Selection)", selectedTheme.Colors.Highlight);
-                Swatch("Border", selectedTheme.Colors.Border);
+                Swatch(_uiShared.L("UI.SettingsUi.Theme.Label.HighlightSelection", "Highlight (Selection)"), selectedTheme.Colors.Highlight);
+                Swatch(_uiShared.L("UI.SettingsUi.Theme.Label.Border", "Border"), selectedTheme.Colors.Border);
             }
 
             ImGui.Separator();
@@ -2650,7 +2655,7 @@ public class SettingsUi : WindowMediatorSubscriberBase
             }
 
             // keep BackgroundAlt as requested
-            _editingTheme.Colors.Background = Edit("Background (Window)", _editingTheme.Colors.Background, v =>
+            _editingTheme.Colors.Background = Edit(_uiShared.L("UI.SettingsUi.Theme.Label.BackgroundWindow", "Background (Window)"), _editingTheme.Colors.Background, v =>
             {
                 _editingTheme.Colors.BackgroundAlt = v;
                 _themeManager.Current.Colors.BackgroundAlt = v; // live
@@ -2660,27 +2665,27 @@ public class SettingsUi : WindowMediatorSubscriberBase
                 _editingTheme.Colors.Primary = v;
                 _themeManager.Current.Colors.Primary = v;
             });
-            _editingTheme.Colors.Highlight = Edit("Highlight (Selection)", _editingTheme.Colors.Highlight, v =>
+            _editingTheme.Colors.Highlight = Edit(_uiShared.L("UI.SettingsUi.Theme.Label.HighlightSelection", "Highlight (Selection)"), _editingTheme.Colors.Highlight, v =>
             {
                 _editingTheme.Colors.Highlight = v;
                 _themeManager.Current.Colors.Highlight = v;
             });
-            _editingTheme.Colors.Border = Edit("Border", _editingTheme.Colors.Border, v =>
+            _editingTheme.Colors.Border = Edit(_uiShared.L("UI.SettingsUi.Theme.Label.Border", "Border"), _editingTheme.Colors.Border, v =>
             {
                 _editingTheme.Colors.Border = v;
                 _themeManager.Current.Colors.Border = v;
             });
-            _editingTheme.Colors.Surface = Edit("Tabs and controls", _editingTheme.Colors.Surface, v =>
+            _editingTheme.Colors.Surface = Edit(_uiShared.L("UI.SettingsUi.Theme.Label.TabsControls", "Tabs and controls"), _editingTheme.Colors.Surface, v =>
             {
                 _editingTheme.Colors.Surface = v;
                 _themeManager.Current.Colors.Surface = v;
             });
-            _editingTheme.Colors.Text = Edit("Primary text", _editingTheme.Colors.Text, v =>
+            _editingTheme.Colors.Text = Edit(_uiShared.L("UI.SettingsUi.Theme.Label.PrimaryText", "Primary text"), _editingTheme.Colors.Text, v =>
             {
                 _editingTheme.Colors.Text = v;
                 _themeManager.Current.Colors.Text = v;
             });
-            _editingTheme.Colors.MutedText = Edit("Hints and previews", _editingTheme.Colors.MutedText, v =>
+            _editingTheme.Colors.MutedText = Edit(_uiShared.L("UI.SettingsUi.Theme.Label.HintsPreviews", "Hints and previews"), _editingTheme.Colors.MutedText, v =>
             {
                 _editingTheme.Colors.MutedText = v;
                 _themeManager.Current.Colors.MutedText = v;
@@ -2780,11 +2785,10 @@ public class SettingsUi : WindowMediatorSubscriberBase
             _configService.Current.EnableRavaDiscoveryPresence = discoveryPresence;
             _configService.Save();
         }
-        _uiShared.DrawHelpText(
-            "When enabled: you and other RavaSync users who also opted in can see each other's ♥ " +
-            "and use the right-click \"Send pair request\" option. When disabled: you don't participate " +
-            "in discovery at all and stay hidden."
-        );
+        _uiShared.DrawHelpText(_uiShared.L(
+                                           "UI.DiscoverySettingsUi.Presence.Help",
+                                           "When enabled: you and other RavaSync users who also opted in can see each other's ♥ and use the right-click \"Send pair request\" option. " + 
+                                           "When disabled: you don't participate in discovery at all and stay hidden."));
 
         ImGuiHelpers.ScaledDummy(5);
 
@@ -2798,10 +2802,9 @@ public class SettingsUi : WindowMediatorSubscriberBase
                 _configService.Save();
             }
         }
-        _uiShared.DrawHelpText(
-            "Adds a \"Send pair request\" option to the right-click menu for RavaSync users " +
-            "that you're not already paired with. Requires discovery to be enabled."
-        );
+        _uiShared.DrawHelpText(_uiShared.L(
+            "UI.DiscoverySettingsUi.SendPairRequest.Help",
+            "Adds a \"Send pair request\" option to the right-click menu for RavaSync users that you're not already paired with. Requires discovery to be enabled."));
 
         ImGuiHelpers.ScaledDummy(5);
 
@@ -2812,12 +2815,8 @@ public class SettingsUi : WindowMediatorSubscriberBase
             _configService.Current.AutoDeclineIncomingPairRequests = autoDecline;
             _configService.Save();
         }
-        _uiShared.DrawHelpText(
-            "Exactly what it says on the tin. If you don't want randoms sending you pair requests, " +
-            "turn this on and they'll be politely told no."
-        );
-
-        ImGuiHelpers.ScaledDummy(5);
+        _uiShared.DrawHelpText(_uiShared.L("UI.DiscoverySettingsUi.AutoDecline.Help", "Exactly what it says on the tin. If you don't want randoms sending you pair requests, turn this on and they'll be politely told no."));
+ImGuiHelpers.ScaledDummy(5);
 
         // --- Heart cosmetic toggle ---
         bool showHeart = _configService.Current.ShowFriendshapedHeart;
@@ -2829,11 +2828,8 @@ public class SettingsUi : WindowMediatorSubscriberBase
                 _configService.Save();
             }
         }
-        _uiShared.DrawHelpText(
-            "Controls the little ♥ on nameplates for other RavaSync users that you're not paired with yet. " +
-            "Purely cosmetic and only relevant when discovery is turned on."
-        );
-    }
+        _uiShared.DrawHelpText(_uiShared.L("UI.DiscoverySettingsUi.ShowHeart.Help", "Controls the little ♥ on nameplates for other RavaSync users that you're not paired with yet. Purely cosmetic and only relevant when discovery is turned on."));
+}
 
 
     private void ApplyThemeTypography(Themes.Theme theme)

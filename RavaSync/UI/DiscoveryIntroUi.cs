@@ -69,12 +69,8 @@ public sealed class DiscoveryIntroUi : WindowMediatorSubscriberBase
         {
             _tempDiscoveryOptIn = allowDiscovery;
         }
-        _uiShared.DrawHelpText(
-            "Turn this on if you're happy for other RavaSync users around you to see that you're using RavaSync " +
-            "and send you pair requests."
-        );
-
-        ImGuiHelpers.ScaledDummy(10);
+        _uiShared.DrawHelpText(_uiShared.L("UI.DiscoveryIntroUi.OptIn.Help", "Turn this on if you're happy for other RavaSync users around you to see that you're using RavaSync and send you pair requests."));
+ImGuiHelpers.ScaledDummy(10);
         ImGui.Separator();
         ImGuiHelpers.ScaledDummy(5);
 

@@ -115,7 +115,9 @@ public class DrawUserPair
         UiSharedService.AttachToolTip(_uiSharedService.L("UI.DrawUserPair.a2f60a17", "Opens the Permissions Window which allows you to manage multiple permissions at once."));
 
         var isSticky = _pair.UserPair!.OwnPermissions.IsSticky();
-        string stickyText = isSticky ? "Disable Preferred Permissions" : "Enable Preferred Permissions";
+        string stickyText = isSticky
+            ? _uiSharedService.L("UI.DrawUserPair.Sticky.Disable", "Disable Preferred Permissions")
+            : _uiSharedService.L("UI.DrawUserPair.Sticky.Enable", "Enable Preferred Permissions");
         var stickyIcon = isSticky ? FontAwesomeIcon.ArrowCircleDown : FontAwesomeIcon.ArrowCircleUp;
         if (_uiSharedService.IconTextButton(stickyIcon, stickyText, _menuWidth, true))
         {
@@ -125,13 +127,13 @@ public class DrawUserPair
         }
         UiSharedService.AttachToolTip(_uiSharedService.L("UI.DrawUserPair.8b66f03a", "Preferred permissions means that this pair will not") + Environment.NewLine + _uiSharedService.L("UI.DrawUserPair.4b593833", " be affected by any syncshell permission changes through you."));
 
-        string individualText = Environment.NewLine + Environment.NewLine + "Note: changing this permission will turn the permissions for this"
-            + Environment.NewLine + "user to preferred permissions. You can change this behavior"
-            + Environment.NewLine + "in the permission settings.";
+        string individualText = Environment.NewLine + Environment.NewLine + _uiSharedService.L( "UI.DrawUserPair.PermissionNote", "Note: changing this permission will turn the permissions for this\nuser to preferred permissions. You can change this behavior\nin the permission settings.");
         bool individual = !_pair.IsDirectlyPaired && _apiController.DefaultPermissions!.IndividualIsSticky;
 
         var isDisableSounds = _pair.UserPair!.OwnPermissions.IsDisableSounds();
-        string disableSoundsText = isDisableSounds ? "Enable sound sync" : "Disable sound sync";
+        string disableSoundsText = isDisableSounds
+            ? _uiSharedService.L("UI.DrawUserPair.SoundSync.Enable", "Enable sound sync")
+            : _uiSharedService.L("UI.DrawUserPair.SoundSync.Disable", "Disable sound sync");
         var disableSoundsIcon = isDisableSounds ? FontAwesomeIcon.VolumeUp : FontAwesomeIcon.VolumeMute;
         if (_uiSharedService.IconTextButton(disableSoundsIcon, disableSoundsText, _menuWidth, true))
         {
@@ -142,7 +144,9 @@ public class DrawUserPair
         UiSharedService.AttachToolTip(_uiSharedService.L("UI.DrawUserPair.4af9f6ea", "Changes sound sync permissions with this user.") + (individual ? individualText : string.Empty));
 
         var isDisableAnims = _pair.UserPair!.OwnPermissions.IsDisableAnimations();
-        string disableAnimsText = isDisableAnims ? "Enable animation sync" : "Disable animation sync";
+        string disableAnimsText = isDisableAnims
+            ? _uiSharedService.L("UI.DrawUserPair.AnimationSync.Enable", "Enable animation sync")
+            : _uiSharedService.L("UI.DrawUserPair.AnimationSync.Disable", "Disable animation sync");
         var disableAnimsIcon = isDisableAnims ? FontAwesomeIcon.Running : FontAwesomeIcon.Stop;
         if (_uiSharedService.IconTextButton(disableAnimsIcon, disableAnimsText, _menuWidth, true))
         {
@@ -153,7 +157,9 @@ public class DrawUserPair
         UiSharedService.AttachToolTip(_uiSharedService.L("UI.DrawUserPair.c7595230", "Changes animation sync permissions with this user.") + (individual ? individualText : string.Empty));
 
         var isDisableVFX = _pair.UserPair!.OwnPermissions.IsDisableVFX();
-        string disableVFXText = isDisableVFX ? "Enable VFX sync" : "Disable VFX sync";
+        string disableVFXText = isDisableVFX
+            ? _uiSharedService.L("UI.DrawUserPair.VfxSync.Enable", "Enable VFX sync")
+            : _uiSharedService.L("UI.DrawUserPair.VfxSync.Disable", "Disable VFX sync");
         var disableVFXIcon = isDisableVFX ? FontAwesomeIcon.Sun : FontAwesomeIcon.Circle;
         if (_uiSharedService.IconTextButton(disableVFXIcon, disableVFXText, _menuWidth, true))
         {
@@ -164,7 +170,9 @@ public class DrawUserPair
         UiSharedService.AttachToolTip(_uiSharedService.L("UI.DrawUserPair.d9f7dfb0", "Changes VFX sync permissions with this user.") + (individual ? individualText : string.Empty));
 
         var isDisableCustomizePlus = _pair.UserPair!.OwnPermissions.IsDisableCustomizePlus();
-        string disableCustomizePlusText = isDisableCustomizePlus ? "Enable Customize+ sync" : "Disable Customize+ sync";
+        string disableCustomizePlusText = isDisableCustomizePlus
+            ? _uiSharedService.L("UI.DrawUserPair.CustomizePlusSync.Enable", "Enable Customize+ sync")
+            : _uiSharedService.L("UI.DrawUserPair.CustomizePlusSync.Disable", "Disable Customize+ sync");
         var disableCustomizePlusIcon = isDisableCustomizePlus ? FontAwesomeIcon.Palette : FontAwesomeIcon.Ban;
         if (_uiSharedService.IconTextButton(disableCustomizePlusIcon, disableCustomizePlusText, _menuWidth, true))
         {
@@ -175,7 +183,9 @@ public class DrawUserPair
         UiSharedService.AttachToolTip(_uiSharedService.L("UI.DrawUserPair.c8cd2dba", "Changes Customize+ sync permissions with this user.") + (individual ? individualText : string.Empty));
 
         bool isDisableMetadata = !_pair.IsMetadataEnabled;
-        string disableMetadataText = isDisableMetadata ? "Enable height metadata" : "Disable height metadata";
+        string disableMetadataText = isDisableMetadata
+            ? _uiSharedService.L("UI.DrawUserPair.HeightMetadata.Enable", "Enable height metadata")
+            : _uiSharedService.L("UI.DrawUserPair.HeightMetadata.Disable", "Disable height metadata");
         var disableMetadataIcon = isDisableMetadata ? FontAwesomeIcon.ArrowsAltV : FontAwesomeIcon.Ban;
 
         if (_uiSharedService.IconTextButton(disableMetadataIcon, disableMetadataText, _menuWidth, true))
@@ -585,8 +595,7 @@ public class DrawUserPair
             currentRightSide -= (_uiSharedService.GetIconSize(FontAwesomeIcon.Running).X + (spacingX / 2f));
             ImGui.SameLine(currentRightSide);
             _uiSharedService.IconText(FontAwesomeIcon.Running);
-            UiSharedService.AttachToolTip($"This user has shared {sharedData.Count} Character Data Sets with you." + UiSharedService.TooltipSeparator
-                + "Click to open the Character Data Hub and show the entries.");
+            UiSharedService.AttachToolTip(string.Format(_uiSharedService.L("UI.DrawUserPair.Tooltip.SharedCharaData", "This user has shared {0} Character Data Sets with you."), sharedData.Count) + UiSharedService.TooltipSeparator + _uiSharedService.L("UI.DrawUserPair.Tooltip.SharedCharaData.OpenHub", "Click to open the Character Data Hub and show the entries."));
             if (ImGui.IsItemClicked(ImGuiMouseButton.Left))
             {
                 _mediator.Publish(new OpenCharaDataHubWithFilterMessage(_pair.UserData));

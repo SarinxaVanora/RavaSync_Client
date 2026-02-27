@@ -480,8 +480,8 @@ internal sealed partial class CharaDataHubUi
                 bool hasPoseData = !string.IsNullOrEmpty(pose.PoseData);
                 _uiSharedService.IconText(FontAwesomeIcon.Running, UiSharedService.GetBoolColor(hasPoseData));
                 UiSharedService.AttachToolTip(hasPoseData
-                    ? "This Pose entry has pose data attached"
-                    : "This Pose entry has no pose data attached");
+                    ? _uiSharedService.L("UI.CharaDataHubUi.McdOnline.Tooltip.PoseHasData", "This Pose entry has pose data attached")
+                    : _uiSharedService.L("UI.CharaDataHubUi.McdOnline.Tooltip.PoseNoData", "This Pose entry has no pose data attached"));
                 ImGui.SameLine();
 
                 using (ImRaii.Disabled(!_uiSharedService.IsInGpose || !(_charaDataManager.AttachingPoseTask?.IsCompleted ?? true) || !_charaDataManager.BrioAvailable))
@@ -728,7 +728,7 @@ internal sealed partial class CharaDataHubUi
                     if (ImGui.IsItemClicked()) SelectedDtoId = entry.Id;
                     if (eIcon != FontAwesomeIcon.None)
                     {
-                        UiSharedService.AttachToolTip($"This entry will expire on {entry.ExpiryDate.ToLocalTime()}");
+                        UiSharedService.AttachToolTip(string.Format(_uiSharedService.L("UI.CharaDataHubUi.McdOnline.Tooltip.ExpiresOn", "This entry will expire on {0}"), entry.ExpiryDate.ToLocalTime()));
                     }
                 }
             }

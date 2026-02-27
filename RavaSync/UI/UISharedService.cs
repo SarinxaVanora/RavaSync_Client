@@ -1012,7 +1012,7 @@ public partial class UiSharedService : DisposableMediatorSubscriberBase
         {
             ImGui.SameLine();
             var text = "Connect";
-            if (_serverSelectionIndex == _serverConfigurationManager.CurrentServerIndex) text = "Reconnect";
+            if (_serverSelectionIndex == _serverConfigurationManager.CurrentServerIndex) text = L("UI.UISharedService.Reconnect", "Reconnect");
             if (IconTextButton(FontAwesomeIcon.Link, text))
             {
                 _serverConfigurationManager.SelectServer(_serverSelectionIndex);
