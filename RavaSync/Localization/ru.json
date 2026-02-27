@@ -1482,29 +1482,36 @@
   "UI.SettingsUi.Language.Help": "Выберите язык интерфейса RavaSync. Применяется сразу.",
   "UI.CompactUI.ReduceMySize": "Уменьшить мой размер",
   "UI.CompactUI.ReduceMySize.Est": "Уменьшить мой размер (~{0})",
-
   "UI.CompactUI.Scope.Header": "Ограничить синхронизацию:",
   "UI.CompactUI.Scope.PairsShells": "Пары и Shells",
   "UI.CompactUI.Scope.Friends": "Друзья",
   "UI.CompactUI.Scope.PartyAlliance": "Группа и Альянс",
-
   "UI.CompactUILegacy.Scope.Everyone": "Все",
   "UI.CompactUILegacy.Scope.Party": "Группа",
   "UI.CompactUILegacy.Scope.Alliance": "Альянс",
-
   "UI.DtrEntry.Connected": "RavaSync: Подключено",
   "UI.DtrEntry.NotConnected": "RavaSync: Не подключено",
   "UI.DtrEntry.Connected.List": "RavaSync: Подключено{0}----------{0}{1}",
-
   "UI.SettingsUi.DtrColors.Default": "По умолчанию",
   "UI.SettingsUi.DtrColors.NotConnected": "Не подключено",
   "UI.SettingsUi.DtrColors.PairsInRange": "Пары в радиусе",
-
   "UI.SettingsUi.NotificationLocation.Nowhere": "Нигде",
   "UI.SettingsUi.NotificationLocation.Chat": "Чат",
   "UI.SettingsUi.NotificationLocation.Toast": "Тост",
   "UI.SettingsUi.NotificationLocation.Both": "Оба",
-
   "UI.SettingsUi.InfoNotif.Title": "Отображение инфо-уведомлений",
-  "UI.SettingsUi.InfoNotif.Help": "Где будут отображаться уведомления \"Info\".\n\"Нигде\" не показывает инфо-уведомления\n\"Чат\" выводит инфо-уведомления в чат\n\"Тост\" показывает тост-уведомления в правом нижнем углу\n\"Оба\" показывает и чат, и тост-уведомления"
+  "UI.SettingsUi.InfoNotif.Help": "Где будут отображаться уведомления \"Info\".\n\"Нигде\" не показывает инфо-уведомления\n\"Чат\" выводит инфо-уведомления в чат\n\"Тост\" показывает тост-уведомления в правом нижнем углу\n\"Оба\" показывает и чат, и тост-уведомления",
+  "UI.SettingsUi.WarningNotif.Title": "Отображение предупреждений",
+  "UI.SettingsUi.WarningNotif.Help": "Где будут отображаться уведомления \"Warning\".\n\"Нигде\" не показывает предупреждения\n\"Чат\" выводит предупреждения в чат\n\"Тост\" показывает тост-уведомления в правом нижнем углу\n\"Оба\" показывает и чат, и тост-уведомления",
+  "UI.SettingsUi.ErrorNotif.Title": "Отображение ошибок",
+  "UI.SettingsUi.ErrorNotif.Help": "Где будут отображаться уведомления \"Error\".\n\"Нигде\" не показывает ошибки\n\"Чат\" выводит ошибки в чат\n\"Тост\" показывает тост-уведомления в правом нижнем углу\n\"Оба\" показывает и чат, и тост-уведомления",
+  "UI.CompactUI.Tab.Pairs": "Пары",
+  "UI.CompactUI.Tab.Shells": "Shells",
+  "UI.CompactUI.Tab.Visible": "Видимые",
+  "UI.DrawFolderTag.Name.OneSidedIndividualPairs": "Односторонние отдельные пары",
+  "UI.DrawFolderTag.Name.OnlinePausedByYou": "Онлайн / приостановлено вами",
+  "UI.DrawFolderTag.Name.OfflinePausedByOther": "Оффлайн / приостановлено другим",
+  "UI.DrawFolderTag.Name.OfflineSyncshellUsers": "Оффлайн пользователи Syncshell",
+  "UI.DrawFolderTag.Name.Visible": "Видимые",
+  "UI.DrawFolderTag.Name.Users": "Пользователи"
 }

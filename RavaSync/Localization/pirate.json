@@ -1482,29 +1482,36 @@
   "UI.SettingsUi.Language.Help": "Pick the tongue fer RavaSync’s UI. Takes effect straight away.",
   "UI.CompactUI.ReduceMySize": "Shrink me size",
   "UI.CompactUI.ReduceMySize.Est": "Shrink me size (~{0})",
-
   "UI.CompactUI.Scope.Header": "Limit Sync to:",
   "UI.CompactUI.Scope.MatesCrews": "Mates & Crews",
   "UI.CompactUI.Scope.Friends": "Mates",
   "UI.CompactUI.Scope.PartyAlliance": "Crew & Alli",
-
   "UI.CompactUILegacy.Scope.Everyone": "Everyone",
   "UI.CompactUILegacy.Scope.Party": "Crew",
   "UI.CompactUILegacy.Scope.Alliance": "Alliance",
-
   "UI.DtrEntry.Connected": "RavaSync: Connected",
   "UI.DtrEntry.NotConnected": "RavaSync: Not Connected",
   "UI.DtrEntry.Connected.List": "RavaSync: Connected{0}----------{0}{1}",
-
   "UI.SettingsUi.DtrColors.Default": "Default",
   "UI.SettingsUi.DtrColors.NotConnected": "Not Connected",
   "UI.SettingsUi.DtrColors.MatesInRange": "Mates in Range",
-
   "UI.SettingsUi.NotificationLocation.Nowhere": "Nowhere",
   "UI.SettingsUi.NotificationLocation.Chat": "Chat",
   "UI.SettingsUi.NotificationLocation.Toast": "Toast",
   "UI.SettingsUi.NotificationLocation.Both": "Both",
-
   "UI.SettingsUi.InfoNotif.Title": "Info Notification Display",
-  "UI.SettingsUi.InfoNotif.Help": "Where ye \"Info\" notices show up.\n\"Nowhere\" shows no Info notices\n\"Chat\" prints Info notices in chat\n\"Toast\" shows toast notices down in the bottom-right\n\"Both\" shows chat and the toast notice"
+  "UI.SettingsUi.InfoNotif.Help": "Where ye \"Info\" notices show up.\n\"Nowhere\" shows no Info notices\n\"Chat\" prints Info notices in chat\n\"Toast\" shows toast notices down in the bottom-right\n\"Both\" shows chat and the toast notice",
+  "UI.SettingsUi.WarningNotif.Title": "Warning Notice Display",
+  "UI.SettingsUi.WarningNotif.Help": "Where ye \"Warning\" notices show up.\n\"Nowhere\" shows no Warning notices\n\"Chat\" prints Warning notices in chat\n\"Toast\" shows toast notices down in the bottom-right\n\"Both\" shows chat and the toast notice",
+  "UI.SettingsUi.ErrorNotif.Title": "Error Notice Display",
+  "UI.SettingsUi.ErrorNotif.Help": "Where ye \"Error\" notices show up.\n\"Nowhere\" shows no Error notices\n\"Chat\" prints Error notices in chat\n\"Toast\" shows toast notices down in the bottom-right\n\"Both\" shows chat and the toast notice",
+  "UI.CompactUI.Tab.Pairs": "Pairs",
+  "UI.CompactUI.Tab.Shells": "Shells",
+  "UI.CompactUI.Tab.Visible": "Visible",
+  "UI.DrawFolderTag.Name.OneSidedIndividualPairs": "One-sided Mateys",
+  "UI.DrawFolderTag.Name.OnlinePausedByYou": "Online / Paused by ye",
+  "UI.DrawFolderTag.Name.OfflinePausedByOther": "Offline / Paused by 'em",
+  "UI.DrawFolderTag.Name.OfflineSyncshellUsers": "Offline Syncshell Mateys",
+  "UI.DrawFolderTag.Name.Visible": "Visible",
+  "UI.DrawFolderTag.Name.Users": "Scallywags"
 }

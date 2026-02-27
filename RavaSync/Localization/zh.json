@@ -1482,29 +1482,36 @@
   "UI.SettingsUi.Language.Help": "选择 RavaSync 界面使用的语言。将立即生效。",
   "UI.CompactUI.ReduceMySize": "缩小我的体积",
   "UI.CompactUI.ReduceMySize.Est": "缩小我的体积 (~{0})",
-
   "UI.CompactUI.Scope.Header": "限制同步范围：",
   "UI.CompactUI.Scope.PairsShells": "配对与Shells",
   "UI.CompactUI.Scope.Friends": "好友",
   "UI.CompactUI.Scope.PartyAlliance": "小队与联盟",
-
   "UI.CompactUILegacy.Scope.Everyone": "所有人",
   "UI.CompactUILegacy.Scope.Party": "小队",
   "UI.CompactUILegacy.Scope.Alliance": "联盟",
-
   "UI.DtrEntry.Connected": "RavaSync：已连接",
   "UI.DtrEntry.NotConnected": "RavaSync：未连接",
   "UI.DtrEntry.Connected.List": "RavaSync：已连接{0}----------{0}{1}",
-
   "UI.SettingsUi.DtrColors.Default": "默认",
   "UI.SettingsUi.DtrColors.NotConnected": "未连接",
   "UI.SettingsUi.DtrColors.PairsInRange": "范围内配对",
-
   "UI.SettingsUi.NotificationLocation.Nowhere": "不显示",
   "UI.SettingsUi.NotificationLocation.Chat": "聊天",
   "UI.SettingsUi.NotificationLocation.Toast": "Toast",
   "UI.SettingsUi.NotificationLocation.Both": "两者",
-
   "UI.SettingsUi.InfoNotif.Title": "信息通知显示",
-  "UI.SettingsUi.InfoNotif.Help": "“Info”通知的显示位置。\n“不显示”不会显示任何信息通知\n“聊天”会在聊天中输出信息通知\n“Toast”会在右下角显示Toast通知\n“两者”会同时显示聊天与Toast通知"
+  "UI.SettingsUi.InfoNotif.Help": "“Info”通知的显示位置。\n“不显示”不会显示任何信息通知\n“聊天”会在聊天中输出信息通知\n“Toast”会在右下角显示Toast通知\n“两者”会同时显示聊天与Toast通知",
+  "UI.SettingsUi.WarningNotif.Title": "警告通知显示",
+  "UI.SettingsUi.WarningNotif.Help": "“Warning”通知的显示位置。\n“不显示”不会显示任何警告通知\n“聊天”会在聊天中输出警告通知\n“Toast”会在右下角显示Toast通知\n“两者”会同时显示聊天与Toast通知",
+  "UI.SettingsUi.ErrorNotif.Title": "错误通知显示",
+  "UI.SettingsUi.ErrorNotif.Help": "“Error”通知的显示位置。\n“不显示”不会显示任何错误通知\n“聊天”会在聊天中输出错误通知\n“Toast”会在右下角显示Toast通知\n“两者”会同时显示聊天与Toast通知",
+  "UI.CompactUI.Tab.Pairs": "配对",
+  "UI.CompactUI.Tab.Shells": "Shells",
+  "UI.CompactUI.Tab.Visible": "可见",
+  "UI.DrawFolderTag.Name.OneSidedIndividualPairs": "单向单独配对",
+  "UI.DrawFolderTag.Name.OnlinePausedByYou": "在线 / 由你暂停",
+  "UI.DrawFolderTag.Name.OfflinePausedByOther": "离线 / 由对方暂停",
+  "UI.DrawFolderTag.Name.OfflineSyncshellUsers": "离线的Syncshell用户",
+  "UI.DrawFolderTag.Name.Visible": "可见",
+  "UI.DrawFolderTag.Name.Users": "用户"
 }

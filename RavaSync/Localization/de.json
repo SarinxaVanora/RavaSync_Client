@@ -1500,5 +1500,18 @@
   "UI.SettingsUi.NotificationLocation.Toast": "Toast",
   "UI.SettingsUi.NotificationLocation.Both": "Beides",
   "UI.SettingsUi.InfoNotif.Title": "Info-Benachrichtigungen anzeigen",
-  "UI.SettingsUi.InfoNotif.Help": "Wo „Info“-Benachrichtigungen angezeigt werden.\n„Nirgendwo“ zeigt keine Info-Benachrichtigungen an\n„Chat“ schreibt Info-Benachrichtigungen in den Chat\n„Toast“ zeigt Toast-Benachrichtigungen unten rechts an\n„Beides“ zeigt Chat und Toast-Benachrichtigung"
+  "UI.SettingsUi.InfoNotif.Help": "Wo „Info“-Benachrichtigungen angezeigt werden.\n„Nirgendwo“ zeigt keine Info-Benachrichtigungen an\n„Chat“ schreibt Info-Benachrichtigungen in den Chat\n„Toast“ zeigt Toast-Benachrichtigungen unten rechts an\n„Beides“ zeigt Chat und Toast-Benachrichtigung",
+  "UI.SettingsUi.WarningNotif.Title": "Warnbenachrichtigungen anzeigen",
+  "UI.SettingsUi.WarningNotif.Help": "Wo „Warning“-Benachrichtigungen angezeigt werden.\n„Nirgendwo“ zeigt keine Warnbenachrichtigungen an\n„Chat“ schreibt Warnbenachrichtigungen in den Chat\n„Toast“ zeigt Toast-Benachrichtigungen unten rechts an\n„Beides“ zeigt Chat und Toast-Benachrichtigung",
+  "UI.SettingsUi.ErrorNotif.Title": "Fehlerbenachrichtigungen anzeigen",
+  "UI.SettingsUi.ErrorNotif.Help": "Wo „Error“-Benachrichtigungen angezeigt werden.\n„Nirgendwo“ zeigt keine Fehlerbenachrichtigungen an\n„Chat“ schreibt Fehlerbenachrichtigungen in den Chat\n„Toast“ zeigt Toast-Benachrichtigungen unten rechts an\n„Beides“ zeigt Chat und Toast-Benachrichtigung",
+  "UI.CompactUI.Tab.Pairs": "Paare",
+  "UI.CompactUI.Tab.Shells": "Hüllen",
+  "UI.CompactUI.Tab.Visible": "Sichtbar",
+  "UI.DrawFolderTag.Name.OneSidedIndividualPairs": "Einseitige Einzelpaare",
+  "UI.DrawFolderTag.Name.OnlinePausedByYou": "Online / von dir pausiert",
+  "UI.DrawFolderTag.Name.OfflinePausedByOther": "Offline / von anderen pausiert",
+  "UI.DrawFolderTag.Name.OfflineSyncshellUsers": "Offline Syncshell-Benutzer",
+  "UI.DrawFolderTag.Name.Visible": "Sichtbar",
+  "UI.DrawFolderTag.Name.Users": "Benutzer"
 }

@@ -1482,29 +1482,36 @@
   "UI.SettingsUi.Language.Help": "RavaSync のUIで使用する言語を選択します。即時に反映されます。",
   "UI.CompactUI.ReduceMySize": "サイズを減らす",
   "UI.CompactUI.ReduceMySize.Est": "サイズを減らす (~{0})",
-
   "UI.CompactUI.Scope.Header": "同期の範囲:",
   "UI.CompactUI.Scope.PairsShells": "ペア & Shells",
   "UI.CompactUI.Scope.Friends": "フレンド",
   "UI.CompactUI.Scope.PartyAlliance": "PT & アライアンス",
-
   "UI.CompactUILegacy.Scope.Everyone": "全員",
   "UI.CompactUILegacy.Scope.Party": "パーティ",
   "UI.CompactUILegacy.Scope.Alliance": "アライアンス",
-
   "UI.DtrEntry.Connected": "RavaSync: 接続済み",
   "UI.DtrEntry.NotConnected": "RavaSync: 未接続",
   "UI.DtrEntry.Connected.List": "RavaSync: 接続済み{0}----------{0}{1}",
-
   "UI.SettingsUi.DtrColors.Default": "デフォルト",
   "UI.SettingsUi.DtrColors.NotConnected": "未接続",
   "UI.SettingsUi.DtrColors.PairsInRange": "範囲内のペア",
-
   "UI.SettingsUi.NotificationLocation.Nowhere": "表示しない",
   "UI.SettingsUi.NotificationLocation.Chat": "チャット",
   "UI.SettingsUi.NotificationLocation.Toast": "トースト",
   "UI.SettingsUi.NotificationLocation.Both": "両方",
-
   "UI.SettingsUi.InfoNotif.Title": "情報通知の表示",
-  "UI.SettingsUi.InfoNotif.Help": "「Info」通知を表示する場所を選びます。\n「表示しない」は情報通知を表示しません\n「チャット」は情報通知をチャットに出力します\n「トースト」は右下にトースト通知を表示します\n「両方」はチャットとトースト通知の両方を表示します"
+  "UI.SettingsUi.InfoNotif.Help": "「Info」通知を表示する場所を選びます。\n「表示しない」は情報通知を表示しません\n「チャット」は情報通知をチャットに出力します\n「トースト」は右下にトースト通知を表示します\n「両方」はチャットとトースト通知の両方を表示します",
+  "UI.SettingsUi.WarningNotif.Title": "警告通知の表示",
+  "UI.SettingsUi.WarningNotif.Help": "「Warning」通知を表示する場所を選びます。\n「表示しない」は警告通知を表示しません\n「チャット」は警告通知をチャットに出力します\n「トースト」は右下にトースト通知を表示します\n「両方」はチャットとトースト通知の両方を表示します",
+  "UI.SettingsUi.ErrorNotif.Title": "エラー通知の表示",
+  "UI.SettingsUi.ErrorNotif.Help": "「Error」通知を表示する場所を選びます。\n「表示しない」はエラー通知を表示しません\n「チャット」はエラー通知をチャットに出力します\n「トースト」は右下にトースト通知を表示します\n「両方」はチャットとトースト通知の両方を表示します",
+  "UI.CompactUI.Tab.Pairs": "ペア",
+  "UI.CompactUI.Tab.Shells": "Shells",
+  "UI.CompactUI.Tab.Visible": "表示中",
+  "UI.DrawFolderTag.Name.OneSidedIndividualPairs": "片側の個別ペア",
+  "UI.DrawFolderTag.Name.OnlinePausedByYou": "オンライン / あなたが一時停止",
+  "UI.DrawFolderTag.Name.OfflinePausedByOther": "オフライン / 相手が一時停止",
+  "UI.DrawFolderTag.Name.OfflineSyncshellUsers": "オフラインのSyncshellユーザー",
+  "UI.DrawFolderTag.Name.Visible": "表示中",
+  "UI.DrawFolderTag.Name.Users": "ユーザー"
 }

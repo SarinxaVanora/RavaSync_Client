@@ -1216,29 +1216,41 @@ public class SettingsUi : WindowMediatorSubscriberBase
             "'Toast' will show toast notifications in the bottom right corner\n" +
             "'Both' will show chat as well as the toast notification"));
 
-        _uiShared.DrawCombo("Warning Notification Display##settingsUi", (NotificationLocation[])Enum.GetValues(typeof(NotificationLocation)), (i) => i.ToString(),
-        (i) =>
-        {
-            _configService.Current.WarningNotification = i;
-            _configService.Save();
-        }, _configService.Current.WarningNotification);
-        _uiShared.DrawHelpText(_uiShared.L("UI.SettingsUi.4fb05ec0", "The location where \"Warning\" notifications will display.")
-                              + Environment.NewLine + "'Nowhere' will not show any Warning notifications"
-                              + Environment.NewLine + "'Chat' will print Warning notifications in chat"
-                              + Environment.NewLine + "'Toast' will show Warning toast notifications in the bottom right corner"
-                              + Environment.NewLine + "'Both' will show chat as well as the toast notification");
+        string LocWarn(NotificationLocation i) =>_uiShared.L($"UI.SettingsUi.NotificationLocation.{i}", i.ToString());
 
-        _uiShared.DrawCombo("Error Notification Display##settingsUi", (NotificationLocation[])Enum.GetValues(typeof(NotificationLocation)), (i) => i.ToString(),
-        (i) =>
-        {
-            _configService.Current.ErrorNotification = i;
-            _configService.Save();
-        }, _configService.Current.ErrorNotification);
-        _uiShared.DrawHelpText(_uiShared.L("UI.SettingsUi.fb7c71b6", "The location where \"Error\" notifications will display.")
-                              + Environment.NewLine + "'Nowhere' will not show any Error notifications"
-                              + Environment.NewLine + "'Chat' will print Error notifications in chat"
-                              + Environment.NewLine + "'Toast' will show Error toast notifications in the bottom right corner"
-                              + Environment.NewLine + "'Both' will show chat as well as the toast notification");
+        _uiShared.DrawCombo(_uiShared.L("UI.SettingsUi.WarningNotif.Title", "Warning Notification Display") + "##settingsUi",
+            (NotificationLocation[])Enum.GetValues(typeof(NotificationLocation)),
+            LocWarn,
+            (i) =>
+            {
+                _configService.Current.WarningNotification = i;
+                _configService.Save();
+            }, _configService.Current.WarningNotification);
+
+        _uiShared.DrawHelpText(_uiShared.L("UI.SettingsUi.WarningNotif.Help",
+            "The location where \"Warning\" notifications will display.\n" +
+            "'Nowhere' will not show any Warning notifications\n" +
+            "'Chat' will print Warning notifications in chat\n" +
+            "'Toast' will show toast notifications in the bottom right corner\n" +
+            "'Both' will show chat as well as the toast notification"));
+
+        string LocError(NotificationLocation i) =>_uiShared.L($"UI.SettingsUi.NotificationLocation.{i}", i.ToString());
+
+        _uiShared.DrawCombo(_uiShared.L("UI.SettingsUi.ErrorNotif.Title", "Error Notification Display") + "##settingsUi",
+            (NotificationLocation[])Enum.GetValues(typeof(NotificationLocation)),
+            LocError,
+            (i) =>
+            {
+                _configService.Current.ErrorNotification = i;
+                _configService.Save();
+            }, _configService.Current.ErrorNotification);
+
+        _uiShared.DrawHelpText(_uiShared.L("UI.SettingsUi.ErrorNotif.Help",
+            "The location where \"Error\" notifications will display.\n" +
+            "'Nowhere' will not show any Error notifications\n" +
+            "'Chat' will print Error notifications in chat\n" +
+            "'Toast' will show toast notifications in the bottom right corner\n" +
+            "'Both' will show chat as well as the toast notification"));
 
         if (ImGui.Checkbox(_uiShared.L("UI.SettingsUi.5327f64b", "Disable optional plugin warnings"), ref disableOptionalPluginWarnings))
         {

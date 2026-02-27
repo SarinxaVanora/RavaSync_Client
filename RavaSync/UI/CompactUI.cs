@@ -456,11 +456,11 @@ public class CompactUi : WindowMediatorSubscriberBase
         }
 
         // Tabs: Direct | Shells | Visible
-        DrawTab("Pairs", PairViewTab.DirectPairs);
+        DrawTab(_uiSharedService.L("UI.CompactUI.Tab.Pairs", "Pairs"), PairViewTab.DirectPairs);
         ImGui.SameLine();
-        DrawTab("Shells", PairViewTab.Shells);
+        DrawTab(_uiSharedService.L("UI.CompactUI.Tab.Shells", "Shells"), PairViewTab.Shells);
         ImGui.SameLine();
-        DrawTab("Visible", PairViewTab.Visible);
+        DrawTab(_uiSharedService.L("UI.CompactUI.Tab.Visible", "Visible"), PairViewTab.Visible);
 
         // Search box, right-aligned on the same row
         ImGui.SameLine();

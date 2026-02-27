@@ -1482,29 +1482,36 @@
   "UI.SettingsUi.Language.Help": "اختر اللغة المستخدمة لواجهة RavaSync. يتم التطبيق فورًا.",
   "UI.CompactUI.ReduceMySize": "تقليل حجمي",
   "UI.CompactUI.ReduceMySize.Est": "تقليل حجمي (~{0})",
-
   "UI.CompactUI.Scope.Header": "حصر المزامنة على:",
   "UI.CompactUI.Scope.PairsShells": "الأزواج وShells",
   "UI.CompactUI.Scope.Friends": "الأصدقاء",
   "UI.CompactUI.Scope.PartyAlliance": "الفريق والتحالف",
-
   "UI.CompactUILegacy.Scope.Everyone": "الجميع",
   "UI.CompactUILegacy.Scope.Party": "الفريق",
   "UI.CompactUILegacy.Scope.Alliance": "التحالف",
-
   "UI.DtrEntry.Connected": "RavaSync: متصل",
   "UI.DtrEntry.NotConnected": "RavaSync: غير متصل",
   "UI.DtrEntry.Connected.List": "RavaSync: متصل{0}----------{0}{1}",
-
   "UI.SettingsUi.DtrColors.Default": "افتراضي",
   "UI.SettingsUi.DtrColors.NotConnected": "غير متصل",
   "UI.SettingsUi.DtrColors.PairsInRange": "أزواج ضمن النطاق",
-
   "UI.SettingsUi.NotificationLocation.Nowhere": "لا مكان",
   "UI.SettingsUi.NotificationLocation.Chat": "الدردشة",
   "UI.SettingsUi.NotificationLocation.Toast": "Toast",
   "UI.SettingsUi.NotificationLocation.Both": "كلاهما",
-
   "UI.SettingsUi.InfoNotif.Title": "عرض إشعارات المعلومات",
-  "UI.SettingsUi.InfoNotif.Help": "المكان الذي ستظهر فيه إشعارات \"Info\".\n\"لا مكان\" لن يعرض أي إشعارات معلومات\n\"الدردشة\" سيطبع إشعارات المعلومات في الدردشة\n\"Toast\" سيعرض إشعارات toast في أسفل اليمين\n\"كلاهما\" سيعرض الدردشة وكذلك إشعار toast"
+  "UI.SettingsUi.InfoNotif.Help": "المكان الذي ستظهر فيه إشعارات \"Info\".\n\"لا مكان\" لن يعرض أي إشعارات معلومات\n\"الدردشة\" سيطبع إشعارات المعلومات في الدردشة\n\"Toast\" سيعرض إشعارات toast في أسفل اليمين\n\"كلاهما\" سيعرض الدردشة وكذلك إشعار toast",
+  "UI.SettingsUi.WarningNotif.Title": "عرض إشعارات التحذير",
+  "UI.SettingsUi.WarningNotif.Help": "المكان الذي ستظهر فيه إشعارات \"Warning\".\n\"لا مكان\" لن يعرض أي إشعارات تحذير\n\"الدردشة\" سيطبع إشعارات التحذير في الدردشة\n\"Toast\" سيعرض إشعارات toast في أسفل اليمين\n\"كلاهما\" سيعرض الدردشة وكذلك إشعار toast",
+  "UI.SettingsUi.ErrorNotif.Title": "عرض إشعارات الخطأ",
+  "UI.SettingsUi.ErrorNotif.Help": "المكان الذي ستظهر فيه إشعارات \"Error\".\n\"لا مكان\" لن يعرض أي إشعارات خطأ\n\"الدردشة\" سيطبع إشعارات الخطأ في الدردشة\n\"Toast\" سيعرض إشعارات toast في أسفل اليمين\n\"كلاهما\" سيعرض الدردشة وكذلك إشعار toast",
+  "UI.CompactUI.Tab.Pairs": "الأزواج",
+  "UI.CompactUI.Tab.Shells": "Shells",
+  "UI.CompactUI.Tab.Visible": "مرئي",
+  "UI.DrawFolderTag.Name.OneSidedIndividualPairs": "أزواج فردية من طرف واحد",
+  "UI.DrawFolderTag.Name.OnlinePausedByYou": "متصل / مُوقَف مؤقتًا بواسطتك",
+  "UI.DrawFolderTag.Name.OfflinePausedByOther": "غير متصل / مُوقَف مؤقتًا بواسطة الآخر",
+  "UI.DrawFolderTag.Name.OfflineSyncshellUsers": "مستخدمو Syncshell غير المتصلين",
+  "UI.DrawFolderTag.Name.Visible": "مرئي",
+  "UI.DrawFolderTag.Name.Users": "المستخدمون"
 }

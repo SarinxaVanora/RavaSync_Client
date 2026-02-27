@@ -125,12 +125,12 @@ public class DrawFolderTag : DrawFolderBase
 
         string name = _id switch
         {
-            TagHandler.CustomUnpairedTag => "One-sided Individual Pairs",
-            TagHandler.CustomOnlineTag => "Online / Paused by you",
-            TagHandler.CustomOfflineTag => "Offline / Paused by other",
-            TagHandler.CustomOfflineSyncshellTag => "Offline Syncshell Users",
-            TagHandler.CustomVisibleTag => "Visible",
-            TagHandler.CustomAllTag => "Users",
+            TagHandler.CustomUnpairedTag => _uiSharedService.L("UI.DrawFolderTag.Name.OneSidedIndividualPairs", "One-sided Individual Pairs"),
+            TagHandler.CustomOnlineTag => _uiSharedService.L("UI.DrawFolderTag.Name.OnlinePausedByYou", "Online / Paused by you"),
+            TagHandler.CustomOfflineTag => _uiSharedService.L("UI.DrawFolderTag.Name.OfflinePausedByOther", "Offline / Paused by other"),
+            TagHandler.CustomOfflineSyncshellTag => _uiSharedService.L("UI.DrawFolderTag.Name.OfflineSyncshellUsers", "Offline Syncshell Users"),
+            TagHandler.CustomVisibleTag => _uiSharedService.L("UI.DrawFolderTag.Name.Visible", "Visible"),
+            TagHandler.CustomAllTag => _uiSharedService.L("UI.DrawFolderTag.Name.Users", "Users"),
             _ => _id
         };
 

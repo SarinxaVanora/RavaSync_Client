@@ -1500,5 +1500,18 @@
   "UI.SettingsUi.NotificationLocation.Toast": "Toast",
   "UI.SettingsUi.NotificationLocation.Both": "Both",
   "UI.SettingsUi.InfoNotif.Title": "Info Notification Display",
-  "UI.SettingsUi.InfoNotif.Help": "The location where \"Info\" notifications will display.\n'Nowhere' will not show any Info notifications\n'Chat' will print Info notifications in chat\n'Toast' will show toast notifications in the bottom right corner\n'Both' will show chat as well as the toast notification"
+  "UI.SettingsUi.InfoNotif.Help": "The location where \"Info\" notifications will display.\n'Nowhere' will not show any Info notifications\n'Chat' will print Info notifications in chat\n'Toast' will show toast notifications in the bottom right corner\n'Both' will show chat as well as the toast notification",
+  "UI.SettingsUi.WarningNotif.Title": "Warning Notification Display",
+  "UI.SettingsUi.WarningNotif.Help": "The location where \"Warning\" notifications will display.\n'Nowhere' will not show any Warning notifications\n'Chat' will print Warning notifications in chat\n'Toast' will show toast notifications in the bottom right corner\n'Both' will show chat as well as the toast notification",
+  "UI.SettingsUi.ErrorNotif.Title": "Error Notification Display",
+  "UI.SettingsUi.ErrorNotif.Help": "The location where \"Error\" notifications will display.\n'Nowhere' will not show any Error notifications\n'Chat' will print Error notifications in chat\n'Toast' will show toast notifications in the bottom right corner\n'Both' will show chat as well as the toast notification",
+  "UI.CompactUI.Tab.Pairs": "Pairs",
+  "UI.CompactUI.Tab.Shells": "Shells",
+  "UI.CompactUI.Tab.Visible": "Visible",
+  "UI.DrawFolderTag.Name.OneSidedIndividualPairs": "One-sided Individual Pairs",
+  "UI.DrawFolderTag.Name.OnlinePausedByYou": "Online / Paused by you",
+  "UI.DrawFolderTag.Name.OfflinePausedByOther": "Offline / Paused by other",
+  "UI.DrawFolderTag.Name.OfflineSyncshellUsers": "Offline Syncshell Users",
+  "UI.DrawFolderTag.Name.Visible": "Visible",
+  "UI.DrawFolderTag.Name.Users": "Users"
 }

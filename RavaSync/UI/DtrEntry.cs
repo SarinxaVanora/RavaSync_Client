@@ -29,7 +29,7 @@ public sealed class DtrEntry : IDisposable, IHostedService
     private string? _text;
     private string? _tooltip;
     private Colors _colors;
-    public DtrEntry(ILogger<DtrEntry> logger, IDtrBar dtrBar, ConfigurationServiceBase<MareConfig> configService, MareMediator mareMediator, PairManager pairManager, ApiController apiController)
+    public DtrEntry(ILogger<DtrEntry> logger, IDtrBar dtrBar, ConfigurationServiceBase<MareConfig> configService, MareMediator mareMediator, PairManager pairManager, ApiController apiController, UiSharedService uiSharedService)
     {
         _logger = logger;
         _dtrBar = dtrBar;
@@ -38,6 +38,7 @@ public sealed class DtrEntry : IDisposable, IHostedService
         _mareMediator = mareMediator;
         _pairManager = pairManager;
         _apiController = apiController;
+        _uiSharedService = uiSharedService;
     }
 
     public void Dispose()

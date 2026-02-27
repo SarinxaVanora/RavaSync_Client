@@ -1482,29 +1482,36 @@
   "UI.SettingsUi.Language.Help": "Elige el idioma de la interfaz de RavaSync. Se aplica de inmediato.",
   "UI.CompactUI.ReduceMySize": "Reducir mi tamaño",
   "UI.CompactUI.ReduceMySize.Est": "Reducir mi tamaño (~{0})",
-
   "UI.CompactUI.Scope.Header": "Limitar sincronización a:",
   "UI.CompactUI.Scope.PairsShells": "Parejas y Shells",
   "UI.CompactUI.Scope.Friends": "Amigos",
   "UI.CompactUI.Scope.PartyAlliance": "Grupo y Alianza",
-
   "UI.CompactUILegacy.Scope.Everyone": "Todos",
   "UI.CompactUILegacy.Scope.Party": "Grupo",
   "UI.CompactUILegacy.Scope.Alliance": "Alianza",
-
   "UI.DtrEntry.Connected": "RavaSync: Conectado",
   "UI.DtrEntry.NotConnected": "RavaSync: No conectado",
   "UI.DtrEntry.Connected.List": "RavaSync: Conectado{0}----------{0}{1}",
-
   "UI.SettingsUi.DtrColors.Default": "Predeterminado",
   "UI.SettingsUi.DtrColors.NotConnected": "No conectado",
   "UI.SettingsUi.DtrColors.PairsInRange": "Parejas en rango",
-
   "UI.SettingsUi.NotificationLocation.Nowhere": "En ningún lugar",
   "UI.SettingsUi.NotificationLocation.Chat": "Chat",
   "UI.SettingsUi.NotificationLocation.Toast": "Toast",
   "UI.SettingsUi.NotificationLocation.Both": "Ambos",
-
   "UI.SettingsUi.InfoNotif.Title": "Mostrar notificaciones de info",
-  "UI.SettingsUi.InfoNotif.Help": "Dónde se mostrarán las notificaciones de «Info».\n«En ningún lugar» no mostrará ninguna notificación de info\n«Chat» imprimirá las notificaciones de info en el chat\n«Toast» mostrará notificaciones toast en la esquina inferior derecha\n«Ambos» mostrará el chat y la notificación toast"
+  "UI.SettingsUi.InfoNotif.Help": "Dónde se mostrarán las notificaciones de «Info».\n«En ningún lugar» no mostrará ninguna notificación de info\n«Chat» imprimirá las notificaciones de info en el chat\n«Toast» mostrará notificaciones toast en la esquina inferior derecha\n«Ambos» mostrará el chat y la notificación toast",
+  "UI.SettingsUi.WarningNotif.Title": "Mostrar notificaciones de advertencia",
+  "UI.SettingsUi.WarningNotif.Help": "Dónde se mostrarán las notificaciones de «Warning».\n«En ningún lugar» no mostrará ninguna notificación de advertencia\n«Chat» imprimirá las notificaciones de advertencia en el chat\n«Toast» mostrará notificaciones toast en la esquina inferior derecha\n«Ambos» mostrará el chat y la notificación toast",
+  "UI.SettingsUi.ErrorNotif.Title": "Mostrar notificaciones de error",
+  "UI.SettingsUi.ErrorNotif.Help": "Dónde se mostrarán las notificaciones de «Error».\n«En ningún lugar» no mostrará ninguna notificación de error\n«Chat» imprimirá las notificaciones de error en el chat\n«Toast» mostrará notificaciones toast en la esquina inferior derecha\n«Ambos» mostrará el chat y la notificación toast",
+  "UI.CompactUI.Tab.Pairs": "Parejas",
+  "UI.CompactUI.Tab.Shells": "Shells",
+  "UI.CompactUI.Tab.Visible": "Visible",
+  "UI.DrawFolderTag.Name.OneSidedIndividualPairs": "Parejas individuales unilaterales",
+  "UI.DrawFolderTag.Name.OnlinePausedByYou": "En línea / En pausa por ti",
+  "UI.DrawFolderTag.Name.OfflinePausedByOther": "Sin conexión / En pausa por otros",
+  "UI.DrawFolderTag.Name.OfflineSyncshellUsers": "Usuarios de Syncshell sin conexión",
+  "UI.DrawFolderTag.Name.Visible": "Visible",
+  "UI.DrawFolderTag.Name.Users": "Usuarios"
 }
