@@ -97,7 +97,7 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
         var ticketReq = new UploadTicketRequestDto(fileSize, munged, 0);
 
         // Acquire ticket (must be DirectB2)
-        var ticketResp = await _orchestrator.SendRequestAsync(HttpMethod.Post, ticketUri, ticketReq, uploadToken).ConfigureAwait(false);
+        using var ticketResp = await _orchestrator.SendRequestAsync(HttpMethod.Post, ticketUri, ticketReq, uploadToken).ConfigureAwait(false);
         if (ticketResp.StatusCode == HttpStatusCode.NotFound)
             throw new InvalidOperationException($"[{fileHash}] Upload ticket endpoint not found; refusing legacy upload.");
 
@@ -165,10 +165,12 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
                 put.Content = content;
                 put.Headers.ExpectContinue = false;
 
-                var putResp = await _directUploadClient.SendAsync(put, HttpCompletionOption.ResponseHeadersRead, uploadToken).ConfigureAwait(false);
+                using var putResp = await _directUploadClient.SendAsync(put, HttpCompletionOption.ResponseHeadersRead, uploadToken).ConfigureAwait(false);
+
                 if (Logger.IsEnabled(LogLevel.Debug))
                 {
-                    Logger.LogDebug("[{hash}] Direct upload PUT attempt {attempt}/{max} Status: {status}", fileHash, attempt, maxAttempts, putResp.StatusCode);
+                    Logger.LogDebug("[{hash}] Direct upload PUT attempt {attempt}/{max} Status: {status}",
+                        fileHash, attempt, maxAttempts, putResp.StatusCode);
                 }
 
                 putResp.EnsureSuccessStatusCode();
@@ -178,7 +180,7 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
                 var completeUri = MareFiles.ServerFilesUploadCompleteFullPath(_orchestrator.UploadCdnUri!, fileHash);
                 var complete = new UploadCompleteDto(temp.RawSize, temp.CompressedSize, temp.Md5Base64, etag, true);
 
-                var completeResp = await _orchestrator.SendRequestAsync(HttpMethod.Post, completeUri, complete, uploadToken).ConfigureAwait(false);
+                using var completeResp = await _orchestrator.SendRequestAsync(HttpMethod.Post, completeUri, complete, uploadToken).ConfigureAwait(false);
                 if (Logger.IsEnabled(LogLevel.Debug))
                 {
                     Logger.LogDebug("[{hash}] UploadComplete Status: {status}", fileHash, completeResp.StatusCode);
@@ -190,11 +192,35 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
             catch (Exception ex) when (attempt < maxAttempts)
             {
                 last = ex;
+
                 if (Logger.IsEnabled(LogLevel.Debug))
+                    Logger.LogDebug(ex, "[{hash}] Direct upload PUT failed (attempt {attempt}/{max}); retrying",
+                        fileHash, attempt, maxAttempts);
+
+                if (IsLikelyTransientTlsReset(ex))
                 {
-                    Logger.LogDebug(ex, "[{hash}] Direct upload PUT failed (attempt {attempt}/{max}); retrying", fileHash, attempt, maxAttempts);
+                    Logger.LogWarning("[{hash}] Upload failed due to transient TLS/reset; reacquiring DirectB2 ticket before retry", fileHash);
+
+                    using var ticketResp2 = await _orchestrator
+                        .SendRequestAsync(HttpMethod.Post, ticketUri, ticketReq, uploadToken)
+                        .ConfigureAwait(false);
+
+                    ticketResp2.EnsureSuccessStatusCode();
+
+                    var ticketJson2 = await ticketResp2.Content.ReadAsStringAsync(uploadToken).ConfigureAwait(false);
+                    ticket = JsonSerializer.Deserialize<UploadTicketResponseDto>(
+                        ticketJson2, new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+
+                    if (ticket == null || !string.Equals(ticket.Mode, "DirectB2", StringComparison.OrdinalIgnoreCase))
+                        throw new InvalidOperationException($"[{fileHash}] Ticket refresh failed; cannot continue.", ex);
+
+                    if (!ticket.UploadRequired)
+                    {
+                        Logger.LogDebug("[{hash}] Ticket refresh reports upload not required; treating as success", fileHash);
+                        return;
+                    }
                 }
-                
+
                 await Task.Delay(250 * attempt, uploadToken).ConfigureAwait(false);
             }
             catch (Exception ex)
@@ -941,6 +967,26 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
             CurrentUploads.Clear();
             progress?.Report("No uploads in progress");
         }
+    }
+
+    private static bool IsLikelyTransientTlsReset(Exception ex)
+    {
+        if (ex is HttpRequestException hre)
+        {
+            var inner = hre.InnerException;
+            while (inner != null)
+            {
+                if (inner is System.Net.Sockets.SocketException se && se.SocketErrorCode == System.Net.Sockets.SocketError.ConnectionReset)
+                    return true;
+
+                if (inner is IOException io && io.Message.Contains("forcibly closed", StringComparison.OrdinalIgnoreCase))
+                    return true;
+
+                inner = inner.InnerException;
+            }
+        }
+
+        return false;
     }
 
     private sealed class ThrottledProgress<T> : IProgress<T>

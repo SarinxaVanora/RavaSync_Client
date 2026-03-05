@@ -57,21 +57,35 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
     private readonly object _autoRecordedKeyLock = new();
     private HashSet<string>? _autoRecordedEmoteKeysCache;
 
+    private readonly FileCacheManager _fileCacheManager;
+    private readonly ConcurrentDictionary<string, string> _transientHashByGamePath = new(StringComparer.OrdinalIgnoreCase);
+
     public bool HasPendingTransients(ObjectKind kind)
     {
         return TransientResources.TryGetValue(kind, out var set) && set.Count > 0;
     }
 
+    public HashSet<string> GetKnownTransientHashes(ObjectKind kind)
+    {
+        if (kind != ObjectKind.Player)
+            return new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        return _transientHashByGamePath.Values
+            .Where(h => !string.IsNullOrWhiteSpace(h))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+    }
 
     public TransientResourceManager(ILogger<TransientResourceManager> logger, TransientConfigService configurationService,
-            DalamudUtilService dalamudUtil, MareMediator mediator) : base(logger, mediator)
+            DalamudUtilService dalamudUtil, MareMediator mediator, FileCacheManager fileCacheManager) : base(logger, mediator)
     {
         _configurationService = configurationService;
         _dalamudUtil = dalamudUtil;
+        _fileCacheManager = fileCacheManager;
 
         Mediator.Subscribe<PenumbraResourceLoadMessage>(this, Manager_PenumbraResourceLoadEvent);
         Mediator.Subscribe<PenumbraModSettingChangedMessage>(this, (_) => Manager_PenumbraModSettingChanged());
         Mediator.Subscribe<PriorityFrameworkUpdateMessage>(this, (_) => DalamudUtil_FrameworkUpdate());
+        Mediator.Subscribe<PrimeTransientPathsMessage>(this, (msg) => PrimeTransientPaths(msg.Address, msg.Kind, msg.GamePaths));
         Mediator.Subscribe<GameObjectHandlerCreatedMessage>(this, (msg) =>
         {
             if (!msg.OwnedObject) return;
@@ -244,6 +258,33 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
         }
 
         return transientResource.Add(item.ToLowerInvariant());
+    }
+
+    private void PrimeTransientPaths(IntPtr actorAddress, ObjectKind kind, IReadOnlyCollection<string> gamePaths)
+    {
+        if (actorAddress == IntPtr.Zero) return;
+        if (gamePaths == null || gamePaths.Count == 0) return;
+
+        if (!TransientResources.TryGetValue(kind, out var transientSet) || transientSet == null)
+            TransientResources[kind] = transientSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        var addedAny = false;
+
+        foreach (var p in gamePaths)
+        {
+            var gp = NormalizePath(p);
+            if (string.IsNullOrWhiteSpace(gp)) continue;
+
+            if (!EndsWithAny(gp, _handledFileTypes)) continue;
+
+            if (_semiTransientAll.Contains(gp)) continue;
+
+            if (transientSet.Add(gp))
+                addedAny = true;
+        }
+
+        if (addedAny)
+            Mediator.Publish(new TransientResourceChangedMessage(actorAddress));
     }
 
     internal void ClearTransientPaths(ObjectKind objectKind, List<string> list)
@@ -483,7 +524,27 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
             }
         }
 
+        var filePathForLookup = filePath; 
+
         filePath = NormalizePath(filePath);
+
+        try
+        {
+            if (!string.IsNullOrWhiteSpace(filePathForLookup))
+            {
+                var map = _fileCacheManager.GetFileCachesByPaths(new[] { filePathForLookup });
+                if (map.TryGetValue(filePathForLookup, out var ent) && ent != null && !string.IsNullOrWhiteSpace(ent.Hash))
+                {
+                    _transientHashByGamePath[replacedGamePath] = ent.Hash;
+                }
+            }
+        }
+        catch
+        {
+            // never break transient tracking
+        }
+
+
         if (IsTransientRecording && string.IsNullOrWhiteSpace(filePath))
             return;
 

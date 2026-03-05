@@ -3,12 +3,17 @@ using Dalamud.Interface;
 using Dalamud.Interface.Colors;
 using Dalamud.Interface.Utility;
 using Dalamud.Interface.Utility.Raii;
+using Dalamud.Plugin.Services;
 using Dalamud.Utility;
+using Microsoft.Extensions.Logging;
+using Penumbra.Api.Enums;
 using RavaSync.API.Data.Enum;
 using RavaSync.API.Data.Extensions;
 using RavaSync.API.Dto.Group;
+using RavaSync.FileCache;
 using RavaSync.Interop.Ipc;
 using RavaSync.MareConfiguration;
+using RavaSync.MareConfiguration.Configurations;
 using RavaSync.PlayerData.Handlers;
 using RavaSync.PlayerData.Pairs;
 using RavaSync.Services;
@@ -20,14 +25,11 @@ using RavaSync.WebAPI;
 using RavaSync.WebAPI.Files;
 using RavaSync.WebAPI.Files.Models;
 using RavaSync.WebAPI.SignalR.Utils;
-using Microsoft.Extensions.Logging;
 using System.Collections.Concurrent;
 using System.Collections.Immutable;
 using System.Globalization;
 using System.Numerics;
 using System.Reflection;
-using RavaSync.MareConfiguration.Configurations;
-using Dalamud.Plugin.Services;
 
 
 
@@ -51,6 +53,7 @@ public class CompactUi : WindowMediatorSubscriberBase
     private readonly CharacterAnalyzer _characterAnalyzer;
     private readonly PlayerPerformanceConfigService _playerPerformanceConfigService;
     private readonly TransientConfigService _transientConfigService;
+    private readonly TransientResourceManager _transientResourceManager;
     private List<IDrawFolder> _drawFolders;
     private Pair? _lastAddedUser;
     private string _lastAddedUserComment = string.Empty;
@@ -82,8 +85,9 @@ public class CompactUi : WindowMediatorSubscriberBase
     public CompactUi(ILogger<CompactUi> logger, UiSharedService uiShared, MareConfigService configService, ApiController apiController, PairManager pairManager,
         ServerConfigurationManager serverManager, MareMediator mediator, FileUploadManager fileTransferManager,
         TagHandler tagHandler, DrawEntityFactory drawEntityFactory, SelectTagForPairUi selectTagForPairUi, SelectPairForTagUi selectPairForTagUi,
-        PerformanceCollectorService performanceCollectorService, IpcManager ipcManager, PlayerPerformanceConfigService playerPerformanceConfigService, CharacterAnalyzer characterAnalyzer, TransientConfigService transientConfigService)
-        : base(logger, mediator, "###RavaSyncMainUI", performanceCollectorService)
+        PerformanceCollectorService performanceCollectorService, IpcManager ipcManager, PlayerPerformanceConfigService playerPerformanceConfigService,
+        CharacterAnalyzer characterAnalyzer, TransientConfigService transientConfigService, TransientResourceManager transientResourceManager)
+            : base(logger, mediator, "###RavaSyncMainUI", performanceCollectorService)
     {
         _uiSharedService = uiShared;
         _configService = configService;
@@ -99,6 +103,7 @@ public class CompactUi : WindowMediatorSubscriberBase
         _playerPerformanceConfigService = playerPerformanceConfigService;
         _characterAnalyzer = characterAnalyzer;
         _transientConfigService = transientConfigService;
+        _transientResourceManager = transientResourceManager;
         _tabMenu = new TopTabMenu(Mediator, _apiController, _pairManager, _uiSharedService);
         _bc7Progress.ProgressChanged += (_, e) =>
         {
@@ -547,6 +552,22 @@ public class CompactUi : WindowMediatorSubscriberBase
         }
     }
 
+    static string NoDot00(string s)
+    {
+        if (string.IsNullOrEmpty(s)) return s;
+
+        var space = s.IndexOf(' ');
+        if (space <= 0) return s;
+
+        var num = s[..space];
+        var unit = s[space..];
+
+        if (num.EndsWith(".00", StringComparison.Ordinal))
+            return num[..^3] + unit;
+
+        return s;
+    }
+
     private void DrawUIDHeader()
     {
         var contentW = UiSharedService.GetWindowContentRegionWidth();
@@ -571,6 +592,8 @@ public class CompactUi : WindowMediatorSubscriberBase
         var eligibleSet = _cachedEligibleBc7Set;
         var (estSaved, estCount, _) = _cachedBc7Est;
 
+        estSaved = RoundToWholeMiBBytes(estSaved);
+
         var analysis = _characterAnalyzer.LastAnalysis;
 
         var btnLabel = estSaved > 0
@@ -589,6 +612,19 @@ public class CompactUi : WindowMediatorSubscriberBase
             .Sum(p => System.Math.Max(0, p.LastAppliedApproximateVRAMBytes));
 
         long totalVramBytes = pairsVramBytes + shellsVramBytes;
+
+        const long MiB = 1024L * 1024L;
+
+        static long RoundToWholeMiBBytes(long bytes)
+        {
+            if (bytes <= 0) return 0;
+            return (long)(Math.Round(bytes / (double)MiB) * MiB);
+        }
+
+        myVramBytes = RoundToWholeMiBBytes(myVramBytes);
+        pairsVramBytes = RoundToWholeMiBBytes(pairsVramBytes);
+        shellsVramBytes = RoundToWholeMiBBytes(shellsVramBytes);
+        totalVramBytes = RoundToWholeMiBBytes(totalVramBytes);
 
         Vector4 shellsColor;
         if (_playerPerformanceConfigService.Current.SyncshellVramCapMiB > 0)
@@ -630,7 +666,7 @@ public class CompactUi : WindowMediatorSubscriberBase
 
             var vramVal = (analysis is null || analysis.Count == 0)
                 ? "—"
-                : UiSharedService.ByteToString(myVramBytes, addSuffix: true);
+                : NoDot00(UiSharedService.ByteToString(myVramBytes, addSuffix: true));
 
             var triVal = (analysis is null || analysis.Count == 0 || myTriangles <= 0)
                 ? "—"
@@ -931,7 +967,6 @@ public class CompactUi : WindowMediatorSubscriberBase
             ImGui.BeginGroup();
 
             float padX = 12f * scale;
-            float rightPadX = 12f * scale;
 
             var title = "VRAM use";
             var titleSz = ImGui.CalcTextSize(title);
@@ -940,44 +975,25 @@ public class CompactUi : WindowMediatorSubscriberBase
             ImGui.TextUnformatted(title);
             ImGui.PopStyleColor();
 
-            var totalValueText = $"Total {UiSharedService.ByteToString(totalVramBytes, addSuffix: true)}";
-            var totalPipeText = " | ";
-            var totalPipeSz = ImGui.CalcTextSize(totalPipeText);
-            var totalValueSz = ImGui.CalcTextSize(totalValueText);
-            var totalBlockW = totalPipeSz.X + totalValueSz.X;
+            var pairsText = string.Format(
+                _uiSharedService.L("UI.CompactUI.e6a5dfed", "Pairs {0}"),
+                NoDot00(UiSharedService.ByteToString(pairsVramBytes, addSuffix: true)));
 
-            var contentMinX = ImGui.GetWindowContentRegionMin().X;
-            var contentMaxX = ImGui.GetWindowContentRegionMax().X;
+            var shellsText =
+                _uiSharedService.L("UI.CompactUI.418f28e3", "Shells ")
+                + NoDot00(UiSharedService.ByteToString(shellsVramBytes, addSuffix: true));
 
-            // LEFT
-            ImGui.SetCursorPosX(contentMinX + padX);
-            ImGui.AlignTextToFramePadding();
+            var totalText = "Total " + NoDot00(UiSharedService.ByteToString(totalVramBytes, addSuffix: true));
 
-            ImGui.TextUnformatted(string.Format(_uiSharedService.L("UI.CompactUI.e6a5dfed", "Pairs {0}"), UiSharedService.ByteToString(pairsVramBytes, addSuffix: true)));
-            ImGui.SameLine(0, 0);
-            ImGui.PushStyleColor(ImGuiCol.Text, ImGuiColors.DalamudGrey2);
-            ImGui.TextUnformatted(_uiSharedService.L("UI.CompactUI.5adbc2b8", " | "));
-            ImGui.PopStyleColor();
-            ImGui.SameLine(0, 0);
-            ImGui.TextUnformatted(_uiSharedService.L("UI.CompactUI.418f28e3", "Shells "));
-            ImGui.SameLine(0, 0);
-            ImGui.PushStyleColor(ImGuiCol.Text, shellsColor);
-            ImGui.TextUnformatted(UiSharedService.ByteToString(shellsVramBytes, addSuffix: true));
-            ImGui.PopStyleColor();
+            var line = $"{pairsText}  |  {shellsText}  |  {totalText}";
 
-            // RIGHT
-            ImGui.SameLine();
-            ImGui.SetCursorPosX(MathF.Max(contentMinX + padX, contentMaxX - padX - totalBlockW));
-            ImGui.AlignTextToFramePadding();
-
-            ImGui.PushStyleColor(ImGuiCol.Text, ImGuiColors.DalamudGrey2);
-            ImGui.TextUnformatted(totalPipeText);
-            ImGui.PopStyleColor();
-
-            ImGui.SameLine(0, 0);
-            ImGui.AlignTextToFramePadding();
-            ImGui.TextUnformatted(totalValueText);
-
+            DrawCenteredTextAutoFit(
+                "##vram_single_line",
+                line,
+                ImGuiColors.DalamudWhite,
+                regionW: contentW,
+                padX: padX,
+                minScale: 0.70f);
 
             ImGui.EndGroup();
 
@@ -990,10 +1006,8 @@ public class CompactUi : WindowMediatorSubscriberBase
 
             dl.AddRectFilled(start, start + new Vector2(w, h), bg, 10f * scale);
             dl.AddRect(start, start + new Vector2(w, h), border, 10f * scale);
-
-            //ImGui.Dummy(new Vector2(0, 1f * scale));
         }
-        
+
         ImGui.Separator();
 
         DrawScopeToggles();
@@ -1006,16 +1020,14 @@ public class CompactUi : WindowMediatorSubscriberBase
         bool isDirectTab = _currentPairViewTab == PairViewTab.DirectPairs;
         bool isShellTab = _currentPairViewTab == PairViewTab.Shells;
 
-
         var allPairs = _pairManager.PairsWithGroups
-            // First, filter based on the current view tab
             .Where(entry =>
             {
                 return _currentPairViewTab switch
                 {
-                    PairViewTab.DirectPairs => entry.Key.IsDirectlyPaired,   
-                    PairViewTab.Shells => !entry.Key.IsDirectlyPaired,  
-                    _ => true                        
+                    PairViewTab.DirectPairs => entry.Key.IsDirectlyPaired,
+                    PairViewTab.Shells => !entry.Key.IsDirectlyPaired,
+                    _ => true
                 };
             })
             .ToDictionary(k => k.Key, k => k.Value);
@@ -1032,49 +1044,84 @@ public class CompactUi : WindowMediatorSubscriberBase
                 .ToDictionary(k => k.Key, k => k.Value)
             : allPairs;
 
-
         string? AlphabeticalSort(KeyValuePair<Pair, List<GroupFullInfoDto>> u)
             => (_configService.Current.ShowCharacterNameInsteadOfNotesForVisible && !string.IsNullOrEmpty(u.Key.PlayerName)
                     ? (_configService.Current.PreferNotesOverNamesForVisible ? u.Key.GetNote() : u.Key.PlayerName)
                     : (u.Key.GetNote() ?? u.Key.UserData.AliasOrUID));
+
+        bool FilterNotOtherSync(KeyValuePair<Pair, List<GroupFullInfoDto>> u)
+            => !u.Key.AutoPausedByOtherSync;
+
         bool FilterOnlineOrPausedSelf(KeyValuePair<Pair, List<GroupFullInfoDto>> u)
             => isDirectTab
-            ? (u.Key.IsOnline || u.Key.UserPair.OwnPermissions.IsPaused())
-            : (u.Key.IsOnline
-               || (!u.Key.IsOnline && !_configService.Current.ShowOfflineUsersSeparately)
-               || u.Key.UserPair.OwnPermissions.IsPaused());
+                ? ((u.Key.IsOnline || (u.Key.UserPair.OwnPermissions.IsPaused() && !u.Key.AutoPausedByOtherSync)) && FilterNotOtherSync(u))
+                : (u.Key.IsOnline
+                   || (!u.Key.IsOnline && !_configService.Current.ShowOfflineUsersSeparately)
+                   || (u.Key.UserPair.OwnPermissions.IsPaused() && !u.Key.AutoPausedByOtherSync))
+                  && FilterNotOtherSync(u);
+
         Dictionary<Pair, List<GroupFullInfoDto>> BasicSortedDictionary(IEnumerable<KeyValuePair<Pair, List<GroupFullInfoDto>>> u)
             => (_configService.Current.SortPairsByVRAM
-            ? u.OrderByDescending(u => System.Math.Max(u.Key.LastAppliedApproximateVRAMBytes, 0))
-                 .ThenByDescending(u => u.Key.IsVisible)
-                 .ThenByDescending(u => u.Key.IsOnline)
-            : u.OrderByDescending(u => u.Key.IsVisible)
-                 .ThenByDescending(u => u.Key.IsOnline))
-        .ThenBy(AlphabeticalSort, StringComparer.OrdinalIgnoreCase)
-        .ToDictionary(u => u.Key, u => u.Value);
+                    ? u.OrderByDescending(u => System.Math.Max(u.Key.LastAppliedApproximateVRAMBytes, 0))
+                        .ThenByDescending(u => u.Key.IsVisible)
+                        .ThenByDescending(u => u.Key.IsOnline)
+                    : u.OrderByDescending(u => u.Key.IsVisible)
+                        .ThenByDescending(u => u.Key.IsOnline))
+                .ThenBy(AlphabeticalSort, StringComparer.OrdinalIgnoreCase)
+                .ToDictionary(u => u.Key, u => u.Value);
 
         ImmutableList<Pair> ImmutablePairList(IEnumerable<KeyValuePair<Pair, List<GroupFullInfoDto>>> u)
             => u.Select(k => k.Key).ToImmutableList();
+
         bool FilterVisibleUsers(KeyValuePair<Pair, List<GroupFullInfoDto>> u)
-            => u.Key.IsVisible
+            => FilterNotOtherSync(u)
+                && u.Key.IsVisible
                 && (_configService.Current.ShowSyncshellUsersInVisible || !(!_configService.Current.ShowSyncshellUsersInVisible && !u.Key.IsDirectlyPaired));
+
         bool FilterTagusers(KeyValuePair<Pair, List<GroupFullInfoDto>> u, string tag)
-            => u.Key.IsDirectlyPaired && !u.Key.IsOneSidedPair && _tagHandler.HasTag(u.Key.UserData.UID, tag);
+            => FilterNotOtherSync(u)
+                && u.Key.IsDirectlyPaired
+                && !u.Key.IsOneSidedPair
+                && _tagHandler.HasTag(u.Key.UserData.UID, tag);
+
         bool FilterGroupUsers(KeyValuePair<Pair, List<GroupFullInfoDto>> u, GroupFullInfoDto group)
-            => u.Value.Exists(g => string.Equals(g.GID, group.GID, StringComparison.Ordinal));
+            => FilterNotOtherSync(u) && u.Value.Exists(g => string.Equals(g.GID, group.GID, StringComparison.Ordinal));
+
         bool FilterNotTaggedUsers(KeyValuePair<Pair, List<GroupFullInfoDto>> u)
-            => u.Key.IsDirectlyPaired && !u.Key.IsOneSidedPair && !_tagHandler.HasAnyTag(u.Key.UserData.UID);
+            => FilterNotOtherSync(u)
+                && u.Key.IsDirectlyPaired
+                && !u.Key.IsOneSidedPair
+                && !_tagHandler.HasAnyTag(u.Key.UserData.UID);
+
         bool FilterOfflineUsers(KeyValuePair<Pair, List<GroupFullInfoDto>> u)
             => isDirectTab
-            ? (!u.Key.IsOnline && !u.Key.UserPair.OwnPermissions.IsPaused())
-            : ((u.Key.IsDirectlyPaired && _configService.Current.ShowSyncshellOfflineUsersSeparately)
-            || !_configService.Current.ShowSyncshellOfflineUsersSeparately)
-            && (!u.Key.IsOneSidedPair || u.Value.Any())
-            && !u.Key.IsOnline
-            && !u.Key.UserPair.OwnPermissions.IsPaused();
-        bool FilterOfflineSyncshellUsers(KeyValuePair<Pair, List<GroupFullInfoDto>> u)
-            => (!u.Key.IsDirectlyPaired && !u.Key.IsOnline && !u.Key.UserPair.OwnPermissions.IsPaused());
+                ? (FilterNotOtherSync(u) && !u.Key.IsOnline && !u.Key.UserPair.OwnPermissions.IsPaused())
+                : ((u.Key.IsDirectlyPaired && _configService.Current.ShowSyncshellOfflineUsersSeparately)
+                   || !_configService.Current.ShowSyncshellOfflineUsersSeparately)
+                  && (!u.Key.IsOneSidedPair || u.Value.Any())
+                  && !u.Key.IsOnline
+                  && !u.Key.UserPair.OwnPermissions.IsPaused()
+                  && FilterNotOtherSync(u);
 
+        bool FilterOfflineSyncshellUsers(KeyValuePair<Pair, List<GroupFullInfoDto>> u)
+            => FilterNotOtherSync(u)
+                && (!u.Key.IsDirectlyPaired && !u.Key.IsOnline && !u.Key.UserPair.OwnPermissions.IsPaused());
+
+        Func<KeyValuePair<Pair, List<GroupFullInfoDto>>, bool> FilterOtherSyncAny =
+            u => u.Key.AutoPausedByOtherSync;
+
+        Func<KeyValuePair<Pair, List<GroupFullInfoDto>>, bool> FilterOtherSyncLightless =
+            u => u.Key.AutoPausedByOtherSync
+                 && string.Equals(u.Key.AutoPausedByOtherSyncName, "Lightless", StringComparison.OrdinalIgnoreCase);
+
+        Func<KeyValuePair<Pair, List<GroupFullInfoDto>>, bool> FilterOtherSyncSnowcloak =
+            u => u.Key.AutoPausedByOtherSync
+                 && string.Equals(u.Key.AutoPausedByOtherSyncName, "Snowcloak", StringComparison.OrdinalIgnoreCase);
+
+        Func<KeyValuePair<Pair, List<GroupFullInfoDto>>, bool> FilterOtherSyncOther =
+            u => u.Key.AutoPausedByOtherSync
+                 && !string.Equals(u.Key.AutoPausedByOtherSyncName, "Lightless", StringComparison.OrdinalIgnoreCase)
+                 && !string.Equals(u.Key.AutoPausedByOtherSyncName, "Snowcloak", StringComparison.OrdinalIgnoreCase);
 
         if (_currentPairViewTab == PairViewTab.Visible)
         {
@@ -1085,6 +1132,27 @@ public class CompactUi : WindowMediatorSubscriberBase
                 TagHandler.CustomVisibleTag,
                 filteredVisiblePairs,
                 allVisiblePairs));
+
+            if (allPairs.Any(FilterOtherSyncAny))
+            {
+                var allOtherSyncOtherPairs = ImmutablePairList(allPairs.Where(FilterOtherSyncOther));
+                var filteredOtherSyncOtherPairs = BasicSortedDictionary(filteredPairs.Where(FilterOtherSyncOther));
+                var otherFolder = _drawEntityFactory.CreateDrawTagFolder(TagHandler.CustomOtherSyncTag, filteredOtherSyncOtherPairs, allOtherSyncOtherPairs);
+
+                var allOtherSyncLightlessPairs = ImmutablePairList(allPairs.Where(FilterOtherSyncLightless));
+                var filteredOtherSyncLightlessPairs = BasicSortedDictionary(filteredPairs.Where(FilterOtherSyncLightless));
+                var lightlessFolder = _drawEntityFactory.CreateDrawTagFolder(TagHandler.CustomOtherSyncLightlessTag, filteredOtherSyncLightlessPairs, allOtherSyncLightlessPairs);
+
+                var allOtherSyncSnowcloakPairs = ImmutablePairList(allPairs.Where(FilterOtherSyncSnowcloak));
+                var filteredOtherSyncSnowcloakPairs = BasicSortedDictionary(filteredPairs.Where(FilterOtherSyncSnowcloak));
+                var snowcloakFolder = _drawEntityFactory.CreateDrawTagFolder(TagHandler.CustomOtherSyncSnowcloakTag, filteredOtherSyncSnowcloakPairs, allOtherSyncSnowcloakPairs);
+
+                drawFolders.Add(new DrawGroupedOtherSyncFolder(
+                    TagHandler.CustomOtherSyncRootTag,
+                    _uiSharedService.L("UI.DrawFolderTag.Name.OtherSync", "Handled by other sync"),
+                    new IDrawFolder[] { otherFolder, lightlessFolder, snowcloakFolder },
+                    _tagHandler));
+            }
 
             return drawFolders;
         }
@@ -1098,6 +1166,27 @@ public class CompactUi : WindowMediatorSubscriberBase
                 TagHandler.CustomVisibleTag,
                 filteredVisiblePairs,
                 allVisiblePairs));
+        }
+
+        if (allPairs.Any(FilterOtherSyncAny))
+        {
+            var allOtherSyncOtherPairs = ImmutablePairList(allPairs.Where(FilterOtherSyncOther));
+            var filteredOtherSyncOtherPairs = BasicSortedDictionary(filteredPairs.Where(FilterOtherSyncOther));
+            var otherFolder = _drawEntityFactory.CreateDrawTagFolder(TagHandler.CustomOtherSyncTag, filteredOtherSyncOtherPairs, allOtherSyncOtherPairs);
+
+            var allOtherSyncLightlessPairs = ImmutablePairList(allPairs.Where(FilterOtherSyncLightless));
+            var filteredOtherSyncLightlessPairs = BasicSortedDictionary(filteredPairs.Where(FilterOtherSyncLightless));
+            var lightlessFolder = _drawEntityFactory.CreateDrawTagFolder(TagHandler.CustomOtherSyncLightlessTag, filteredOtherSyncLightlessPairs, allOtherSyncLightlessPairs);
+
+            var allOtherSyncSnowcloakPairs = ImmutablePairList(allPairs.Where(FilterOtherSyncSnowcloak));
+            var filteredOtherSyncSnowcloakPairs = BasicSortedDictionary(filteredPairs.Where(FilterOtherSyncSnowcloak));
+            var snowcloakFolder = _drawEntityFactory.CreateDrawTagFolder(TagHandler.CustomOtherSyncSnowcloakTag, filteredOtherSyncSnowcloakPairs, allOtherSyncSnowcloakPairs);
+
+            drawFolders.Add(new DrawGroupedOtherSyncFolder(
+                TagHandler.CustomOtherSyncRootTag,
+                _uiSharedService.L("UI.DrawFolderTag.Name.OtherSync", "Handled by other sync"),
+                new IDrawFolder[] { otherFolder, lightlessFolder, snowcloakFolder },
+                _tagHandler));
         }
 
         if (!isDirectTab)
@@ -1132,7 +1221,6 @@ public class CompactUi : WindowMediatorSubscriberBase
             else
                 drawFolders.AddRange(groupFolders);
         }
-
 
         var tags = _tagHandler.GetAllTagsSorted();
         foreach (var tag in tags)
@@ -1366,6 +1454,9 @@ public class CompactUi : WindowMediatorSubscriberBase
         if (analysis is null || analysis.Count == 0)
             return;
 
+        var seenHashes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var seenModelHashes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
         KeyValuePair<ObjectKind, Dictionary<string, CharacterAnalyzer.FileDataEntry>>[] snapshot;
         try
         {
@@ -1390,27 +1481,71 @@ public class CompactUi : WindowMediatorSubscriberBase
                 continue;
             }
 
+            var gamePathToEntry = new Dictionary<string, CharacterAnalyzer.FileDataEntry>(StringComparer.OrdinalIgnoreCase);
+
             foreach (var e in entries)
             {
-                _cachedMyVramBytes += e.OriginalSize;
-                _cachedMyTriangles += TryReadTriangleCount(e);
+                if (e == null) continue;
 
-                // BC7 eligible set (tex only, not already BC7)
-                if (!string.Equals(e.FileType, "tex", StringComparison.Ordinal))
+                static string NormalizeGp(string p)
+                {
+                    if (string.IsNullOrWhiteSpace(p)) return string.Empty;
+                    return p.ToLowerInvariant().Replace("\\", "/", StringComparison.OrdinalIgnoreCase);
+                }
+
+                if (e.GamePaths != null)
+                {
+                    foreach (var gpRaw in e.GamePaths)
+                    {
+                        if (string.IsNullOrWhiteSpace(gpRaw)) continue;
+
+                        var gp = NormalizeGp(gpRaw);
+                        if (string.IsNullOrWhiteSpace(gp)) continue;
+
+                        if (!gamePathToEntry.ContainsKey(gp))
+                            gamePathToEntry[gp] = e;
+                    }
+                }
+
+                // Unique-hash VRAM
+                if (!string.IsNullOrEmpty(e.Hash) && seenHashes.Add(e.Hash))
+                {
+                    _cachedMyVramBytes += Math.Max(0, e.VramBytes);
+                }
+
+                // Unique model triangles
+                if (!string.IsNullOrEmpty(e.Hash)
+                    && (string.Equals(e.FileType, "mdl", StringComparison.OrdinalIgnoreCase)
+                        || (e.GamePaths?.Any(p => p.EndsWith(".mdl", StringComparison.OrdinalIgnoreCase)) ?? false)))
+                {
+                    if (seenModelHashes.Add(e.Hash))
+                        _cachedMyTriangles += TryReadTriangleCount(e);
+                }
+
+                if (!string.Equals(e.FileType, "tex", StringComparison.OrdinalIgnoreCase))
                     continue;
 
-                if (string.Equals(e.Format.Value, "BC7", StringComparison.Ordinal))
-                    continue;
-
-                // guard: need at least 1 path
                 if (e.FilePaths is null || e.FilePaths.Count == 0)
+                    continue;
+
+                if (!TextureCompressionPlanner.TryParseFormat(e.Format.Value, out var srcFmt))
+                    continue;
+
+                // best hint: game path (content-type heuristics), else file path
+                string? hint = (e.GamePaths != null && e.GamePaths.Count > 0) ? e.GamePaths[0] : e.FilePaths[0];
+
+                if (!TextureCompressionPlanner.TryChooseTarget(hint, srcFmt, out var target) || target == TextureCompressionPlanner.Target.None)
+                    continue;
+
+                // If already in target, skip
+                if (string.Equals(e.Format.Value, target.ToString(), StringComparison.OrdinalIgnoreCase))
                     continue;
 
                 var primary = e.FilePaths[0];
                 if (!_cachedEligibleBc7Set.ContainsKey(primary))
                 {
                     _cachedEligibleBc7Set[primary] = e.FilePaths.Skip(1).ToArray();
-                    _cachedBc7Items.Add((e.Format.Value, e.OriginalSize));
+                    _cachedBc7Items.Add(($"{target}:{e.Format.Value}", e.OriginalSize));
                 }
             }
         }
@@ -1432,24 +1567,60 @@ public class CompactUi : WindowMediatorSubscriberBase
         _bc7Cts.Dispose();
         _bc7Cts = new();
 
+        var plan = new Dictionary<TextureType, Dictionary<string, string[]>>();
+
+        var analysis = _characterAnalyzer.LastAnalysis;
+        if (analysis != null)
+        {
+            var primaryToEntry = new Dictionary<string, CharacterAnalyzer.FileDataEntry>(StringComparer.OrdinalIgnoreCase);
+            try
+            {
+                foreach (var byObj in analysis.Values)
+                {
+                    foreach (var e in byObj.Values)
+                    {
+                        if (e == null) continue;
+                        if (!string.Equals(e.FileType, "tex", StringComparison.OrdinalIgnoreCase)) continue;
+                        if (e.FilePaths == null || e.FilePaths.Count == 0) continue;
+
+                        var primary = e.FilePaths[0];
+                        if (!primaryToEntry.ContainsKey(primary))
+                            primaryToEntry[primary] = e;
+                    }
+                }
+            }
+            catch
+            {
+                primaryToEntry.Clear();
+            }
+
+            foreach (var kv in _bc7Set)
+            {
+                var primary = kv.Key;
+                var dups = kv.Value ?? Array.Empty<string>();
+
+                TextureType targetType = TextureType.Bc7Tex;
+
+                if (!plan.TryGetValue(targetType, out var bucket))
+                    plan[targetType] = bucket = new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase);
+
+                bucket[primary] = dups;
+            }
+        }
+        else
+        {
+            // No analysis? Treat it as BC7-only (old behaviour)
+            var bucket = new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase);
+            foreach (var kv in _bc7Set)
+                bucket[kv.Key] = kv.Value ?? Array.Empty<string>();
+
+            plan[TextureType.Bc7Tex] = bucket;
+        }
+
         _bc7Task = _ipcManager.Penumbra.ConvertTextureFiles(
-            _logger, _bc7Set, _bc7Progress, _bc7Cts.Token);
+            _logger, plan, _bc7Progress, _bc7Cts.Token);
 
         _bc7ShowModal = true;
-    }
-
-    private static bool TryGetBppForFormat(string fmt, out int bpp)
-    {
-        fmt = fmt?.Trim()?.ToUpperInvariant() ?? "";
-
-        if (fmt is "A8R8G8B8" or "R8G8B8A8" or "RGBA8" or "ARGB8" or "X8R8G8B8") { bpp = 32; return true; }
-
-        if (fmt is "DXT1" or "BC1" or "BC4") { bpp = 4; return true; }
-
-        if (fmt is "DXT3" or "DXT5" or "BC2" or "BC3" or "BC5" or "BC7") { bpp = 8; return true; }
-
-        bpp = 8; // safe default so we don't claim savings incorrectly
-        return false;
     }
 
 
@@ -1458,23 +1629,41 @@ public class CompactUi : WindowMediatorSubscriberBase
     {
         long before = 0, after = 0;
         var byFmt = new Dictionary<string, (int files, long b, long a)>(StringComparer.OrdinalIgnoreCase);
-        const int bc7Bpp = 8;
 
-        foreach (var (fmt, size) in items)
+        foreach (var (fmtPacked, size) in items)
         {
-            TryGetBppForFormat(fmt, out var srcBpp); // returns 8 by default if unknown
-                                                     // scale by bpp ratio; this matches what the converter does in spirit
-            double factor = (double)bc7Bpp / srcBpp;
+            // fmtPacked is either "SRC" (legacy) or "TARGET:SRC"
+            var parts = (fmtPacked ?? "").Split(':', 2, StringSplitOptions.RemoveEmptyEntries);
+            string tgt = parts.Length == 2 ? parts[0] : "BC7";
+            string src = parts.Length == 2 ? parts[1] : parts[0];
+
+            // source bpp
+            int srcBpp;
+            var s = src.Trim().ToUpperInvariant();
+            if (s is "A8R8G8B8" or "R8G8B8A8" or "RGBA8" or "ARGB8" or "X8R8G8B8") srcBpp = 32;
+            else if (s is "DXT1" or "BC1" or "BC4") srcBpp = 4;
+            else if (s is "DXT3" or "DXT5" or "BC2" or "BC3" or "BC5" or "BC7") srcBpp = 8;
+            else srcBpp = 8;
+
+            // target bpp
+            int tgtBpp;
+            var t = tgt.Trim().ToUpperInvariant();
+            if (t is "BC1" or "BC4") tgtBpp = 4;
+            else tgtBpp = 8; // BC3/BC5/BC7
+
+            // estimate by bpp ratio
+            double factor = (double)tgtBpp / srcBpp;
             long est = (long)Math.Round(size * factor);
 
             before += size;
             after += est;
 
-            if (!byFmt.TryGetValue(fmt, out var agg)) agg = (0, 0, 0);
+            var key = $"{src}→{tgt}";
+            if (!byFmt.TryGetValue(key, out var agg)) agg = (0, 0, 0);
             agg.files += 1;
             agg.b += size;
             agg.a += est;
-            byFmt[fmt] = agg;
+            byFmt[key] = agg;
         }
 
         return (before - after, items.Count, byFmt);

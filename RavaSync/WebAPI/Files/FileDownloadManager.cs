@@ -29,7 +29,7 @@ namespace RavaSync.WebAPI.Files;
 
 public partial class FileDownloadManager : DisposableMediatorSubscriberBase
 {
-    private readonly Dictionary<string, FileDownloadStatus> _downloadStatus;
+    private Dictionary<string, FileDownloadStatus> _downloadStatus;
     private readonly FileCompactor _fileCompactor;
     private readonly FileCacheManager _fileDbManager;
     private readonly FileTransferOrchestrator _orchestrator;
@@ -43,6 +43,7 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
     private readonly DelayedActivatorService _delayedActivator;
     private const int MaxCdnAttemptsPerFile = 3;
     private static readonly TimeSpan CdnAttemptTimeout = TimeSpan.FromSeconds(60);
+    private const long InlineCdnDecodeMaxPayloadBytes = 4L * 1024 * 1024;
 
     private readonly CdnDecodeWorker _cdnDecodeWorker;
 
@@ -54,6 +55,89 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
     private const long AutoCdnSlowBpsThreshold = 768 * 1024;
 
     private int _autoCdnParallel = 4;
+
+    private readonly ConcurrentDictionary<string, byte> _createdDirs = new(StringComparer.OrdinalIgnoreCase);
+
+    private sealed class GroupProgressState
+    {
+        public long PendingBytes;
+        public long PendingFiles;
+        public long LastFlushTicks;
+        public long LastPublishTicks;
+    }
+
+    private readonly ConcurrentDictionary<string, GroupProgressState> _groupProgress
+        = new(StringComparer.Ordinal);
+
+    private void AddGroupProgress(GameObjectHandler downloadId, string groupKey, long bytes, long files)
+    {
+        var state = _groupProgress.GetOrAdd(groupKey, _ => new GroupProgressState());
+
+        Interlocked.Add(ref state.PendingBytes, bytes);
+        Interlocked.Add(ref state.PendingFiles, files);
+
+        TryFlushGroupProgress(groupKey, state, force: false);
+        var now = Stopwatch.GetTimestamp();
+        var last = Volatile.Read(ref state.LastPublishTicks);
+
+        long intervalTicks = (long)(Stopwatch.Frequency * 0.10);
+
+        if ((now - last) >= intervalTicks &&
+            Interlocked.CompareExchange(ref state.LastPublishTicks, now, last) == last)
+        {
+            Mediator.Publish(new DownloadStartedMessage(downloadId, _downloadStatus));
+        }
+    }
+
+    private void TryFlushGroupProgress(string groupKey, GroupProgressState state, bool force)
+    {
+        // Flush at most ~20Hz unless forced.
+        var now = Stopwatch.GetTimestamp();
+        var last = Volatile.Read(ref state.LastFlushTicks);
+
+        // 50ms in Stopwatch ticks
+        long flushIntervalTicks = (long)(Stopwatch.Frequency * 0.05);
+
+        if (!force && (now - last) < flushIntervalTicks)
+            return;
+
+        // If another thread just flushed, bail.
+        if (!force && Interlocked.CompareExchange(ref state.LastFlushTicks, now, last) != last)
+            return;
+
+        var bytes = Interlocked.Exchange(ref state.PendingBytes, 0);
+        var files = Interlocked.Exchange(ref state.PendingFiles, 0);
+
+        if (bytes == 0 && files == 0 && !force)
+            return;
+
+        if (_downloadStatus.TryGetValue(groupKey, out var st))
+        {
+            lock (st)
+            {
+                if (files != 0) st.TransferredFiles += (int)files;
+                if (bytes != 0) st.TransferredBytes += bytes;
+            }
+        }
+    }
+
+    private void ForceFlushGroupProgress(string groupKey)
+    {
+        if (_groupProgress.TryGetValue(groupKey, out var state))
+            TryFlushGroupProgress(groupKey, state, force: true);
+    }
+
+
+    private void EnsureDirectoryForFile(string filePath)
+    {
+        var dir = Path.GetDirectoryName(filePath);
+        if (string.IsNullOrWhiteSpace(dir)) return;
+
+        if (_createdDirs.TryAdd(dir, 0))
+        {
+            Directory.CreateDirectory(dir);
+        }
+    }
 
 
     private static int GetCdnDecodeParallelism()
@@ -78,8 +162,8 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
         var maxParallel = AutoCdnMaxParallel;
 
         // During room-entry storms, clamp parallelism to reduce IO/CPU spikes.
-        if (SyncStorm.IsActive)
-            maxParallel = Math.Min(maxParallel, 4);
+        //if (SyncStorm.IsActive)
+        //    maxParallel = Math.Min(maxParallel, 4);
 
         if (configuredParallel > 0)
             return Math.Clamp(configuredParallel, 1, Math.Min(maxParallel, Math.Max(1, filesInGroup)));
@@ -122,12 +206,9 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
         }
     }
 
-    // per-hash inflight dedupe (across pairs) so the same hash doesn't spawn duplicated bars
-    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> _inflightHashes
-        = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, byte> _inflightHashes = new(StringComparer.OrdinalIgnoreCase);
     
-    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, Cdn404State> _cdn404State
-        = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, Cdn404State> _cdn404State = new(StringComparer.OrdinalIgnoreCase);
 
     private sealed class Cdn404State
     {
@@ -182,7 +263,7 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
             AutomaticDecompression = DecompressionMethods.None,
             PooledConnectionLifetime = TimeSpan.FromMinutes(10),
             PooledConnectionIdleTimeout = TimeSpan.FromMinutes(2),
-            ConnectTimeout = TimeSpan.FromSeconds(10),
+            ConnectTimeout = TimeSpan.FromSeconds(60),
             MaxConnectionsPerServer = 256,
             EnableMultipleHttp2Connections = true,
         };
@@ -306,7 +387,11 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
     {
         ReleaseInflight(CurrentDownloads);
         CurrentDownloads.Clear();
-        _downloadStatus.Clear();
+
+        _downloadStatus = new Dictionary<string, FileDownloadStatus>(StringComparer.Ordinal);
+
+        _createdDirs.Clear();
+        _groupProgress.Clear();
     }
 
     public async Task DownloadFiles(GameObjectHandler gameObject, List<FileReplacementData> fileReplacementDto, CancellationToken ct)
@@ -324,6 +409,51 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
         {
             Mediator.Publish(new DownloadFinishedMessage(gameObject));
             Mediator.Publish(new ResumeScanMessage(nameof(DownloadFiles)));
+        }
+    }
+
+
+    private static async Task CopyExactlyWithProgressAsync(Stream src, Stream dst, long bytes, Action<int> onRead, CancellationToken ct)
+    {
+        var buffer = ArrayPool<byte>.Shared.Rent(256 * 1024);
+        try
+        {
+            long remaining = bytes;
+            while (remaining > 0)
+            {
+                int want = (int)Math.Min(buffer.Length, remaining);
+                int read = await src.ReadAsync(buffer.AsMemory(0, want), ct).ConfigureAwait(false);
+                if (read <= 0) throw new EndOfStreamException($"Expected {bytes} bytes, got {bytes - remaining}");
+
+                await dst.WriteAsync(buffer.AsMemory(0, read), ct).ConfigureAwait(false);
+                remaining -= read;
+
+                onRead(read);
+            }
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buffer);
+        }
+    }
+
+    private static async Task CopyToWithProgressAsync(Stream src, Stream dst, Action<int> onRead, CancellationToken ct)
+    {
+        var buffer = ArrayPool<byte>.Shared.Rent(256 * 1024);
+        try
+        {
+            while (true)
+            {
+                int read = await src.ReadAsync(buffer.AsMemory(0, buffer.Length), ct).ConfigureAwait(false);
+                if (read <= 0) break;
+
+                await dst.WriteAsync(buffer.AsMemory(0, read), ct).ConfigureAwait(false);
+                onRead(read);
+            }
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buffer);
         }
     }
 
@@ -370,6 +500,48 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
         }
 
         base.Dispose(disposing);
+    }
+
+
+
+    private sealed class ProgressReadStream : Stream
+    {
+        private readonly Stream _inner;
+        private readonly Action<int> _onRead;
+
+        public ProgressReadStream(Stream inner, Action<int> onRead)
+        {
+            _inner = inner;
+            _onRead = onRead;
+        }
+
+        public override bool CanRead => _inner.CanRead;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => throw new NotSupportedException();
+        public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
+        public override void Flush() => throw new NotSupportedException();
+
+        public override int Read(byte[] buffer, int offset, int count)
+        {
+            var r = _inner.Read(buffer, offset, count);
+            if (r > 0) _onRead(r);
+            return r;
+        }
+
+        public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            var r = await _inner.ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
+            if (r > 0) _onRead(r);
+            return r;
+        }
+
+        public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+            => ReadAsync(buffer.AsMemory(offset, count), cancellationToken).AsTask();
+
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
     }
 
     private sealed class PrefixedReadStream : Stream
@@ -646,10 +818,11 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
 
         if (Volatile.Read(ref anyGroupFailure) != 0)
         {
-            Logger.LogError("CDN fast-path: one or more groups failed. Aborting download. Failed groups: {groups}",
+            Logger.LogWarning("CDN fast-path: one or more groups failed. Aborting download. Failed groups: {groups}",
                 string.Join(", ", failedGroups.Distinct(StringComparer.Ordinal)));
 
-            throw new HttpRequestException("CDN fast-path failed for groups: " + string.Join(", ", failedGroups.Distinct(StringComparer.Ordinal)));
+            ClearDownload();
+            return;
         }
 
         Logger.LogDebug("Download end: {id}", gameObjectHandler);
@@ -935,6 +1108,25 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
         if (string.IsNullOrWhiteSpace(hash)) return false;
         if (string.IsNullOrWhiteSpace(finalCachePath)) return false;
 
+        // Never hard-delay core asset types (face/ears/body/etc).
+        static bool NeverDelayExt(string extWithDot)
+        {
+            if (string.IsNullOrWhiteSpace(extWithDot)) return false;
+
+            var e = extWithDot.TrimStart('.');
+            return e.Equals("mdl", StringComparison.OrdinalIgnoreCase)
+                || e.Equals("tex", StringComparison.OrdinalIgnoreCase)
+                || e.Equals("mtrl", StringComparison.OrdinalIgnoreCase)
+                || e.Equals("imc", StringComparison.OrdinalIgnoreCase)
+                || e.Equals("eqp", StringComparison.OrdinalIgnoreCase)
+                || e.Equals("eqdp", StringComparison.OrdinalIgnoreCase)
+                || e.Equals("est", StringComparison.OrdinalIgnoreCase)
+                || e.Equals("gmp", StringComparison.OrdinalIgnoreCase);
+        }
+
+        if (NeverDelayExt(Path.GetExtension(finalCachePath)))
+            return false;
+
         if (!ActivationPolicy.IsHardDelayed(finalCachePath))
             return false;
 
@@ -1105,6 +1297,8 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
                 {
                     statusStart.DownloadStatus = DownloadStatus.Downloading;
                 }
+
+                Mediator.Publish(new DownloadStartedMessage(gameObjectHandler, _downloadStatus));
             }
 
             var index = -1;
@@ -1137,11 +1331,16 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
             try
             {
                 await Task.WhenAll(workers).ConfigureAwait(false);
+                ForceFlushGroupProgress(groupKey);
             }
             catch (OperationCanceledException)
             {
                 Interlocked.Exchange(ref anyFailure[0], 1);
-                throw;
+
+                try { ForceFlushGroupProgress(groupKey); } catch { /* ignore */ }
+
+                if (ct.IsCancellationRequested)
+                    return false;
             }
 
             var hadTimeout = Volatile.Read(ref anyTimeoutOrBackoff[0]) != 0;
@@ -1177,9 +1376,10 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
             {
                 lock (status)
                 {
-                    status.DownloadStatus = DownloadStatus.Decompressing;
+                    status.DownloadStatus = DownloadStatus.Downloading;
                 }
             }
+            Mediator.Publish(new DownloadStartedMessage(gameObjectHandler, _downloadStatus));
 
             Logger.LogDebug("CDN fast-path: completed all files for group {group} via CDN", groupKey);
             success = true;
@@ -1302,16 +1502,34 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
                     var filePath = _fileDbManager.GetCacheFilePath(headerHash, ext);
 
                     var cfg = _mareConfigService.Current;
-                    var hard = ActivationPolicy.IsHardDelayed(filePath);
-                    var soft = !hard && ActivationPolicy.IsSoftDelayed(filePath);
 
-                    Directory.CreateDirectory(Path.GetDirectoryName(filePath)!);
+                    static bool NeverDelayExt(string extNoDot)
+                    {
+                        if (string.IsNullOrWhiteSpace(extNoDot)) return false;
+
+                        return extNoDot.Equals("mdl", StringComparison.OrdinalIgnoreCase)
+                            || extNoDot.Equals("tex", StringComparison.OrdinalIgnoreCase)
+                            || extNoDot.Equals("mtrl", StringComparison.OrdinalIgnoreCase)
+                            || extNoDot.Equals("imc", StringComparison.OrdinalIgnoreCase)
+                            || extNoDot.Equals("eqp", StringComparison.OrdinalIgnoreCase)
+                            || extNoDot.Equals("eqdp", StringComparison.OrdinalIgnoreCase)
+                            || extNoDot.Equals("est", StringComparison.OrdinalIgnoreCase)
+                            || extNoDot.Equals("gmp", StringComparison.OrdinalIgnoreCase);
+                    }
+
+                    var neverDelay = NeverDelayExt(ext);
+
+                    var hard = !neverDelay && ActivationPolicy.IsHardDelayed(filePath);
+                    var soft = !hard && !neverDelay && ActivationPolicy.IsSoftDelayed(filePath);
+
+                    EnsureDirectoryForFile(filePath);
 
                     // CRITICAL: write to temp first so we never truncate/zero the live cache file.
                     var tempPath = CreateTempDownloadPath(filePath);
                     var destPath = filePath;
 
                     string? stagedHash = null;
+                    var countedBytesLive = false;
 
                     try
                     {
@@ -1319,53 +1537,87 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
                         long bytesWritten;
                         bool usedHeaderlessXorCompat = false;
 
-                        var spoolPath = tempPath + ".spool." + Guid.NewGuid().ToString("N");
+                        Stream? payloadStream = input;
 
-                        await using (var spoolOut = new FileStream(
-                            spoolPath,
-                            new FileStreamOptions
-                            {
-                                Access = FileAccess.Write,
-                                Mode = FileMode.Create,
-                                Share = FileShare.None,
-                                Options = FileOptions.Asynchronous | FileOptions.SequentialScan,
-                                BufferSize = 256 * 1024
-                            }))
+                        if (looksHeadered && payloadLen > 0 && payloadLen <= InlineCdnDecodeMaxPayloadBytes && payloadStream != null)
                         {
-                            if (looksHeadered)
+                            payloadStream = new ProgressReadStream(payloadStream, read =>
                             {
-                                await CopyExactlyAsync(respStream, spoolOut, payloadLen, attemptToken).ConfigureAwait(false);
-                            }
-                            else
-                            {
-                                await respStream.CopyToAsync(spoolOut, 256 * 1024, attemptToken).ConfigureAwait(false);
-                            }
+                                AddGroupProgress(gameObjectHandler, groupKey, read, 0);
+                            });
+                            countedBytesLive = true;
 
-                            await spoolOut.FlushAsync(attemptToken).ConfigureAwait(false);
-                        }
+                            sw.Restart();
 
-                        sw.Stop();
-                        sw = Stopwatch.StartNew();
-
-                        if (looksHeadered)
-                        {
-                            (computed, bytesWritten) = await _cdnDecodeWorker.EnqueueAsync(
-                                spoolPath,
+                            (computed, bytesWritten) = await DecompressLz4ToFileAndHashAsync(
+                                payloadStream,
                                 tempPath,
                                 transfer.TotalRaw,
-                                expectedHashUpper: headerHash,
-                                xorMunged: munged,
                                 attemptToken).ConfigureAwait(false);
+
+                            sw.Stop();
                         }
                         else
                         {
-                            (computed, bytesWritten, usedHeaderlessXorCompat) =
-                                await DecodeHeaderlessSpoolWithCompatAsync(
+                            var spoolPath = tempPath + ".spool." + Guid.NewGuid().ToString("N");
+
+                            await using (var spoolOut = new FileStream(
+                                spoolPath,
+                                new FileStreamOptions
+                                {
+                                    Access = FileAccess.Write,
+                                    Mode = FileMode.Create,
+                                    Share = FileShare.None,
+                                    Options = FileOptions.Asynchronous | FileOptions.SequentialScan,
+                                    BufferSize = 256 * 1024
+                                }))
+                            {
+                                if (looksHeadered)
+                                {
+                                    await CopyExactlyWithProgressAsync(respStream, spoolOut, payloadLen, read =>
+                                    {
+                                        AddGroupProgress(gameObjectHandler, groupKey, read, 0);
+                                    }, attemptToken).ConfigureAwait(false);
+
+                                    countedBytesLive = true;
+                                }
+                                else
+                                {
+                                    await CopyToWithProgressAsync(respStream, spoolOut, read =>
+                                    {
+                                        AddGroupProgress(gameObjectHandler, groupKey, read, 0);
+                                    }, attemptToken).ConfigureAwait(false);
+
+                                    countedBytesLive = true;
+                                }
+
+                                await spoolOut.FlushAsync(attemptToken).ConfigureAwait(false);
+                            }
+
+                            sw = Stopwatch.StartNew();
+
+                            if (looksHeadered)
+                            {
+                                (computed, bytesWritten) = await _cdnDecodeWorker.EnqueueAsync(
                                     spoolPath,
                                     tempPath,
                                     transfer.TotalRaw,
-                                    transfer.Hash,
+                                    expectedHashUpper: headerHash,
+                                    xorMunged: munged,
                                     attemptToken).ConfigureAwait(false);
+                            }
+                            else
+                            {
+                                (computed, bytesWritten, usedHeaderlessXorCompat) =
+                                    await DecodeHeaderlessSpoolWithCompatAsync(
+                                        spoolPath,
+                                        tempPath,
+                                        transfer.TotalRaw,
+                                        transfer.Hash,
+                                        attemptToken).ConfigureAwait(false);
+                            }
+
+                            sw.Stop();
                         }
 
                         if (usedHeaderlessXorCompat)
@@ -1373,7 +1625,6 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
                             Logger.LogDebug("CDN fast-path: headerless XOR compat path used for {hash}", transfer.Hash);
                         }
 
-                        sw.Stop();
 
                         if (bytesWritten >= (2 * 1024 * 1024) && sw.Elapsed.TotalSeconds >= 1.0)
                         {
@@ -1464,7 +1715,7 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
                     if (cfg.DelayActivationEnabled && hard)
                     {
                         destPath = Path.Combine(_delayedActivator.QuarantineRoot, headerHash + Path.GetExtension(filePath));
-                        Directory.CreateDirectory(Path.GetDirectoryName(destPath)!);
+                        EnsureDirectoryForFile(destPath);
 
                         stagedHash = headerHash;
                         _fileDbManager.StageFile(headerHash, filePath);
@@ -1498,7 +1749,7 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
                         catch (Exception ex) when (hard && IsFileInUse(ex))
                         {
                             var quarantinePath = Path.Combine(_delayedActivator.QuarantineRoot, headerHash + Path.GetExtension(filePath));
-                            Directory.CreateDirectory(Path.GetDirectoryName(quarantinePath)!);
+                            EnsureDirectoryForFile(quarantinePath);
 
                             stagedHash = headerHash;
                             _fileDbManager.StageFile(headerHash, filePath);
@@ -1547,14 +1798,10 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
 
                     results.Add(new CdnDownloadedFile(headerHash, filePath, destPath, hard, soft));
 
-                    if (_downloadStatus.TryGetValue(groupKey, out var st))
-                    {
-                        lock (st)
-                        {
-                            st.TransferredFiles++;
-                            st.TransferredBytes += transfer.Total;
-                        }
-                    }
+                    if (!countedBytesLive && transfer.Total > 0)
+                        AddGroupProgress(gameObjectHandler, groupKey, transfer.Total, 0);
+
+                    AddGroupProgress(gameObjectHandler, groupKey, 0, 1);
 
                     return;
                 }
@@ -1595,15 +1842,7 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
                             PersistFileToStorageLowPri(transfer.Hash, finalPath2, ct);
 
                             _cdn404State.TryRemove(transfer.Hash, out _);
-
-                            if (_downloadStatus.TryGetValue(groupKey, out var st2))
-                            {
-                                lock (st2)
-                                {
-                                    st2.TransferredFiles++;
-                                    st2.TransferredBytes += transfer.Total;
-                                }
-                            }
+                            AddGroupProgress(gameObjectHandler, groupKey, transfer.Total, 1);
 
                             try
                             {
@@ -1660,8 +1899,29 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
         }
     }
 
+    public void NotifyActorRedrawn(nint actorAddress)
+    {
+        try
+        {
+            _delayedActivator.NotifyActorRedrawn(actorAddress);
+        }
+        catch
+        {
+            // best effort
+        }
+    }
 
-
+    public bool HasPendingDelayedForActor(nint actorAddress)
+    {
+        try
+        {
+            return _delayedActivator.HasPendingForActor(actorAddress);
+        }
+        catch
+        {
+            return false;
+        }
+    }
 
     private bool ExtraContentValidation(string filePath, string hash)
     {

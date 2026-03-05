@@ -187,9 +187,26 @@ public class IdDisplayHandler
             }
             else if (pair.LastAppliedApproximateVRAMBytes >= 0)
             {
+                static string NoDot00(string s)
+                {
+                    if (string.IsNullOrEmpty(s)) return s;
+
+                    var space = s.IndexOf(' ');
+                    if (space <= 0) return s;
+
+                    var num = s[..space];
+                    var unit = s[space..];
+
+                    if (num.EndsWith(".00", StringComparison.Ordinal))
+                        return num[..^3] + unit;
+
+                    return s;
+                }
+
                 ImGui.PushStyleColor(ImGuiCol.Text, ImGuiColors.DalamudGrey);
 
-                var vramText = UiSharedService.ByteToString(pair.LastAppliedApproximateVRAMBytes, addSuffix: true);
+                var roundedBytes = (long)(Math.Round(pair.LastAppliedApproximateVRAMBytes / 1048576d) * 1048576d);
+                var vramText = NoDot00(UiSharedService.ByteToString(roundedBytes, addSuffix: true));
                 var trisText = pair.LastAppliedDataTris > 0
                     ? pair.LastAppliedDataTris.ToString("N0")
                     : "—";

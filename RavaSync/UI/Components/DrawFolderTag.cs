@@ -32,6 +32,11 @@ public class DrawFolderTag : DrawFolderBase
         TagHandler.CustomVisibleTag => false,
         TagHandler.CustomAllTag => true,
         TagHandler.CustomOfflineSyncshellTag => false,
+
+        TagHandler.CustomOtherSyncTag => false,
+        TagHandler.CustomOtherSyncLightlessTag => false,
+        TagHandler.CustomOtherSyncSnowcloakTag => false,
+
         _ => true,
     };
 
@@ -43,6 +48,11 @@ public class DrawFolderTag : DrawFolderBase
         TagHandler.CustomVisibleTag => false,
         TagHandler.CustomAllTag => false,
         TagHandler.CustomOfflineSyncshellTag => false,
+
+        TagHandler.CustomOtherSyncTag => false,
+        TagHandler.CustomOtherSyncLightlessTag => false,
+        TagHandler.CustomOtherSyncSnowcloakTag => false,
+
         _ => true,
     };
 
@@ -54,6 +64,12 @@ public class DrawFolderTag : DrawFolderBase
         TagHandler.CustomVisibleTag => false,
         TagHandler.CustomAllTag => false,
         TagHandler.CustomOfflineSyncshellTag => false,
+
+        TagHandler.CustomOtherSyncRootTag => false,
+        TagHandler.CustomOtherSyncTag => false,
+        TagHandler.CustomOtherSyncLightlessTag => false,
+        TagHandler.CustomOtherSyncSnowcloakTag => false,
+
         _ => _allPairs.Count > 0,
     };
 
@@ -78,6 +94,11 @@ public class DrawFolderTag : DrawFolderBase
             TagHandler.CustomOfflineSyncshellTag => FontAwesomeIcon.Unlink,
             TagHandler.CustomVisibleTag => FontAwesomeIcon.Eye,
             TagHandler.CustomAllTag => FontAwesomeIcon.User,
+
+            TagHandler.CustomOtherSyncTag => FontAwesomeIcon.Sync,
+            TagHandler.CustomOtherSyncLightlessTag => FontAwesomeIcon.BoltLightning,
+            TagHandler.CustomOtherSyncSnowcloakTag => FontAwesomeIcon.Snowflake,
+
             _ => FontAwesomeIcon.Folder
         };
 
@@ -131,6 +152,12 @@ public class DrawFolderTag : DrawFolderBase
             TagHandler.CustomOfflineSyncshellTag => _uiSharedService.L("UI.DrawFolderTag.Name.OfflineSyncshellUsers", "Offline Syncshell Users"),
             TagHandler.CustomVisibleTag => _uiSharedService.L("UI.DrawFolderTag.Name.Visible", "Visible"),
             TagHandler.CustomAllTag => _uiSharedService.L("UI.DrawFolderTag.Name.Users", "Users"),
+
+            TagHandler.CustomOtherSyncRootTag => _uiSharedService.L("UI.DrawFolderTag.Name.OtherSync", "Handled by other sync"),
+            TagHandler.CustomOtherSyncTag => _uiSharedService.L("UI.DrawFolderTag.Name.OtherSync.Other", "Other"),
+            TagHandler.CustomOtherSyncLightlessTag => _uiSharedService.L("UI.DrawFolderTag.Name.OtherSync.Lightless", "Lightless"),
+            TagHandler.CustomOtherSyncSnowcloakTag => _uiSharedService.L("UI.DrawFolderTag.Name.OtherSync.Snowcloak", "Snowcloak"),
+
             _ => _id
         };
 

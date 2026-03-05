@@ -30,6 +30,8 @@ namespace RavaSync.WebAPI.Files
         private readonly List<PendingFile> _pendingBatch = new(MaxFilesPerFrame);
 
         private readonly ConcurrentDictionary<string, byte> _pendingHashes = new(StringComparer.OrdinalIgnoreCase);
+        private readonly ConcurrentDictionary<nint, long> _lastExternalRedrawTick = new();
+        private const int ExternalRedrawSuppressMs = 1200;
 
         private sealed record ApplyResult(PendingFile File, ApplyOutcome Outcome, string? Error = null);
 
@@ -53,10 +55,11 @@ namespace RavaSync.WebAPI.Files
             public DateTime LastTouchUtc;
             public DateTime DueUtc;
             public DateTime LastRedrawUtc;
+            public bool Dirty;
         }
 
         private readonly ConcurrentDictionary<nint, ActorRedrawState> _actorRedrawStates = new();
-
+        private readonly ConcurrentDictionary<nint, int> _pendingByActor = new();
 
         private readonly Random _rng = new();
 
@@ -108,7 +111,14 @@ namespace RavaSync.WebAPI.Files
             if (string.IsNullOrWhiteSpace(f.FileHash)) return;
 
             if (_pendingHashes.TryAdd(f.FileHash, 0))
+            {
+                if (f.ActorAddress is nint addr && addr != nint.Zero)
+                {
+                    _pendingByActor.AddOrUpdate(addr, 1, (_, cur) => cur + 1);
+                }
+
                 _pending.Enqueue(f);
+            }
         }
         private const int ActorCoalesceDelayMs = 150;
         private const int ActorMaxHoldMs = 1500;  
@@ -118,6 +128,13 @@ namespace RavaSync.WebAPI.Files
         {
             if (addr == nint.Zero) return;
 
+            var nowTick = Environment.TickCount64;
+            if (_lastExternalRedrawTick.TryGetValue(addr, out var last) &&
+                (nowTick - last) < ExternalRedrawSuppressMs)
+            {
+                return;
+            }
+
             var now = DateTime.UtcNow;
 
             _actorRedrawStates.AddOrUpdate(addr,
@@ -126,13 +143,15 @@ namespace RavaSync.WebAPI.Files
                     FirstTouchUtc = now,
                     LastTouchUtc = now,
                     DueUtc = now.AddMilliseconds(ActorCoalesceDelayMs),
-                    LastRedrawUtc = DateTime.MinValue
+                    LastRedrawUtc = DateTime.MinValue,
+                    Dirty = true
                 },
                 (_, state) =>
                 {
                     lock (state.Gate)
                     {
                         state.LastTouchUtc = now;
+                        state.Dirty = true;
 
                         // Push the due time out, but cap by max-hold so we still redraw even under constant churn.
                         var pushed = now.AddMilliseconds(ActorCoalesceDelayMs);
@@ -148,6 +167,8 @@ namespace RavaSync.WebAPI.Files
             if (actorAddress is nint addr && addr != nint.Zero)
                 TouchActor(addr);
         }
+
+
 
         private async Task ApplyWorkerLoop(CancellationToken ct)
         {
@@ -296,15 +317,30 @@ namespace RavaSync.WebAPI.Files
                     {
                         case ApplyOutcome.Success:
                             {
-                                // Worker already did unstage + cleanup; just clear tracking and schedule redraw if needed
                                 _pendingHashes.TryRemove(f.FileHash, out _);
+
+                                // Decrement pending count for the actor (if any)
+                                if (f.ActorAddress is nint addr && addr != nint.Zero)
+                                {
+                                    _pendingByActor.AddOrUpdate(addr, 0, (_, cur) => cur > 0 ? cur - 1 : 0);
+                                    if (_pendingByActor.TryGetValue(addr, out var left) && left <= 0)
+                                        _pendingByActor.TryRemove(addr, out _);
+                                }
 
                                 if (IsRedrawCriticalFinalPath(f.FinalPath))
                                 {
-                                    if (f.ActorAddress is nint addr && addr != nint.Zero)
-                                        TouchActor(addr);
+                                    if (!f.HardDelay)
+                                    {
+                                        if (f.ActorAddress is nint a2 && a2 != nint.Zero)
+                                            TouchActor(a2);
+                                        else
+                                            if (_logger.IsEnabled(LogLevel.Debug))
+                                            _logger.LogDebug("Redraw-critical finalize without actor address: {path} ({hash})", f.FinalPath, f.FileHash);
+                                    }
                                     else
-                                        _logger.LogDebug("Redraw-critical finalize without actor address: {path} ({hash})", f.FinalPath, f.FileHash);
+                                    {
+                                        _logger.LogTrace("Skipping redraw scheduling for hard-delayed finalize: {path} ({hash})", f.FinalPath, f.FileHash);
+                                    }
                                 }
 
                                 break;
@@ -322,6 +358,15 @@ namespace RavaSync.WebAPI.Files
                             {
                                 _logger.LogWarning("Failed to apply delayed file {path} ({hash}): {err}", f.FinalPath, f.FileHash, r.Error);
                                 _pendingHashes.TryRemove(f.FileHash, out _);
+
+                                // Decrement pending count for the actor (if any)
+                                if (f.ActorAddress is nint addr && addr != nint.Zero)
+                                {
+                                    _pendingByActor.AddOrUpdate(addr, 0, (_, cur) => cur > 0 ? cur - 1 : 0);
+                                    if (_pendingByActor.TryGetValue(addr, out var left) && left <= 0)
+                                        _pendingByActor.TryRemove(addr, out _);
+                                }
+
                                 break;
                             }
                     }
@@ -428,6 +473,14 @@ namespace RavaSync.WebAPI.Files
 
                 var now = DateTime.UtcNow;
 
+                var nowTick = Environment.TickCount64;
+
+                foreach (var kvp in _lastExternalRedrawTick)
+                {
+                    if ((nowTick - kvp.Value) > 60000) 
+                        _lastExternalRedrawTick.TryRemove(kvp.Key, out _);
+                }
+
                 foreach (var kvp in _actorRedrawStates)
                 {
                     var state = kvp.Value;
@@ -444,7 +497,8 @@ namespace RavaSync.WebAPI.Files
                 if (_actorRedrawStates.IsEmpty)
                     return;
 
-                var toRemove = new List<nint>();
+                // We remove states after a redraw so they can't re-trigger endlessly.
+                var toRemove = new List<nint>(32);
 
                 foreach (var obj in _objectTable)
                 {
@@ -458,25 +512,33 @@ namespace RavaSync.WebAPI.Files
 
                     lock (state.Gate)
                     {
-                        if (now >= state.DueUtc)
-                        {
-                            if (state.LastRedrawUtc == DateTime.MinValue ||
-                                (now - state.LastRedrawUtc) >= TimeSpan.FromMilliseconds(ActorMinRedrawIntervalMs))
-                            {
-                                doRedraw = true;
-                                state.LastRedrawUtc = now;
-                            }
+                        if (!state.Dirty)
+                            continue;
 
-                            toRemove.Add(pc.Address);
+                        if (now < state.DueUtc)
+                            continue;
+
+                        if (state.LastRedrawUtc != DateTime.MinValue &&
+                            (now - state.LastRedrawUtc) < TimeSpan.FromMilliseconds(ActorMinRedrawIntervalMs))
+                        {
+                            state.DueUtc = state.LastRedrawUtc.AddMilliseconds(ActorMinRedrawIntervalMs);
+                            continue;
                         }
+
+                        doRedraw = true;
+                        state.LastRedrawUtc = now;
+
+                        state.Dirty = false;
+
+                        toRemove.Add(pc.Address);
                     }
 
                     if (doRedraw)
                         _mareMediator.Publish(new PenumbraRedrawCharacterMessage(pc));
                 }
 
-                foreach (var addr in toRemove)
-                    _actorRedrawStates.TryRemove(addr, out _);
+                for (int i = 0; i < toRemove.Count; i++)
+                    _actorRedrawStates.TryRemove(toRemove[i], out _);
             }
             catch (Exception ex)
             {
@@ -684,6 +746,20 @@ namespace RavaSync.WebAPI.Files
                 || finalPath.EndsWith(".scd", StringComparison.OrdinalIgnoreCase)
                 || finalPath.EndsWith(".eid", StringComparison.OrdinalIgnoreCase)
                 || finalPath.EndsWith(".skp", StringComparison.OrdinalIgnoreCase);
+        }
+
+        public bool HasPendingForActor(nint actorAddress)
+        {
+            if (actorAddress == nint.Zero) return false;
+            return _pendingByActor.ContainsKey(actorAddress);
+        }
+
+        public void NotifyActorRedrawn(nint actorAddress)
+        {
+            if (actorAddress == nint.Zero) return;
+
+            _lastExternalRedrawTick[actorAddress] = Environment.TickCount64;
+            _actorRedrawStates.TryRemove(actorAddress, out _);
         }
 
         public void Dispose()

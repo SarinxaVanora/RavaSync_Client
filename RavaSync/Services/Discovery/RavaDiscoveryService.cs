@@ -17,8 +17,7 @@ using System.Threading.Tasks;
 
 namespace RavaSync.Services.Discovery;
 
-public sealed class RavaDiscoveryService
-    : DisposableMediatorSubscriberBase, IHostedService
+public sealed class RavaDiscoveryService : DisposableMediatorSubscriberBase, IHostedService
 {
     private readonly ILogger<RavaDiscoveryService> _logger;
     private readonly IObjectTable _objects;
@@ -50,31 +49,29 @@ public sealed class RavaDiscoveryService
     private int _roundRobinStartIndex = 0;
     private bool _isMeshListening = false;
 
-    private sealed record ObjectSessionCacheEntry(
-        string SessionId,
-        DateTime LastSeenUtc);
+    private bool _localYieldToOtherSync = false;
+    private string _localYieldOwner = string.Empty;
+    private readonly object _yieldBroadcastGate = new();
+    private bool? _lastYieldBroadcast;
+    private string _lastYieldBroadcastOwner = string.Empty;
+
+    private sealed record RemoteYieldCacheEntry(bool Yield, string Owner, DateTime LastSeenUtc);
+    private readonly ConcurrentDictionary<string, RemoteYieldCacheEntry> _lastRemoteYieldByUid = new(StringComparer.Ordinal);
+    private static readonly TimeSpan RemoteYieldDedupWindow = TimeSpan.FromSeconds(6);
+
+
+    private sealed record ObjectSessionCacheEntry(string SessionId,DateTime LastSeenUtc);
 
     private readonly ConcurrentDictionary<nint, ObjectSessionCacheEntry> _objectSessionCache = new();
     private static readonly TimeSpan ObjectSessionCacheTtl = TimeSpan.FromSeconds(10);
     private static readonly TimeSpan ObjectSessionCachePruneInterval = TimeSpan.FromSeconds(5);
     private DateTime _lastObjectSessionPruneUtc = DateTime.MinValue;
 
-    public sealed record RavaPeerInfo(
-        string SessionId,
-        byte[] PeerKey,
-        DateTime FirstSeenUtc,
-        DateTime LastSeenUtc
-    );
+    public sealed record RavaPeerInfo(string SessionId,byte[] PeerKey,DateTime FirstSeenUtc,DateTime LastSeenUtc);
+    public sealed record RavaYieldByIdentReceivedMessage(string FromIdent, bool YieldToOtherSync, string Owner, TimeSpan Ttl);
 
-    public RavaDiscoveryService(
-        ILogger<RavaDiscoveryService> logger,
-        IObjectTable objectTable,
-        IClientState clientState,
-        IRavaMesh mesh,
-        MareMediator mediator,
-        DalamudUtilService dalamudUtil,
-        ApiController api,
-        MareConfigService configService) : base(logger, mediator)
+    public RavaDiscoveryService(ILogger<RavaDiscoveryService> logger,IObjectTable objectTable,
+        IClientState clientState,IRavaMesh mesh,MareMediator mediator,DalamudUtilService dalamudUtil,ApiController api,MareConfigService configService) : base(logger, mediator)
     {
         _logger = logger;
         _objects = objectTable;
@@ -106,6 +103,21 @@ public sealed class RavaDiscoveryService
         {
             ResetMeshListener();
         });
+
+        _mediator.Subscribe<LocalOtherSyncYieldStateChangedMessage>(this, msg =>
+        {
+            var yield = msg.YieldToOtherSync;
+            var owner = msg.Owner ?? string.Empty;
+
+            if (!yield) owner = string.Empty;
+            if (_localYieldToOtherSync == yield && string.Equals(_localYieldOwner, owner, StringComparison.OrdinalIgnoreCase))
+                return;
+
+            _localYieldToOtherSync = yield;
+            _localYieldOwner = owner;
+
+            BroadcastLocalOtherSyncState(_localYieldToOtherSync, _localYieldOwner);
+        });
     }
 
     private void ResetMeshListener()
@@ -126,6 +138,13 @@ public sealed class RavaDiscoveryService
         _knownPeers.Clear();
         _lastHelloSentUtc.Clear();
         _objectSessionCache.Clear();
+
+        lock (_yieldBroadcastGate)
+        {
+            _lastYieldBroadcast = null;
+            _lastYieldBroadcastOwner = string.Empty;
+        }
+        _lastRemoteYieldByUid.Clear();
     }
 
     public Task StartAsync(CancellationToken cancellationToken)
@@ -144,9 +163,6 @@ public sealed class RavaDiscoveryService
         return Task.CompletedTask;
     }
 
-    /// <summary>
-    /// Public API: given an ident, do we know this ident belongs to a RavaSync user?
-    /// </summary>
     public bool IsIdentKnownAsRavaUser(string ident)
     {
         var sessionId = RavaSessionId.FromIdent(ident);
@@ -185,6 +201,9 @@ public sealed class RavaDiscoveryService
             {
                 _mesh.Listen(_mySessionId, OnMeshMessageAsync);
                 _isMeshListening = true;
+
+                // Re-broadcast current local yield state on mesh start (reconnect case)
+                BroadcastLocalOtherSyncState(_localYieldToOtherSync, _localYieldOwner);
             }
             catch (Exception ex)
             {
@@ -263,8 +282,62 @@ public sealed class RavaDiscoveryService
         {
             switch (message)
             {
+                case RavaHello h:
+                    TouchPeer(h.FromSessionId, h.FromPeerKey);
+                    break;
+                case RavaHelloAck a:
+                    TouchPeer(a.FromSessionId, a.FromPeerKey);
+                    break;
+                case RavaYield y:
+                    TouchPeer(y.FromSessionId, peerKey: null);
+                    break;
+                case RavaGame g:
+                    TouchPeer(g.FromSessionId, peerKey: null);
+                    break;
+                case RavaGoodbye b:
+                    TouchPeer(b.FromSessionId, peerKey: null);
+                    break;
+            }
+
+            switch (message)
+            {
+                case RavaYield y:
+                    {
+                        var now = DateTime.UtcNow;
+
+                        var uid = y.FromUid ?? string.Empty;
+                        if (string.IsNullOrWhiteSpace(uid))
+                            break;
+
+                        var owner = y.Owner ?? string.Empty;
+                        if (!y.YieldToOtherSync)
+                            owner = string.Empty;
+
+                        var incoming = new RemoteYieldCacheEntry(y.YieldToOtherSync, owner, now);
+
+                        if (_lastRemoteYieldByUid.TryGetValue(uid, out var last))
+                        {
+                            var same =
+                                last.Yield == incoming.Yield
+                                && string.Equals(last.Owner, incoming.Owner, StringComparison.OrdinalIgnoreCase);
+
+                            if (same && (now - last.LastSeenUtc) < RemoteYieldDedupWindow)
+                            {
+                                _lastRemoteYieldByUid[uid] = last with { LastSeenUtc = now };
+                                break;
+                            }
+                        }
+
+                        _lastRemoteYieldByUid[uid] = incoming;
+
+                        _mediator.Publish(new RemoteOtherSyncYieldMessage( AffectedUid: uid,YieldToOtherSync: incoming.Yield,Owner: incoming.Owner,Ttl: TimeSpan.FromSeconds(12)));
+
+                        break;
+                    }
+
                 case RavaGame game:
-                    _mediator.Publish(new SyncshellGameMeshMessage(sessionId, game.FromSessionId, game.Payload));
+                    _ = _dalamudUtil.RunOnFrameworkThread(() =>
+                        _mediator.Publish(new SyncshellGameMeshMessage(sessionId, game.FromSessionId, game.Payload)));
                     break;
 
                 case RavaHello hello:
@@ -294,6 +367,26 @@ public sealed class RavaDiscoveryService
         }
 
         return Task.CompletedTask;
+    }
+
+    private void TouchPeer(string sessionId, byte[]? peerKey)
+    {
+        if (string.IsNullOrWhiteSpace(sessionId))
+            return;
+
+        var now = DateTime.UtcNow;
+
+        _knownPeers.AddOrUpdate(sessionId,
+            _ => new RavaPeerInfo(
+                SessionId: sessionId,
+                PeerKey: peerKey ?? Array.Empty<byte>(),
+                FirstSeenUtc: now,
+                LastSeenUtc: now),
+            (_, existing) => existing with
+            {
+                LastSeenUtc = now,
+                PeerKey = (peerKey != null && peerKey.Length > 0) ? peerKey : existing.PeerKey
+            });
     }
 
     private void HandleHello(string transportSessionId, RavaHello hello)
@@ -372,6 +465,12 @@ public sealed class RavaDiscoveryService
 
         _mySessionId = null;
 
+        lock (_yieldBroadcastGate)
+        {
+            _lastYieldBroadcast = null;
+            _lastYieldBroadcastOwner = string.Empty;
+        }
+
         if (!string.IsNullOrEmpty(oldSession))
         {
             try
@@ -387,6 +486,7 @@ public sealed class RavaDiscoveryService
         }
 
         _lastTerritoryId = territory;
+
     }
 
     private void PruneObjectSessionCache(DateTime nowUtc)
@@ -415,7 +515,6 @@ public sealed class RavaDiscoveryService
         {
             if ((nowUtc - cached.LastSeenUtc) <= ObjectSessionCacheTtl)
             {
-                // refresh timestamp cheaply
                 _objectSessionCache[addr] = cached with { LastSeenUtc = nowUtc };
                 sessionId = cached.SessionId;
                 return !string.IsNullOrEmpty(sessionId);
@@ -458,6 +557,46 @@ public sealed class RavaDiscoveryService
                 _knownPeers.TryRemove(kvp.Key, out _);
                 _lastHelloSentUtc.TryRemove(kvp.Key, out _);
             }
+        }
+    }
+
+    public void BroadcastLocalOtherSyncState(bool yieldToOtherSync, string owner)
+    {
+        if (!_api.IsConnected) return;
+        if (!_isMeshListening) return;
+        if (_mySessionId == null) return;
+        if (_ownUser == null) return;
+
+        owner ??= string.Empty;
+
+        if (!yieldToOtherSync)
+            owner = string.Empty;
+
+        lock (_yieldBroadcastGate)
+        {
+            if (_lastYieldBroadcast.HasValue
+                && _lastYieldBroadcast.Value == yieldToOtherSync
+                && string.Equals(_lastYieldBroadcastOwner, owner, StringComparison.OrdinalIgnoreCase))
+            {
+                return;
+            }
+
+            _lastYieldBroadcast = yieldToOtherSync;
+            _lastYieldBroadcastOwner = owner;
+        }
+
+        var peers = _knownPeers.Keys.ToArray();
+        if (peers.Length == 0) return;
+
+        var msg = new RavaYield(
+            FromSessionId: _mySessionId,
+            FromUid: _ownUser.UID,
+            YieldToOtherSync: yieldToOtherSync,
+            Owner: owner);
+
+        for (int i = 0; i < peers.Length; i++)
+        {
+            _ = _mesh.SendAsync(peers[i], msg);
         }
     }
 

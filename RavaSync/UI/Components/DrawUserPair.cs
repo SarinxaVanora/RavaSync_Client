@@ -80,6 +80,42 @@ public class DrawUserPair
 
     private void DrawCommonClientMenu()
     {
+        if (_pair.AutoPausedByOtherSync || _pair.OverrideOtherSync)
+        {
+            var who = string.IsNullOrWhiteSpace(_pair.AutoPausedByOtherSyncName)
+                ? "another sync service"
+                : _pair.AutoPausedByOtherSyncName;
+
+            if (!_pair.OverrideOtherSync)
+            {
+                if (_uiSharedService.IconTextButton(FontAwesomeIcon.HandPaper, "Take over from " + who, _menuWidth, true))
+                {
+                    _pair.OverrideOtherSync = true;
+
+                    _pair.AutoPausedByOtherSync = false;
+                    _pair.AutoPausedByOtherSyncName = string.Empty;
+
+                    _pair.ReclaimFromOtherSync(requestApplyIfPossible: true);
+
+                    ImGui.CloseCurrentPopup();
+                }
+
+                UiSharedService.AttachToolTip("Force RavaSync to handle this user even if " + who + " is active.");
+                ImGui.Separator();
+            }
+            else
+            {
+                if (_uiSharedService.IconTextButton(FontAwesomeIcon.Undo, "Release override (yield to other sync)", _menuWidth, true))
+                {
+                    _pair.OverrideOtherSync = false;
+                    ImGui.CloseCurrentPopup();
+                }
+
+                UiSharedService.AttachToolTip("Return to normal behavior: RavaSync will yield again when another sync service owns this user.");
+                ImGui.Separator();
+            }
+        }
+
         if (!_pair.IsPaused)
         {
             if (_uiSharedService.IconTextButton(FontAwesomeIcon.User, _uiSharedService.L("UI.DrawUserPair.9fffd1be", "Open Profile"), _menuWidth, true))
@@ -246,9 +282,45 @@ public class DrawUserPair
 
         if (pair.IsPaused)
         {
+            // Pause reason indicators (distinct icon + text)
             using var _ = ImRaii.PushColor(ImGuiCol.Text, ImGuiColors.DalamudYellow);
-            _uiSharedService.IconText(FontAwesomeIcon.PauseCircle);
-            userPairText = aliasOrUid + " is paused";
+
+            if (pair.UserPair?.OwnPermissions.IsPaused() ?? false)
+            {
+                _uiSharedService.IconText(FontAwesomeIcon.PauseCircle);
+                userPairText = aliasOrUid + " is paused";
+            }
+            else if (pair.AutoPausedByCap)
+            {
+                _uiSharedService.IconText(FontAwesomeIcon.ExclamationTriangle);
+                userPairText = aliasOrUid + " is auto-paused (VRAM / triangle thresholds)";
+            }
+            else if (pair.AutoPausedByScope)
+            {
+                _uiSharedService.IconText(FontAwesomeIcon.UserCog);
+                userPairText = aliasOrUid + " is auto-paused (syncshell cap / scope)";
+            }
+            else if (pair.AutoPausedByOtherSync && !pair.OverrideOtherSync)
+            {
+                var who = string.IsNullOrWhiteSpace(pair.AutoPausedByOtherSyncName)
+                    ? "another sync service"
+                    : pair.AutoPausedByOtherSyncName;
+
+                var icon = FontAwesomeIcon.Sync;
+                if (string.Equals(who, "Lightless", StringComparison.OrdinalIgnoreCase))
+                    icon = FontAwesomeIcon.BoltLightning;
+                else if (string.Equals(who, "Snowcloak", StringComparison.OrdinalIgnoreCase))
+                    icon = FontAwesomeIcon.Snowflake;
+
+                _uiSharedService.IconText(icon);
+                userPairText = aliasOrUid + " is handled by " + who;
+            }
+            else
+            {
+                // Fallback 
+                _uiSharedService.IconText(FontAwesomeIcon.PauseCircle);
+                userPairText = aliasOrUid + " is paused";
+            }
         }
         else if (!pair.IsOnline)
         {
@@ -481,23 +553,52 @@ public class DrawUserPair
 
         currentRightSide -= (pauseButtonSize.X + spacingX);
         ImGui.SameLine(currentRightSide);
+
         if (_uiSharedService.IconButton(pauseIcon))
         {
-            var perm = ownPerms;
-
-            if (UiSharedService.CtrlPressed() && !perm.IsPaused())
+            // When another sync service owns this user, reuse the pause button to manually reclaim.
+            if (_pair.AutoPausedByOtherSync && !_pair.OverrideOtherSync)
             {
-                perm.SetSticky(true);
+                _pair.OverrideOtherSync = true;
+                _pair.AutoPausedByOtherSync = false;
+                _pair.AutoPausedByOtherSyncName = string.Empty;
+
+                _pair.ReclaimFromOtherSync(requestApplyIfPossible: true);
             }
-            perm.SetPaused(!perm.IsPaused());
-            _ = _apiController.UserSetPairPermissions(new(_pair.UserData, perm));
+            else
+            {
+                var perm = ownPerms;
+
+                if (UiSharedService.CtrlPressed() && !perm.IsPaused())
+                {
+                    perm.SetSticky(true);
+                }
+
+                perm.SetPaused(!perm.IsPaused());
+                _ = _apiController.UserSetPairPermissions(new(_pair.UserData, perm));
+            }
         }
-        UiSharedService.AttachToolTip(!ownPerms.IsPaused()
-            ? ("Pause pairing with " + _pair.UserData.AliasOrUID
-                + (ownPerms.IsSticky()
-                    ? string.Empty
-                    : UiSharedService.TooltipSeparator + _uiSharedService.L("UI.DrawUserPair.9c09dbc9", "Hold CTRL to enable preferred permissions while pausing.") + Environment.NewLine + _uiSharedService.L("UI.DrawUserPair.0967fa69", "This will leave this pair paused even if unpausing syncshells including this pair.")))
-            : "Resume pairing with " + _pair.UserData.AliasOrUID);
+
+        if (_pair.AutoPausedByOtherSync && !_pair.OverrideOtherSync)
+        {
+            var who = string.IsNullOrWhiteSpace(_pair.AutoPausedByOtherSyncName)
+                ? "another sync service"
+                : _pair.AutoPausedByOtherSyncName;
+
+            UiSharedService.AttachToolTip("Take over from " + who + " (manual reclaim)");
+        }
+        else
+        {
+            UiSharedService.AttachToolTip(!ownPerms.IsPaused()
+                ? ("Pause pairing with " + _pair.UserData.AliasOrUID
+                    + (ownPerms.IsSticky()
+                        ? string.Empty
+                        : UiSharedService.TooltipSeparator
+                            + _uiSharedService.L("UI.DrawUserPair.9c09dbc9", "Hold CTRL to enable preferred permissions while pausing.")
+                            + Environment.NewLine
+                            + _uiSharedService.L("UI.DrawUserPair.0967fa69", "This will leave this pair paused even if unpausing syncshells including this pair.")))
+                : "Resume pairing with " + _pair.UserData.AliasOrUID);
+        }
 
         if (_pair.IsPaired)
         {

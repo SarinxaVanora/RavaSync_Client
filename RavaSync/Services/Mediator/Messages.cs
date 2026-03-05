@@ -1,6 +1,7 @@
 ﻿using Dalamud.Game.ClientState.Objects.SubKinds;
 using Dalamud.Game.ClientState.Objects.Types;
 using RavaSync.API.Data;
+using RavaSync.API.Data.Enum;
 using RavaSync.API.Dto;
 using RavaSync.API.Dto.CharaData;
 using RavaSync.API.Dto.Group;
@@ -117,7 +118,16 @@ public record ContextMenuPairRequestMessage(string TargetIdent, string charName)
 public record DirectPairRequestMessage(string TargetIdent, string TargetName) : MessageBase;
 public record SyncshellGameMeshMessage(string LocalSessionId, string FromSessionId, byte[] Payload) : MessageBase;
 
+public record RemoteOtherSyncYieldMessage(string AffectedUid, bool YieldToOtherSync, string Owner, TimeSpan Ttl) : MessageBase;
+public record LocalOtherSyncYieldStateChangedMessage(bool YieldToOtherSync, string Owner) : MessageBase;
+
+public record PrimeTransientPathsMessage(IntPtr Address, ObjectKind Kind, IReadOnlyCollection<string> GamePaths) : SameThreadMessage;
+
+public record RemoteOtherSyncConnectedMessage(string? Owner) : MessageBase;
+public record RemoteOtherSyncDisconnectedMessage(string? Owner) : MessageBase;
+
 public record BlacklistUiMessage() : MessageBase;
+
 
 
 #pragma warning restore S2094

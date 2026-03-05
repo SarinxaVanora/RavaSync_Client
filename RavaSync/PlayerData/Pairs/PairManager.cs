@@ -1,5 +1,8 @@
-﻿using Dalamud.Game.Gui.ContextMenu;
+﻿using Dalamud.Game.ClientState.Objects.Enums;
+using Dalamud.Game.Gui.ContextMenu;
+using Dalamud.Game.Text.SeStringHandling;
 using Dalamud.Plugin.Services;
+using Microsoft.Extensions.Logging;
 using RavaSync.API.Data;
 using RavaSync.API.Data.Comparer;
 using RavaSync.API.Data.Extensions;
@@ -8,14 +11,12 @@ using RavaSync.API.Dto.User;
 using RavaSync.MareConfiguration;
 using RavaSync.MareConfiguration.Models;
 using RavaSync.PlayerData.Factories;
+using RavaSync.Services;
+using RavaSync.Services.Discovery;
 using RavaSync.Services.Events;
 using RavaSync.Services.Mediator;
-using Microsoft.Extensions.Logging;
-using System.Collections.Concurrent;
-using Dalamud.Game.Text.SeStringHandling;
-using RavaSync.Services;
-using Dalamud.Game.ClientState.Objects.Enums;
 using RavaSync.WebAPI;
+using System.Collections.Concurrent;
 
 
 
@@ -30,6 +31,8 @@ public sealed class PairManager : DisposableMediatorSubscriberBase
     private readonly PairFactory _pairFactory;
     private readonly MareMediator _mediator;
     private readonly DalamudUtilService _dalamudUtil;
+    private sealed record PendingOtherSyncLatch(bool YieldToOtherSync, string Owner);
+    private readonly ConcurrentDictionary<string, PendingOtherSyncLatch> _pendingOtherSyncLatchByUid = new(StringComparer.Ordinal);
     private Lazy<List<Pair>> _directPairsInternal;
     private Lazy<Dictionary<GroupFullInfoDto, List<Pair>>> _groupPairsInternal;
     private Lazy<Dictionary<Pair, List<GroupFullInfoDto>>> _pairsWithGroupsInternal;
@@ -51,6 +54,35 @@ public sealed class PairManager : DisposableMediatorSubscriberBase
         
         Mediator.Subscribe<DisconnectedMessage>(this, (_) => ClearPairs());
         Mediator.Subscribe<CutsceneEndMessage>(this, (_) => ReapplyPairData());
+        Mediator.Subscribe<RemoteOtherSyncConnectedMessage>(this, msg =>
+        {
+            HandleRemoteOtherSyncConnected(msg.Owner ?? "OtherSync");
+        });
+
+        Mediator.Subscribe<RemoteOtherSyncDisconnectedMessage>(this, msg =>
+        {
+            HandleRemoteOtherSyncDisconnected(msg.Owner ?? "OtherSync");
+        });
+        Mediator.Subscribe<RemoteOtherSyncYieldMessage>(this, msg =>
+        {
+            var uid = msg.AffectedUid;
+            var owner = msg.Owner ?? string.Empty;
+
+            if (_pendingOtherSyncLatchByUid.TryGetValue(uid, out var existing)
+                && existing.YieldToOtherSync == msg.YieldToOtherSync
+                && string.Equals(existing.Owner, owner, StringComparison.OrdinalIgnoreCase))
+            {
+                return;
+            }
+
+            _pendingOtherSyncLatchByUid[uid] = new PendingOtherSyncLatch(msg.YieldToOtherSync, owner);
+
+            var pair = GetPairByUID(uid);
+            if (pair == null) return;
+
+            ApplyPendingOtherSyncLatchIfAny(pair);
+            Mediator.Publish(new RefreshUiMessage());
+        });
         _directPairsInternal = DirectPairsLazy();
         _groupPairsInternal = GroupPairsLazy();
         _pairsWithGroupsInternal = PairsWithGroupsLazy();
@@ -73,9 +105,18 @@ public sealed class PairManager : DisposableMediatorSubscriberBase
     public void AddGroupPair(GroupPairFullInfoDto dto)
     {
         if (!_allClientPairs.ContainsKey(dto.User))
-            _allClientPairs[dto.User] = _pairFactory.Create(new UserFullPairDto(dto.User, API.Data.Enum.IndividualPairStatus.None,
+        {
+            var created = _pairFactory.Create(new UserFullPairDto(dto.User, API.Data.Enum.IndividualPairStatus.None,
                 [dto.Group.GID], dto.SelfToOtherPermissions, dto.OtherToSelfPermissions));
-        else _allClientPairs[dto.User].UserPair.Groups.Add(dto.GID);
+
+            _allClientPairs[dto.User] = created;
+            ApplyPendingOtherSyncLatchIfAny(created);
+        }
+        else
+        {
+            _allClientPairs[dto.User].UserPair.Groups.Add(dto.GID);
+        }
+
         RecreateLazy();
     }
 
@@ -90,11 +131,22 @@ public sealed class PairManager : DisposableMediatorSubscriberBase
         return null;
     }
 
+    private void ApplyPendingOtherSyncLatchIfAny(Pair pair)
+    {
+        var uid = pair.UserData.UID;
+        if (!_pendingOtherSyncLatchByUid.TryGetValue(uid, out var pending))
+            return;
+        pair.ApplyRemoteOtherSyncOverride(pending.YieldToOtherSync, pending.Owner);
+    }
+
     public void AddUserPair(UserFullPairDto dto)
     {
         if (!_allClientPairs.ContainsKey(dto.User))
         {
-            _allClientPairs[dto.User] = _pairFactory.Create(dto);
+            var created = _pairFactory.Create(dto);
+            _allClientPairs[dto.User] = created;
+
+            ApplyPendingOtherSyncLatchIfAny(created);
         }
         else
         {
@@ -109,7 +161,10 @@ public sealed class PairManager : DisposableMediatorSubscriberBase
     {
         if (!_allClientPairs.ContainsKey(dto.User))
         {
-            _allClientPairs[dto.User] = _pairFactory.Create(dto);
+            var created = _pairFactory.Create(dto);
+            _allClientPairs[dto.User] = created;
+
+            ApplyPendingOtherSyncLatchIfAny(created);
         }
         else
         {
@@ -131,6 +186,7 @@ public sealed class PairManager : DisposableMediatorSubscriberBase
         DisposePairs();
         _allClientPairs.Clear();
         _allGroups.Clear();
+        _pendingOtherSyncLatchByUid.Clear();
         RecreateLazy();
     }
 
@@ -508,6 +564,34 @@ public sealed class PairManager : DisposableMediatorSubscriberBase
         }
 
         return false;
+    }
+
+    private void HandleRemoteOtherSyncDisconnected(string owner)
+    {
+        foreach (var pair in _allClientPairs.Values)
+        {
+            pair.ApplyRemoteOtherSyncOverride(yieldToOtherSync: false, owner: owner);
+            pair.ClearRemoteOtherSyncOverride();
+        }
+
+        Mediator.Publish(new RefreshUiMessage());
+    }
+
+    private void HandleRemoteOtherSyncConnected(string owner)
+    {
+        foreach (var pair in _allClientPairs.Values)
+        {
+            if (pair.OverrideOtherSync)
+            {
+                pair.ApplyRemoteOtherSyncOverride(yieldToOtherSync: false, owner: owner);
+                pair.ClearRemoteOtherSyncOverride();
+                continue;
+            }
+
+            pair.ApplyRemoteOtherSyncOverride(yieldToOtherSync: true, owner: owner);
+        }
+
+        Mediator.Publish(new RefreshUiMessage());
     }
 
     private void RecreateLazy()

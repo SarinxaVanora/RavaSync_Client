@@ -58,6 +58,7 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
     private int _manualRepairRunning = 0;
     private int? _lastAssignedObjectIndex = null;
     private DateTime _lastAssignedCollectionAssignUtc = DateTime.MinValue;
+    private long _lastApplyCompletedTick;
     private static int ComputeNormalApplyConcurrency()
     {
         var logical = Environment.ProcessorCount;
@@ -151,6 +152,9 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
             _lastAppliedTempModsFingerprint = null;
 
             IsVisible = false;
+
+            _lastBroadcastYield = null;
+            _lastBroadcastOwner = string.Empty;
         });
 
         Mediator.Subscribe<PenumbraInitializedMessage>(this, (_) =>
@@ -184,7 +188,7 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
             if (_charaHandler == null) return;
             if (msg.DownloadId != _charaHandler) return;
 
-            Pair.SetCurrentDownloadStatus(msg.DownloadStatus);
+            Pair.SetCurrentDownloadStatus(SnapshotStatus(msg.DownloadStatus));
         });
 
         Mediator.Subscribe<DownloadFinishedMessage>(this, (msg) =>
@@ -249,6 +253,8 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
 
     private void EnqueueApply(Guid applicationBase, CharacterData characterData, bool forceApplyCustomization)
     {
+        if (Pair.AutoPausedByOtherSync && !Pair.EffectiveOverrideOtherSync) return;
+
         lock (_applyCoalesceGate)
         {
             _applyQueuedBase = applicationBase;
@@ -264,7 +270,6 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
             {
                 try
                 {
-                    // Short debounce window: collapses rapid apply bursts into one
                     var delayMs = SyncStorm.IsActive ? 90 : 40;
                     await Task.Delay(delayMs, token).ConfigureAwait(false);
 
@@ -563,11 +568,15 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
                         break;
 
                     case PlayerChanges.Glamourer:
+                        //if (allowPlayerRedraw)
+                        //{
+                        //    var extra = SyncStorm.IsActive ? ((PlayerNameHash?.GetHashCode(StringComparison.Ordinal) ?? 0) & 0x3F) : 0;
+                        //    var delayMs = SyncStorm.IsActive ? (80 + extra) : 50; // storm: 80–143ms, normal: 50ms
+                        //    await Task.Delay(delayMs, token).ConfigureAwait(false);
+                        //}
                         if (allowPlayerRedraw)
                         {
-                            var extra = SyncStorm.IsActive ? ((PlayerNameHash?.GetHashCode(StringComparison.Ordinal) ?? 0) & 0x3F) : 0;
-                            var delayMs = SyncStorm.IsActive ? (80 + extra) : 50; // storm: 80–143ms, normal: 50ms
-                            await Task.Delay(delayMs, token).ConfigureAwait(false);
+                            await Task.Delay(50, token).ConfigureAwait(false);
                         }
 
                         if (charaData.GlamourerData.TryGetValue(changes.Key, out var glamourerData))
@@ -654,6 +663,14 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
                 return;
 
             await _ipcManager.Penumbra.RedrawAsync(Logger, _charaHandler, applicationId, token).ConfigureAwait(false);
+            try
+            {
+                _downloadManager.NotifyActorRedrawn(_charaHandler.Address);
+            }
+            catch
+            {
+                // best effort
+            }
         }
         finally
         {
@@ -677,7 +694,13 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
                 if (_applicationId != applicationId)
                     return;
 
-                var sem = SyncStorm.IsActive ? StormApplySemaphore : NormalApplySemaphore;
+                //var sem = SyncStorm.IsActive ? StormApplySemaphore : NormalApplySemaphore;
+                //if (sem.CurrentCount == 0)
+                //{
+                //    await Task.Delay(200, token).ConfigureAwait(false);
+                //    continue;
+                //}
+                var sem = NormalApplySemaphore;
                 if (sem.CurrentCount == 0)
                 {
                     await Task.Delay(200, token).ConfigureAwait(false);
@@ -847,13 +870,13 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
         bool downloadedAny = false;
 
         // Smooth room-entry storms: add a tiny jitter so every pair doesn't spike on the same frame
-        if (SyncStorm.IsActive)
-        {
-            var seed = (PlayerNameHash?.GetHashCode(StringComparison.Ordinal) ?? 0) ^ Environment.TickCount;
-            var rnd = new Random(seed);
-            var delay = rnd.Next(20, 90);
-            await Task.Delay(delay, downloadToken).ConfigureAwait(false);
-        }
+        //if (SyncStorm.IsActive)
+        //{
+        //    var seed = (PlayerNameHash?.GetHashCode(StringComparison.Ordinal) ?? 0) ^ Environment.TickCount;
+        //    var rnd = new Random(seed);
+        //    var delay = rnd.Next(20, 90);
+        //    await Task.Delay(delay, downloadToken).ConfigureAwait(false);
+        //}
 
         if (updateModdedPaths)
         {
@@ -1101,7 +1124,8 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
 
         try
         {
-            applySemaphore = SyncStorm.IsActive ? StormApplySemaphore : NormalApplySemaphore;
+            //applySemaphore = SyncStorm.IsActive ? StormApplySemaphore : NormalApplySemaphore;
+            applySemaphore = NormalApplySemaphore;
 
             await applySemaphore.WaitAsync(token).ConfigureAwait(false);
             acquired = true;
@@ -1129,6 +1153,7 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
                 var penumbraStateChanged = false;
                 bool needsRedraw = false;
                 bool collectionReassignedThisRun = false;
+                bool deferRedrawToDeferredHardApply = false;
 
                 bool hasHardRedrawCriticalPenumbraChange = false;
 
@@ -1208,6 +1233,24 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
                         resolvedModdedPaths[kvp.Key] = finalCachePath;
 
                         if (string.IsNullOrEmpty(hash) || string.IsNullOrEmpty(finalCachePath))
+                            continue;
+
+                        static bool NeverDelayGamePath(string gamePath)
+                        {
+                            if (string.IsNullOrWhiteSpace(gamePath)) return false;
+
+                            var ext = Path.GetExtension(gamePath).TrimStart('.');
+                            return ext.Equals("mdl", StringComparison.OrdinalIgnoreCase)
+                                || ext.Equals("tex", StringComparison.OrdinalIgnoreCase)
+                                || ext.Equals("mtrl", StringComparison.OrdinalIgnoreCase)
+                                || ext.Equals("imc", StringComparison.OrdinalIgnoreCase)
+                                || ext.Equals("eqp", StringComparison.OrdinalIgnoreCase)
+                                || ext.Equals("eqdp", StringComparison.OrdinalIgnoreCase)
+                                || ext.Equals("est", StringComparison.OrdinalIgnoreCase)
+                                || ext.Equals("gmp", StringComparison.OrdinalIgnoreCase);
+                        }
+
+                        if (NeverDelayGamePath(kvp.Key.GamePath))
                             continue;
 
                         if (!ActivationPolicy.IsHardDelayed(finalCachePath))
@@ -1323,6 +1366,25 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
                         }
                     }
 
+                    if ((containsAnimationCriticalPath || containsVfxCriticalPath) && _charaHandler != null && _charaHandler.Address != nint.Zero)
+                    {
+                        var prime = new List<string>(64);
+
+                        foreach (var k in applyNowPaths.Keys)
+                        {
+                            var gp = k.GamePath;
+                            if (string.IsNullOrWhiteSpace(gp)) continue;
+
+                            if (IsAnimationCriticalGamePath(gp) || IsVfxCriticalGamePath(gp))
+                                prime.Add(gp);
+                        }
+
+                        if (prime.Count > 0)
+                        {
+                            Mediator.Publish(new PrimeTransientPathsMessage((IntPtr)_charaHandler.Address, ObjectKind.Player, prime));
+                        }
+                    }
+
                     var tempMods = BuildPenumbraTempMods(applyNowPaths);
                     var fingerprint = ComputeTempModsFingerprint(tempMods);
 
@@ -1383,8 +1445,14 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
 
                     if (deferredHardDelayed.Count > 0)
                     {
+                        deferRedrawToDeferredHardApply = true;
+
                         var capturedAppId = _applicationId;
-                        _deferredHardDelayedApplyTask = ApplyDeferredHardDelayedModsAsync(capturedAppId, resolvedModdedPaths, deferredHardDelayed, token);
+                        _deferredHardDelayedApplyTask = ApplyDeferredHardDelayedModsAsync(
+                            capturedAppId,
+                            resolvedModdedPaths,
+                            deferredHardDelayed,
+                            token);
                     }
                 }
 
@@ -1434,7 +1502,22 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
                     }
                     else
                     {
-                        await OnePassRedrawAsync(_applicationId, token).ConfigureAwait(false);
+                        if (deferRedrawToDeferredHardApply)
+                        {
+                            Logger.LogDebug("[{applicationId}] Skipping main redraw: deferred hard-delayed apply will finalize temp mods + redraw once", _applicationId);
+                        }
+                        else
+                        {
+                            var actorAddr = _charaHandler.Address;
+                            if (_downloadManager.HasPendingDelayedForActor(actorAddr))
+                            {
+                                Logger.LogDebug("[{applicationId}] Skipping PairHandler redraw: DelayedActivator pending for actor {addr}", _applicationId, actorAddr);
+                            }
+                            else
+                            {
+                                await OnePassRedrawAsync(_applicationId, token).ConfigureAwait(false);
+                            }
+                        }
                     }
                 }
 
@@ -1448,7 +1531,7 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
 
                 if (shouldPostRepair)
                     RequestPostApplyRepair(charaData);
-
+                _lastApplyCompletedTick = Environment.TickCount64;
                 Logger.LogDebug("[{applicationId}] Application finished", _applicationId);
             }
             catch (OperationCanceledException)
@@ -1611,13 +1694,210 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
 
     private long _addressZeroSinceTick = -1;
     private bool _initialApplyPending;
+    private long _otherSyncPollTick;
+    private nint _lastKnownOwnershipAddr = nint.Zero;
+
+    private bool? _lastBroadcastYield;
+    private string _lastBroadcastOwner = string.Empty;
+
+    private void BroadcastLocalOtherSyncYieldState(bool yieldToOtherSync, string owner)
+    {
+        owner ??= string.Empty;
+
+        if (_lastBroadcastYield.HasValue
+            && _lastBroadcastYield.Value == yieldToOtherSync
+            && string.Equals(_lastBroadcastOwner, owner, StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        _lastBroadcastYield = yieldToOtherSync;
+        _lastBroadcastOwner = owner;
+
+        Mediator.Publish(new LocalOtherSyncYieldStateChangedMessage(yieldToOtherSync, owner));
+    }
 
     private void FrameworkUpdate()
     {
+        var nowTick = Environment.TickCount64;
+
+        bool ShouldPollNow(int intervalMs)
+        {
+            if ((nowTick - _otherSyncPollTick) < intervalMs) return false;
+            _otherSyncPollTick = nowTick;
+            return true;
+        }
+
+        nint ResolveOwnershipAddress()
+        {
+            var a = _charaHandler?.Address ?? nint.Zero;
+            if (a != nint.Zero)
+            {
+                _lastKnownOwnershipAddr = a;
+                return a;
+            }
+
+            var pc = _dalamudUtil.FindPlayerByNameHash(Pair.Ident);
+            if (pc != default((string, nint)) && pc.Address != nint.Zero)
+            {
+                _lastKnownOwnershipAddr = pc.Address;
+                return pc.Address;
+            }
+
+            if (Pair.AutoPausedByOtherSync && _lastKnownOwnershipAddr != nint.Zero)
+                return _lastKnownOwnershipAddr;
+
+            return nint.Zero;
+        }
+
+        bool PollAndActOtherSync(string context, int pollIntervalMs)
+        {
+            if (Pair.RemoteOtherSyncOverrideActive)
+            {
+                var effectivePoll = Math.Min(pollIntervalMs, 250);
+                if (!ShouldPollNow(effectivePoll)) return true;
+
+                var remoteOwner = string.IsNullOrWhiteSpace(Pair.RemoteOtherSyncOwner) ? "OtherSync" : Pair.RemoteOtherSyncOwner;
+
+                if (Pair.RemoteOtherSyncYield)
+                {
+                    if (!Pair.AutoPausedByOtherSync || !string.Equals(Pair.AutoPausedByOtherSyncName, remoteOwner, StringComparison.OrdinalIgnoreCase))
+                    {
+                        Pair.AutoPausedByOtherSync = true;
+                        Pair.AutoPausedByOtherSyncName = remoteOwner;
+                        _downloadCancellationTokenSource = _downloadCancellationTokenSource?.CancelRecreate();
+                        _applicationCancellationTokenSource = _applicationCancellationTokenSource?.CancelRecreate();
+
+                        Pair.SetVisibleTransferStatus(Pair.VisibleTransferIndicator.None);
+                        Pair.SetCurrentDownloadStatus(null);
+
+                        _initialApplyPending = false;
+
+                        Mediator.Publish(new RefreshUiMessage());
+                    }
+
+                    if (_charaHandler != null)
+                    {
+                        PlayerName = string.Empty;
+                        _charaHandler.Dispose();
+                        _charaHandler = null;
+
+                        Interlocked.Exchange(ref _initializeStarted, 0);
+                        _initializeTask = null;
+                    }
+
+                    if (!IsVisible)
+                    {
+                        IsVisible = true;
+                        SyncStorm.RegisterVisibleNow();
+                    }
+
+                    return true; // remote authoritative
+                }
+                else
+                {
+
+                    if (Pair.AutoPausedByOtherSync)
+                    {
+                        Pair.AutoPausedByOtherSync = false;
+                        Pair.AutoPausedByOtherSyncName = string.Empty;
+
+                        BroadcastLocalOtherSyncYieldState(yieldToOtherSync: false, owner: string.Empty);
+
+                        // Reset + allow re-init like a fresh visible if needed.
+                        HandleOtherSyncReleased(requestApplyIfPossible: true);
+
+                        Mediator.Publish(new RefreshUiMessage());
+                    }
+
+                    return false;
+                }
+            }
+
+            if (Pair.EffectiveOverrideOtherSync)
+            {
+                if (Pair.AutoPausedByOtherSync)
+                {
+                    BroadcastLocalOtherSyncYieldState(yieldToOtherSync: false, owner: string.Empty);
+                    HandleOtherSyncReleased(requestApplyIfPossible: true);
+                    return true;
+                }
+
+                return false;
+            }
+
+            var latched = Pair.AutoPausedByOtherSync;
+
+            if (!ShouldPollNow(pollIntervalMs)) return false;
+
+            var addrToCheck = ResolveOwnershipAddress();
+            if (addrToCheck == nint.Zero) return false;
+            // Local IPC path
+            if (_ipcManager.OtherSync.TryGetOwningOtherSync(addrToCheck, out var owner))
+            {
+                if (!Pair.AutoPausedByOtherSync || !string.Equals(Pair.AutoPausedByOtherSyncName, owner, StringComparison.OrdinalIgnoreCase))
+                {
+                    Pair.AutoPausedByOtherSync = true;
+                    Pair.AutoPausedByOtherSyncName = owner;
+
+                    BroadcastLocalOtherSyncYieldState(yieldToOtherSync: true, owner: owner);
+
+                    _downloadCancellationTokenSource = _downloadCancellationTokenSource?.CancelRecreate();
+                    _applicationCancellationTokenSource = _applicationCancellationTokenSource?.CancelRecreate();
+
+                    Pair.SetVisibleTransferStatus(Pair.VisibleTransferIndicator.None);
+                    Pair.SetCurrentDownloadStatus(null);
+
+                    _initialApplyPending = false;
+
+                    Mediator.Publish(new RefreshUiMessage());
+                }
+
+                if (_charaHandler != null)
+                {
+                    PlayerName = string.Empty;
+                    _charaHandler.Dispose();
+                    _charaHandler = null;
+
+                    Interlocked.Exchange(ref _initializeStarted, 0);
+                    _initializeTask = null;
+                }
+
+                if (!IsVisible)
+                {
+                    IsVisible = true;
+                    SyncStorm.RegisterVisibleNow();
+                }
+
+                return true;
+            }
+
+            if (latched)
+            {
+                BroadcastLocalOtherSyncYieldState(yieldToOtherSync: false, owner: string.Empty);
+
+                HandleOtherSyncReleased(requestApplyIfPossible: true);
+                return true;
+            }
+
+            return false;
+        }
+
+        var pollMs = Pair.AutoPausedByOtherSync ? 250 : 1000;
+        if (PollAndActOtherSync("global", pollIntervalMs: pollMs))
+            return;
+
         if (string.IsNullOrEmpty(PlayerName))
         {
             var pc = _dalamudUtil.FindPlayerByNameHash(Pair.Ident);
             if (pc == default((string, nint))) return;
+
+            if (Pair.EffectiveOverrideOtherSync && Pair.AutoPausedByOtherSync)
+            {
+                Pair.AutoPausedByOtherSync = false;
+                Pair.AutoPausedByOtherSyncName = string.Empty;
+                Mediator.Publish(new RefreshUiMessage());
+            }
 
             if (Interlocked.CompareExchange(ref _initializeStarted, 1, 0) == 0)
             {
@@ -1645,13 +1925,19 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
             return;
         }
 
-
         var addr = _charaHandler?.Address ?? nint.Zero;
-        var nowTick = Environment.TickCount64;
 
         if (addr != nint.Zero)
         {
             _addressZeroSinceTick = -1;
+
+            if (Pair.EffectiveOverrideOtherSync && Pair.AutoPausedByOtherSync)
+            {
+                Pair.AutoPausedByOtherSync = false;
+                Pair.AutoPausedByOtherSyncName = string.Empty;
+                _initialApplyPending = true;
+                Mediator.Publish(new RefreshUiMessage());
+            }
 
             if (!IsVisible)
             {
@@ -1666,10 +1952,18 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
 
                 Logger.LogTrace("{this} visibility changed, now: {visi}", this, IsVisible);
             }
-
         }
         else if (IsVisible)
         {
+            if (Pair.AutoPausedByOtherSync)
+            {
+                Logger.LogWarning("[OtherSync] addr==0 while visible for {pair} but still latched to {owner}; polling via global checker",
+                    Pair.UserData.AliasOrUID,
+                    string.IsNullOrWhiteSpace(Pair.AutoPausedByOtherSyncName) ? "<unknown>" : Pair.AutoPausedByOtherSyncName);
+
+                _initialApplyPending = true;
+            }
+
             if (_addressZeroSinceTick < 0)
                 _addressZeroSinceTick = nowTick;
 
@@ -1681,6 +1975,7 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
                     var oldIdx = _lastAssignedObjectIndex;
 
                     IsVisible = false;
+                    _lastKnownOwnershipAddr = nint.Zero;
 
                     _lastAssignedObjectIndex = null;
                     _lastAssignedCollectionAssignUtc = DateTime.MinValue;
@@ -1692,8 +1987,7 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
                     _downloadCancellationTokenSource?.CancelDispose();
                     _downloadCancellationTokenSource = null;
 
-                    // If we previously owned an ObjectIndex, clear that slot so it can't leak onto a new actor.
-                    if (oldIdx.HasValue && oldIdx.Value >= 0)
+                    if (!Pair.AutoPausedByOtherSync && oldIdx.HasValue && oldIdx.Value >= 0)
                     {
                         var idxToClean = oldIdx.Value;
 
@@ -1713,23 +2007,35 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
                                 Logger.LogDebug(ex, "Cleanup-on-invisible failed for idx {idx}", idxToClean);
                             }
                         });
-
                     }
 
                     Logger.LogTrace("{this} visibility changed, now: {visi}", this, IsVisible);
                     return;
-
                 }
 
                 _addressZeroSinceTick = nowTick;
             }
         }
 
+        if (Pair.AutoPausedByOtherSync && !Pair.EffectiveOverrideOtherSync) return;
+
         if (!IsVisible || !_initialApplyPending) return;
         if (_charaHandler == null || _cachedData == null) return;
         if (_charaHandler.CurrentDrawCondition != GameObjectHandler.DrawCondition.None) return;
 
         _initialApplyPending = false;
+
+        var nowTick2 = Environment.TickCount64;
+
+        var cachedHash = _cachedData?.DataHash.Value;
+        if (!string.IsNullOrEmpty(cachedHash)
+            && string.Equals(cachedHash, _lastAttemptedDataHash, StringComparison.Ordinal)
+            && (nowTick2 - _lastApplyCompletedTick) < 2500)
+        {
+            Logger.LogTrace("[VIS] Skipping forced initial apply for {this}: same hash {hash} applied {ms}ms ago",
+                this, cachedHash, (nowTick2 - _lastApplyCompletedTick));
+            return;
+        }
 
         var appData = Guid.NewGuid();
         _redrawOnNextApplication = true;
@@ -1771,6 +2077,14 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
         });
 
 
+        if (Pair.LastReceivedCharacterData != null)
+        {
+            _cachedData = Pair.LastReceivedCharacterData.DeepClone();
+            _lastAttemptedDataHash = null;
+            _forceApplyMods = true;
+            _redrawOnNextApplication = true;
+            _initialApplyPending = true;
+        }
     }
 
 
@@ -2728,6 +3042,141 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
                 }
             }
         });
+    }
+    public void ReclaimFromOtherSync(bool requestApplyIfPossible, bool treatAsFirstVisible)
+    {
+        Pair.AutoPausedByOtherSync = false;
+        Pair.AutoPausedByOtherSyncName = string.Empty;
+
+        _downloadCancellationTokenSource = _downloadCancellationTokenSource?.CancelRecreate();
+        _applicationCancellationTokenSource = _applicationCancellationTokenSource?.CancelRecreate();
+
+        try { _downloadManager.ClearDownload(); } catch { /* best effort */ }
+        _pairDownloadTask = null;
+
+        Pair.SetVisibleTransferStatus(Pair.VisibleTransferIndicator.None);
+        Pair.SetCurrentDownloadStatus(null);
+
+        if (treatAsFirstVisible)
+        {
+            ResetToUninitializedState();
+            Mediator.Publish(new RefreshUiMessage());
+            return;
+        }
+
+        if (_charaHandler != null && _charaHandler.Address != nint.Zero && !string.IsNullOrEmpty(PlayerName))
+        {
+            if (Pair.LastReceivedCharacterData != null)
+                _cachedData = Pair.LastReceivedCharacterData.DeepClone();
+
+            _lastAttemptedDataHash = null;
+            _lastAppliedTempModsFingerprint = null;
+
+            _hasRetriedAfterMissingDownload = false;
+            _hasRetriedAfterMissingAtApply = false;
+
+            _forceApplyMods = true;
+            _redrawOnNextApplication = true;
+
+            _lastAssignedObjectIndex = null;
+            _lastAssignedCollectionAssignUtc = DateTime.MinValue;
+            _customizeIds.Clear();
+
+            _addressZeroSinceTick = -1;
+            _initialApplyPending = true;
+
+            if (requestApplyIfPossible)
+            {
+                if (!IsVisible)
+                {
+                    IsVisible = true;
+                    SyncStorm.RegisterVisibleNow();
+                }
+
+                _ = _dalamudUtil.RunOnFrameworkThread(() =>
+                {
+                    Pair.ApplyLastReceivedData(forced: true);
+                });
+            }
+
+            Mediator.Publish(new RefreshUiMessage());
+            return;
+        }
+
+        ResetToUninitializedState();
+        Mediator.Publish(new RefreshUiMessage());
+    }
+
+    private void HandleOtherSyncReleased(bool requestApplyIfPossible)
+        => ReclaimFromOtherSync(requestApplyIfPossible, treatAsFirstVisible: true);
+
+    private void ResetToUninitializedState()
+    {
+        _downloadCancellationTokenSource = _downloadCancellationTokenSource?.CancelRecreate();
+        _applicationCancellationTokenSource = _applicationCancellationTokenSource?.CancelRecreate();
+
+        try { _downloadManager.ClearDownload(); } catch { /* best effort */ }
+        _pairDownloadTask = null;
+
+        _cachedData ??= Pair.LastReceivedCharacterData?.DeepClone();
+        _dataReceivedInDowntime = null;
+
+        _lastAttemptedDataHash = null;
+        _lastAppliedTempModsFingerprint = null;
+
+        _hasRetriedAfterMissingDownload = false;
+        _hasRetriedAfterMissingAtApply = false;
+
+        _forceApplyMods = true;
+        _redrawOnNextApplication = true;
+
+        _lastAssignedObjectIndex = null;
+        _lastAssignedCollectionAssignUtc = DateTime.MinValue;
+        _customizeIds.Clear();
+
+        _addressZeroSinceTick = -1;
+        _initialApplyPending = true;
+
+        PlayerName = string.Empty;
+
+        _charaHandler?.Dispose();
+        _charaHandler = null;
+
+        Interlocked.Exchange(ref _initializeStarted, 0);
+        _initializeTask = null;
+
+        Pair.SetVisibleTransferStatus(Pair.VisibleTransferIndicator.None);
+        Pair.SetCurrentDownloadStatus(null);
+
+        IsVisible = false;
+
+        _lastBroadcastYield = null;
+        _lastBroadcastOwner = string.Empty;
+    }
+
+    private static Dictionary<string, FileDownloadStatus> SnapshotStatus(Dictionary<string, FileDownloadStatus>? src)
+    {
+        if (src == null || src.Count == 0)
+            return new Dictionary<string, FileDownloadStatus>(StringComparer.Ordinal);
+
+        var dst = new Dictionary<string, FileDownloadStatus>(src.Count, StringComparer.Ordinal);
+
+        foreach (var kv in src)
+        {
+            var s = kv.Value;
+            if (s == null) continue;
+
+            dst[kv.Key] = new FileDownloadStatus
+            {
+                DownloadStatus = s.DownloadStatus,
+                TotalBytes = s.TotalBytes,
+                TransferredBytes = s.TransferredBytes,
+                TotalFiles = s.TotalFiles,
+                TransferredFiles = s.TransferredFiles
+            };
+        }
+
+        return dst;
     }
 
 }

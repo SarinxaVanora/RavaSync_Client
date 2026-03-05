@@ -28,7 +28,8 @@ public class DownloadUi : WindowMediatorSubscriberBase
     private readonly DalamudUtilService _dalamudUtilService;
     private readonly FileUploadManager _fileTransferManager;
     private readonly UiSharedService _uiShared;
-    private readonly ConcurrentDictionary<GameObjectHandler, bool> _uploadingPlayers = new();
+    private readonly ConcurrentDictionary<GameObjectHandler, long> _uploadingPlayers = new();
+    private const long UploadingHoldMs = 20L * 20L * 1000L;
     private IDalamudTextureWrap? _aetherFrame;
     private IDalamudTextureWrap? _aetherFill;
     private IDalamudTextureWrap? _aetherFillBlue;
@@ -96,12 +97,14 @@ public class DownloadUi : WindowMediatorSubscriberBase
         {
             var now = DateTime.UtcNow;
 
+            var snap = SnapshotStatus(msg.DownloadStatus);
+
             _currentDownloads.AddOrUpdate(msg.DownloadId,
                 addValueFactory: _ =>
                 {
                     return new DownloadAggregate
                     {
-                        Status = msg.DownloadStatus,
+                        Status = snap,
                         LastUpdateUtc = now,
                         Finished = false
                     };
@@ -121,7 +124,7 @@ public class DownloadUi : WindowMediatorSubscriberBase
                         existing.AccTransferredFiles += prevTransferredFiles;
                     }
 
-                    existing.Status = msg.DownloadStatus;
+                    existing.Status = snap;
                     existing.LastUpdateUtc = now;
                     existing.Finished = false;
                     return existing;
@@ -142,13 +145,9 @@ public class DownloadUi : WindowMediatorSubscriberBase
         Mediator.Subscribe<PlayerUploadingMessage>(this, (msg) =>
         {
             if (msg.IsUploading)
-            {
-                _uploadingPlayers[msg.Handler] = true;
-            }
+                _uploadingPlayers[msg.Handler] = Environment.TickCount64;
             else
-            {
                 _uploadingPlayers.TryRemove(msg.Handler, out _);
-            }
         });
         EnsureAetherTextures();
     }
@@ -399,7 +398,16 @@ public class DownloadUi : WindowMediatorSubscriberBase
                         dlProgressPercent = totalBytes <= 0 ? 0.0 : transferredBytes / (double)totalBytes;
                         dlProgressPercent = Math.Clamp(dlProgressPercent, 0.0, 1.0);
 
-                        downloadText = $"{UiSharedService.ByteToString(transferredBytes, addSuffix: false)}/{UiSharedService.ByteToString(totalBytes)}";
+                        var atEnd = dlProgressPercent >= 0.9995;
+
+                        if (atEnd && !transfer.Value.Finished)
+                        {
+                            downloadText = $"Finalizing…  {UiSharedService.ByteToString(transferredBytes, addSuffix: false)}/{UiSharedService.ByteToString(totalBytes)}";
+                        }
+                        else
+                        {
+                            downloadText = $"{UiSharedService.ByteToString(transferredBytes, addSuffix: false)}/{UiSharedService.ByteToString(totalBytes)}";
+                        }
                     }
 
                     var dt = io.DeltaTime;
@@ -463,9 +471,39 @@ public class DownloadUi : WindowMediatorSubscriberBase
 
             if (_configService.Current.ShowUploading)
             {
-                foreach (var player in _uploadingPlayers.Select(p => p.Key).ToList())
+                var nowTick = Environment.TickCount64;
+
+                foreach (var kvp in _uploadingPlayers.ToList())
                 {
+                    var player = kvp.Key;
+                    var lastTick = kvp.Value;
+
+                    if (player.Address == IntPtr.Zero)
+                    {
+                        _uploadingPlayers.TryRemove(player, out _);
+                        continue;
+                    }
+
+                    if ((nowTick - lastTick) > UploadingHoldMs)
+                    {
+                        _uploadingPlayers.TryRemove(player, out _);
+                        continue;
+                    }
+
                     var go = player.GetGameObject();
+                    if (go == null)
+                    {
+                        _uploadingPlayers.TryRemove(player, out _);
+                        continue;
+                    }
+
+                    // Only ever draw on actual players
+                    if (go.ObjectKind != Dalamud.Game.ClientState.Objects.Enums.ObjectKind.Player)
+                    {
+                        _uploadingPlayers.TryRemove(player, out _);
+                        continue;
+                    }
+
                     var screenPos = _dalamudUtilService.WorldToScreen(go);
                     if (screenPos == Vector2.Zero) continue;
 
@@ -495,7 +533,7 @@ public class DownloadUi : WindowMediatorSubscriberBase
                     }
                     catch
                     {
-                        // ignore errors thrown on UI
+                        // ignore UI errors
                     }
                 }
             }
@@ -1348,6 +1386,31 @@ public class DownloadUi : WindowMediatorSubscriberBase
             if (!keep.Contains(k))
                 _smoothedScreens.Remove(k);
         }
+    }
+
+    private static Dictionary<string, FileDownloadStatus> SnapshotStatus(Dictionary<string, FileDownloadStatus>? src)
+    {
+        if (src == null || src.Count == 0)
+            return new Dictionary<string, FileDownloadStatus>(StringComparer.Ordinal);
+
+        var dst = new Dictionary<string, FileDownloadStatus>(src.Count, StringComparer.Ordinal);
+
+        foreach (var kv in src)
+        {
+            var s = kv.Value;
+            if (s == null) continue;
+
+            dst[kv.Key] = new FileDownloadStatus
+            {
+                DownloadStatus = s.DownloadStatus,
+                TotalBytes = s.TotalBytes,
+                TransferredBytes = s.TransferredBytes,
+                TotalFiles = s.TotalFiles,
+                TransferredFiles = s.TransferredFiles
+            };
+        }
+
+        return dst;
     }
 
     public override bool DrawConditions()

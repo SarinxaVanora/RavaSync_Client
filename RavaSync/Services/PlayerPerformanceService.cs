@@ -26,8 +26,11 @@ public class PlayerPerformanceService : MediatorSubscriberBase
     private readonly ILogger<PlayerPerformanceService> _logger;
     private readonly MareMediator _mediator;
     private readonly PlayerPerformanceConfigService _playerPerformanceConfigService;
+    private readonly TransientResourceManager _transientResourceManager;
     private readonly ConcurrentDictionary<string, bool> _warnedForPlayers = new(StringComparer.Ordinal);
-    private readonly ConcurrentDictionary<string, long> _textureSizeByHash = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, (long Bytes, long Stamp)> _textureVramByHash = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, (long Bytes, long Stamp)> _modelVramByHash = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, UserData> _autoThresholdPausedUsers = new(StringComparer.Ordinal);
 
     // pooled VRAM (bytes) per non-direct (Syncshell) UID
     private readonly ConcurrentDictionary<string, long> _syncshellVramByUid = new(StringComparer.Ordinal);
@@ -51,9 +54,6 @@ public class PlayerPerformanceService : MediatorSubscriberBase
     private int _stateSaveInFlight; // 0/1 via Interlocked
     private DateTime _nextStateSaveAttemptUtc = DateTime.MinValue;
 
-    private static readonly TimeSpan AutoPauseInterval = TimeSpan.FromMilliseconds(500);
-    private DateTime _nextAutoPauseUtc = DateTime.MinValue;
-
     private static readonly TimeSpan AutoCapCheckInterval = TimeSpan.FromMilliseconds(500);
     private DateTime _nextAutoCapCheckUtc = DateTime.MinValue;
 
@@ -67,7 +67,7 @@ public class PlayerPerformanceService : MediatorSubscriberBase
 
     public PlayerPerformanceService(ILogger<PlayerPerformanceService> logger, MareMediator mediator,
         PlayerPerformanceConfigService playerPerformanceConfigService, FileCacheManager fileCacheManager,
-        XivDataAnalyzer xivDataAnalyzer) : base(logger, mediator)
+        XivDataAnalyzer xivDataAnalyzer, TransientResourceManager transientResourceManager) : base(logger, mediator)
     {
 
         _logger = logger;
@@ -75,6 +75,7 @@ public class PlayerPerformanceService : MediatorSubscriberBase
         _playerPerformanceConfigService = playerPerformanceConfigService;
         _fileCacheManager = fileCacheManager;
         _xivDataAnalyzer = xivDataAnalyzer;
+        _transientResourceManager = transientResourceManager;
 
         _mediator.Subscribe<FrameworkUpdateMessage>(this, _ => AutoPauseHandler());
         _mediator.Subscribe<DelayedFrameworkUpdateMessage>(this, _ => AutoPauseHandler());
@@ -88,29 +89,70 @@ public class PlayerPerformanceService : MediatorSubscriberBase
     {
         var config = _playerPerformanceConfigService.Current;
 
-        HashSet<string>? moddedTextureHashes = null;
-        HashSet<string>? moddedModelHashes = null;
+        var moddedTextureHashes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var moddedModelHashes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-        if (charaData.FileReplacements.TryGetValue(API.Data.Enum.ObjectKind.Player, out List<FileReplacementData>? playerReplacements))
-        {
-            moddedTextureHashes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            moddedModelHashes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            CollectPlayerReplacementHashes(playerReplacements, moddedTextureHashes, moddedModelHashes);
-        }
+        CollectReplacementHashesAllKinds(charaData, moddedTextureHashes, moddedModelHashes);
 
-        bool notPausedAfterVram = ComputeAndAutoPauseOnVRAMUsageThresholds(pairHandler, charaData, [], moddedTextureHashes);
+        bool notPausedAfterVram = ComputeAndAutoPauseOnVRAMUsageThresholds(pairHandler, charaData, [], moddedTextureHashes, moddedModelHashes);
         if (!notPausedAfterVram) return false;
 
         bool notPausedAfterTris = await CheckTriangleUsageThresholds(pairHandler, charaData, moddedModelHashes).ConfigureAwait(false);
         if (!notPausedAfterTris) return false;
 
-        if (IsIgnored(config, pairHandler.Pair.UserData))
-            return true;
-
         var vramUsage = pairHandler.Pair.LastAppliedApproximateVRAMBytes;
         var triUsage = pairHandler.Pair.LastAppliedDataTris;
 
         bool isPrefPerm = pairHandler.Pair.UserPair.OwnPermissions.HasFlag(API.Data.Enum.UserPermissions.Sticky);
+        {
+            var uid = pairHandler.Pair.UserData.UID;
+
+            if (!pairHandler.Pair.UserPair.OwnPermissions.IsPaused())
+            {
+                _autoThresholdPausedUsers.TryRemove(uid, out _);
+            }
+            else
+            {
+                if (!_autoThresholdPausedUsers.IsEmpty
+                    && _autoThresholdPausedUsers.ContainsKey(uid)
+                    && !pairHandler.Pair.AutoPausedByCap)
+                {
+                    var cfg = _playerPerformanceConfigService.Current;
+
+                    bool exceedsVramAutoPause = CheckForThreshold(
+                        cfg.AutoPausePlayersExceedingThresholds,
+                        cfg.VRAMSizeAutoPauseThresholdMiB * 1024L * 1024L,
+                        vramUsage,
+                        cfg.AutoPausePlayersWithPreferredPermissionsExceedingThresholds,
+                        isPrefPerm);
+
+                    bool exceedsTrisAutoPause = CheckForThreshold(
+                        cfg.AutoPausePlayersExceedingThresholds,
+                        cfg.TrisAutoPauseThresholdThousands * 1000L,
+                        triUsage,
+                        cfg.AutoPausePlayersWithPreferredPermissionsExceedingThresholds,
+                        isPrefPerm);
+
+                    if (!exceedsVramAutoPause && !exceedsTrisAutoPause)
+                    {
+                        _autoThresholdPausedUsers.TryRemove(uid, out _);
+
+                        _mediator.Publish(new ResumeMessage(pairHandler.Pair.UserData));
+
+                        if (_logger.IsEnabled(LogLevel.Information))
+                        {
+                            _logger.LogInformation("Auto-unpaused {user} — now under thresholds (VRAM={vram}, Tris={tris})",
+                                pairHandler.Pair.UserData.AliasOrUID,
+                                UiSharedService.ByteToString(vramUsage, addSuffix: true),
+                                triUsage);
+                        }
+                    }
+                }
+            }
+        }
+
+        if (IsIgnored(config, pairHandler.Pair.UserData))
+            return true;
 
         bool exceedsTris = CheckForThreshold(config.WarnOnExceedingThresholds, config.TrisWarningThresholdThousands * 1000,
             triUsage, config.WarnOnPreferredPermissionsExceedingThresholds, isPrefPerm);
@@ -193,34 +235,12 @@ public class PlayerPerformanceService : MediatorSubscriberBase
 
         long triUsage = 0;
 
-        if (!charaData.FileReplacements.TryGetValue(API.Data.Enum.ObjectKind.Player, out List<FileReplacementData>? playerReplacements))
-        {
-            pair.LastAppliedDataTris = 0;
-            return true;
-        }
-
         var moddedModelHashes = precomputedModelHashes ?? new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         if (precomputedModelHashes == null)
         {
-            foreach (var replacement in playerReplacements)
-            {
-                if (!string.IsNullOrEmpty(replacement.FileSwapPath))
-                    continue;
-
-                bool hasModelPath = false;
-                foreach (var gamePath in replacement.GamePaths)
-                {
-                    if (gamePath.EndsWith("mdl", StringComparison.OrdinalIgnoreCase))
-                    {
-                        hasModelPath = true;
-                        break;
-                    }
-                }
-
-                if (hasModelPath)
-                    moddedModelHashes.Add(replacement.Hash);
-            }
+            var tmpTex = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            CollectReplacementHashesAllKinds(charaData, tmpTex, moddedModelHashes);
         }
 
         foreach (var hash in moddedModelHashes)
@@ -231,7 +251,7 @@ public class PlayerPerformanceService : MediatorSubscriberBase
         pair.LastAppliedDataTris = triUsage;
 
         if (_logger.IsEnabled(LogLevel.Debug))
-            _logger.LogDebug("Calculated VRAM usage for {p}", pairHandler);
+            _logger.LogDebug("Calculated triangle usage for {p}", pairHandler);
 
         // no warning of any kind on ignored pairs
         if (IsIgnored(config, pair.UserData))
@@ -252,6 +272,7 @@ public class PlayerPerformanceService : MediatorSubscriberBase
             _mediator.Publish(new EventMessage(new Event(pair.PlayerName, pair.UserData, nameof(PlayerPerformanceService), EventSeverity.Warning,
                 $"Exceeds triangle threshold: automatically paused ({triUsage}/{config.TrisAutoPauseThresholdThousands * 1000} triangles)")));
 
+            _autoThresholdPausedUsers[pair.UserData.UID] = pair.UserData;
             _mediator.Publish(new PauseMessage(pair.UserData));
 
             return false;
@@ -260,42 +281,12 @@ public class PlayerPerformanceService : MediatorSubscriberBase
         return true;
     }
 
-    public bool ComputeAndAutoPauseOnVRAMUsageThresholds(PairHandler pairHandler, CharacterData charaData, List<DownloadFileTransfer> toDownloadFiles, HashSet<string>? precomputedTextureHashes = null)
+    public bool ComputeAndAutoPauseOnVRAMUsageThresholds(PairHandler pairHandler, CharacterData charaData, List<DownloadFileTransfer> toDownloadFiles, HashSet<string>? precomputedTextureHashes = null, HashSet<string>? precomputedModelHashes = null)
     {
         var config = _playerPerformanceConfigService.Current;
         var pair = pairHandler.Pair;
 
         long vramUsage = 0;
-
-        if (!charaData.FileReplacements.TryGetValue(API.Data.Enum.ObjectKind.Player, out List<FileReplacementData>? playerReplacements))
-        {
-            pair.LastAppliedApproximateVRAMBytes = 0;
-            return true;
-        }
-
-        var moddedTextureHashes = precomputedTextureHashes ?? new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
-        if (precomputedTextureHashes == null)
-        {
-            foreach (var replacement in playerReplacements)
-            {
-                if (!string.IsNullOrEmpty(replacement.FileSwapPath))
-                    continue;
-
-                bool hasTexturePath = false;
-                foreach (var gamePath in replacement.GamePaths)
-                {
-                    if (gamePath.EndsWith(".tex", StringComparison.OrdinalIgnoreCase))
-                    {
-                        hasTexturePath = true;
-                        break;
-                    }
-                }
-
-                if (hasTexturePath)
-                    moddedTextureHashes.Add(replacement.Hash);
-            }
-        }
 
         Dictionary<string, long>? pendingDownloadSizes = null;
         if (toDownloadFiles != null && toDownloadFiles.Count > 0)
@@ -308,65 +299,68 @@ public class PlayerPerformanceService : MediatorSubscriberBase
             }
         }
 
-        foreach (var hash in moddedTextureHashes)
+        HashSet<string> hashes;
+        if (precomputedTextureHashes == null && precomputedModelHashes == null)
         {
-            long fileSize = 0;
+            hashes = CollectReplacementHashesUnique(charaData);
+        }
+        else
+        {
+            hashes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (precomputedTextureHashes != null) foreach (var h in precomputedTextureHashes) if (!string.IsNullOrWhiteSpace(h)) hashes.Add(h);
+            if (precomputedModelHashes != null) foreach (var h in precomputedModelHashes) if (!string.IsNullOrWhiteSpace(h)) hashes.Add(h);
+
+            if (hashes.Count == 0)
+                hashes = CollectReplacementHashesUnique(charaData);
+        }
+
+        foreach (var hash in hashes)
+        {
+            long bytes = 0;
 
             if (pendingDownloadSizes != null && pendingDownloadSizes.TryGetValue(hash, out var pendingSize))
             {
-                fileSize = pendingSize;
+                bytes = pendingSize;
+                vramUsage += Math.Max(0, bytes);
+                continue;
+            }
+
+            var fileEntry = _fileCacheManager.GetFileCacheByHash(hash);
+            if (fileEntry == null) continue;
+            if (!fileEntry.IsCacheEntry) continue;
+
+            var path = fileEntry.ResolvedFilepath;
+            if (string.IsNullOrWhiteSpace(path) || !File.Exists(path)) continue;
+
+            var ext = Path.GetExtension(path);
+
+            if (ext.Equals(".tex", StringComparison.OrdinalIgnoreCase))
+            {
+                if (!TryGetCachedTexVram(hash, path, out bytes))
+                    continue;
+            }
+            else if (ext.Equals(".mdl", StringComparison.OrdinalIgnoreCase))
+            {
+                if (!TryGetCachedMdlVram(hash, path, out bytes))
+                    continue;
             }
             else
             {
-                if (_textureSizeByHash.TryGetValue(hash, out var cachedSize))
-                {
-                    fileSize = cachedSize;
-                }
-                else
-                {
-                    var fileEntry = _fileCacheManager.GetFileCacheByHash(hash);
-                    if (fileEntry == null) continue;
-
-                    if (fileEntry.Size == null)
-                    {
-                        try
-                        {
-                            var fi = new FileInfo(fileEntry.ResolvedFilepath);
-                            fileEntry.Size = fi.Length;
-                            fileEntry.LastModifiedDateTicks = fi.LastWriteTimeUtc.Ticks.ToString(System.Globalization.CultureInfo.InvariantCulture);
-
-                            _fileCacheManager.UpdateHashedFile(fileEntry, computeProperties: false);
-                        }
-                        catch (IOException)
-                        {
-                            continue;
-                        }
-                        catch (UnauthorizedAccessException)
-                        {
-                            continue;
-                        }
-                    }
-
-                    fileSize = fileEntry.Size.Value;
-                    _textureSizeByHash.TryAdd(hash, fileSize);
-                }
-
+                continue;
             }
 
-            vramUsage += fileSize;
+            vramUsage += Math.Max(0, bytes);
         }
 
         pair.LastAppliedApproximateVRAMBytes = vramUsage;
 
         _logger.LogDebug("Calculated VRAM usage for {p}", pairHandler);
 
-        // no warning of any kind on ignored pairs
         if (IsIgnored(config, pair.UserData))
             return true;
 
         bool isPrefPerm = pair.UserPair.OwnPermissions.HasFlag(API.Data.Enum.UserPermissions.Sticky);
 
-        // now check auto pause
         if (CheckForThreshold(config.AutoPausePlayersExceedingThresholds, config.VRAMSizeAutoPauseThresholdMiB * 1024 * 1024,
             vramUsage, config.AutoPausePlayersWithPreferredPermissionsExceedingThresholds, isPrefPerm))
         {
@@ -376,6 +370,8 @@ public class PlayerPerformanceService : MediatorSubscriberBase
                 $" and has been automatically paused.",
                 MareConfiguration.Models.NotificationType.Warning));
 
+            _autoThresholdPausedUsers[pair.UserData.UID] = pair.UserData;
+
             _mediator.Publish(new PauseMessage(pair.UserData));
 
             _mediator.Publish(new EventMessage(new Event(pair.PlayerName, pair.UserData, nameof(PlayerPerformanceService), EventSeverity.Warning,
@@ -384,12 +380,6 @@ public class PlayerPerformanceService : MediatorSubscriberBase
             return false;
         }
 
-        // === Syncshell pooled VRAM cap enforcement (VISIBLE and UNPAUSED ONLY) ===
-
-        // a pair contributes to the pool ONLY when:
-        // - NOT a direct pair
-        // - is currently VISIBLE
-        // - NOT paused for any reason (manual or auto)
         if (pair.AutoPausedByCap && !pair.UserPair.OwnPermissions.IsPaused())
         {
             pair.AutoPausedByCap = false;
@@ -398,7 +388,6 @@ public class PlayerPerformanceService : MediatorSubscriberBase
         bool isEffectivelyPaused = pair.UserPair.OwnPermissions.IsPaused() || pair.AutoPausedByCap;
         bool contributesToPool = !pair.IsDirectlyPaired && pair.IsVisible && !isEffectivelyPaused;
 
-        // keep the pool in sync with visibility/pause state
         if (contributesToPool)
         {
             UpsertSyncshellVram(pair.UserData.UID, vramUsage);
@@ -409,14 +398,12 @@ public class PlayerPerformanceService : MediatorSubscriberBase
             RemoveSyncshellVram(pair.UserData.UID);
         }
 
-        // read cap (MiB ? bytes); 0 = disabled
         int capMiB = _playerPerformanceConfigService.Current.SyncshellVramCapMiB;
-        if (capMiB > 0) //&& !pair.IsDirectlyPaired)
+        if (capMiB > 0)
         {
             long capBytes = (long)capMiB * 1024L * 1024L;
             long totalBytes = GetTotalSyncshellVramBytes();
 
-            // only enforce against users that would otherwise contribute (visible & unpaused)
             if (!pair.IsDirectlyPaired && contributesToPool && totalBytes > capBytes)
             {
                 if (!pair.AutoPausedByCap)
@@ -435,8 +422,6 @@ public class PlayerPerformanceService : MediatorSubscriberBase
                 }
             }
         }
-        // === end pooled cap ===
-
 
         return true;
     }
@@ -554,40 +539,51 @@ public class PlayerPerformanceService : MediatorSubscriberBase
             MarkStateDirty();
         }
     }
-    private static void CollectPlayerReplacementHashes(List<FileReplacementData> playerReplacements,HashSet<string> moddedTextureHashes,HashSet<string> moddedModelHashes)
+    private static void CollectReplacementHashesAllKinds(CharacterData charaData,HashSet<string> moddedTextureHashes,HashSet<string> moddedModelHashes)
     {
-        foreach (var replacement in playerReplacements)
+        moddedTextureHashes.Clear();
+        moddedModelHashes.Clear();
+
+        foreach (var kv in charaData.FileReplacements)
         {
-            if (!string.IsNullOrEmpty(replacement.FileSwapPath))
-                continue;
+            var list = kv.Value;
+            if (list == null) continue;
 
-            bool hasTexturePath = false;
-            bool hasModelPath = false;
-
-            foreach (var gamePath in replacement.GamePaths)
+            foreach (var replacement in list)
             {
-                if (!hasTexturePath && gamePath.EndsWith(".tex", StringComparison.OrdinalIgnoreCase))
-                    hasTexturePath = true;
+                if (replacement == null) continue;
+                if (string.IsNullOrEmpty(replacement.Hash)) continue;
 
-                if (!hasModelPath && gamePath.EndsWith("mdl", StringComparison.OrdinalIgnoreCase))
-                    hasModelPath = true;
+                if (!string.IsNullOrEmpty(replacement.FileSwapPath))
+                    continue;
 
-                if (hasTexturePath && hasModelPath)
-                    break;
+                bool hasTex = false;
+                bool hasMdl = false;
+
+                if (replacement.GamePaths != null)
+                {
+                    foreach (var gamePath in replacement.GamePaths)
+                    {
+                        if (!hasTex && gamePath.EndsWith(".tex", StringComparison.OrdinalIgnoreCase))
+                            hasTex = true;
+
+                        if (!hasMdl && gamePath.EndsWith(".mdl", StringComparison.OrdinalIgnoreCase))
+                            hasMdl = true;
+
+                        if (hasTex && hasMdl)
+                            break;
+                    }
+                }
+
+                if (hasTex) moddedTextureHashes.Add(replacement.Hash);
+                if (hasMdl) moddedModelHashes.Add(replacement.Hash);
             }
-
-            if (hasTexturePath)
-                moddedTextureHashes.Add(replacement.Hash);
-
-            if (hasModelPath)
-                moddedModelHashes.Add(replacement.Hash);
         }
     }
     private void MarkAutoCapCandidatesDirty() => Interlocked.Exchange(ref _autoCapCandidatesDirty, 1);
     private static bool CheckForThreshold(bool thresholdEnabled, long threshold, long value, bool checkForPrefPerm, bool isPrefPerm) =>
         thresholdEnabled && threshold > 0 && threshold < value && ((checkForPrefPerm && isPrefPerm) || !isPrefPerm);
 
-    //small class to build schema for AutoCap system state persistence
     private sealed class AutoCapState
     {
         public int Version { get; set; } = 1;
@@ -704,6 +700,77 @@ public class PlayerPerformanceService : MediatorSubscriberBase
         }
     }
 
+    private static long GetStamp(string path)
+    {
+        var fi = new FileInfo(path);
+        unchecked
+        {
+            return (fi.LastWriteTimeUtc.Ticks << 1) ^ fi.Length;
+        }
+    }
+
+    private bool TryGetCachedTexVram(string hash, string path, out long bytes)
+    {
+        bytes = 0;
+        long stamp;
+        try { stamp = GetStamp(path); }
+        catch { return false; }
+
+        if (_textureVramByHash.TryGetValue(hash, out var cached) && cached.Stamp == stamp)
+        {
+            bytes = cached.Bytes;
+            return true;
+        }
+
+        if (!VramEstimator.TryEstimateTexVramBytes(path, out bytes))
+            return false;
+
+        _textureVramByHash[hash] = (bytes, stamp);
+        return true;
+    }
+    private bool TryGetCachedMdlVram(string hash, string path, out long bytes)
+    {
+        bytes = 0;
+        long stamp;
+        try { stamp = GetStamp(path); }
+        catch { return false; }
+
+        if (_modelVramByHash.TryGetValue(hash, out var cached) && cached.Stamp == stamp)
+        {
+            bytes = cached.Bytes;
+            return true;
+        }
+
+        if (!VramEstimator.TryEstimateMdlVramBytes(path, out bytes))
+            return false;
+
+        _modelVramByHash[hash] = (bytes, stamp);
+        return true;
+    }
+
+    private static HashSet<string> CollectReplacementHashesUnique(CharacterData charaData)
+    {
+        var hashes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var kv in charaData.FileReplacements)
+        {
+            var list = kv.Value;
+            if (list == null) continue;
+
+            foreach (var replacement in list)
+            {
+                if (replacement == null) continue;
+                if (string.IsNullOrEmpty(replacement.Hash)) continue;
+
+                if (!string.IsNullOrEmpty(replacement.FileSwapPath))
+                    continue;
+
+                hashes.Add(replacement.Hash);
+            }
+        }
+
+        return hashes;
+    }
 
     //Kaia, you fucking idiot. Why awas this making huge calls every tick? WHY. I fixed it, love, your own drunk ass.
     private void LoadAutoCapState()

@@ -8,6 +8,7 @@ using RavaSync.API.Dto.User;
 using RavaSync.PlayerData.Factories;
 using RavaSync.PlayerData.Handlers;
 using RavaSync.Services;
+using RavaSync.Services.Discovery;
 using RavaSync.Services.Mediator;
 using RavaSync.Services.ServerConfiguration;
 using RavaSync.Utils;
@@ -30,6 +31,7 @@ public class Pair
     private OnlineUserIdentDto? _onlineUserIdentDto = null;
     private long _lastUploadStatusTick = 0;
     private CancellationTokenSource? _pendingEmptyApplyCts;
+
 
     public static Func<string, bool>? IsBlacklistedCallback { get; set; }
 
@@ -54,6 +56,7 @@ public class Pair
     UserPair.OwnPermissions.IsPaused()
     || AutoPausedByCap
     || AutoPausedByScope
+    || ((AutoPausedByOtherSync || (RemoteOtherSyncOverrideActive && RemoteOtherSyncYield)) && !EffectiveOverrideOtherSync)
     || (IsBlacklistedCallback?.Invoke(UserData.UID) ?? false);
 
     public bool IsVisible => CachedPlayer?.IsVisible ?? false;
@@ -68,6 +71,13 @@ public class Pair
     public long LastAppliedApproximateVRAMBytes { get; set; } = -1;
     public bool AutoPausedByCap { get; set; } = false;
     public bool AutoPausedByScope { get; set; } = false;
+    public bool AutoPausedByOtherSync { get; set; } = false;
+    public string AutoPausedByOtherSyncName { get; set; } = string.Empty;
+    public bool OverrideOtherSync { get; set; } = false;
+    public bool RemoteOtherSyncOverrideActive { get; private set; } = false;
+    public bool EffectiveOverrideOtherSync => OverrideOtherSync || (RemoteOtherSyncOverrideActive && !RemoteOtherSyncYield);
+    public bool RemoteOtherSyncYield { get; private set; } = false;
+    public string RemoteOtherSyncOwner { get; private set; } = string.Empty;
     public string Ident => _onlineUserIdentDto?.Ident ?? string.Empty;
 
     public UserData UserData => UserPair.User;
@@ -216,10 +226,55 @@ public class Pair
 
     public void ApplyLastReceivedData(bool forced = false)
     {
+        if (AutoPausedByOtherSync && !EffectiveOverrideOtherSync) return;
         if (CachedPlayer == null) return;
         if (LastReceivedCharacterData == null) return;
 
         CachedPlayer.ApplyCharacterData(Guid.NewGuid(), RemoveNotSyncedFiles(LastReceivedCharacterData.DeepClone())!, forced);
+    }
+
+    public void ReclaimFromOtherSync(bool requestApplyIfPossible = true)
+    {
+        AutoPausedByOtherSync = false;
+        AutoPausedByOtherSyncName = string.Empty;
+
+        CachedPlayer?.ReclaimFromOtherSync(requestApplyIfPossible, treatAsFirstVisible: false);
+    }
+
+    public void ApplyRemoteOtherSyncOverride(bool yieldToOtherSync, string owner)
+    {
+        owner ??= string.Empty;
+
+        if (RemoteOtherSyncOverrideActive
+            && RemoteOtherSyncYield == yieldToOtherSync
+            && string.Equals(RemoteOtherSyncOwner ?? string.Empty, owner, StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        RemoteOtherSyncOverrideActive = true;
+        RemoteOtherSyncYield = yieldToOtherSync;
+        RemoteOtherSyncOwner = owner;
+
+        if (yieldToOtherSync)
+        {
+            AutoPausedByOtherSync = true;
+            AutoPausedByOtherSyncName = string.IsNullOrWhiteSpace(owner) ? "OtherSync" : owner;
+        }
+        else
+        {
+            AutoPausedByOtherSync = false;
+            AutoPausedByOtherSyncName = string.Empty;
+
+            ReclaimFromOtherSync(requestApplyIfPossible: true);
+        }
+    }
+
+    public void ClearRemoteOtherSyncOverride()
+    {
+        RemoteOtherSyncOverrideActive = false;
+        RemoteOtherSyncYield = false;
+        RemoteOtherSyncOwner = string.Empty;
     }
 
     public void RequestManualFileRepair()

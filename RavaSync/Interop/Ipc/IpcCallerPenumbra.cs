@@ -279,48 +279,96 @@ public sealed class IpcCallerPenumbra : DisposableMediatorSubscriberBase, IIpcCa
 
     public async Task ConvertTextureFiles(ILogger logger, Dictionary<string, string[]> textures, IProgress<(string, int)> progress, CancellationToken token)
     {
+        var plan = new Dictionary<TextureType, Dictionary<string, string[]>>()
+        {
+            [TextureType.Bc7Tex] = textures ?? new Dictionary<string, string[]>(),
+        };
+
+        await ConvertTextureFiles(logger, plan, progress, token).ConfigureAwait(false);
+    }
+    public async Task ConvertTextureFiles(ILogger logger, Dictionary<TextureType, Dictionary<string, string[]>> texturesByTarget, IProgress<(string, int)> progress, CancellationToken token)
+    {
         if (!APIAvailable) return;
 
         _mareMediator.Publish(new HaltScanMessage(nameof(ConvertTextureFiles)));
-        int currentTexture = 0;
-        foreach (var texture in textures)
+
+        static string Norm(string p) => (p ?? string.Empty).Replace('\\', '/');
+
+        static bool ShouldUseMipMaps(string path)
         {
-            if (token.IsCancellationRequested) break;
+            var p = Norm(path);
+            if (string.IsNullOrWhiteSpace(p)) return true;
 
-            progress.Report((texture.Key, ++currentTexture));
-            logger.LogInformation("Converting Texture {path} to {type}", texture.Key, TextureType.Bc7Tex);
+            bool isUiLike =
+                p.Contains("/ui/", StringComparison.OrdinalIgnoreCase) ||
+                p.Contains("icon", StringComparison.OrdinalIgnoreCase) ||
+                p.Contains("hud", StringComparison.OrdinalIgnoreCase);
 
-            var ok = await SafeIpc.TryRun(Logger, "Penumbra.ConvertTextureFile", TimeSpan.FromSeconds(30), async ct =>
+            if (isUiLike)
+                return false;
+
+            return true;
+        }
+
+        try
+        {
+            int total = 0;
+            foreach (var grp in texturesByTarget.Values)
+                total += grp?.Count ?? 0;
+
+            int current = 0;
+
+            foreach (var kvType in texturesByTarget)
             {
-                var convertTask = _penumbraConvertTextureFile.Invoke(texture.Key, texture.Key, TextureType.Bc7Tex, mipMaps: true);
-                await convertTask.ConfigureAwait(false);
-            }).ConfigureAwait(false);
+                if (token.IsCancellationRequested) break;
 
-            if (ok && texture.Value.Any())
-            {
-                foreach (var duplicatedTexture in texture.Value)
+                var type = kvType.Key;
+                var textures = kvType.Value;
+                if (textures == null || textures.Count == 0) continue;
+
+                foreach (var texture in textures)
                 {
-                    logger.LogInformation("Migrating duplicate {dup}", duplicatedTexture);
-                    try
+                    if (token.IsCancellationRequested) break;
+
+                    var path = texture.Key;
+                    bool mipMaps = ShouldUseMipMaps(path);
+
+                    progress.Report((path, ++current));
+
+                    var ok = await SafeIpc.TryRun(Logger, "Penumbra.ConvertTextureFile", TimeSpan.FromSeconds(30), async ct =>
                     {
-                        File.Copy(texture.Key, duplicatedTexture, overwrite: true);
-                    }
-                    catch (Exception ex)
+                        var convertTask = _penumbraConvertTextureFile.Invoke(path, path, type, mipMaps: mipMaps);
+                        await convertTask.ConfigureAwait(false);
+                    }).ConfigureAwait(false);
+
+                    if (ok && texture.Value != null && texture.Value.Any())
                     {
-                        logger.LogError(ex, "Failed to copy duplicate {dup}", duplicatedTexture);
+                        foreach (var dup in texture.Value)
+                        {
+                            try
+                            {
+                                File.Copy(path, dup, overwrite: true);
+                            }
+                            catch (Exception ex)
+                            {
+                                logger.LogError(ex, "Failed to copy duplicate {dup}", dup);
+                            }
+                        }
                     }
                 }
             }
         }
-        _mareMediator.Publish(new ResumeScanMessage(nameof(ConvertTextureFiles)));
-
-        await _dalamudUtil.RunOnFrameworkThread(async () =>
+        finally
         {
-            var gameObject = await _dalamudUtil.CreateGameObjectAsync(await _dalamudUtil.GetPlayerPointerAsync().ConfigureAwait(false)).ConfigureAwait(false);
-            _penumbraRedraw.Invoke(gameObject!.ObjectIndex, setting: RedrawType.Redraw);
-        }).ConfigureAwait(false);
-    }
+            _mareMediator.Publish(new ResumeScanMessage(nameof(ConvertTextureFiles)));
 
+            await _dalamudUtil.RunOnFrameworkThread(async () =>
+            {
+                var gameObject = await _dalamudUtil.CreateGameObjectAsync(await _dalamudUtil.GetPlayerPointerAsync().ConfigureAwait(false)).ConfigureAwait(false);
+                _penumbraRedraw.Invoke(gameObject!.ObjectIndex, setting: RedrawType.Redraw);
+            }).ConfigureAwait(false);
+        }
+    }
     public async Task<Guid> CreateTemporaryCollectionAsync(ILogger logger, string uid)
     {
         if (!APIAvailable) return Guid.Empty;

@@ -106,32 +106,87 @@ public sealed class CharacterAnalyzer : MediatorSubscriberBase, IDisposable
             {
                 token.ThrowIfCancellationRequested();
 
-                var fileCacheEntries = _fileCacheManager.GetAllFileCachesByHash(fileEntry.Hash, ignoreCacheEntries: true, validate: false).ToList();
-                if (fileCacheEntries.Count == 0) continue;
+                var fileCacheEntries = _fileCacheManager
+                    .GetAllFileCachesByHash(fileEntry.Hash, ignoreCacheEntries: true, validate: false)
+                    .ToList();
 
-                var filePath = fileCacheEntries[0].ResolvedFilepath;
-                FileInfo fi = new(filePath);
+                if (fileCacheEntries.Count == 0)
+                    continue;
+
+                var resolvedPaths = fileCacheEntries
+                    .Select(c => c.ResolvedFilepath)
+                    .Where(p => !string.IsNullOrWhiteSpace(p))
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .ToList();
+
+                if (resolvedPaths.Count == 0)
+                    continue;
+
+                var existingPaths = resolvedPaths
+                    .Where(p => File.Exists(p))
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .ToList();
+
+                if (existingPaths.Count == 0)
+                    continue;
+
+                var probePath = existingPaths[0];
+
                 string ext = "unk?";
                 try
                 {
-                    ext = fi.Extension[1..];
+                    var fi = new FileInfo(probePath);
+                    ext = fi.Extension.Length > 1 ? fi.Extension[1..] : "unk?";
                 }
                 catch (Exception ex)
                 {
-                    Logger.LogWarning(ex, "Could not identify extension for {path}", filePath);
+                    Logger.LogWarning(ex, "Could not identify extension for {path}", probePath);
                 }
 
                 var tris = await _xivDataAnalyzer.GetTrianglesByHash(fileEntry.Hash).ConfigureAwait(false);
 
+                long vramBytes = 0;
+                try
+                {
+                    if (string.Equals(ext, "tex", StringComparison.OrdinalIgnoreCase))
+                    {
+                        foreach (var p in existingPaths)
+                        {
+                            if (VramEstimator.TryEstimateTexVramBytes(p, out var b))
+                                vramBytes = Math.Max(vramBytes, b);
+                        }
+                    }
+                    else if (string.Equals(ext, "mdl", StringComparison.OrdinalIgnoreCase))
+                    {
+                        foreach (var p in existingPaths)
+                        {
+                            if (VramEstimator.TryEstimateMdlVramBytes(p, out var b))
+                                vramBytes = Math.Max(vramBytes, b);
+                        }
+                    }
+                }
+                catch
+                {
+                    vramBytes = 0;
+                }
+
+                long size = 0;
+                long compSize = 0;
                 foreach (var entry in fileCacheEntries)
                 {
-                    data[fileEntry.Hash] = new FileDataEntry(fileEntry.Hash, ext,
-                        [.. fileEntry.GamePaths],
-                        fileCacheEntries.Select(c => c.ResolvedFilepath).Distinct().ToList(),
-                        entry.Size > 0 ? entry.Size.Value : 0,
-                        entry.CompressedSize > 0 ? entry.CompressedSize.Value : 0,
-                        tris);
+                    if (entry.Size > 0) size = Math.Max(size, entry.Size.Value);
+                    if (entry.CompressedSize > 0) compSize = Math.Max(compSize, entry.CompressedSize.Value);
                 }
+
+                data[fileEntry.Hash] = new FileDataEntry(
+                    fileEntry.Hash,
+                    ext,
+                    [.. fileEntry.GamePaths],
+                    existingPaths,
+                    size,
+                    compSize,
+                    tris,
+                    vramBytes);
             }
 
             LastAnalysis[obj.Key] = data;
@@ -188,7 +243,7 @@ public sealed class CharacterAnalyzer : MediatorSubscriberBase, IDisposable
         Logger.LogInformation("IMPORTANT NOTES:\n\r- For RavaSync up- and downloads only the compressed size is relevant.\n\r- An unusually high total files count beyond 200 and up will also increase your download time to others significantly.");
     }
 
-    internal sealed record FileDataEntry(string Hash, string FileType, List<string> GamePaths, List<string> FilePaths, long OriginalSize, long CompressedSize, long Triangles)
+    internal sealed record FileDataEntry(string Hash, string FileType, List<string> GamePaths, List<string> FilePaths, long OriginalSize, long CompressedSize, long Triangles, long VramBytes)
     {
         public bool IsComputed => OriginalSize > 0 && CompressedSize > 0;
         public async Task ComputeSizes(FileCacheManager fileCacheManager, CancellationToken token)
@@ -207,6 +262,7 @@ public sealed class CharacterAnalyzer : MediatorSubscriberBase, IDisposable
         public long OriginalSize { get; private set; } = OriginalSize;
         public long CompressedSize { get; private set; } = CompressedSize;
         public long Triangles { get; private set; } = Triangles;
+        public long VramBytes { get; private set; } = VramBytes;
 
         public Lazy<string> Format = new(() =>
         {

@@ -1,21 +1,15 @@
-﻿using System;
-using System.Collections.Generic;
-
-namespace RavaSync.Utils;
-
-internal static class SyncStorm
+﻿internal static class SyncStorm
 {
     private static readonly object _gate = new();
     private static readonly Queue<long> _recentVisibleTicks = new();
 
-    // Storm stays active for this many ms after we detect it
-    private const int StormHoldMs = 2500;
+    private const int StormHoldMs = 2200;
 
-    // Count how many "became visible" events in this window
-    private const int WindowMs = 1000;
+    private const int WindowMs = 1100;
 
-    // Threshold to consider it a storm
-    private const int Threshold = 8;
+    private const int TriggerThreshold = 12;
+
+    private const int ExtendThreshold = 16;
 
     private static long _stormUntilTick;
 
@@ -33,11 +27,13 @@ internal static class SyncStorm
             while (_recentVisibleTicks.Count > 0 && (now - _recentVisibleTicks.Peek()) > WindowMs)
                 _recentVisibleTicks.Dequeue();
 
-            if (_recentVisibleTicks.Count >= Threshold)
+            var isActive = now < _stormUntilTick;
+            var threshold = isActive ? ExtendThreshold : TriggerThreshold;
+
+            if (_recentVisibleTicks.Count >= threshold)
             {
                 var until = now + StormHoldMs;
-                var cur = _stormUntilTick;
-                if (until > cur)
+                if (until > _stormUntilTick)
                     _stormUntilTick = until;
             }
         }
