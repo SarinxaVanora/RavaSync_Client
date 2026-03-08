@@ -125,7 +125,7 @@ public record PrimeTransientPathsMessage(IntPtr Address, ObjectKind Kind, IReadO
 
 public record RemoteOtherSyncConnectedMessage(string? Owner) : MessageBase;
 public record RemoteOtherSyncDisconnectedMessage(string? Owner) : MessageBase;
-
+public sealed record InitialFinalRedrawConsumedMessage(nint ActorAddress) : SameThreadMessage;
 public record BlacklistUiMessage() : MessageBase;
 
 

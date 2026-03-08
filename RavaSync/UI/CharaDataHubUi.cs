@@ -384,7 +384,7 @@ internal sealed partial class CharaDataHubUi : WindowMediatorSubscriberBase
 
     private void DrawGposeControls()
     {
-        _uiSharedService.BigText(_uiSharedService.L("UI.CharaDataHubUi.d41d8cd9", ""));
+        _uiSharedService.BigText(_uiSharedService.L("UI.CharaDataHubUi.Header.GposeActors", "GPose Actors"));
         ImGuiHelpers.ScaledDummy(5);
         using var indent = ImRaii.PushIndent(10f);
 
@@ -445,7 +445,7 @@ internal sealed partial class CharaDataHubUi : WindowMediatorSubscriberBase
 
     private void DrawDataApplication()
     {
-        _uiSharedService.BigText(_uiSharedService.L("UI.CharaDataHubUi.d41d8cd9", ""));
+        _uiSharedService.BigText(_uiSharedService.L("UI.CharaDataHubUi.Header.ApplyData", "Apply Data"));
 
         ImGuiHelpers.ScaledDummy(5);
 
@@ -886,7 +886,7 @@ internal sealed partial class CharaDataHubUi : WindowMediatorSubscriberBase
 
     private void DrawMcdfExport()
     {
-        _uiSharedService.BigText(_uiSharedService.L("UI.CharaDataHubUi.d41d8cd9", ""));
+        _uiSharedService.BigText(_uiSharedService.L("UI.CharaDataHubUi.Header.McdfExport", "MCDF Export"));
 
         DrawHelpFoldout(_uiSharedService.L("UI.CharaDataHubUi.ab3e695b", "This feature allows you to pack your character into a MCDF file and manually send it to other people. MCDF files can officially only be imported during GPose through RavaSync. ") +
             "Be aware that the possibility exists that people write unofficial custom exporters to extract the containing data.");
@@ -1069,7 +1069,7 @@ internal sealed partial class CharaDataHubUi : WindowMediatorSubscriberBase
     private void DrawSettings()
     {
         ImGuiHelpers.ScaledDummy(5);
-        _uiSharedService.BigText(_uiSharedService.L("UI.CharaDataHubUi.d41d8cd9", ""));
+        _uiSharedService.BigText(_uiSharedService.L("UI.CharaDataHubUi.Header.Settings", "Settings"));
         ImGuiHelpers.ScaledDummy(5);
         bool openInGpose = _configService.Current.OpenMareHubOnGposeStart;
         if (ImGui.Checkbox(_uiSharedService.L("UI.CharaDataHubUi.d9779bc0", "Open Character Data Hub when GPose loads"), ref openInGpose))

@@ -11,7 +11,7 @@ internal partial class CharaDataHubUi
 {
     private void DrawNearbyPoses()
     {
-        _uiSharedService.BigText(_uiSharedService.L("UI.CharaDataHubUi.NearbyPoses.d41d8cd9", ""));
+        _uiSharedService.BigText(_uiSharedService.L("UI.CharaDataHubUi.NearbyPoses.d41d8cd9", "Poses Nearby"));
 
         DrawHelpFoldout(_uiSharedService.L("UI.CharaDataHubUi.NearbyPoses.f34cfe6c", "This tab will show you all Shared World Poses nearby you.") + Environment.NewLine + Environment.NewLine
                         + "Shared World Poses are poses in character data that have world data attached to them and are set to shared. "

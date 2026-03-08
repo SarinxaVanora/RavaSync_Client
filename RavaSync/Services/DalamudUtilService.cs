@@ -1006,7 +1006,24 @@ public class DalamudUtilService : IHostedService, IMediatorSubscriber
             }
 
             var localPlayer = _clientState.LocalPlayer;
-            if (localPlayer != null)
+            var clientLoggedIn = _clientState.IsLoggedIn;
+
+            if (!clientLoggedIn && IsLoggedIn)
+            {
+                _logger.LogDebug("Logged out");
+                IsLoggedIn = false;
+                Mediator.Publish(new DalamudLogoutMessage());
+            }
+            else if (clientLoggedIn && localPlayer != null && !IsLoggedIn)
+            {
+                _logger.LogDebug("Logged in");
+                IsLoggedIn = true;
+                _lastZone = _clientState.TerritoryType;
+                _cid = RebuildCID();
+                Mediator.Publish(new DalamudLoginMessage());
+            }
+
+            if (clientLoggedIn && localPlayer != null)
             {
                 _classJobId = localPlayer.ClassJob.RowId;
             }
@@ -1018,21 +1035,6 @@ public class DalamudUtilService : IHostedService, IMediatorSubscriber
 
             if (isNormalFrameworkUpdate)
                 return;
-
-            if (localPlayer != null && !IsLoggedIn)
-            {
-                _logger.LogDebug("Logged in");
-                IsLoggedIn = true;
-                _lastZone = _clientState.TerritoryType;
-                _cid = RebuildCID();
-                Mediator.Publish(new DalamudLoginMessage());
-            }
-            else if (localPlayer == null && IsLoggedIn)
-            {
-                _logger.LogDebug("Logged out");
-                IsLoggedIn = false;
-                Mediator.Publish(new DalamudLogoutMessage());
-            }
 
             if (_gameConfig != null
                 && _gameConfig.TryGet(Dalamud.Game.Config.SystemConfigOption.LodType_DX11, out bool lodEnabled))

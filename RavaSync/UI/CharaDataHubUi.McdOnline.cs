@@ -143,7 +143,7 @@ internal sealed partial class CharaDataHubUi
 
     private void DrawEditCharaDataAccessAndSharing(CharaDataExtendedUpdateDto updateDto)
     {
-        _uiSharedService.BigText(_uiSharedService.L("UI.CharaDataHubUi.McdOnline.d41d8cd9", ""));
+        _uiSharedService.BigText(_uiSharedService.L("UI.CharaDataHubUi.McdOnline.d41d8cd9", "MCD Online"));
 
         UiSharedService.ScaledNextItemWidth(200);
         var dtoAccessType = updateDto.AccessType;
@@ -194,7 +194,7 @@ internal sealed partial class CharaDataHubUi
 
     private void DrawEditCharaDataAppearance(CharaDataFullExtendedDto dataDto, CharaDataExtendedUpdateDto updateDto)
     {
-        _uiSharedService.BigText(_uiSharedService.L("UI.CharaDataHubUi.McdOnline.d41d8cd9", ""));
+        _uiSharedService.BigText(_uiSharedService.L("UI.CharaDataHubUi.McdOnline.d41d8cd9", "MCD Online"));
 
         if (_uiSharedService.IconTextButton(FontAwesomeIcon.ArrowRight, _uiSharedService.L("UI.CharaDataHubUi.McdOnline.79532975", "Set Appearance to Current Appearance")))
         {
@@ -276,7 +276,7 @@ internal sealed partial class CharaDataHubUi
 
     private void DrawEditCharaDataGeneral(CharaDataFullExtendedDto dataDto, CharaDataExtendedUpdateDto updateDto)
     {
-        _uiSharedService.BigText(_uiSharedService.L("UI.CharaDataHubUi.McdOnline.d41d8cd9", ""));
+        _uiSharedService.BigText(_uiSharedService.L("UI.CharaDataHubUi.McdOnline.d41d8cd9", "MCD Online"));
         string code = dataDto.FullId;
         using (ImRaii.Disabled())
         {
@@ -404,7 +404,7 @@ internal sealed partial class CharaDataHubUi
 
     private void DrawEditCharaDataPoses(CharaDataExtendedUpdateDto updateDto)
     {
-        _uiSharedService.BigText(_uiSharedService.L("UI.CharaDataHubUi.McdOnline.d41d8cd9", ""));
+        _uiSharedService.BigText(_uiSharedService.L("UI.CharaDataHubUi.McdOnline.d41d8cd9", "MCD Online"));
         var poseCount = updateDto.PoseList.Count();
         using (ImRaii.Disabled(poseCount >= maxPoses))
         {
@@ -560,7 +560,7 @@ internal sealed partial class CharaDataHubUi
 
     private void DrawMcdOnline()
     {
-        _uiSharedService.BigText(_uiSharedService.L("UI.CharaDataHubUi.McdOnline.d41d8cd9", ""));
+        _uiSharedService.BigText(_uiSharedService.L("UI.CharaDataHubUi.McdOnline.d41d8cd9", "MCD Online"));
 
         DrawHelpFoldout(_uiSharedService.L("UI.CharaDataHubUi.McdOnline.91b3495e", "In this tab you can create, view and edit your own RavaSync Character Data that is stored on the server.") + Environment.NewLine + Environment.NewLine
             + "RavaSync Character Data Online functions similar to the previous MCDF standard for exporting your character, except that you do not have to send a file to the other person but solely a code." + Environment.NewLine + Environment.NewLine

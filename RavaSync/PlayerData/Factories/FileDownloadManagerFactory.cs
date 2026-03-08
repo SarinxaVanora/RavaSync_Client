@@ -14,7 +14,6 @@ public class FileDownloadManagerFactory
     private readonly ILoggerFactory _loggerFactory;
     private readonly MareMediator _mareMediator;
     private readonly MareConfigService _mareConfigService;
-    private readonly DelayedActivatorService _delayedActivator;
 
     public FileDownloadManagerFactory(
         ILoggerFactory loggerFactory,
@@ -22,8 +21,7 @@ public class FileDownloadManagerFactory
         FileTransferOrchestrator fileTransferOrchestrator,
         FileCacheManager fileCacheManager,
         FileCompactor fileCompactor,
-        MareConfigService mareConfigService,
-        DelayedActivatorService delayedActivator)
+        MareConfigService mareConfigService)
     {
         _loggerFactory = loggerFactory;
         _mareMediator = mareMediator;
@@ -31,7 +29,6 @@ public class FileDownloadManagerFactory
         _fileCacheManager = fileCacheManager;
         _fileCompactor = fileCompactor;
         _mareConfigService = mareConfigService;
-        _delayedActivator = delayedActivator;
     }
 
     public FileDownloadManager Create()
@@ -42,7 +39,6 @@ public class FileDownloadManagerFactory
             _fileTransferOrchestrator,
             _fileCacheManager,
             _fileCompactor,
-            _mareConfigService,
-            _delayedActivator);
+            _mareConfigService);
     }
 }

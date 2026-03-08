@@ -121,7 +121,6 @@ public sealed class Plugin : IDalamudPlugin
             collection.AddSingleton<GameObjectHandlerFactory>();
             collection.AddSingleton<FileDownloadManagerFactory>();
             collection.AddSingleton<SafetyGate>();
-            collection.AddSingleton<DelayedActivatorService>();
             collection.AddSingleton<PairHandlerFactory>();
             collection.AddSingleton<PairFactory>();
             collection.AddSingleton<XivDataAnalyzer>();
@@ -423,8 +422,6 @@ public sealed class Plugin : IDalamudPlugin
         _ = _host.Services.GetRequiredService<FriendshapedMarkerService>();
 
         _ = _host.Services.GetRequiredService<ScopeAutoPauseService>();
-        var activator = _host.Services.GetRequiredService<DelayedActivatorService>();
-        activator.Initialize(condition);
 
         _ = _host.StartAsync();
     }

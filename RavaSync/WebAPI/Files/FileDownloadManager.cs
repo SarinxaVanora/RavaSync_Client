@@ -40,10 +40,9 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
     const int Lz4BlockSize = 4 * 1024 * 1024;
     private const int CdnBufferSize = 4 * 1024 * 1024;
     private readonly MareConfigService _mareConfigService;
-    private readonly DelayedActivatorService _delayedActivator;
     private const int MaxCdnAttemptsPerFile = 3;
     private static readonly TimeSpan CdnAttemptTimeout = TimeSpan.FromSeconds(60);
-    private const long InlineCdnDecodeMaxPayloadBytes = 4L * 1024 * 1024;
+    private const long InlineCdnDecodeMaxPayloadBytes = 2L * 1024 * 1024;
 
     private readonly CdnDecodeWorker _cdnDecodeWorker;
 
@@ -142,16 +141,7 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
 
     private static int GetCdnDecodeParallelism()
     {
-        // We run inside the game process, so don't use all cores.
-        // This caps only the expensive local work (decompress/hash/write), not HTTP fetching.
         var cpu = Environment.ProcessorCount;
-
-        // Conservative defaults for frame pacing:
-        // - 4–8 logical cores: 1 decode worker
-        // - 10–16 logical cores: 2 decode workers
-        // - 18+ logical cores: 3 decode workers
-        //
-        // Cap at 3 on purpose; beyond this, frame-time regressions usually outweigh gains.
         if (cpu <= 8) return 1;
         if (cpu <= 16) return 2;
         return 3;
@@ -160,10 +150,6 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
     private int GetCdnParallelTarget(int configuredParallel, int filesInGroup)
     {
         var maxParallel = AutoCdnMaxParallel;
-
-        // During room-entry storms, clamp parallelism to reduce IO/CPU spikes.
-        //if (SyncStorm.IsActive)
-        //    maxParallel = Math.Min(maxParallel, 4);
 
         if (configuredParallel > 0)
             return Math.Clamp(configuredParallel, 1, Math.Min(maxParallel, Math.Max(1, filesInGroup)));
@@ -220,7 +206,7 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
 
     public FileDownloadManager(ILogger<FileDownloadManager> logger, MareMediator mediator,
         FileTransferOrchestrator orchestrator,
-        FileCacheManager fileCacheManager, FileCompactor fileCompactor, MareConfigService mareConfigService, DelayedActivatorService delayedActivator) : base(logger, mediator)
+        FileCacheManager fileCacheManager, FileCompactor fileCompactor, MareConfigService mareConfigService) : base(logger, mediator)
     {
         _downloadStatus = new Dictionary<string, FileDownloadStatus>(StringComparer.Ordinal);
         _orchestrator = orchestrator;
@@ -228,7 +214,6 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
         _fileCompactor = fileCompactor;
         _activeDownloadStreams = [];
         _mareConfigService = mareConfigService;
-        _delayedActivator = delayedActivator;
         _cdnFastClient = CreateCdnFastClient();
         _cdnDecodeWorker = new CdnDecodeWorker(
             Logger,
@@ -650,16 +635,12 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
         }
 
         // de-dupe strictly by hash, then:
-        // - skip staged hashes (already queued/applied)
-        // - skip hashes already pending in delayed activation (queued but not applied yet)
         // - use filesystem as truth for presence + validate cache entries against expected sizes
         // - DO NOT mark hashes inflight unless they are actually transferable (dto.FileExists=true)
         // - self-heal stray on-disk files without DB entries when possible
         var candidates = downloadFileInfoFromService
             .GroupBy(d => d.Hash, StringComparer.OrdinalIgnoreCase)
             .Select(g => g.First())
-            .Where(dto => !_fileDbManager.IsHashStaged(dto.Hash))
-            .Where(dto => !_delayedActivator.IsHashPending(dto.Hash))
             .Where(dto =>
             {
                 // Prefer RawSize if provided, otherwise fall back to Size for basic length checks.
@@ -825,6 +806,11 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
             return;
         }
 
+        foreach (var key in _groupProgress.Keys)
+        {
+            ForceFlushGroupProgress(key);
+        }
+
         Logger.LogDebug("Download end: {id}", gameObjectHandler);
 
         ClearDownload();
@@ -839,11 +825,11 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
     }
 
 
-    private void PersistFileToStorageLowPri(string fileHash, string filePath, CancellationToken ct)
+    private Task PersistFileToStorageLowPri(string fileHash, string filePath, CancellationToken ct)
     {
         try
         {
-            _ = _cdnDecodeWorker.EnqueueWorkAsync(_ =>
+            return _cdnDecodeWorker.EnqueueWorkAsync(_ =>
             {
                 PersistFileToStorage(fileHash, filePath);
                 return true;
@@ -851,7 +837,7 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
         }
         catch
         {
-            // best effort
+            return Task.CompletedTask;
         }
     }
 
@@ -1074,18 +1060,16 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
         throw new InvalidDataException("CDN header too large or invalid");
     }
 
-    private void CleanupFailedCdnDownload(string pathToDelete, string? stagedHash = null)
+    private void CleanupFailedCdnDownload(string pathToDelete)
     {
         try
         {
             if (!string.IsNullOrWhiteSpace(pathToDelete) && File.Exists(pathToDelete))
                 File.Delete(pathToDelete);
         }
-        catch { /* ignore */ }
-
-        if (!string.IsNullOrWhiteSpace(stagedHash))
+        catch
         {
-            try { _fileDbManager.UnstageFile(stagedHash); } catch { /* ignore */ }
+            // ignore
         }
     }
 
@@ -1100,63 +1084,6 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
         // Keep temp in the same directory so the move is atomic on Windows.
         var tmp = name + ".tmp." + Environment.ProcessId + "." + Guid.NewGuid().ToString("N");
         return Path.Combine(dir, tmp);
-    }
-    public bool TryResolveHardDelayedPath(string hash, string finalCachePath, out string resolvedPath)
-    {
-        resolvedPath = finalCachePath;
-
-        if (string.IsNullOrWhiteSpace(hash)) return false;
-        if (string.IsNullOrWhiteSpace(finalCachePath)) return false;
-
-        // Never hard-delay core asset types (face/ears/body/etc).
-        static bool NeverDelayExt(string extWithDot)
-        {
-            if (string.IsNullOrWhiteSpace(extWithDot)) return false;
-
-            var e = extWithDot.TrimStart('.');
-            return e.Equals("mdl", StringComparison.OrdinalIgnoreCase)
-                || e.Equals("tex", StringComparison.OrdinalIgnoreCase)
-                || e.Equals("mtrl", StringComparison.OrdinalIgnoreCase)
-                || e.Equals("imc", StringComparison.OrdinalIgnoreCase)
-                || e.Equals("eqp", StringComparison.OrdinalIgnoreCase)
-                || e.Equals("eqdp", StringComparison.OrdinalIgnoreCase)
-                || e.Equals("est", StringComparison.OrdinalIgnoreCase)
-                || e.Equals("gmp", StringComparison.OrdinalIgnoreCase);
-        }
-
-        if (NeverDelayExt(Path.GetExtension(finalCachePath)))
-            return false;
-
-        if (!ActivationPolicy.IsHardDelayed(finalCachePath))
-            return false;
-
-        if (File.Exists(finalCachePath))
-            return true;
-
-        var ext = Path.GetExtension(finalCachePath);
-        var quarantinePath = Path.Combine(_delayedActivator.QuarantineRoot, hash.ToUpperInvariant() + ext);
-
-        if (File.Exists(quarantinePath))
-        {
-            try
-            {
-                if (new FileInfo(quarantinePath).Length < 16)
-                {
-                    Logger.LogWarning("Quarantine file is zero-byte, deleting and forcing redownload: {file}", quarantinePath);
-                    try { File.Delete(quarantinePath); } catch { }
-                    return false;
-                }
-            }
-            catch
-            {
-                return false;
-            }
-
-            resolvedPath = quarantinePath;
-            return true;
-        }
-
-        return false;
     }
     private static bool IsFileInUse(Exception ex)
     {
@@ -1353,23 +1280,16 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
                 return false;
             }
 
+            var persistTasks = new List<Task>(results.Count);
+
             foreach (var r in results)
             {
-                if (r.DestPath == r.FinalPath)
-                {
-                    PersistFileToStorageLowPri(r.Hash, r.FinalPath, ct);
-                }
-                else
-                {
-                    _delayedActivator.Enqueue(new PendingFile(
-                        r.DestPath,
-                        r.FinalPath,
-                        r.Hash,
-                        r.Hard,
-                        r.Soft,
-                        gameObjectHandler?.Address
-                    ));
-                }
+                persistTasks.Add(PersistFileToStorageLowPri(r.Hash, r.FinalPath, ct));
+            }
+
+            if (persistTasks.Count > 0)
+            {
+                await Task.WhenAll(persistTasks).ConfigureAwait(false);
             }
 
             if (_downloadStatus.TryGetValue(groupKey, out var status))
@@ -1501,34 +1421,12 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
                     var ext = fileExtByHash.TryGetValue(headerHash, out var e) ? e : "dat";
                     var filePath = _fileDbManager.GetCacheFilePath(headerHash, ext);
 
-                    var cfg = _mareConfigService.Current;
-
-                    static bool NeverDelayExt(string extNoDot)
-                    {
-                        if (string.IsNullOrWhiteSpace(extNoDot)) return false;
-
-                        return extNoDot.Equals("mdl", StringComparison.OrdinalIgnoreCase)
-                            || extNoDot.Equals("tex", StringComparison.OrdinalIgnoreCase)
-                            || extNoDot.Equals("mtrl", StringComparison.OrdinalIgnoreCase)
-                            || extNoDot.Equals("imc", StringComparison.OrdinalIgnoreCase)
-                            || extNoDot.Equals("eqp", StringComparison.OrdinalIgnoreCase)
-                            || extNoDot.Equals("eqdp", StringComparison.OrdinalIgnoreCase)
-                            || extNoDot.Equals("est", StringComparison.OrdinalIgnoreCase)
-                            || extNoDot.Equals("gmp", StringComparison.OrdinalIgnoreCase);
-                    }
-
-                    var neverDelay = NeverDelayExt(ext);
-
-                    var hard = !neverDelay && ActivationPolicy.IsHardDelayed(filePath);
-                    var soft = !hard && !neverDelay && ActivationPolicy.IsSoftDelayed(filePath);
-
                     EnsureDirectoryForFile(filePath);
 
                     // CRITICAL: write to temp first so we never truncate/zero the live cache file.
                     var tempPath = CreateTempDownloadPath(filePath);
                     var destPath = filePath;
 
-                    string? stagedHash = null;
                     var countedBytesLive = false;
 
                     try
@@ -1639,7 +1537,7 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
                                 "CDN fast-path: bad content for {hash} (computed={computed}, bytes={bytes}); cleaning temp and retrying",
                                 headerHash, computed, bytesWritten);
 
-                            CleanupFailedCdnDownload(tempPath, stagedHash);
+                            CleanupFailedCdnDownload(tempPath);
 
                             if (attempts >= MaxCdnAttemptsPerFile)
                             {
@@ -1654,7 +1552,7 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
                     {
                         // Per-attempt timeout: never leave partial files behind.
                         Interlocked.Exchange(ref anyTimeoutOrBackoff[0], 1);
-                        CleanupFailedCdnDownload(tempPath, stagedHash);
+                        CleanupFailedCdnDownload(tempPath);
 
                         Logger.LogWarning(oce,
                             "CDN fast-path: timeout while downloading {hash} from {url}, attempt {attempt}/{max}",
@@ -1670,7 +1568,7 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
                     }
                     catch (Exception ex)
                     {
-                        CleanupFailedCdnDownload(tempPath, stagedHash);
+                        CleanupFailedCdnDownload(tempPath);
 
                         Logger.LogWarning(ex,
                             "CDN fast-path: error while downloading {hash} from {url}, attempt {attempt}/{max}",
@@ -1701,7 +1599,7 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
                     {
                         Logger.LogWarning("CDN fast-path: extra validation failed for {hash}, cleaning temp and retrying", headerHash);
 
-                        CleanupFailedCdnDownload(tempPath, stagedHash);
+                        CleanupFailedCdnDownload(tempPath);
 
                         if (attempts >= MaxCdnAttemptsPerFile)
                         {
@@ -1712,91 +1610,30 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
                         continue;
                     }
 
-                    if (cfg.DelayActivationEnabled && hard)
+                    try
                     {
-                        destPath = Path.Combine(_delayedActivator.QuarantineRoot, headerHash + Path.GetExtension(filePath));
-                        EnsureDirectoryForFile(destPath);
-
-                        stagedHash = headerHash;
-                        _fileDbManager.StageFile(headerHash, filePath);
-
-                        try
-                        {
-                            File.Move(tempPath, destPath, overwrite: true);
-                        }
-                        catch (Exception ex)
-                        {
-                            Logger.LogWarning(ex, "CDN fast-path: failed to move {hash} into quarantine {path}", headerHash, destPath);
-
-                            CleanupFailedCdnDownload(tempPath, stagedHash);
-                            CleanupFailedCdnDownload(destPath, stagedHash);
-
-                            if (attempts >= MaxCdnAttemptsPerFile)
-                            {
-                                Interlocked.Exchange(ref anyFailure[0], 1);
-                                return;
-                            }
-
-                            continue;
-                        }
+                        File.Move(tempPath, filePath, overwrite: true);
+                        destPath = filePath;
                     }
-                    else
+                    catch (Exception ex)
                     {
-                        try
+                        Logger.LogWarning(ex, "CDN fast-path: failed to finalize {hash} to {path}", headerHash, filePath);
+
+                        CleanupFailedCdnDownload(tempPath);
+
+                        if (attempts >= MaxCdnAttemptsPerFile)
                         {
-                            File.Move(tempPath, filePath, overwrite: true);
+                            Interlocked.Exchange(ref anyFailure[0], 1);
+                            return;
                         }
-                        catch (Exception ex) when (hard && IsFileInUse(ex))
-                        {
-                            var quarantinePath = Path.Combine(_delayedActivator.QuarantineRoot, headerHash + Path.GetExtension(filePath));
-                            EnsureDirectoryForFile(quarantinePath);
 
-                            stagedHash = headerHash;
-                            _fileDbManager.StageFile(headerHash, filePath);
-
-                            try
-                            {
-                                File.Move(tempPath, quarantinePath, overwrite: true);
-                                destPath = quarantinePath;
-                            }
-                            catch (Exception ex2)
-                            {
-                                Logger.LogWarning(ex2,
-                                    "CDN fast-path: failed to move {hash} into quarantine fallback {path}",
-                                    headerHash, quarantinePath);
-
-                                CleanupFailedCdnDownload(tempPath, stagedHash);
-                                CleanupFailedCdnDownload(quarantinePath, stagedHash);
-
-                                if (attempts >= MaxCdnAttemptsPerFile)
-                                {
-                                    Interlocked.Exchange(ref anyFailure[0], 1);
-                                    return;
-                                }
-
-                                continue;
-                            }
-                        }
-                        catch (Exception ex)
-                        {
-                            Logger.LogWarning(ex, "CDN fast-path: failed to finalize {hash} to {path}", headerHash, filePath);
-
-                            CleanupFailedCdnDownload(tempPath, stagedHash);
-
-                            if (attempts >= MaxCdnAttemptsPerFile)
-                            {
-                                Interlocked.Exchange(ref anyFailure[0], 1);
-                                return;
-                            }
-
-                            continue;
-                        }
+                        continue;
                     }
 
                     _cdn404State.TryRemove(headerHash, out _);
                     _cdn404State.TryRemove(transfer.Hash, out _);
 
-                    results.Add(new CdnDownloadedFile(headerHash, filePath, destPath, hard, soft));
+                    results.Add(new CdnDownloadedFile(headerHash, filePath));
 
                     if (!countedBytesLive && transfer.Total > 0)
                         AddGroupProgress(gameObjectHandler, groupKey, transfer.Total, 0);
@@ -1843,14 +1680,6 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
 
                             _cdn404State.TryRemove(transfer.Hash, out _);
                             AddGroupProgress(gameObjectHandler, groupKey, transfer.Total, 1);
-
-                            try
-                            {
-                                if (_fileDbManager.IsHashStaged(transfer.Hash) && !_delayedActivator.IsHashPending(transfer.Hash))
-                                    _fileDbManager.UnstageFile(transfer.Hash);
-                            }
-                            catch { /* ignore */ }
-
                             return;
                         }
                     }
@@ -1859,14 +1688,6 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
                     if (attempts >= MaxCdnAttemptsPerFile)
                     {
                         Interlocked.Exchange(ref anyFailure[0], 1);
-
-                        try
-                        {
-                            if (_fileDbManager.IsHashStaged(transfer.Hash) && !_delayedActivator.IsHashPending(transfer.Hash))
-                                _fileDbManager.UnstageFile(transfer.Hash);
-                        }
-                        catch { /* ignore */ }
-
                         return;
                     }
 
@@ -1896,30 +1717,6 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
         finally
         {
             _inflightHashes.TryRemove(transfer.Hash, out _);
-        }
-    }
-
-    public void NotifyActorRedrawn(nint actorAddress)
-    {
-        try
-        {
-            _delayedActivator.NotifyActorRedrawn(actorAddress);
-        }
-        catch
-        {
-            // best effort
-        }
-    }
-
-    public bool HasPendingDelayedForActor(nint actorAddress)
-    {
-        try
-        {
-            return _delayedActivator.HasPendingForActor(actorAddress);
-        }
-        catch
-        {
-            return false;
         }
     }
 
@@ -2336,7 +2133,7 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
         }
     }
 
-    private sealed record CdnDownloadedFile(string Hash, string FinalPath, string DestPath, bool Hard, bool Soft);
+    private sealed record CdnDownloadedFile(string Hash, string FinalPath);
 
     sealed class LimitedXorStream : Stream
     {

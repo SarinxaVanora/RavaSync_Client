@@ -423,8 +423,6 @@ public class Pair
     public IReadOnlyDictionary<string, FileDownloadStatus>? CurrentDownloadStatus => _currentDownloadStatus;
     internal void SetCurrentDownloadStatus(Dictionary<string, FileDownloadStatus>? status) => _currentDownloadStatus = status;
 
-
-
     public void ToggleMetadataAndReapply()
     {
         IsMetadataEnabled = !IsMetadataEnabled;

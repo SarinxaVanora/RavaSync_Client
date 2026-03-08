@@ -1292,13 +1292,22 @@ public class SettingsUi : WindowMediatorSubscriberBase
         ImGui.Dummy(new Vector2(10));
         ImGui.Separator();
         ImGui.Dummy(new Vector2(10));
+
+        bool autoPauseCombat = _playerPerformanceConfigService.Current.AutoPauseWhileInCombat;
+        if (ImGui.Checkbox(_uiShared.L("UI.SettingsUi.AutoPauseWhileInCombat", "Auto pause visible players while you are in combat"), ref autoPauseCombat))
+        {
+            _playerPerformanceConfigService.Current.AutoPauseWhileInCombat = autoPauseCombat;
+            _playerPerformanceConfigService.Save();
+        }
+        _uiShared.DrawHelpText(_uiShared.L("UI.SettingsUi.AutoPauseWhileInCombat.Help","When enabled, RavaSync will pause all currently visible players when you enter combat, then automatically unpause only those players when combat ends."));
+
         bool showPerformanceIndicator = _playerPerformanceConfigService.Current.ShowPerformanceIndicator;
         if (ImGui.Checkbox(_uiShared.L("UI.SettingsUi.32ca13f6", "Show performance indicator"), ref showPerformanceIndicator))
         {
             _playerPerformanceConfigService.Current.ShowPerformanceIndicator = showPerformanceIndicator;
             _playerPerformanceConfigService.Save();
         }
-        _uiShared.DrawHelpText(_uiShared.L("UI.SettingsUi.4b4fce66", "Will show a performance indicator when players exceed defined thresholds in Mares UI.") + Environment.NewLine + _uiShared.L("UI.SettingsUi.daaee07d", "Will use warning thresholds."));
+        _uiShared.DrawHelpText(_uiShared.L("UI.SettingsUi.4b4fce66", "Will show a performance indicator when players exceed defined thresholds in Rava UI.") + Environment.NewLine + _uiShared.L("UI.SettingsUi.daaee07d", "Will use warning thresholds."));
         bool warnOnExceedingThresholds = _playerPerformanceConfigService.Current.WarnOnExceedingThresholds;
         if (ImGui.Checkbox(_uiShared.L("UI.SettingsUi.d09ce6d2", "Warn on loading in players exceeding performance thresholds"), ref warnOnExceedingThresholds))
         {

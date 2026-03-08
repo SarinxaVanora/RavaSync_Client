@@ -49,7 +49,7 @@ public class PermissionWindowUI : WindowMediatorSubscriberBase
         var style = ImGui.GetStyle();
         var indentSize = ImGui.GetFrameHeight() + style.ItemSpacing.X;
 
-        _uiSharedService.BigText(_uiSharedService.L("UI.PermissionWindowUI.d41d8cd9", "") + Pair.UserData.AliasOrUID);
+        _uiSharedService.BigText(_uiSharedService.L("UI.PermissionWindowUI.d41d8cd9", "Permissions for ") + Pair.UserData.AliasOrUID);
         ImGuiHelpers.ScaledDummy(1f);
 
         if (ImGui.Checkbox(_uiSharedService.L("UI.PermissionWindowUI.453d261e", "Preferred Permissions"), ref sticky))

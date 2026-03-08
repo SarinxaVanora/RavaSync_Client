@@ -127,7 +127,7 @@ internal class EventViewerUI : WindowMediatorSubscriberBase
             Process.Start(ps);
         }
 
-        _uiSharedService.BigText(_uiSharedService.L("UI.EventViewerUI.d41d8cd9", ""));
+        _uiSharedService.BigText(_uiSharedService.L("UI.EventViewerUI.d41d8cd9", "Event Viewer"));
         var foldOut = ImRaii.TreeNode("Filter");
         if (foldOut)
         {

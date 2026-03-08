@@ -155,7 +155,7 @@ public class VisibleUserDataDistributor : DisposableMediatorSubscriberBase
                 {
                     if (_usersToPushDataTo.Count == 0) return;
                     if (Logger.IsEnabled(LogLevel.Debug))
-                        Logger.LogDebug("Pushing {data} to {users}", dataToSend.DataHash, string.Join(", ", _usersToPushDataTo.Select(k => k.AliasOrUID)));
+                        Logger.LogDebug("Sending your appearence to {users}", string.Join(", ", _usersToPushDataTo.Select(k => k.AliasOrUID)));
 
                     await _apiController.PushCharacterData(dataToSend, [.. _usersToPushDataTo]).ConfigureAwait(false);
                     _usersToPushDataTo.Clear();

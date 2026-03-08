@@ -52,6 +52,13 @@ public sealed class GameObjectHandler : DisposableMediatorSubscriberBase, IHighP
 
         Mediator.Subscribe<FrameworkUpdateMessage>(this, (_) => FrameworkUpdate());
 
+        Mediator.Subscribe<DalamudLogoutMessage>(this, (_) =>
+        {
+            _haltProcessing = true;
+            Invalidate();
+            _nextUpdateUtc = DateTime.MinValue;
+        });
+
         Mediator.Subscribe<ZoneSwitchEndMessage>(this, (_) => ZoneSwitchEnd());
         Mediator.Subscribe<ZoneSwitchStartMessage>(this, (_) => ZoneSwitchStart());
 
@@ -160,7 +167,7 @@ public sealed class GameObjectHandler : DisposableMediatorSubscriberBase, IHighP
     {
         Address = IntPtr.Zero;
         DrawObjectAddress = IntPtr.Zero;
-        _haltProcessing = false;
+        CurrentDrawCondition = DrawCondition.ObjectZero;
     }
 
     public async Task<bool> IsBeingDrawnRunOnFrameworkAsync()
@@ -358,6 +365,14 @@ public sealed class GameObjectHandler : DisposableMediatorSubscriberBase, IHighP
 
     private void FrameworkUpdate()
     {
+        if (!_dalamudUtil.IsLoggedIn || _dalamudUtil.IsZoning)
+        {
+            _haltProcessing = true;
+            Invalidate();
+            return;
+        }
+
+        if (_haltProcessing) return;
         if (!_delayedZoningTask?.IsCompleted ?? false) return;
 
         var now = DateTime.UtcNow;
@@ -423,11 +438,9 @@ public sealed class GameObjectHandler : DisposableMediatorSubscriberBase, IHighP
 
     private void ZoneSwitchEnd()
     {
-        if (!_isOwnedObject) return;
-
         try
         {
-            _zoningCts?.CancelAfter(2500);
+            _zoningCts?.Cancel();
         }
         catch (ObjectDisposedException)
         {
@@ -441,7 +454,17 @@ public sealed class GameObjectHandler : DisposableMediatorSubscriberBase, IHighP
 
     private void ZoneSwitchStart()
     {
-        if (!_isOwnedObject) return;
+        try
+        {
+            _zoningCts?.Cancel();
+        }
+        catch
+        {
+            // ignore
+        }
+
+        _haltProcessing = true;
+        Invalidate();
 
         _zoningCts = new();
         Logger.LogDebug("[{obj}] Starting Delay After Zoning", this);
@@ -457,6 +480,8 @@ public sealed class GameObjectHandler : DisposableMediatorSubscriberBase, IHighP
             }
             finally
             {
+                _haltProcessing = false;
+                _nextUpdateUtc = DateTime.MinValue;
                 Logger.LogDebug("[{this}] Delay after zoning complete", this);
                 _zoningCts.Dispose();
             }

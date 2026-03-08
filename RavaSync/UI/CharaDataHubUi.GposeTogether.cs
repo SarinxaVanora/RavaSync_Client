@@ -27,7 +27,7 @@ internal sealed partial class CharaDataHubUi
             ImGuiHelpers.ScaledDummy(5);
         }
 
-        _uiSharedService.BigText(_uiSharedService.L("UI.CharaDataHubUi.GposeTogether.d41d8cd9", ""));
+        _uiSharedService.BigText(_uiSharedService.L("UI.CharaDataHubUi.GposeTogether.d41d8cd9", "GPose Together"));
         DrawHelpFoldout(_uiSharedService.L("UI.CharaDataHubUi.GposeTogether.040e66ec", "GPose together is a way to do multiplayer GPose sessions and collaborations.") + UiSharedService.DoubleNewLine
             + "GPose together requires Brio to function. Only Brio is also supported for the actual posing interactions. Attempting to pose using other tools will lead to conflicts and exploding characters." + UiSharedService.DoubleNewLine
             + "To use GPose together you either create or join a GPose Together Lobby. After you and other people have joined, make sure that everyone is on the same map. "
@@ -38,7 +38,7 @@ internal sealed partial class CharaDataHubUi
         using var disabled = ImRaii.Disabled(!_charaDataManager.BrioAvailable || !_uiSharedService.ApiController.IsConnected);
 
         UiSharedService.DistanceSeparator();
-        _uiSharedService.BigText(_uiSharedService.L("UI.CharaDataHubUi.GposeTogether.d41d8cd9", ""));
+        _uiSharedService.BigText(_uiSharedService.L("UI.CharaDataHubUi.GposeTogether.d41d8cd9", "GPose Together"));
         if (string.IsNullOrEmpty(_charaDataGposeTogetherManager.CurrentGPoseLobbyId))
         {
             if (_uiSharedService.IconTextButton(FontAwesomeIcon.Plus, _uiSharedService.L("UI.CharaDataHubUi.GposeTogether.830d7887", "Create New GPose Together Lobby")))

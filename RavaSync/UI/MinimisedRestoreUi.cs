@@ -5,9 +5,13 @@ using Dalamud.Interface.Textures.TextureWraps;
 using Dalamud.Interface.Utility;
 using Dalamud.Interface.Utility.Raii;
 using Microsoft.Extensions.Logging;
+using RavaSync.API.Data.Enum;
 using RavaSync.MareConfiguration;
 using RavaSync.Services;
 using RavaSync.Services.Mediator;
+using RavaSync.Services.ServerConfiguration;
+using RavaSync.WebAPI;
+using RavaSync.WebAPI.SignalR.Utils;
 using System.Numerics;
 
 namespace RavaSync.UI;
@@ -16,6 +20,8 @@ public sealed class MinimisedRestoreUi : WindowMediatorSubscriberBase
 {
     private readonly UiSharedService _uiShared;
     private readonly MareConfigService _config;
+    private readonly ApiController _apiController;
+    private readonly ServerConfigurationManager _serverManager;
     private bool _didDrag;
     private bool _ignoreNextRestoredClose;
 
@@ -29,11 +35,15 @@ public sealed class MinimisedRestoreUi : WindowMediatorSubscriberBase
      UiSharedService uiShared,
      MareConfigService config,
      MareMediator mediator,
-     PerformanceCollectorService performanceCollectorService)
+     PerformanceCollectorService performanceCollectorService,
+     ApiController apiController,
+     ServerConfigurationManager serverManager)
      : base(logger, mediator, "###RavaSyncMinimizedRestore", performanceCollectorService)
     {
         _uiShared = uiShared;
         _config = config;
+        _apiController = apiController;
+        _serverManager = serverManager;
 
         IsOpen = _config.Current.HasValidSetup() && _config.Current.ShowMinimizedRestoreIcon;
 
@@ -114,13 +124,19 @@ public sealed class MinimisedRestoreUi : WindowMediatorSubscriberBase
         var size = new Vector2(44f, 44f) * ImGuiHelpers.GlobalScale;
         var start = ImGui.GetCursorScreenPos();
 
-        ImGui.InvisibleButton("##restore", size, ImGuiButtonFlags.MouseButtonLeft);
+        ImGui.InvisibleButton("##restore", size, ImGuiButtonFlags.MouseButtonLeft | ImGuiButtonFlags.MouseButtonRight | ImGuiButtonFlags.MouseButtonMiddle);
 
         var dl = ImGui.GetWindowDrawList();
         var end = start + size;
 
+        bool isConnectingOrConnected = _apiController.ServerState is ServerState.Connected or ServerState.Connecting or ServerState.Reconnecting;
+        bool connectionToggleBusy = _apiController.ServerState is ServerState.Reconnecting or ServerState.Disconnecting;
+        var accentColor = isConnectingOrConnected
+            ? new Vector4(0.75f, 0.50f, 1.0f, 0.85f)
+            : new Vector4(0.90f, 0.20f, 0.26f, 0.90f);
+
         dl.AddRectFilled(start, end, ImGui.GetColorU32(new Vector4(0.08f, 0.02f, 0.12f, 0.85f)), 10f * ImGuiHelpers.GlobalScale);
-        dl.AddRect(start, end, ImGui.GetColorU32(new Vector4(0.75f, 0.50f, 1.0f, 0.85f)), 10f * ImGuiHelpers.GlobalScale, 0, 1.5f * ImGuiHelpers.GlobalScale);
+        dl.AddRect(start, end, ImGui.GetColorU32(accentColor), 10f * ImGuiHelpers.GlobalScale, 0, 1.5f * ImGuiHelpers.GlobalScale);
 
         if (_iconTex != null)
         {
@@ -157,7 +173,7 @@ public sealed class MinimisedRestoreUi : WindowMediatorSubscriberBase
 
         if (ImGui.IsItemDeactivated() && !_didDrag)
         {
-            if (!ImGui.IsMouseReleased(ImGuiMouseButton.Right))
+            if (!ImGui.IsMouseReleased(ImGuiMouseButton.Right) && !ImGui.IsMouseReleased(ImGuiMouseButton.Middle))
             {
                 var pos = ImGui.GetWindowPos();
                 Mediator.Publish(new RestoreMainUiAtPositionMessage(pos));
@@ -171,13 +187,41 @@ public sealed class MinimisedRestoreUi : WindowMediatorSubscriberBase
             Mediator.Publish(new UiToggleMessage(typeof(ToolsHubUi)));
         }
 
+        if (!_didDrag && ImGui.IsItemHovered() && ImGui.IsMouseReleased(ImGuiMouseButton.Middle) && !connectionToggleBusy)
+        {
+            ToggleServerConnection();
+        }
+
         if (ImGui.IsItemHovered())
         {
             ImGui.BeginTooltip();
-            ImGui.TextUnformatted(_uiShared.L("UI.MinimisedRestoreUi.4936E024", "Left click: Open RavaSync\nRight click: Tools Hub"));
+            var connectHint = connectionToggleBusy
+                ? _uiShared.L("UI.MinimisedRestoreUi.92C204E8", "Middle click: Connection busy")
+                : isConnectingOrConnected
+                    ? _uiShared.L("UI.MinimisedRestoreUi.0A1E4A91", "Middle click: Disconnect")
+                    : _uiShared.L("UI.MinimisedRestoreUi.28A1F7C2", "Middle click: Connect");
+            ImGui.TextUnformatted(_uiShared.L("UI.MinimisedRestoreUi.4936E024", "Left click: Open RavaSync\nRight click: Tools Hub") + "\n" + connectHint);
             ImGui.EndTooltip();
         }
     }
+    private void ToggleServerConnection()
+    {
+        bool isConnectingOrConnected = _apiController.ServerState is ServerState.Connected or ServerState.Connecting or ServerState.Reconnecting;
+
+        if (isConnectingOrConnected && !_serverManager.CurrentServer.FullPause)
+        {
+            _serverManager.CurrentServer.FullPause = true;
+            _serverManager.Save();
+        }
+        else if (!isConnectingOrConnected && _serverManager.CurrentServer.FullPause)
+        {
+            _serverManager.CurrentServer.FullPause = false;
+            _serverManager.Save();
+        }
+
+        _ = _apiController.CreateConnectionsAsync();
+    }
+
     private static byte[] ReadEmbedded(string resourceName)
     {
         using var s = typeof(MinimisedRestoreUi).Assembly.GetManifestResourceStream(resourceName);

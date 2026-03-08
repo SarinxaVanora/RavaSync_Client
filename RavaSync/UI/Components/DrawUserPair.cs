@@ -233,7 +233,7 @@ public class DrawUserPair
         }
 
         UiSharedService.AttachToolTip(
-            _uiSharedService.L("UI.DrawUserPair.d41d8cd9", "")
+            _uiSharedService.L("UI.DrawUserPair.d41d8cd9", "Changes height metadata permissions with this user.")
             + (individual ? individualText : string.Empty));
     }
 

@@ -61,7 +61,7 @@ public class EditProfileUi : WindowMediatorSubscriberBase
 
     protected override void DrawInternal()
     {
-        _uiSharedService.BigText(_uiSharedService.L("UI.EditProfileUi.d41d8cd9", ""));
+        _uiSharedService.BigText(_uiSharedService.L("UI.EditProfileUi.d41d8cd9", "Edit Profile"));
 
         var profile = _mareProfileManager.GetMareProfile(new UserData(_apiController.UID));
 
@@ -120,11 +120,11 @@ public class EditProfileUi : WindowMediatorSubscriberBase
         ImGui.EndDisabled();
 
         ImGui.Separator();
-        _uiSharedService.BigText(_uiSharedService.L("UI.EditProfileUi.d41d8cd9", ""));
+        _uiSharedService.BigText(_uiSharedService.L("UI.EditProfileUi.d41d8cd9", "Edit Profile"));
 
         ImGui.TextWrapped(string.Format(_uiSharedService.L("UI.EditProfileUi.9cbb3e8f", "- All users that are paired and unpaused with you will be able to see your profile picture and description.{0}- Other users have the possibility to report your profile for breaking the rules.{1}- !!! AVOID: anything as profile image that can be considered highly illegal or obscene (bestiality, anything that could be considered a sexual act with a minor (that includes Lalafells), etc.){2}- !!! AVOID: slurs of any kind in the description that can be considered highly offensive{3}- In case of valid reports from other users this can lead to disabling your profile forever or terminating your RavaSync account indefinitely.{4}- Judgement of your profile validity from reports through staff is not up to debate and the decisions to disable your profile/account permanent.{5}- If your profile picture or profile description could be considered NSFW, enable the toggle below."), Environment.NewLine, Environment.NewLine, Environment.NewLine, Environment.NewLine, Environment.NewLine, Environment.NewLine));
         ImGui.Separator();
-        _uiSharedService.BigText(_uiSharedService.L("UI.EditProfileUi.d41d8cd9", ""));
+        _uiSharedService.BigText(_uiSharedService.L("UI.EditProfileUi.d41d8cd9", "Edit Profile"));
 
         if (_uiSharedService.IconTextButton(FontAwesomeIcon.FileUpload, _uiSharedService.L("UI.EditProfileUi.c9ab69c4", "Upload new profile picture")))
         {

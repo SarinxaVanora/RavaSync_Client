@@ -1,19 +1,20 @@
 ﻿using Dalamud.Bindings.ImGui;
 using Dalamud.Interface.Colors;
-using Dalamud.Interface.Textures;
 using Dalamud.Interface.Textures.TextureWraps;
-using Dalamud.Plugin.Services;
 using Microsoft.Extensions.Logging;
 using RavaSync.MareConfiguration;
 using RavaSync.PlayerData.Handlers;
+using RavaSync.PlayerData.Pairs;
 using RavaSync.Services;
 using RavaSync.Services.Mediator;
 using RavaSync.WebAPI.Files;
 using RavaSync.WebAPI.Files.Models;
 using System.Collections.Concurrent;
-using System.IO;
 using System.Numerics;
-using System.Reflection;
+using RavaSync.PlayerData.Factories;
+using ObjectKind = RavaSync.API.Data.Enum.ObjectKind;
+using Dalamud.Plugin.Services;
+using Dalamud.Game.ClientState.Objects.Types;
 
 namespace RavaSync.UI;
 
@@ -27,9 +28,9 @@ public class DownloadUi : WindowMediatorSubscriberBase
     private static readonly TimeSpan DownloadUiHoldWindow = TimeSpan.FromSeconds(2);
     private readonly DalamudUtilService _dalamudUtilService;
     private readonly FileUploadManager _fileTransferManager;
+    private readonly PairManager _pairManager;
     private readonly UiSharedService _uiShared;
-    private readonly ConcurrentDictionary<GameObjectHandler, long> _uploadingPlayers = new();
-    private const long UploadingHoldMs = 20L * 20L * 1000L;
+    private readonly IObjectTable _objectTable;
     private IDalamudTextureWrap? _aetherFrame;
     private IDalamudTextureWrap? _aetherFill;
     private IDalamudTextureWrap? _aetherFillBlue;
@@ -62,14 +63,16 @@ public class DownloadUi : WindowMediatorSubscriberBase
 
 
 
-    public DownloadUi(ILogger<DownloadUi> logger, DalamudUtilService dalamudUtilService, MareConfigService configService,
-        FileUploadManager fileTransferManager, MareMediator mediator, UiSharedService uiShared, PerformanceCollectorService performanceCollectorService)
+    public DownloadUi(ILogger<DownloadUi> logger, DalamudUtilService dalamudUtilService, MareConfigService configService, FileUploadManager fileTransferManager, PairManager pairManager, IObjectTable objectTable,
+        MareMediator mediator, UiSharedService uiShared, PerformanceCollectorService performanceCollectorService)
         : base(logger, mediator, "RavaSync Downloads", performanceCollectorService)
     {
         _dalamudUtilService = dalamudUtilService;
         _configService = configService;
         _fileTransferManager = fileTransferManager;
         _uiShared = uiShared;
+        _pairManager = pairManager;
+        _objectTable = objectTable;
 
         SizeConstraints = new WindowSizeConstraints()
         {
@@ -142,13 +145,6 @@ public class DownloadUi : WindowMediatorSubscriberBase
 
         Mediator.Subscribe<GposeStartMessage>(this, (_) => IsOpen = false);
         Mediator.Subscribe<GposeEndMessage>(this, (_) => IsOpen = true);
-        Mediator.Subscribe<PlayerUploadingMessage>(this, (msg) =>
-        {
-            if (msg.IsUploading)
-                _uploadingPlayers[msg.Handler] = Environment.TickCount64;
-            else
-                _uploadingPlayers.TryRemove(msg.Handler, out _);
-        });
         EnsureAetherTextures();
     }
 
@@ -471,44 +467,20 @@ public class DownloadUi : WindowMediatorSubscriberBase
 
             if (_configService.Current.ShowUploading)
             {
-                var nowTick = Environment.TickCount64;
-
-                foreach (var kvp in _uploadingPlayers.ToList())
+                foreach (var pair in _pairManager.PairsWithGroups.Keys)
                 {
-                    var player = kvp.Key;
-                    var lastTick = kvp.Value;
-
-                    if (player.Address == IntPtr.Zero)
-                    {
-                        _uploadingPlayers.TryRemove(player, out _);
+                    if (!pair.IsUploading)
                         continue;
-                    }
 
-                    if ((nowTick - lastTick) > UploadingHoldMs)
-                    {
-                        _uploadingPlayers.TryRemove(player, out _);
+                    if (!TryResolveUploadingPlayerObject(pair, out var go, out var addr))
                         continue;
-                    }
 
-                    var go = player.GetGameObject();
-                    if (go == null)
-                    {
-                        _uploadingPlayers.TryRemove(player, out _);
+                    var screenPos2 = _dalamudUtilService.WorldToScreen(go);
+                    if (screenPos2 == Vector2.Zero)
                         continue;
-                    }
 
-                    // Only ever draw on actual players
-                    if (go.ObjectKind != Dalamud.Game.ClientState.Objects.Enums.ObjectKind.Player)
-                    {
-                        _uploadingPlayers.TryRemove(player, out _);
-                        continue;
-                    }
-
-                    var screenPos = _dalamudUtilService.WorldToScreen(go);
-                    if (screenPos == Vector2.Zero) continue;
-
-                    keepKeys.Add(player.Address);
-                    screenPos = SmoothAndSnapScreen(player.Address, screenPos, dtPos);
+                    keepKeys.Add(addr);
+                    screenPos2 = SmoothAndSnapScreen(addr, screenPos2, dtPos);
 
                     try
                     {
@@ -518,8 +490,8 @@ public class DownloadUi : WindowMediatorSubscriberBase
 
                         var drawList = ImGui.GetBackgroundDrawList();
                         var tp = new Vector2(
-                            MathF.Round(screenPos.X - textSize.X / 2f - 1f),
-                            MathF.Round(screenPos.Y - textSize.Y / 2f - 1f)
+                            MathF.Round(screenPos2.X - textSize.X / 2f - 1f),
+                            MathF.Round(screenPos2.Y - textSize.Y / 2f - 1f)
                         );
 
                         UiSharedService.DrawOutlinedFont(
@@ -1413,6 +1385,48 @@ public class DownloadUi : WindowMediatorSubscriberBase
         return dst;
     }
 
+    private bool TryResolveUploadingPlayerObject(Pair pair, out IGameObject? go, out IntPtr addr)
+    {
+        go = null;
+        addr = IntPtr.Zero;
+
+        var a = _dalamudUtilService.GetPlayerCharacterFromCachedTableByIdent(pair.Ident);
+
+        if (a == nint.Zero)
+        {
+            var found = _dalamudUtilService.FindPlayerByNameHash(pair.Ident);
+            if (found == default((string, nint)) || found.Address == nint.Zero)
+                return false;
+
+            a = found.Address;
+        }
+
+        addr = (IntPtr)a;
+
+        try
+        {
+            for (int i = 0; i < _objectTable.Length; i++)
+            {
+                var o = _objectTable[i];
+                if (o == null) continue;
+
+                if ((IntPtr)o.Address != addr) continue;
+
+                if (o.ObjectKind != Dalamud.Game.ClientState.Objects.Enums.ObjectKind.Player)
+                    return false;
+
+                go = o;
+                return true;
+            }
+        }
+        catch
+        {
+            // ignore lookup errors; best effort
+        }
+
+        return false;
+    }
+
     public override bool DrawConditions()
     {
         if (_uiShared.EditTrackerPosition) 
@@ -1427,7 +1441,7 @@ public class DownloadUi : WindowMediatorSubscriberBase
             return false;
 
 
-        if (!_configService.Current.EditGlobalTransferOverlay && !_currentDownloads.Any() && !_fileTransferManager.CurrentUploads.Any() && !_uploadingPlayers.Any())
+        if (!_configService.Current.EditGlobalTransferOverlay && !_currentDownloads.Any() && !_fileTransferManager.CurrentUploads.Any() && !_pairManager.PairsWithGroups.Keys.Any(p => p.IsUploading))
             return false;
 
         if (!IsOpen) 

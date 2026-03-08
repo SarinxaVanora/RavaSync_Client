@@ -1,3 +1,4 @@
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using RavaSync.API.Data;
 using RavaSync.API.Data.Extensions;
@@ -27,10 +28,13 @@ public class PlayerPerformanceService : MediatorSubscriberBase
     private readonly MareMediator _mediator;
     private readonly PlayerPerformanceConfigService _playerPerformanceConfigService;
     private readonly TransientResourceManager _transientResourceManager;
+    private readonly IServiceProvider _services;
     private readonly ConcurrentDictionary<string, bool> _warnedForPlayers = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, (long Bytes, long Stamp)> _textureVramByHash = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, (long Bytes, long Stamp)> _modelVramByHash = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, UserData> _autoThresholdPausedUsers = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, UserData> _autoCombatPausedUsers = new(StringComparer.Ordinal);
+    private int _combatPauseActive;
 
     // pooled VRAM (bytes) per non-direct (Syncshell) UID
     private readonly ConcurrentDictionary<string, long> _syncshellVramByUid = new(StringComparer.Ordinal);
@@ -46,28 +50,22 @@ public class PlayerPerformanceService : MediatorSubscriberBase
     Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
                  "RavaSync", "autoCapState.json");
 
-    // debounce writes
     private int _stateDirty; // 0/1 via Interlocked
     private DateTime _lastSave = DateTime.MinValue;
 
-    // avoid kicking save attempts every frame while throttled
     private int _stateSaveInFlight; // 0/1 via Interlocked
     private DateTime _nextStateSaveAttemptUtc = DateTime.MinValue;
 
     private static readonly TimeSpan AutoCapCheckInterval = TimeSpan.FromMilliseconds(500);
     private DateTime _nextAutoCapCheckUtc = DateTime.MinValue;
 
-    // Only rescan auto-cap candidates when something relevant changed
-    private int _autoCapCandidatesDirty = 1; // start dirty so first pass evaluates
+    private int _autoCapCandidatesDirty = 1;
     private long _lastObservedAutoCapBytes = -1;
-
-
-
-
 
     public PlayerPerformanceService(ILogger<PlayerPerformanceService> logger, MareMediator mediator,
         PlayerPerformanceConfigService playerPerformanceConfigService, FileCacheManager fileCacheManager,
-        XivDataAnalyzer xivDataAnalyzer, TransientResourceManager transientResourceManager) : base(logger, mediator)
+        XivDataAnalyzer xivDataAnalyzer, TransientResourceManager transientResourceManager,
+        IServiceProvider services) : base(logger, mediator)
     {
 
         _logger = logger;
@@ -76,12 +74,15 @@ public class PlayerPerformanceService : MediatorSubscriberBase
         _fileCacheManager = fileCacheManager;
         _xivDataAnalyzer = xivDataAnalyzer;
         _transientResourceManager = transientResourceManager;
+        _services = services;
 
         _mediator.Subscribe<FrameworkUpdateMessage>(this, _ => AutoPauseHandler());
         _mediator.Subscribe<DelayedFrameworkUpdateMessage>(this, _ => AutoPauseHandler());
         LoadAutoCapState();
         Mediator.Subscribe<FrameworkUpdateMessage>(this, _ => TryKickAutoCapStateSave());
         Mediator.Subscribe<DelayedFrameworkUpdateMessage>(this, _ => TryKickAutoCapStateSave());
+        _mediator.Subscribe<CombatOrPerformanceStartMessage>(this, _ => HandleCombatAutoPauseStart());
+        _mediator.Subscribe<CombatOrPerformanceEndMessage>(this, _ => HandleCombatAutoPauseEnd());
 
     }
 
@@ -770,6 +771,108 @@ public class PlayerPerformanceService : MediatorSubscriberBase
         }
 
         return hashes;
+    }
+
+    private IEnumerable<Pair> EnumerateAllPairs()
+    {
+        PairManager? pm = null;
+        try
+        {
+            pm = _services.GetService<PairManager>();
+        }
+        catch
+        {
+            // best effort
+        }
+
+        if (pm == null)
+            yield break;
+
+        foreach (var p in pm.DirectPairs)
+            yield return p;
+
+        foreach (var group in pm.GroupPairs.Values)
+            foreach (var p in group)
+                yield return p;
+    }
+
+    private void HandleCombatAutoPauseStart()
+    {
+        var cfg = _playerPerformanceConfigService.Current;
+        if (!cfg.AutoPauseWhileInCombat) return;
+
+        if (Interlocked.Exchange(ref _combatPauseActive, 1) == 1)
+            return;
+
+        _autoCombatPausedUsers.Clear();
+
+        foreach (var pair in EnumerateAllPairs())
+        {
+            try
+            {
+                if (!pair.IsVisible) continue;
+
+                // don't interfere with other-sync ownership
+                if (pair.AutoPausedByOtherSync && !pair.EffectiveOverrideOtherSync) continue;
+
+                // already paused? don't touch, and don't record it
+                if (pair.UserPair?.OwnPermissions.IsPaused() ?? false) continue;
+
+                // if they are paused by cap right now, don't touch
+                if (pair.AutoPausedByCap) continue;
+
+                // ignore list should still apply
+                if (IsIgnored(cfg, pair.UserData)) continue;
+
+                _autoCombatPausedUsers[pair.UserData.UID] = pair.UserData;
+                _mediator.Publish(new PauseMessage(pair.UserData));
+            }
+            catch
+            {
+                // best effort
+            }
+        }
+
+        if (_logger.IsEnabled(LogLevel.Debug))
+            _logger.LogDebug("Combat auto-pause: paused {count} visible users", _autoCombatPausedUsers.Count);
+    }
+
+    private void HandleCombatAutoPauseEnd()
+    {
+        if (Interlocked.Exchange(ref _combatPauseActive, 0) == 0)
+            return;
+
+        if (_autoCombatPausedUsers.IsEmpty)
+            return;
+
+        var liveByUid = new Dictionary<string, Pair>(StringComparer.Ordinal);
+        foreach (var p in EnumerateAllPairs())
+        {
+            if (p?.UserData?.UID is string uid && !string.IsNullOrEmpty(uid))
+                liveByUid[uid] = p;
+        }
+
+        foreach (var kv in _autoCombatPausedUsers)
+        {
+            var uid = kv.Key;
+            var user = kv.Value;
+
+            try
+            {
+                if (_autoThresholdPausedUsers.ContainsKey(uid)) continue;
+                if (_autoCapPausedUsers.ContainsKey(uid)) continue;
+
+                if (liveByUid.TryGetValue(uid, out var livePair) && livePair.AutoPausedByCap) continue;
+
+                _mediator.Publish(new ResumeMessage(user));
+            }
+            catch { }
+        }
+
+        _autoCombatPausedUsers.Clear();
+
+        if (_logger.IsEnabled(LogLevel.Debug))
+            _logger.LogDebug("Combat auto-pause: resumed users and cleared list");
     }
 
     //Kaia, you fucking idiot. Why awas this making huge calls every tick? WHY. I fixed it, love, your own drunk ass.

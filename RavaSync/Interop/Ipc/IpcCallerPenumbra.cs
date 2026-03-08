@@ -41,18 +41,6 @@ public sealed class IpcCallerPenumbra : DisposableMediatorSubscriberBase, IIpcCa
         }
     }
 
-    private readonly ConcurrentDictionary<int, TempCollectionAssignState> _tempCollectionAssignState = new();
-
-    private sealed class TempCollectionAssignState
-    {
-        public Guid LastCollection;
-        public int FailCount;
-        public DateTime NextAttemptUtc;
-        public DateTime LastWarnUtc;
-        public DateTime LastForceUtc;
-    }
-
-
     private readonly ConcurrentDictionary<IntPtr, bool> _penumbraRedrawRequests = new();
 
     private readonly EventSubscriber _penumbraDispose;
@@ -218,55 +206,23 @@ public sealed class IpcCallerPenumbra : DisposableMediatorSubscriberBase, IIpcCa
         {
             assigned = await _dalamudUtil.RunOnFrameworkThread(() =>
             {
-                var now = DateTime.UtcNow;
-                var state = _tempCollectionAssignState.GetOrAdd(idx, _ => new TempCollectionAssignState());
-
-                if (state.LastCollection != collName)
-                {
-                    state.LastCollection = collName;
-                    state.FailCount = 0;
-                    state.NextAttemptUtc = DateTime.MinValue;
-                    state.LastWarnUtc = DateTime.MinValue;
-                    state.LastForceUtc = DateTime.MinValue;
-                }
-
-                if (now < state.NextAttemptUtc)
-                    return false;
-
                 var ec = _penumbraAssignTemporaryCollection.Invoke(collName, idx, forceAssignment: false);
                 if (ec == PenumbraApiEc.Success)
                 {
-                    _tempCollectionAssignState.TryRemove(idx, out _);
                     logger.LogTrace("[Penumbra] Assigned temp collection {collection} to idx {idx} (polite)", collName, idx);
                     return true;
                 }
 
-                if ((now - state.LastForceUtc) >= TimeSpan.FromSeconds(3))
+                var ecForce = _penumbraAssignTemporaryCollection.Invoke(collName, idx, forceAssignment: true);
+                if (ecForce == PenumbraApiEc.Success)
                 {
-                    state.LastForceUtc = now;
-
-                    var ecForce = _penumbraAssignTemporaryCollection.Invoke(collName, idx, forceAssignment: true);
-                    if (ecForce == PenumbraApiEc.Success)
-                    {
-                        _tempCollectionAssignState.TryRemove(idx, out _);
-                        logger.LogTrace("[Penumbra] Assigned temp collection {collection} to idx {idx} (forced)", collName, idx);
-                        return true;
-                    }
-
-                    ec = ecForce;
+                    logger.LogTrace("[Penumbra] Assigned temp collection {collection} to idx {idx} (forced)", collName, idx);
+                    return true;
                 }
 
-                state.FailCount++;
-                var delayMs = (int)Math.Min(30_000, 500 * Math.Pow(2, Math.Min(state.FailCount, 10)));
-                state.NextAttemptUtc = now.AddMilliseconds(delayMs);
-
-                if (now - state.LastWarnUtc > TimeSpan.FromMinutes(1))
-                {
-                    state.LastWarnUtc = now;
-                    logger.LogWarning(
-                        "[Penumbra] Temp collection assign failed for idx {idx} (ec={ec}). Another plugin may be controlling this actor. Backing off for {delay}ms.",
-                        idx, ec, delayMs);
-                }
+                logger.LogDebug(
+                    "[Penumbra] Temp collection assign failed for idx {idx} (polite={ec}, forced={ecForce}). This is a temporary claim failure only.",
+                    idx, ec, ecForce);
 
                 return false;
             }).ConfigureAwait(false);
@@ -274,8 +230,6 @@ public sealed class IpcCallerPenumbra : DisposableMediatorSubscriberBase, IIpcCa
 
         return assigned;
     }
-
-
 
     public async Task ConvertTextureFiles(ILogger logger, Dictionary<string, string[]> textures, IProgress<(string, int)> progress, CancellationToken token)
     {

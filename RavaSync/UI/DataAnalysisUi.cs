@@ -938,7 +938,7 @@ public class DataAnalysisUi : WindowMediatorSubscriberBase
                     ImGui.TableNextColumn();
                     if (string.Equals(item.Format.Value, "BC7", StringComparison.Ordinal))
                     {
-                        ImGui.TextUnformatted(_uiSharedService.L("UI.DataAnalysisUi.d41d8cd9", ""));
+                        ImGui.TextUnformatted(_uiSharedService.L("UI.DataAnalysisUi.d41d8cd9", "Already BC7"));
                         continue;
                     }
                     var filePath = item.FilePaths[0];

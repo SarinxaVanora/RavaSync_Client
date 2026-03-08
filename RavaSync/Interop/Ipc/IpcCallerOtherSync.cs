@@ -114,7 +114,8 @@ public sealed class IpcCallerOtherSync : IIpcCaller
                 if (list != null && list.Contains(address))
                 {
                     var llPause = TryGetLightlessFullPause(onlyIfListNonEmpty: true, listCountHint: list.Count);
-                    if (llPause == true)
+
+                    if (llPause != false)
                         return false;
 
                     owner = "Lightless";
@@ -136,7 +137,8 @@ public sealed class IpcCallerOtherSync : IIpcCaller
                 if (list != null && list.Contains(address))
                 {
                     var scPause = TryGetSnowcloakFullPause(onlyIfListNonEmpty: true, listCountHint: list.Count);
-                    if (scPause == true)
+
+                    if (scPause != false)
                         return false;
 
                     owner = "Snowcloak";
@@ -198,7 +200,8 @@ public sealed class IpcCallerOtherSync : IIpcCaller
                 if (lightlessList != null && lightlessList.Count > 0)
                 {
                     var llPause = TryGetLightlessFullPause(onlyIfListNonEmpty: true, listCountHint: lightlessList.Count);
-                    if (llPause != true)
+
+                    if (llPause == false)
                     {
                         foreach (var a in lightlessList)
                             if (a != nint.Zero) set.Add(a);
@@ -222,7 +225,8 @@ public sealed class IpcCallerOtherSync : IIpcCaller
                 if (snowcloakList != null && snowcloakList.Count > 0)
                 {
                     var scPause = TryGetSnowcloakFullPause(onlyIfListNonEmpty: true, listCountHint: snowcloakList.Count);
-                    if (scPause != true)
+
+                    if (scPause == false)
                     {
                         foreach (var a in snowcloakList)
                             if (a != nint.Zero) set.Add(a);

@@ -14,21 +14,15 @@ public sealed class CrashRecoveryService : IHostedService, IDisposable
     private readonly ILogger<CrashRecoveryService> _logger;
     private readonly MareConfigService _cfg;
     private readonly MareMediator _mediator;
-    private readonly DelayedActivatorService _delayedActivator;
 
     private string _sentinelPath = string.Empty;
     private int _sentinelWritten = 0;
 
-    public CrashRecoveryService(
-        ILogger<CrashRecoveryService> logger,
-        MareConfigService cfg,
-        MareMediator mediator,
-        DelayedActivatorService delayedActivator)
+    public CrashRecoveryService(ILogger<CrashRecoveryService> logger,MareConfigService cfg,MareMediator mediator)
     {
         _logger = logger;
         _cfg = cfg;
         _mediator = mediator;
-        _delayedActivator = delayedActivator;
     }
 
     public Task StartAsync(CancellationToken cancellationToken)
@@ -42,10 +36,9 @@ public sealed class CrashRecoveryService : IHostedService, IDisposable
         if (uncleanShutdownDetected)
         {
             var cacheFolder = _cfg.Current.CacheFolder;
-            var quarantineFolder = _delayedActivator.QuarantineRoot;
 
-            var (tinyDeleted, tinyFailed) = CleanupTinyFiles(16, cacheFolder, quarantineFolder);
-            var (tmpDeleted, tmpFailed) = CleanupTempArtifacts(cacheFolder, quarantineFolder);
+            var (tinyDeleted, tinyFailed) = CleanupTinyFiles(16, cacheFolder);
+            var (tmpDeleted, tmpFailed) = CleanupTempArtifacts(cacheFolder);
 
             _mediator.Publish(new NotificationMessage(
                 "RavaSync Recovery",
