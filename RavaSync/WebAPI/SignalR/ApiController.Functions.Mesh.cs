@@ -1,4 +1,4 @@
-﻿using RavaSync.API.Dto;
+using RavaSync.API.Dto;
 using RavaSync.API.SignalR;
 using Microsoft.AspNetCore.SignalR.Client;
 using Microsoft.Extensions.Logging;
@@ -9,14 +9,20 @@ namespace RavaSync.WebAPI
     {
         public Task MeshRegister(string sessionId)
         {
-            CheckConnection();
-            return _mareHub!.SendAsync(nameof(MeshRegister), sessionId);
+            var hub = _mareHub;
+            if (hub == null || hub.State != HubConnectionState.Connected)
+                return Task.CompletedTask;
+
+            return hub.SendAsync(nameof(MeshRegister), sessionId);
         }
 
         public Task MeshSend(MeshMessageDto message)
         {
-            CheckConnection();
-            return _mareHub!.SendAsync(nameof(MeshSend), message);
+            var hub = _mareHub;
+            if (hub == null || hub.State != HubConnectionState.Connected)
+                return Task.CompletedTask;
+
+            return hub.SendAsync(nameof(MeshSend), message);
         }
 
         public Task Client_MeshMessage(MeshMessageDto dto)

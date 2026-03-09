@@ -573,15 +573,7 @@ public class CompactUi : WindowMediatorSubscriberBase
         var contentW = UiSharedService.GetWindowContentRegionWidth();
         var scale = ImGuiHelpers.GlobalScale;
 
-        if (_apiController.ServerState is not ServerState.Connected)
-        {
-            var text = GetServerError();
-            if (!string.IsNullOrEmpty(text))
-                UiSharedService.ColorTextWrapped(text, GetUidColor());
-            else
-                UiSharedService.ColorTextWrapped(GetUidText(), GetUidColor());
-            return;
-        }
+        bool isConnected = _apiController.ServerState is ServerState.Connected;
 
         RefreshHeaderCacheIfNeeded();
 
@@ -649,10 +641,10 @@ public class CompactUi : WindowMediatorSubscriberBase
 
             ImGui.BeginGroup();
 
-            var name = _apiController.DisplayName ?? string.Empty;
+            var name = isConnected ? (_apiController.DisplayName ?? string.Empty) : _uiSharedService.L("UI.CompactUI.OfflineHeader", "OFFLINE");
             var uid = _apiController.UID ?? string.Empty;
 
-            bool needsVanity = !string.IsNullOrEmpty(uid) && string.Equals(name, uid, StringComparison.Ordinal);
+            bool needsVanity = isConnected && !string.IsNullOrEmpty(uid) && string.Equals(name, uid, StringComparison.Ordinal);
 
             float nameH;
             using (_uiSharedService.UidFont.Push())
@@ -957,6 +949,59 @@ public class CompactUi : WindowMediatorSubscriberBase
             dl.AddRect(panelStart, panelStart + new Vector2(w, h), border, 10f * scale);
 
             ImGui.Dummy(new Vector2(0, 0.5f * scale));
+        }
+
+        if (!isConnected)
+        {
+            var statusText = GetUidText();
+            var detailText = GetServerError();
+            var statusColor = GetUidColor();
+
+            var statusSize = ImGui.CalcTextSize(statusText);
+            ImGui.SetCursorPosX(MathF.Max(0f, (contentW - statusSize.X) * 0.5f));
+            ImGui.PushStyleColor(ImGuiCol.Text, statusColor);
+            ImGui.TextUnformatted(statusText);
+            ImGui.PopStyleColor();
+
+            if (!string.IsNullOrEmpty(detailText) && !string.Equals(detailText, statusText, StringComparison.Ordinal))
+            {
+                float wrapWidth = MathF.Max(120f * scale, contentW - (24f * scale));
+
+                var words = detailText.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+                var wrappedLines = new List<string>();
+                var currentLine = string.Empty;
+
+                foreach (var word in words)
+                {
+                    var candidate = string.IsNullOrEmpty(currentLine) ? word : currentLine + " " + word;
+                    if (ImGui.CalcTextSize(candidate).X <= wrapWidth || string.IsNullOrEmpty(currentLine))
+                    {
+                        currentLine = candidate;
+                    }
+                    else
+                    {
+                        wrappedLines.Add(currentLine);
+                        currentLine = word;
+                    }
+                }
+
+                if (!string.IsNullOrEmpty(currentLine))
+                    wrappedLines.Add(currentLine);
+
+                ImGui.PushStyleColor(ImGuiCol.Text, statusColor);
+
+                foreach (var line in wrappedLines)
+                {
+                    var lineSize = ImGui.CalcTextSize(line);
+                    ImGui.SetCursorPosX(MathF.Max(0f, (contentW - lineSize.X) * 0.5f));
+                    ImGui.TextUnformatted(line);
+                }
+
+                ImGui.PopStyleColor();
+            }
+
+            ImGui.Dummy(new Vector2(0, 2f * scale));
+            return;
         }
 
         // ---------- VRAM panel ----------

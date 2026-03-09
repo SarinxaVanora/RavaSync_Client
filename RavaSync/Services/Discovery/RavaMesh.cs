@@ -18,7 +18,6 @@ public sealed record RavaHelloAck(string FromSessionId, byte[] FromPeerKey) : IR
 public sealed record RavaPairRequest(PairRequestDto Request) : IRavaMeshMessage;
 public sealed record RavaGoodbye(string FromSessionId, byte[] FromPeerKey) : IRavaMeshMessage;
 
-// Sent as MeshMessageType.Game payload (server unchanged)
 public sealed record RavaYield(string FromSessionId, string FromUid, bool YieldToOtherSync, string Owner) : IRavaMeshMessage;
 
 public sealed record RavaGame(string FromSessionId, byte[] Payload) : IRavaMeshMessage;
@@ -70,7 +69,7 @@ public sealed class RavaMesh : IRavaMesh
 
         EnsureHubMeshHooked();
 
-        _ = _api.MeshRegister(sessionId);
+        _ = SafeMeshRegisterAsync(sessionId);
     }
 
     public void Unlisten(string sessionId)
@@ -83,9 +82,9 @@ public sealed class RavaMesh : IRavaMesh
             _currentSessionId = null;
     }
 
-    public Task SendAsync(string sessionId, IRavaMeshMessage message)
+    public async Task SendAsync(string sessionId, IRavaMeshMessage message)
     {
-        if (string.IsNullOrEmpty(sessionId)) return Task.CompletedTask;
+        if (string.IsNullOrEmpty(sessionId)) return;
 
         var fromSession = _currentSessionId ?? string.Empty;
 
@@ -142,7 +141,29 @@ public sealed class RavaMesh : IRavaMesh
             _ => throw new ArgumentOutOfRangeException(nameof(message), $"Unknown mesh message type: {message.GetType().Name}")
         };
 
-        return _api.MeshSend(dto);
+        try
+        {
+            await _api.MeshSend(dto).ConfigureAwait(false);
+        }
+        catch (InvalidOperationException ex)
+        {
+            _logger.LogDebug(ex, "Skipping mesh send to {sessionId}: hub not active", sessionId);
+        }
+    }
+
+
+    private async Task SafeMeshRegisterAsync(string? sessionId)
+    {
+        if (string.IsNullOrEmpty(sessionId)) return;
+
+        try
+        {
+            await _api.MeshRegister(sessionId).ConfigureAwait(false);
+        }
+        catch (InvalidOperationException ex)
+        {
+            _logger.LogDebug(ex, "Skipping mesh register for {sessionId}: hub not active", sessionId);
+        }
     }
 
     private static byte[] BuildYieldPayload(string fromUid, bool yield, string owner)
@@ -191,7 +212,7 @@ public sealed class RavaMesh : IRavaMesh
             _api.OnMeshMessage(OnMeshMessageFromHub);
 
             if (!string.IsNullOrEmpty(_currentSessionId))
-                _ = _api.MeshRegister(_currentSessionId);
+                _ = SafeMeshRegisterAsync(_currentSessionId);
 
             _logger.LogDebug("RavaMesh re-hooked to hub epoch {epoch}", epoch);
         }

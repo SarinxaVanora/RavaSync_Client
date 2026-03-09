@@ -252,7 +252,7 @@ public sealed class GameObjectHandler : DisposableMediatorSubscriberBase, IHighP
                     Logger.LogTrace("Checking [{this}] equip data from game obj, result: {diff}", this, equipDiff);
             }
 
-            if (equipDiff && !_isOwnedObject) // send the message out immediately and cancel out, no reason to continue if not self
+            if (equipDiff && !_isOwnedObject)
             {
                 Logger.LogTrace("[{this}] Changed", this);
                 return;
@@ -287,10 +287,18 @@ public sealed class GameObjectHandler : DisposableMediatorSubscriberBase, IHighP
                     Logger.LogTrace("Checking [{this}] customize data from game obj, result: {diff}", this, equipDiff);
             }
 
-            if ((addrDiff || drawObjDiff || equipDiff || customizeDiff || nameChange) && _isOwnedObject)
+            if (_isOwnedObject)
             {
-                Logger.LogDebug("[{this}] Changed, Sending CreateCacheObjectMessage", this);
-                Mediator.Publish(new CreateCacheForObjectMessage(this));
+                var semanticDiff = equipDiff || customizeDiff || nameChange;
+                if (semanticDiff)
+                {
+                    Logger.LogDebug("[{this}] Changed, Sending CreateCacheObjectMessage", this);
+                    Mediator.Publish(new CreateCacheForObjectMessage(this));
+                }
+                else if (addrDiff || drawObjDiff)
+                {
+                    Logger.LogTrace("[{this}] Suppressing CreateCacheObjectMessage for pointer-only churn (addrDiff={addrDiff}, drawObjDiff={drawObjDiff})", this, addrDiff, drawObjDiff);
+                }
             }
         }
         else if (addrDiff || drawObjDiff)

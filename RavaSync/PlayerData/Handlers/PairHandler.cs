@@ -50,6 +50,8 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
     private bool _isVisible;
     private Guid _penumbraCollection;
     private Task<Guid>? _penumbraCollectionTask;
+    private CancellationTokenSource? _penumbraCollectionTeardownCts;
+    private static readonly TimeSpan PenumbraCollectionTeardownDelay = TimeSpan.FromSeconds(15);
     private Task? _initializeTask;
     private int _initializeStarted;
     private bool _redrawOnNextApplication = false;
@@ -143,10 +145,10 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
         _playerPerformanceService = playerPerformanceService;
         _serverConfigManager = serverConfigManager;
         _penumbraCollection = Guid.Empty;
-        _penumbraCollectionTask = _ipcManager.Penumbra.CreateTemporaryCollectionAsync(logger, Pair.UserData.UID);
+        _penumbraCollectionTask = null;
 
         Mediator.Subscribe<FrameworkUpdateMessage>(this, (_) => FrameworkUpdate());
-        Mediator.Subscribe<ZoneSwitchStartMessage>(this, (_) =>
+        Mediator.Subscribe<ZoneSwitchStartMessage>(this, (zs) =>
         {
             _downloadCancellationTokenSource = _downloadCancellationTokenSource?.CancelRecreate();
             _applicationCancellationTokenSource = _applicationCancellationTokenSource?.CancelRecreate();
@@ -162,17 +164,20 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
             _lastAssignedCollectionAssignUtc = DateTime.MinValue;
             _lastAppliedTempModsFingerprint = null;
 
+            CancelPendingPenumbraCollectionTeardown();
+            _= RemovePenumbraCollectionAsync(Guid.NewGuid());
+
             IsVisible = false;
 
             _lastBroadcastYield = null;
             _lastBroadcastOwner = string.Empty;
-            
         });
 
         Mediator.Subscribe<PenumbraInitializedMessage>(this, (_) =>
         {
+            CancelPendingPenumbraCollectionTeardown();
             _penumbraCollection = Guid.Empty;
-            _penumbraCollectionTask = _ipcManager.Penumbra.CreateTemporaryCollectionAsync(Logger, Pair.UserData.UID);
+            _penumbraCollectionTask = null;
 
             _lastAppliedTempModsFingerprint = null;
             _lastAssignedObjectIndex = null;
@@ -506,7 +511,7 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
             {
                 Logger.LogTrace("[{applicationId}] Restoring state for {name} ({OnlineUser})", applicationId, name, Pair.UserPair);
                 Logger.LogDebug("[{applicationId}] Removing Temp Collection for {name} ({user})", applicationId, name, Pair.UserPair);
-                _ipcManager.Penumbra.RemoveTemporaryCollectionAsync(Logger, applicationId, _penumbraCollection).GetAwaiter().GetResult();
+                RemovePenumbraCollectionAsync(applicationId).GetAwaiter().GetResult();
                 if (!IsVisible)
                 {
                     Logger.LogDebug("[{applicationId}] Restoring Glamourer for {name} ({user})", applicationId, name, Pair.UserPair);
@@ -1211,6 +1216,8 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
 
                         var oldIdx = _lastAssignedObjectIndex;
 
+                        await EnsurePenumbraCollectionAsync().ConfigureAwait(false);
+
                         var ok = await _ipcManager.Penumbra
                             .AssignTemporaryCollectionAsync(Logger, _penumbraCollection, objIndex)
                             .ConfigureAwait(false);
@@ -1889,6 +1896,8 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
 
                     _initialApplyPending = false;
 
+                    SchedulePenumbraCollectionTeardown();
+
                     _charaHandler?.Invalidate();
                     _downloadCancellationTokenSource?.CancelDispose();
                     _downloadCancellationTokenSource = null;
@@ -1956,8 +1965,7 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
 
     private async Task InitializeAsync(string name)
     {
-        _penumbraCollectionTask ??= _ipcManager.Penumbra.CreateTemporaryCollectionAsync(Logger, Pair.UserData.UID);
-        _penumbraCollection = await _penumbraCollectionTask.ConfigureAwait(false);
+        CancelPendingPenumbraCollectionTeardown();
 
         PlayerName = name;
 
@@ -3010,6 +3018,9 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
         _lastAssignedCollectionAssignUtc = DateTime.MinValue;
         _customizeIds.Clear();
 
+        CancelPendingPenumbraCollectionTeardown();
+        _ = Task.Run(() => RemovePenumbraCollectionAsync(Guid.NewGuid()));
+
         _addressZeroSinceTick = -1;
         _initialApplyPending = true;
         _otherSyncReleaseCandidateSinceTick = -1;
@@ -3033,6 +3044,90 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
         
     }
 
+
+    private void CancelPendingPenumbraCollectionTeardown()
+    {
+        _penumbraCollectionTeardownCts?.CancelDispose();
+        _penumbraCollectionTeardownCts = null;
+    }
+
+    private void SchedulePenumbraCollectionTeardown()
+    {
+        CancelPendingPenumbraCollectionTeardown();
+
+        if (_penumbraCollection == Guid.Empty && _penumbraCollectionTask == null)
+            return;
+
+        var cts = new CancellationTokenSource();
+        _penumbraCollectionTeardownCts = cts;
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await Task.Delay(PenumbraCollectionTeardownDelay, cts.Token).ConfigureAwait(false);
+
+                if (cts.IsCancellationRequested || IsVisible || _lifetime.ApplicationStopping.IsCancellationRequested)
+                    return;
+
+                await RemovePenumbraCollectionAsync(Guid.NewGuid()).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+            }
+            catch (Exception ex)
+            {
+                Logger.LogDebug(ex, "Delayed temp collection teardown failed for {pair}", Pair);
+            }
+            finally
+            {
+                if (ReferenceEquals(_penumbraCollectionTeardownCts, cts))
+                    _penumbraCollectionTeardownCts = null;
+
+                cts.Dispose();
+            }
+        });
+    }
+
+    private async Task EnsurePenumbraCollectionAsync()
+    {
+        CancelPendingPenumbraCollectionTeardown();
+
+        if (_penumbraCollection != Guid.Empty)
+            return;
+
+        _penumbraCollectionTask ??= _ipcManager.Penumbra.CreateTemporaryCollectionAsync(Logger, Pair.UserData.UID);
+        _penumbraCollection = await _penumbraCollectionTask.ConfigureAwait(false);
+    }
+
+    private async Task RemovePenumbraCollectionAsync(Guid applicationId)
+    {
+        CancelPendingPenumbraCollectionTeardown();
+
+        var coll = _penumbraCollection;
+        var collTask = _penumbraCollectionTask;
+
+        _penumbraCollection = Guid.Empty;
+        _penumbraCollectionTask = null;
+
+        if (coll == Guid.Empty && collTask != null)
+        {
+            try
+            {
+                coll = await collTask.ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                Logger.LogDebug(ex, "Temp collection creation task faulted while tearing down for {pair}", Pair);
+                return;
+            }
+        }
+
+        if (coll == Guid.Empty)
+            return;
+
+        await _ipcManager.Penumbra.RemoveTemporaryCollectionAsync(Logger, applicationId, coll).ConfigureAwait(false);
+    }
 
     private static List<FileReplacementData> DeduplicateReplacementsByHash(List<FileReplacementData> input)
     {
@@ -3237,6 +3332,9 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
             _charaHandler.Dispose();
             _charaHandler = null;
         }
+
+        CancelPendingPenumbraCollectionTeardown();
+        _ = Task.Run(() => RemovePenumbraCollectionAsync(Guid.NewGuid()));
 
         Interlocked.Exchange(ref _initializeStarted, 0);
         _initializeTask = null;
