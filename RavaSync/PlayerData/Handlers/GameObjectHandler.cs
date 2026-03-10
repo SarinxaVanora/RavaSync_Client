@@ -45,7 +45,7 @@ public sealed class GameObjectHandler : DisposableMediatorSubscriberBase, IHighP
                 if (_delayedZoningTask?.IsCompleted ?? true)
                 {
                     if (msg.Address != Address) return;
-                    Mediator.Publish(new CreateCacheForObjectMessage(this));
+                    Mediator.Publish(new CreateCacheForObjectMessage(this, "GameObject:TransientResourceChanged"));
                 }
             });
         }
@@ -293,7 +293,7 @@ public sealed class GameObjectHandler : DisposableMediatorSubscriberBase, IHighP
                 if (semanticDiff)
                 {
                     Logger.LogDebug("[{this}] Changed, Sending CreateCacheObjectMessage", this);
-                    Mediator.Publish(new CreateCacheForObjectMessage(this));
+                    Mediator.Publish(new CreateCacheForObjectMessage(this, $"GameObject:SemanticDiff(equip={equipDiff},customize={customizeDiff},name={nameChange})"));
                 }
                 else if (addrDiff || drawObjDiff)
                 {

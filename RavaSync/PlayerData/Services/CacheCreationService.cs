@@ -15,6 +15,8 @@ public sealed class CacheCreationService : DisposableMediatorSubscriberBase
     private readonly PlayerDataFactory _characterDataFactory;
     private readonly HashSet<ObjectKind> _currentlyCreating = [];
     private readonly HashSet<ObjectKind> _debouncedObjectCache = [];
+    private readonly Dictionary<ObjectKind, HashSet<string>> _debouncedReasons = [];
+    private readonly Dictionary<ObjectKind, HashSet<string>> _activeReasons = [];
     private readonly CharacterData _playerData = new();
     private readonly Dictionary<ObjectKind, GameObjectHandler> _playerRelatedObjects = [];
     private readonly CancellationTokenSource _runtimeCts = new();
@@ -22,6 +24,10 @@ public sealed class CacheCreationService : DisposableMediatorSubscriberBase
     private CancellationTokenSource _debounceCts = new();
     private bool _haltCharaDataCreation;
     private bool _isZoning = false;
+    private readonly DateTime _serviceStartUtc = DateTime.UtcNow;
+    private DateTime _lastPlayerAppearanceSignalUtc = DateTime.MinValue;
+    private static readonly TimeSpan PenumbraTransientFollowWindow = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan InitialPenumbraTransientSettleWindow = TimeSpan.FromSeconds(10);
 
     public CacheCreationService(ILogger<CacheCreationService> logger, MareMediator mediator, GameObjectHandlerFactory gameObjectHandlerFactory,
         PlayerDataFactory characterDataFactory, DalamudUtilService dalamudUtil) : base(logger, mediator)
@@ -38,8 +44,11 @@ public sealed class CacheCreationService : DisposableMediatorSubscriberBase
 
         Mediator.Subscribe<CreateCacheForObjectMessage>(this, (msg) =>
         {
-            Logger.LogDebug("Received CreateCacheForObject for {handler}, updating", msg.ObjectToCreateFor);
-            AddCacheToCreate(msg.ObjectToCreateFor.ObjectKind);
+            if (msg.ObjectToCreateFor.ObjectKind == ObjectKind.Player && IsPlayerAppearanceSignalReason(msg.Reason))
+            {
+                NotePlayerAppearanceSignal();
+            }
+            AddCacheToCreate(msg.ObjectToCreateFor.ObjectKind, msg.Reason);
         });
 
         _playerRelatedObjects[ObjectKind.Player] = gameObjectHandlerFactory.Create(ObjectKind.Player, dalamudUtil.GetPlayerPtr, isWatched: true)
@@ -55,8 +64,9 @@ public sealed class CacheCreationService : DisposableMediatorSubscriberBase
         {
             if (msg.GameObjectHandler == _playerRelatedObjects[ObjectKind.Player])
             {
-                AddCacheToCreate(ObjectKind.Player);
-                AddCacheToCreate(ObjectKind.Pet);
+                NotePlayerAppearanceSignal();
+                AddCacheToCreate(ObjectKind.Player, "ClassJobChanged:Player");
+                AddCacheToCreate(ObjectKind.Pet, "ClassJobChanged:Pet");
             }
         });
 
@@ -64,11 +74,10 @@ public sealed class CacheCreationService : DisposableMediatorSubscriberBase
         {
             if (msg.ObjectToCreateFor.ObjectKind == ObjectKind.Pet)
             {
-                Logger.LogTrace("Received clear cache for {obj}, ignoring", msg.ObjectToCreateFor);
                 return;
             }
-            Logger.LogDebug("Clearing cache for {obj}", msg.ObjectToCreateFor);
-            AddCacheToCreate(msg.ObjectToCreateFor.ObjectKind);
+
+            AddCacheToCreate(msg.ObjectToCreateFor.ObjectKind, $"ClearCache:{msg.ObjectToCreateFor.ObjectKind}");
         });
 
         Mediator.Subscribe<CustomizePlusMessage>(this, (msg) =>
@@ -78,16 +87,18 @@ public sealed class CacheCreationService : DisposableMediatorSubscriberBase
                 .Where(item => msg.Address == null
                 || item.Value.Address == msg.Address).Select(k => k.Key))
             {
-                Logger.LogDebug("Received CustomizePlus change, updating {obj}", item);
-                AddCacheToCreate(item);
+                if (item == ObjectKind.Player)
+                {
+                    NotePlayerAppearanceSignal();
+                }
+                AddCacheToCreate(item, $"CustomizePlus:{item}");
             }
         });
 
         Mediator.Subscribe<HeelsOffsetMessage>(this, (msg) =>
         {
             if (_isZoning) return;
-            Logger.LogDebug("Received Heels Offset change, updating player");
-            AddCacheToCreate();
+            AddCacheToCreate(ObjectKind.Player, "HeelsOffset");
         });
 
         Mediator.Subscribe<GlamourerChangedMessage>(this, (msg) =>
@@ -96,8 +107,11 @@ public sealed class CacheCreationService : DisposableMediatorSubscriberBase
             var changedType = _playerRelatedObjects.FirstOrDefault(f => f.Value.Address == msg.Address);
             if (!default(KeyValuePair<ObjectKind, GameObjectHandler>).Equals(changedType))
             {
-                Logger.LogDebug("Received GlamourerChangedMessage for {kind}", changedType);
-                AddCacheToCreate(changedType.Key);
+                if (changedType.Key == ObjectKind.Player)
+                {
+                    NotePlayerAppearanceSignal();
+                }
+                AddCacheToCreate(changedType.Key, $"Glamourer:{changedType.Key}");
             }
         });
 
@@ -106,8 +120,7 @@ public sealed class CacheCreationService : DisposableMediatorSubscriberBase
             if (_isZoning) return;
             if (!string.Equals(msg.NewHonorificTitle, _playerData.HonorificData, StringComparison.Ordinal))
             {
-                Logger.LogDebug("Received Honorific change, updating player");
-                AddCacheToCreate(ObjectKind.Player);
+                AddCacheToCreate(ObjectKind.Player, "HonorificChanged");
             }
         });
 
@@ -117,8 +130,7 @@ public sealed class CacheCreationService : DisposableMediatorSubscriberBase
             var changedType = _playerRelatedObjects.FirstOrDefault(f => f.Value.Address == msg.Address);
             if (!default(KeyValuePair<ObjectKind, GameObjectHandler>).Equals(changedType) && changedType.Key == ObjectKind.Player)
             {
-                Logger.LogDebug("Received Moodles change, updating player");
-                AddCacheToCreate(ObjectKind.Player);
+                AddCacheToCreate(ObjectKind.Player, "MoodlesChanged");
             }
         });
 
@@ -127,18 +139,16 @@ public sealed class CacheCreationService : DisposableMediatorSubscriberBase
             if (_isZoning) return;
             if (!string.Equals(msg.PetNicknamesData, _playerData.PetNamesData, StringComparison.Ordinal))
             {
-                Logger.LogDebug("Received Pet Nicknames change, updating player");
-                AddCacheToCreate(ObjectKind.Player);
+                AddCacheToCreate(ObjectKind.Player, "PetNamesChanged");
             }
         });
 
         Mediator.Subscribe<PenumbraModSettingChangedMessage>(this, (msg) =>
         {
-            Logger.LogDebug("Received Penumbra Mod settings change, updating everything");
-            AddCacheToCreate(ObjectKind.Player);
-            AddCacheToCreate(ObjectKind.Pet);
-            AddCacheToCreate(ObjectKind.MinionOrMount);
-            AddCacheToCreate(ObjectKind.Companion);
+            AddCacheToCreate(ObjectKind.Player, "PenumbraModSettingChanged");
+            AddCacheToCreate(ObjectKind.Pet, "PenumbraModSettingChanged");
+            AddCacheToCreate(ObjectKind.MinionOrMount, "PenumbraModSettingChanged");
+            AddCacheToCreate(ObjectKind.Companion, "PenumbraModSettingChanged");
         });
 
         Mediator.Subscribe<FrameworkUpdateMessage>(this, (msg) => ProcessCacheCreation());
@@ -155,7 +165,73 @@ public sealed class CacheCreationService : DisposableMediatorSubscriberBase
         _creationCts.Dispose();
     }
 
-    private void AddCacheToCreate(ObjectKind kind = ObjectKind.Player)
+    private void NotePlayerAppearanceSignal()
+    {
+        _lastPlayerAppearanceSignalUtc = DateTime.UtcNow;
+    }
+
+    private bool IsWithinPenumbraTransientFollowWindow()
+    {
+        return DateTime.UtcNow - _lastPlayerAppearanceSignalUtc <= PenumbraTransientFollowWindow;
+    }
+
+    private bool IsWithinInitialPenumbraTransientSettleWindow()
+    {
+        return DateTime.UtcNow - _serviceStartUtc <= InitialPenumbraTransientSettleWindow;
+    }
+
+    private static bool IsPlayerAppearanceSignalReason(string? reason)
+    {
+        if (string.IsNullOrEmpty(reason)) return false;
+
+        return reason.StartsWith("GameObject:SemanticDiff", StringComparison.Ordinal)
+            || reason.StartsWith("CustomizePlus:", StringComparison.Ordinal)
+            || reason.StartsWith("Glamourer:", StringComparison.Ordinal)
+            || reason.StartsWith("ClassJobChanged:", StringComparison.Ordinal);
+    }
+
+    private static bool IsPurePenumbraTransientCombo(IReadOnlyCollection<string> reasons)
+    {
+        if (reasons.Count == 0) return false;
+
+        bool hasPenumbra = false;
+        bool hasTransient = false;
+
+        foreach (var reason in reasons)
+        {
+            if (string.Equals(reason, "PenumbraModSettingChanged", StringComparison.Ordinal))
+            {
+                hasPenumbra = true;
+                continue;
+            }
+
+            if (string.Equals(reason, "GameObject:TransientResourceChanged", StringComparison.Ordinal))
+            {
+                hasTransient = true;
+                continue;
+            }
+
+            return false;
+        }
+
+        return hasPenumbra && hasTransient;
+    }
+
+    private bool ShouldSkipPenumbraTransientOnlyBuild(IReadOnlyCollection<string> reasons)
+    {
+        if (!IsPurePenumbraTransientCombo(reasons))
+            return false;
+
+        if (IsWithinInitialPenumbraTransientSettleWindow())
+            return false;
+
+        if (IsWithinPenumbraTransientFollowWindow())
+            return false;
+
+        return true;
+    }
+
+    private void AddCacheToCreate(ObjectKind kind = ObjectKind.Player, string reason = "Unspecified")
     {
         _debounceCts.Cancel();
         _debounceCts.Dispose();
@@ -165,6 +241,13 @@ public sealed class CacheCreationService : DisposableMediatorSubscriberBase
         lock (_cacheCreateLockObj)
         {
             _debouncedObjectCache.Add(kind);
+            if (!_debouncedReasons.TryGetValue(kind, out var reasons))
+            {
+                reasons = [];
+                _debouncedReasons[kind] = reasons;
+            }
+
+            reasons.Add(reason);
         }
 
         _ = Task.Run(async () =>
@@ -173,17 +256,27 @@ public sealed class CacheCreationService : DisposableMediatorSubscriberBase
             {
                 await Task.Delay(TimeSpan.FromSeconds(1), token).ConfigureAwait(false);
 
-                List<ObjectKind> snapshot;
                 lock (_cacheCreateLockObj)
                 {
-                    snapshot = _debouncedObjectCache.ToList();
-                    foreach (var item in snapshot)
+                    foreach (var item in _debouncedObjectCache)
+                    {
                         _cachesToCreate.Add(item);
+                        if (_debouncedReasons.TryGetValue(item, out var reasons) && reasons.Count > 0)
+                        {
+                            if (!_activeReasons.TryGetValue(item, out var active))
+                            {
+                                active = [];
+                                _activeReasons[item] = active;
+                            }
+
+                            foreach (var reasonItem in reasons)
+                                active.Add(reasonItem);
+                        }
+                    }
 
                     _debouncedObjectCache.Clear();
+                    _debouncedReasons.Clear();
                 }
-
-                Logger.LogTrace("Debounce complete, inserting objects to create for: {obj}", string.Join(", ", snapshot));
             }
             catch (OperationCanceledException)
             {
@@ -191,7 +284,6 @@ public sealed class CacheCreationService : DisposableMediatorSubscriberBase
             }
         });
     }
-
 
     private void ProcessCacheCreation()
     {
@@ -202,7 +294,6 @@ public sealed class CacheCreationService : DisposableMediatorSubscriberBase
         if (_playerRelatedObjects.Any(p => p.Value.CurrentDrawCondition is
             not (GameObjectHandler.DrawCondition.None or GameObjectHandler.DrawCondition.DrawObjectZero or GameObjectHandler.DrawCondition.ObjectZero)))
         {
-            Logger.LogDebug("Waiting for draw to finish before executing cache creation");
             return;
         }
 
@@ -226,13 +317,24 @@ public sealed class CacheCreationService : DisposableMediatorSubscriberBase
 
             await Task.Delay(TimeSpan.FromSeconds(1), linkedCts.Token).ConfigureAwait(false);
 
-            Logger.LogDebug("Creating Caches for {objectKinds}", string.Join(", ", objectKindsToCreate));
-
             try
             {
                 Dictionary<ObjectKind, CharacterDataFragment?> createdData = [];
                 foreach (var objectKind in _currentlyCreating)
                 {
+                    HashSet<string> reasonSet;
+                    lock (_cacheCreateLockObj)
+                    {
+                        reasonSet = _activeReasons.TryGetValue(objectKind, out var reasons) && reasons.Count > 0
+                            ? [.. reasons]
+                            : [];
+                    }
+
+                    if (ShouldSkipPenumbraTransientOnlyBuild(reasonSet))
+                    {
+                        continue;
+                    }
+
                     createdData[objectKind] = await _characterDataFactory.BuildCharacterData(_playerRelatedObjects[objectKind], linkedCts.Token).ConfigureAwait(false);
                 }
 
@@ -241,12 +343,21 @@ public sealed class CacheCreationService : DisposableMediatorSubscriberBase
                     _playerData.SetFragment(kvp.Key, kvp.Value);
                 }
 
-                Mediator.Publish(new CharacterDataCreatedMessage(_playerData.ToAPI()));
+                if (createdData.Count > 0)
+                {
+                    Mediator.Publish(new CharacterDataCreatedMessage(_playerData.ToAPI()));
+                }
+
+                var createdKeys = createdData.Keys.ToList();
                 _currentlyCreating.Clear();
+                lock (_cacheCreateLockObj)
+                {
+                    foreach (var key in createdKeys)
+                        _activeReasons.Remove(key);
+                }
             }
             catch (OperationCanceledException)
             {
-                Logger.LogDebug("Cache Creation cancelled");
             }
             catch (Exception ex)
             {
@@ -254,7 +365,11 @@ public sealed class CacheCreationService : DisposableMediatorSubscriberBase
             }
             finally
             {
-                Logger.LogDebug("Cache Creation complete");
+                lock (_cacheCreateLockObj)
+                {
+                    foreach (var key in _currentlyCreating.ToList())
+                        _activeReasons.Remove(key);
+                }
             }
         });
     }
