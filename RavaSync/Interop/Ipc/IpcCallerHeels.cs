@@ -37,7 +37,7 @@ public sealed class IpcCallerHeels : IIpcCaller
 
     private void HeelsOffsetChange(string offset)
     {
-        _mareMediator.Publish(new HeelsOffsetMessage());
+        _mareMediator.Publish(new HeelsOffsetMessage(offset));
     }
 
     public async Task<string> GetOffsetAsync()

@@ -86,6 +86,7 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
     private static readonly SemaphoreSlim GlobalPostApplyRepairSemaphore = new(2, 2);
     private string? _lastAttemptedDataHash;
     private string? _lastAppliedTempModsFingerprint;
+    private string? _lastAppliedManipulationFingerprint = null;
 
     private readonly object _missingCheckGate = new();
     private string? _lastMissingCheckedHash;
@@ -163,9 +164,10 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
             _lastAssignedObjectIndex = null;
             _lastAssignedCollectionAssignUtc = DateTime.MinValue;
             _lastAppliedTempModsFingerprint = null;
+            _lastAppliedManipulationFingerprint = null;
 
             CancelPendingPenumbraCollectionTeardown();
-            _= RemovePenumbraCollectionAsync(Guid.NewGuid());
+            _ = RemovePenumbraCollectionAsync(Guid.NewGuid());
 
             IsVisible = false;
 
@@ -180,6 +182,7 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
             _penumbraCollectionTask = null;
 
             _lastAppliedTempModsFingerprint = null;
+            _lastAppliedManipulationFingerprint = null;
             _lastAssignedObjectIndex = null;
             _lastAssignedCollectionAssignUtc = DateTime.MinValue;
 
@@ -551,6 +554,8 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
         {
             PlayerName = null;
             _cachedData = null;
+            _lastAppliedTempModsFingerprint = null;
+            _lastAppliedManipulationFingerprint = null;
             Logger.LogDebug("Disposing {name} complete", name);
         }
     }
@@ -1164,8 +1169,8 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
 
         try
         {
-            //applySemaphore = SyncStorm.IsActive ? StormApplySemaphore : NormalApplySemaphore;
-            applySemaphore = NormalApplySemaphore;
+            applySemaphore = SyncStorm.IsActive ? StormApplySemaphore : NormalApplySemaphore;
+            //applySemaphore = NormalApplySemaphore;
 
             await applySemaphore.WaitAsync(token).ConfigureAwait(false);
             acquired = true;
@@ -1402,19 +1407,32 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
 
                 if (updateManip)
                 {
-                    if (Pair.IsMetadataEnabled)
+                    var newManipFingerprint = Pair.IsMetadataEnabled
+                        ? ComputeManipulationFingerprint(charaData.ManipulationData)
+                        : string.Empty;
+
+                    if (!string.Equals(newManipFingerprint, _lastAppliedManipulationFingerprint, StringComparison.Ordinal))
                     {
-                        await _ipcManager.Penumbra
-                            .SetManipulationDataAsync(Logger, _applicationId, _penumbraCollection, charaData.ManipulationData)
-                            .ConfigureAwait(false);
+                        if (Pair.IsMetadataEnabled)
+                        {
+                            await _ipcManager.Penumbra
+                                .SetManipulationDataAsync(Logger, _applicationId, _penumbraCollection, charaData.ManipulationData)
+                                .ConfigureAwait(false);
+                        }
+                        else
+                        {
+                            await _ipcManager.Penumbra
+                                .ClearManipulationDataAsync(Logger, _applicationId, _penumbraCollection)
+                                .ConfigureAwait(false);
+                        }
+
+                        _lastAppliedManipulationFingerprint = newManipFingerprint;
+                        needsRedraw = true;
                     }
                     else
                     {
-                        await _ipcManager.Penumbra
-                            .ClearManipulationDataAsync(Logger, _applicationId, _penumbraCollection)
-                            .ConfigureAwait(false);
+                        Logger.LogDebug("[{applicationId}] Manipulation data unchanged; skipping manipulation apply/redraw", _applicationId);
                     }
-                    needsRedraw = true;
                 }
 
                 token.ThrowIfCancellationRequested();
@@ -1429,7 +1447,7 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
 
 
                 //var allowPlayerRedraw = downloadedAny || updateManip || collectionReassignedThisRun || forcedRedrawRequested;
-                var allowPlayerRedraw = updateManip || collectionReassignedThisRun || forcedRedrawRequested;
+                var allowPlayerRedraw = updateManip || forcedRedrawRequested;
 
                 foreach (var kind in updatedData)
                 {
@@ -1531,7 +1549,6 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
             || gamePath.EndsWith(".eid", StringComparison.OrdinalIgnoreCase)
             || gamePath.EndsWith(".skp", StringComparison.OrdinalIgnoreCase);
     }
-
 
     private bool HasAnyMissingCacheFiles(Guid applicationBase, CharacterData characterData)
     {
@@ -1893,6 +1910,7 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
                     _lastAssignedObjectIndex = null;
                     _lastAssignedCollectionAssignUtc = DateTime.MinValue;
                     _lastAppliedTempModsFingerprint = null;
+                    _lastAppliedManipulationFingerprint = null;
 
                     _initialApplyPending = false;
 
@@ -1962,7 +1980,6 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
         });
     }
 
-
     private async Task InitializeAsync(string name)
     {
         CancelPendingPenumbraCollectionTeardown();
@@ -2001,8 +2018,6 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
             
         }
     }
-
-
 
     private async Task RevertCustomizationDataAsync(ObjectKind objectKind, string name, Guid applicationId, CancellationToken cancelToken)
     {
@@ -2076,7 +2091,6 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
             }
         }
     }
-
 
     private void ProcessNoSwapReplacement(Guid applicationBase, FileReplacementData item, ConcurrentBag<FileReplacementData> missingFiles, ConcurrentDictionary<(string GamePath, string? Hash), string> outputDict, ConcurrentDictionary<string, FileCacheEntity?> fileCacheMemo, object migrationLock, Action markMigrationChanged, CancellationToken token)
     {
@@ -2231,7 +2245,6 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
             }
         }
     }
-
 
     private List<FileReplacementData> TryCalculateModdedDictionary(Guid applicationBase, CharacterData charaData, out Dictionary<(string GamePath, string? Hash), string> moddedDictionary, CancellationToken token)
     {
@@ -2413,6 +2426,11 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
             Array.Clear(rentedKeys, 0, keyCount);
             keyPool.Return(rentedKeys);
         }
+    }
+    
+    private static string ComputeManipulationFingerprint(string? manipulationData)
+    {
+        return manipulationData?.Trim() ?? string.Empty;
     }
 
     private Dictionary<string, string> BuildPenumbraTempMods(Dictionary<(string GamePath, string? Hash), string> moddedPaths)
@@ -2957,6 +2975,7 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
 
             _lastAttemptedDataHash = null;
             _lastAppliedTempModsFingerprint = null;
+            _lastAppliedManipulationFingerprint = null;
 
             _hasRetriedAfterMissingDownload = false;
             _hasRetriedAfterMissingAtApply = false;
@@ -2964,7 +2983,6 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
             _forceApplyMods = true;
             _redrawOnNextApplication = true;
             
-
             _lastAssignedObjectIndex = null;
             _lastAssignedCollectionAssignUtc = DateTime.MinValue;
             _customizeIds.Clear();
@@ -3007,6 +3025,7 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
 
         _lastAttemptedDataHash = null;
         _lastAppliedTempModsFingerprint = null;
+        _lastAppliedManipulationFingerprint = null;
 
         _hasRetriedAfterMissingDownload = false;
         _hasRetriedAfterMissingAtApply = false;
@@ -3324,6 +3343,10 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
         _initialApplyPending = false;
         _redrawOnNextApplication = false;
         _addressZeroSinceTick = -1;
+
+        _lastAttemptedDataHash = null;
+        _lastAppliedTempModsFingerprint = null;
+        _lastAppliedManipulationFingerprint = null;
 
         PlayerName = string.Empty;
 

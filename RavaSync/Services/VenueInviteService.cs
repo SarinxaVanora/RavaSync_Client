@@ -137,7 +137,11 @@ public sealed class VenueInviteService : IDisposable
 
             // For UI/suppression we pass the plot key so it "covers" interior + garden.
             var uiKey = plotKey;
-            _mediator.Publish(new OpenVenueJoinUiMessage(uiKey, info.DisplayName, info.ShellGid));
+
+            await _util.RunOnFrameworkThread(() =>
+            {
+                _mediator.Publish(new OpenVenueJoinUiMessage(uiKey, info.DisplayName, info.ShellGid));
+            }).ConfigureAwait(false);
         }
         catch (Exception ex)
         {

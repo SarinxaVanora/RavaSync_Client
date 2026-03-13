@@ -487,14 +487,14 @@ public class CompactUi : WindowMediatorSubscriberBase
 
     private void DrawTransfers()
     {
-        var currentUploads = _fileTransferManager.CurrentUploads.ToList();
+        var currentUploads = _fileTransferManager.GetCurrentUploadsSnapshot();
         ImGui.AlignTextToFramePadding();
         _uiSharedService.IconText(FontAwesomeIcon.Upload);
         ImGui.SameLine(35 * ImGuiHelpers.GlobalScale);
 
         if (currentUploads.Any())
         {
-            var totalUploads = currentUploads.Count;
+            var totalUploads = currentUploads.Count();
 
             var doneUploads = currentUploads.Count(c => c.IsTransferred);
             var totalUploaded = currentUploads.Sum(c => c.Transferred);

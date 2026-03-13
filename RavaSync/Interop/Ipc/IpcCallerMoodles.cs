@@ -1,5 +1,4 @@
-﻿using Dalamud.Game.ClientState.Objects.SubKinds;
-using Dalamud.Plugin;
+﻿using Dalamud.Plugin;
 using Dalamud.Plugin.Ipc;
 using RavaSync.Services;
 using RavaSync.Services.Mediator;
@@ -10,7 +9,7 @@ namespace RavaSync.Interop.Ipc;
 public sealed class IpcCallerMoodles : IIpcCaller
 {
     private readonly ICallGateSubscriber<int> _moodlesApiVersion;
-    private readonly ICallGateSubscriber<IPlayerCharacter, object> _moodlesOnChange;
+    private readonly ICallGateSubscriber<nint, object> _moodlesOnChange;
     private readonly ICallGateSubscriber<nint, string> _moodlesGetStatus;
     private readonly ICallGateSubscriber<nint, string, object> _moodlesSetStatus;
     private readonly ICallGateSubscriber<nint, object> _moodlesRevertStatus;
@@ -26,7 +25,7 @@ public sealed class IpcCallerMoodles : IIpcCaller
         _mareMediator = mareMediator;
 
         _moodlesApiVersion = pi.GetIpcSubscriber<int>("Moodles.Version");
-        _moodlesOnChange = pi.GetIpcSubscriber<IPlayerCharacter, object>("Moodles.StatusManagerModified");
+        _moodlesOnChange = pi.GetIpcSubscriber<nint, object>("Moodles.StatusManagerModified");
         _moodlesGetStatus = pi.GetIpcSubscriber<nint, string>("Moodles.GetStatusManagerByPtrV2");
         _moodlesSetStatus = pi.GetIpcSubscriber<nint, string, object>("Moodles.SetStatusManagerByPtrV2");
         _moodlesRevertStatus = pi.GetIpcSubscriber<nint, object>("Moodles.ClearStatusManagerByPtrV2");
@@ -36,9 +35,18 @@ public sealed class IpcCallerMoodles : IIpcCaller
         CheckAPI();
     }
 
-    private void OnMoodlesChange(IPlayerCharacter character)
+    private void OnMoodlesChange(nint address)
     {
-        _mareMediator.Publish(new MoodlesMessage(character.Address));
+        try
+        {
+            var status = _moodlesGetStatus.InvokeFunc(address) ?? string.Empty;
+            _mareMediator.Publish(new MoodlesMessage(address, status));
+        }
+        catch (Exception e)
+        {
+            _logger.LogWarning(e, "Could not obtain Moodles status during change event");
+            _mareMediator.Publish(new MoodlesMessage(address, string.Empty));
+        }
     }
 
     public bool APIAvailable { get; private set; } = false;

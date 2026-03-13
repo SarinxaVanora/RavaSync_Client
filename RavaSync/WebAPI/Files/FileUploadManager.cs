@@ -52,23 +52,50 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
     }
 
     public List<FileTransfer> CurrentUploads { get; } = [];
+    private readonly object _currentUploadsLock = new();
     private enum AuthMode { NeedAuthorization, PreAuthorized }
 
-    public bool IsUploading => CurrentUploads.Count > 0;
+    public bool IsUploading
+    {
+        get
+        {
+            lock (_currentUploadsLock)
+            {
+                return CurrentUploads.Count > 0;
+            }
+        }
+    }
+
+    public FileTransfer[] GetCurrentUploadsSnapshot()
+    {
+        lock (_currentUploadsLock)
+        {
+            return CurrentUploads.ToArray();
+        }
+    }
+
+    private void ClearCurrentUploads()
+    {
+        lock (_currentUploadsLock)
+        {
+            CurrentUploads.Clear();
+        }
+    }
 
     public bool CancelUpload()
     {
-        if (CurrentUploads.Count > 0)
+        lock (_currentUploadsLock)
         {
-            Logger.LogDebug("Cancelling current upload");
-            _uploadCancellationTokenSource?.Cancel();
-            _uploadCancellationTokenSource?.Dispose();
-            _uploadCancellationTokenSource = null;
-            CurrentUploads.Clear();
-            return true;
+            if (CurrentUploads.Count <= 0)
+                return false;
         }
 
-        return false;
+        Logger.LogDebug("Cancelling current upload");
+        _uploadCancellationTokenSource?.Cancel();
+        _uploadCancellationTokenSource?.Dispose();
+        _uploadCancellationTokenSource = null;
+        ClearCurrentUploads();
+        return true;
     }
 
     public async Task DeleteAllFiles()
@@ -372,7 +399,7 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
             try { _uploadCancellationTokenSource?.Dispose(); } catch { /* ignore */ }
             _uploadCancellationTokenSource = null;
 
-            CurrentUploads.Clear();
+            ClearCurrentUploads();
         }
     }
 
@@ -471,7 +498,7 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
         _uploadCancellationTokenSource?.Cancel();
         _uploadCancellationTokenSource?.Dispose();
         _uploadCancellationTokenSource = null;
-        CurrentUploads.Clear();
+        ClearCurrentUploads();
         _verifiedUploadedHashes.Clear();
     }
 
@@ -652,43 +679,46 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
 
         var uploadEntryByHash = new System.Collections.Concurrent.ConcurrentDictionary<string, UploadFileTransfer>(StringComparer.Ordinal);
 
-        foreach (var existing in CurrentUploads)
-        {
-            if (existing is UploadFileTransfer upload && !string.IsNullOrEmpty(upload.Hash))
-                uploadEntryByHash[upload.Hash] = upload;
-        }
-
-        foreach (var h in allowedHashes)
-        {
-            try
+            lock (_currentUploadsLock)
             {
-                if (!uploadEntryByHash.TryGetValue(h, out var entry))
+                foreach (var existing in CurrentUploads)
                 {
-                    if (!localPathByHash.TryGetValue(h, out var localPath)) continue;
+                    if (existing is UploadFileTransfer upload && !string.IsNullOrEmpty(upload.Hash))
+                        uploadEntryByHash[upload.Hash] = upload;
+                }
 
-                    var size = new FileInfo(localPath).Length;
-                    sizeByHash[h] = size;
-
-                    entry = new UploadFileTransfer(new UploadFileDto { Hash = h })
+                foreach (var h in allowedHashes)
+                {
+                    try
                     {
-                        Total = size,
-                    };
+                        if (!uploadEntryByHash.TryGetValue(h, out var entry))
+                        {
+                            if (!localPathByHash.TryGetValue(h, out var localPath)) continue;
 
-                    CurrentUploads.Add(entry);
-                    uploadEntryByHash[h] = entry;
-                }
-                else if (!sizeByHash.ContainsKey(h) && localPathByHash.TryGetValue(h, out var localPath))
-                {
-                    sizeByHash[h] = new FileInfo(localPath).Length;
+                            var size = new FileInfo(localPath).Length;
+                            sizeByHash[h] = size;
+
+                            entry = new UploadFileTransfer(new UploadFileDto { Hash = h })
+                            {
+                                Total = size,
+                            };
+
+                            CurrentUploads.Add(entry);
+                            uploadEntryByHash[h] = entry;
+                        }
+                        else if (!sizeByHash.ContainsKey(h) && localPathByHash.TryGetValue(h, out var localPath))
+                        {
+                            sizeByHash[h] = new FileInfo(localPath).Length;
+                        }
+                    }
+                    catch
+                    {
+                        // best effort
+                    }
                 }
             }
-            catch
-            {
-                // best effort
-            }
-        }
 
-        const int MaxUploadAttempts = 3;
+            const int MaxUploadAttempts = 3;
 
             // fixed if user explicitly configured, adaptive only for Auto (0)
             var configured = _mareConfigService.Current.ParallelUploads;
@@ -964,7 +994,7 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
         finally
         {
             // ---- UI: never leave "Uploading..." stuck once this batch is done/cancelled/faulted ----
-            CurrentUploads.Clear();
+            ClearCurrentUploads();
             progress?.Report("No uploads in progress");
         }
     }

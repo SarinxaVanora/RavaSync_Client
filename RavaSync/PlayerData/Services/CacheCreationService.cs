@@ -98,7 +98,6 @@ public sealed class CacheCreationService : DisposableMediatorSubscriberBase
         Mediator.Subscribe<HeelsOffsetMessage>(this, (msg) =>
         {
             if (_isZoning) return;
-            AddCacheToCreate(ObjectKind.Player, "HeelsOffset");
         });
 
         Mediator.Subscribe<GlamourerChangedMessage>(this, (msg) =>
@@ -118,29 +117,16 @@ public sealed class CacheCreationService : DisposableMediatorSubscriberBase
         Mediator.Subscribe<HonorificMessage>(this, (msg) =>
         {
             if (_isZoning) return;
-            if (!string.Equals(msg.NewHonorificTitle, _playerData.HonorificData, StringComparison.Ordinal))
-            {
-                AddCacheToCreate(ObjectKind.Player, "HonorificChanged");
-            }
         });
 
         Mediator.Subscribe<MoodlesMessage>(this, (msg) =>
         {
             if (_isZoning) return;
-            var changedType = _playerRelatedObjects.FirstOrDefault(f => f.Value.Address == msg.Address);
-            if (!default(KeyValuePair<ObjectKind, GameObjectHandler>).Equals(changedType) && changedType.Key == ObjectKind.Player)
-            {
-                AddCacheToCreate(ObjectKind.Player, "MoodlesChanged");
-            }
         });
 
         Mediator.Subscribe<PetNamesMessage>(this, (msg) =>
         {
             if (_isZoning) return;
-            if (!string.Equals(msg.PetNicknamesData, _playerData.PetNamesData, StringComparison.Ordinal))
-            {
-                AddCacheToCreate(ObjectKind.Player, "PetNamesChanged");
-            }
         });
 
         Mediator.Subscribe<PenumbraModSettingChangedMessage>(this, (msg) =>
@@ -223,7 +209,7 @@ public sealed class CacheCreationService : DisposableMediatorSubscriberBase
             return false;
 
         if (IsWithinInitialPenumbraTransientSettleWindow())
-            return false;
+            return true;
 
         if (IsWithinPenumbraTransientFollowWindow())
             return false;

@@ -42,7 +42,7 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
     private readonly MareConfigService _mareConfigService;
     private const int MaxCdnAttemptsPerFile = 3;
     private static readonly TimeSpan CdnAttemptTimeout = TimeSpan.FromSeconds(60);
-    private const long InlineCdnDecodeMaxPayloadBytes = 2L * 1024 * 1024;
+    private const long InlineCdnDecodeMaxPayloadBytes = 512L * 1024;
 
     private readonly CdnDecodeWorker _cdnDecodeWorker;
 

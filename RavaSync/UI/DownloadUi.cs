@@ -164,10 +164,10 @@ public class DownloadUi : WindowMediatorSubscriberBase
         {
             try
             {
-                var currentUploads = _fileTransferManager.CurrentUploads;
-                if (currentUploads.Count > 0)
+                var currentUploads = _fileTransferManager.GetCurrentUploadsSnapshot();
+                if (currentUploads.Length > 0)
                 {
-                    var totalUploads = currentUploads.Count;
+                    var totalUploads = currentUploads.Length;
 
                     var doneUploads = 0;
                     long totalUploaded = 0;
@@ -795,7 +795,7 @@ public class DownloadUi : WindowMediatorSubscriberBase
     }
 
     private static bool AnyUploadsActive(FileUploadManager mgr)
-        => mgr.CurrentUploads.Any();
+        => mgr.GetCurrentUploadsSnapshot().Length > 0;
 
     private (int W, int H) GetGlobalBarSize(bool haveAether)
     {
@@ -1100,9 +1100,9 @@ public class DownloadUi : WindowMediatorSubscriberBase
             : $"{dlTransferredFiles}/{dlTotalFiles}  ({UiSharedService.ByteToString(dlTransferredBytes, addSuffix: false)}/{UiSharedService.ByteToString(dlTotalBytes)})";
 
         // ===== Build upload aggregate =====
-        var uploads = haveUploads ? _fileTransferManager.CurrentUploads : null;
+        var uploads = haveUploads ? _fileTransferManager.GetCurrentUploadsSnapshot() : null;
 
-        var ulTotalUploads = uploads?.Count ?? 0;
+        var ulTotalUploads = uploads?.Length ?? 0;
         var ulDoneUploads = 0;
         long ulTotalUploaded = 0;
         long ulTotalToUpload = 0;
@@ -1441,7 +1441,7 @@ public class DownloadUi : WindowMediatorSubscriberBase
             return false;
 
 
-        if (!_configService.Current.EditGlobalTransferOverlay && !_currentDownloads.Any() && !_fileTransferManager.CurrentUploads.Any() && !_pairManager.PairsWithGroups.Keys.Any(p => p.IsUploading))
+        if (!_configService.Current.EditGlobalTransferOverlay && !_currentDownloads.Any() && !_fileTransferManager.GetCurrentUploadsSnapshot().Any() && !_pairManager.PairsWithGroups.Keys.Any(p => p.IsUploading))
             return false;
 
         if (!IsOpen) 
