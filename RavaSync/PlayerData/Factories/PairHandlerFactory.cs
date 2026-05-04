@@ -5,6 +5,7 @@ using RavaSync.PlayerData.Pairs;
 using RavaSync.Services;
 using RavaSync.Services.Mediator;
 using RavaSync.Services.ServerConfiguration;
+using RavaSync.PlayerData.Services;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 
@@ -23,12 +24,15 @@ public class PairHandlerFactory
     private readonly PlayerPerformanceService _playerPerformanceService;
     private readonly ServerConfigurationManager _serverConfigManager;
     private readonly PluginWarningNotificationService _pluginWarningNotificationManager;
+    private readonly ModPathResolver _modPathResolver;
+    private readonly ObjectIndexCleanupService _objectIndexCleanupService;
+    private readonly PapSanitisationService _papSanitisationService;
 
     public PairHandlerFactory(ILoggerFactory loggerFactory, GameObjectHandlerFactory gameObjectHandlerFactory, IpcManager ipcManager,
         FileDownloadManagerFactory fileDownloadManagerFactory, DalamudUtilService dalamudUtilService,
         PluginWarningNotificationService pluginWarningNotificationManager, IHostApplicationLifetime hostApplicationLifetime,
         FileCacheManager fileCacheManager, MareMediator mareMediator, PlayerPerformanceService playerPerformanceService,
-        ServerConfigurationManager serverConfigManager)
+        ServerConfigurationManager serverConfigManager, ModPathResolver modPathResolver, ObjectIndexCleanupService objectIndexCleanupService, PapSanitisationService papSanitizationService)
     {
         _loggerFactory = loggerFactory;
         _gameObjectHandlerFactory = gameObjectHandlerFactory;
@@ -41,12 +45,15 @@ public class PairHandlerFactory
         _mareMediator = mareMediator;
         _playerPerformanceService = playerPerformanceService;
         _serverConfigManager = serverConfigManager;
+        _modPathResolver = modPathResolver;
+        _objectIndexCleanupService = objectIndexCleanupService;
+        _papSanitisationService = papSanitizationService;
     }
 
     public PairHandler Create(Pair pair)
     {
         return new PairHandler(_loggerFactory.CreateLogger<PairHandler>(), pair, _gameObjectHandlerFactory,
-            _ipcManager, _fileDownloadManagerFactory.Create(), _pluginWarningNotificationManager, _dalamudUtilService, _hostApplicationLifetime,
-            _fileCacheManager, _mareMediator, _playerPerformanceService, _serverConfigManager);
+            _ipcManager, _fileDownloadManagerFactory, _pluginWarningNotificationManager, _dalamudUtilService, _hostApplicationLifetime,
+            _fileCacheManager, _mareMediator, _playerPerformanceService, _serverConfigManager, _modPathResolver, _objectIndexCleanupService, _papSanitisationService);
     }
 }

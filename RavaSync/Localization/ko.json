@@ -1578,5 +1578,7 @@
   "UI.VenueRegistrationUi.567b566d": "Venue 이름:",
   "UI.VenueRegistrationUi.77dfd213": "취소",
   "UI.VenueRegistrationUi.a6a95932": "이 플롯을 Syncshell 중 하나에 연결합니다.",
-  "UI.VenueRegistrationUi.fac9bd39": "적용된 데이터 없음"
+  "UI.VenueRegistrationUi.fac9bd39": "적용된 데이터 없음",
+  "UI.DrawUserPair.RedrawTarget": "Redraw target",
+  "UI.DrawUserPair.RedrawTarget.Tooltip": "Executes a Penumbra redraw on this visible target."
 }

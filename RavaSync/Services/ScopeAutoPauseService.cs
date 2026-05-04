@@ -37,20 +37,13 @@ public class ScopeAutoPauseService : MediatorSubscriberBase
 
     private volatile ScopeMode _mode;
 
-    private static readonly TimeSpan TickInterval = TimeSpan.FromMilliseconds(250);
+    private static readonly TimeSpan TickInterval = TimeSpan.FromMilliseconds(50);
     private DateTime _nextTickUtc = DateTime.MinValue;
 
     private int _saveScheduled = 0;
     private CancellationTokenSource _saveCts = new();
 
-    public ScopeAutoPauseService(
-        ILogger<ScopeAutoPauseService> logger,
-        MareMediator mediator,
-        PairManager pairManager,
-        DalamudUtilService xiv,
-        TransientConfigService transientConfigService,
-        IFriendResolver friendResolver
-    ) : base(logger, mediator)
+    public ScopeAutoPauseService(ILogger<ScopeAutoPauseService> logger, MareMediator mediator,PairManager pairManager,DalamudUtilService xiv,TransientConfigService transientConfigService,IFriendResolver friendResolver) : base(logger, mediator)
     {
         _logger = logger;
         _mediator = mediator;
@@ -86,7 +79,6 @@ public class ScopeAutoPauseService : MediatorSubscriberBase
         if (string.IsNullOrWhiteSpace(name)) return string.Empty;
         var n = name.Trim();
 
-        // Drop world suffix patterns like "First Last@World" or "First Last (World)"
         int at = n.IndexOf('@');
         if (at >= 0) n = n[..at].Trim();
 
@@ -111,7 +103,7 @@ public class ScopeAutoPauseService : MediatorSubscriberBase
 
     private (string raw, string norm) GetBestNamePair(string uid, string? liveName)
     {
-        // Prefer live, otherwise cached; always provide both raw + normalized
+        // Prefer live, otherwise cached;
         string raw = !string.IsNullOrEmpty(liveName)
             ? liveName!
             : (_lastKnownNameRaw.TryGetValue(uid, out var cachedRaw) ? cachedRaw : string.Empty);
@@ -160,7 +152,6 @@ public class ScopeAutoPauseService : MediatorSubscriberBase
         }
 
         // For Friends/Party/Alliance: immediately resume any pairs that are NOW in-scope,
-        // regardless of current visibility (explicit user action should take effect right away).
         bool changed = false;
         foreach (var uid in _autoScopePausedUids.Keys.ToArray())
         {
@@ -204,18 +195,18 @@ public class ScopeAutoPauseService : MediatorSubscriberBase
         if (now < _nextTickUtc) return;
         _nextTickUtc = now + TickInterval;
 
+        if (_mode == ScopeMode.Everyone && _autoScopePausedUids.IsEmpty) return;
+
         // Update last-known names for any visible actors with a live name
-        foreach (var kv in _pairManager.PairsWithGroups.Keys)
+        _pairManager.ForEachVisiblePair(pair =>
         {
-            if (!kv.IsVisible) continue;
-            if (string.IsNullOrEmpty(kv.PlayerName)) continue;
+            if (string.IsNullOrEmpty(pair.PlayerName)) return;
 
-            var uid = kv.UserData.UID;
-            _lastKnownNameRaw[uid] = kv.PlayerName!;
-            _lastKnownNameNorm[uid] = NormalizeName(kv.PlayerName!);
-        }
+            var uid = pair.UserData.UID;
+            _lastKnownNameRaw[uid] = pair.PlayerName!;
+            _lastKnownNameNorm[uid] = NormalizeName(pair.PlayerName!);
+        });
 
-        // Fast path: Everyone => nothing to enforce, already handled in OnScopeChanged
         if (_mode == ScopeMode.Everyone) return;
 
         // Build membership sets once (only if needed) + normalized versions for matching
@@ -227,9 +218,10 @@ public class ScopeAutoPauseService : MediatorSubscriberBase
         var allianceNorm = NormalizeSet(alliance);
 
         // --- PASS 1: Pause visible + OUT OF SCOPE (one action per tick) ---
-        foreach (var pair in _pairManager.PairsWithGroups.Keys)
+        var acted = false;
+        _pairManager.ForEachVisiblePair(pair =>
         {
-            if (!pair.IsVisible) continue; // enforce scope only for visible people
+            if (acted) return; // enforce scope only for visible people
 
             var (raw, norm) = GetBestNamePair(pair.UserData.UID, pair.PlayerName);
 
@@ -245,20 +237,23 @@ public class ScopeAutoPauseService : MediatorSubscriberBase
             {
                 _autoScopePausedUids[pair.UserData.UID] = true;
                 pair.AutoPausedByScope = true;
+                pair.EnterPausedVanillaState();
                 _mediator.Publish(new PauseMessage(pair.UserData));
                 Touch(pair.UserData.UID);
                 SaveState();
-                return; // one action per tick
+                acted = true;
             }
-        }
+        });
+
+        if (acted)
+            return;
 
         // --- PASS 2: Resume NOW IN SCOPE (one action per tick) ---
-        // NOTE: we DO NOT require visibility here. This fixes the “join party doesn’t unpause” case.
         foreach (var uid in _autoScopePausedUids.Keys.ToArray())
         {
             var pair = _pairManager.GetPairByUID(uid);
 
-            // Pair gone from manager -> forget our marker
+            // Pair gone from manager
             if (pair == null)
             {
                 _autoScopePausedUids.TryRemove(uid, out _);
@@ -317,7 +312,6 @@ public class ScopeAutoPauseService : MediatorSubscriberBase
         _saveCts = new();
         var token = _saveCts.Token;
 
-        // Debounce + do disk I/O off the hot path
         _ = Task.Run(async () =>
         {
             try

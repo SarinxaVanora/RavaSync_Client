@@ -5,6 +5,7 @@ using RavaSync.PlayerData.Handlers;
 using RavaSync.PlayerData.Pairs;
 using Microsoft.Extensions.Logging;
 using System.Text.Json;
+using RavaSync.PlayerData.Services;
 
 namespace RavaSync.Utils;
 
@@ -85,7 +86,8 @@ public static class VariousExtensions
                     cachedPlayer, objectKind, hasNewButNotOldFileReplacements, hasOldButNotNewFileReplacements, hasNewButNotOldGlamourerData, hasOldButNotNewGlamourerData, PlayerChanges.ModFiles, PlayerChanges.Glamourer);
                 charaDataToUpdate[objectKind].Add(PlayerChanges.ModFiles);
                 charaDataToUpdate[objectKind].Add(PlayerChanges.Glamourer);
-                charaDataToUpdate[objectKind].Add(PlayerChanges.ForcedRedraw);
+                if (objectKind != ObjectKind.Player)
+                    charaDataToUpdate[objectKind].Add(PlayerChanges.ForcedRedraw);
             }
             else
             {
@@ -96,7 +98,7 @@ public static class VariousExtensions
                     {
                         logger.LogDebug("[BASE-{appBase}] Updating {object}/{kind} (FileReplacements not equal) => {change}", applicationBase, cachedPlayer, objectKind, PlayerChanges.ModFiles);
                         charaDataToUpdate[objectKind].Add(PlayerChanges.ModFiles);
-                        if (forceApplyMods || objectKind != ObjectKind.Player)
+                        if (objectKind != ObjectKind.Player)
                         {
                             charaDataToUpdate[objectKind].Add(PlayerChanges.ForcedRedraw);
                         }
@@ -114,9 +116,9 @@ public static class VariousExtensions
                                 .OrderBy(g => string.IsNullOrEmpty(g.Hash) ? g.FileSwapPath : g.Hash, StringComparer.OrdinalIgnoreCase).ToList();
                             var newTail = newFileReplacements.Where(g => g.GamePaths.Any(p => p.Contains("/tail/", StringComparison.OrdinalIgnoreCase)))
                                 .OrderBy(g => string.IsNullOrEmpty(g.Hash) ? g.FileSwapPath : g.Hash, StringComparer.OrdinalIgnoreCase).ToList();
-                            var existingTransients = existingFileReplacements.Where(g => g.GamePaths.Any(g => !g.EndsWith("mdl") && !g.EndsWith("tex") && !g.EndsWith("mtrl")))
+                            var existingTransients = existingFileReplacements.Where(g => g.GamePaths.Any(PairApplyUtilities.IsTransientRedrawCriticalGamePath))
                                 .OrderBy(g => string.IsNullOrEmpty(g.Hash) ? g.FileSwapPath : g.Hash, StringComparer.OrdinalIgnoreCase).ToList();
-                            var newTransients = newFileReplacements.Where(g => g.GamePaths.Any(g => !g.EndsWith("mdl") && !g.EndsWith("tex") && !g.EndsWith("mtrl")))
+                            var newTransients = newFileReplacements.Where(g => g.GamePaths.Any(PairApplyUtilities.IsTransientRedrawCriticalGamePath))
                                 .OrderBy(g => string.IsNullOrEmpty(g.Hash) ? g.FileSwapPath : g.Hash, StringComparer.OrdinalIgnoreCase).ToList();
 
                             logger.LogTrace("[BASE-{appbase}] ExistingFace: {of}, NewFace: {fc}; ExistingHair: {eh}, NewHair: {nh}; ExistingTail: {et}, NewTail: {nt}; ExistingTransient: {etr}, NewTransient: {ntr}", applicationBase,
@@ -124,18 +126,25 @@ public static class VariousExtensions
                             var differentFace = !existingFace.SequenceEqual(newFace, PlayerData.Data.FileReplacementDataComparer.Instance);
                             var differentHair = !existingHair.SequenceEqual(newHair, PlayerData.Data.FileReplacementDataComparer.Instance);
                             var differentTail = !existingTail.SequenceEqual(newTail, PlayerData.Data.FileReplacementDataComparer.Instance);
-                            var differenTransients = !existingTransients.SequenceEqual(newTransients, PlayerData.Data.FileReplacementDataComparer.Instance);
+                            var differentTransients = !existingTransients.SequenceEqual(newTransients, PlayerData.Data.FileReplacementDataComparer.Instance);
 
-                            if (differenTransients)
+                            if (differentTransients)
                             {
-                                logger.LogDebug("[BASE-{appbase}] Different Subparts: Transients: {transients} => {change}", applicationBase,
-                                    differenTransients, PlayerChanges.ForcedRedraw);
-                                charaDataToUpdate[objectKind].Add(PlayerChanges.ForcedRedraw);
+                                logger.LogDebug("[BASE-{appbase}] Different transient/animation/VFX paths: {transients}; redraw decision will be handled by the download-aware temp-content gate", applicationBase,
+                                    differentTransients);
+                                charaDataToUpdate[objectKind].Add(PlayerChanges.ModFiles);
                             }
-                            else if (differentFace || differentHair || differentTail)
+
+                            if (differentFace || differentHair || differentTail)
                             {
-                                logger.LogDebug("[BASE-{appbase}] Different Subparts: Face: {face}, Hair: {hair}, Tail: {tail} => no forced redraw", applicationBase,
-                                    differentFace, differentHair, differentTail);
+                                //logger.LogDebug("[BASE-{appbase}] Different Subparts: Face: {face}, Hair: {hair}, Tail: {tail} => no forced redraw; Glamourer/temp-files refresh handles these like gear", applicationBase,
+                                //    differentFace, differentHair, differentTail);
+
+                                // Apply Glamourer
+                                charaDataToUpdate[objectKind].Add(PlayerChanges.Glamourer);
+
+                                //re-evaluate mod files so race swaps pull in the right textures.
+                                charaDataToUpdate[objectKind].Add(PlayerChanges.ModFiles);
                             }
 
                         }
@@ -179,12 +188,21 @@ public static class VariousExtensions
 
             if (objectKind != ObjectKind.Player) continue;
 
-            bool manipDataDifferent = !string.Equals(oldData.ManipulationData, newData.ManipulationData, StringComparison.Ordinal);
+            var oldEffectiveManipulationData = cachedPlayer.Pair.GetEffectiveManipulationData(oldData.ManipulationData);
+            var newEffectiveManipulationData = cachedPlayer.Pair.GetEffectiveManipulationData(newData.ManipulationData);
+
+            bool manipDataDifferent = !string.Equals(
+                oldEffectiveManipulationData?.Trim() ?? string.Empty,
+                newEffectiveManipulationData?.Trim() ?? string.Empty,
+                StringComparison.Ordinal);
+
             if (manipDataDifferent || forceApplyMods)
             {
-                logger.LogDebug("[BASE-{appBase}] Updating {object}/{kind} (Diff manip data) => {change}", applicationBase, cachedPlayer, objectKind, PlayerChanges.ModManip);
+                logger.LogDebug("[BASE-{appBase}] Updating {object}/{kind} (Manip data changed={changed}, forced={forced}) => {change}", applicationBase, cachedPlayer, objectKind, manipDataDifferent, forceApplyMods, PlayerChanges.ModManip);
                 charaDataToUpdate[objectKind].Add(PlayerChanges.ModManip);
-                charaDataToUpdate[objectKind].Add(PlayerChanges.ForcedRedraw);
+
+                if (manipDataDifferent)
+                    charaDataToUpdate[objectKind].Add(PlayerChanges.ForcedRedraw);
             }
 
             bool heelsOffsetDifferent = !string.Equals(oldData.HeelsData, newData.HeelsData, StringComparison.Ordinal);

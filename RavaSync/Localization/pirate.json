@@ -1763,5 +1763,7 @@
   "UI.VenueRegistrationUi.567b566d": "Venue Name:! ",
   "UI.VenueRegistrationUi.77dfd213": "Belay! ",
   "UI.VenueRegistrationUi.a6a95932": "Link this plot to one of yer SyncCrews! ",
-  "UI.VenueRegistrationUi.fac9bd39": "nay data applied"
+  "UI.VenueRegistrationUi.fac9bd39": "nay data applied",
+  "UI.DrawUserPair.RedrawTarget": "Redraw target",
+  "UI.DrawUserPair.RedrawTarget.Tooltip": "Executes a Penumbra redraw on this visible target."
 }

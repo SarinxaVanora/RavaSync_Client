@@ -40,6 +40,8 @@ internal sealed class TempLz4UploadFile : IAsyncDisposable
 
         var buffer = ArrayPool<byte>.Shared.Rent(BlockSize);
         long raw = 0;
+        const long YieldEveryBytes = 2L * 1024 * 1024;
+        long sinceYield = 0;
         try
         {
             int read;
@@ -47,7 +49,15 @@ internal sealed class TempLz4UploadFile : IAsyncDisposable
             {
                 await lz4.WriteAsync(buffer.AsMemory(0, read), ct).ConfigureAwait(false);
                 raw += read;
+                sinceYield += read;
                 rawReadProgress?.Report(raw);
+
+                if (sinceYield >= YieldEveryBytes)
+                {
+                    sinceYield = 0;
+                    await Task.Yield();
+                    ct.ThrowIfCancellationRequested();
+                }
             }
 
             await lz4.FlushAsync(ct).ConfigureAwait(false);

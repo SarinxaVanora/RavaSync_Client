@@ -18,10 +18,16 @@ public sealed class GameObjectHandler : DisposableMediatorSubscriberBase, IHighP
     private byte _classJob = 0;
     private Task? _delayedZoningTask;
     private bool _haltProcessing = false;
+    private bool _pendingTransientPublishAfterRedraw = false;
+    private bool _pendingPlayerPublishAfterRequestedRedraw = false;
     private CancellationTokenSource _zoningCts = new();
-    private DateTime _nextUpdateUtc = DateTime.MinValue;
-    private static readonly TimeSpan _ownedUpdateInterval = TimeSpan.FromMilliseconds(33);   // ~30Hz
-    private static readonly TimeSpan _otherUpdateInterval = TimeSpan.FromMilliseconds(100);  // 10Hz
+    private long _nextUpdateTick;
+    private bool _redrawPublishIssued;
+    private bool _suppressNextSemanticDiffPublishAfterRedraw;
+    private const int OwnedUpdateIntervalMs = 33;   // ~30Hz
+    private const int OwnedStableUpdateIntervalMs = 66;
+    private const int OtherUpdateIntervalMs = 100;  // 10Hz
+    private const int OtherStableUpdateIntervalMs = 180;
 
 
     public GameObjectHandler(ILogger<GameObjectHandler> logger, PerformanceCollectorService performanceCollector,
@@ -42,12 +48,36 @@ public sealed class GameObjectHandler : DisposableMediatorSubscriberBase, IHighP
         {
             Mediator.Subscribe<TransientResourceChangedMessage>(this, (msg) =>
             {
-                if (_delayedZoningTask?.IsCompleted ?? true)
-                {
-                    if (msg.Address != Address) return;
-                    Mediator.Publish(new CreateCacheForObjectMessage(this, "GameObject:TransientResourceChanged"));
-                }
+                if (!(_delayedZoningTask?.IsCompleted ?? true)) return;
+                if (msg.Address != Address) return;
+
+                if (ObjectKind == ObjectKind.Player)
+                    _pendingTransientPublishAfterRedraw = true;
+
+                Mediator.Publish(new CreateCacheForObjectMessage(this, "GameObject:TransientResourceChanged"));
             });
+
+            if (objectKind == ObjectKind.Player)
+            {
+                Mediator.Subscribe<ClassJobChangedMessage>(this, (msg) =>
+                {
+                    if (ReferenceEquals(msg.GameObjectHandler, this))
+                        _pendingTransientPublishAfterRedraw = true;
+                });
+
+                Mediator.Subscribe<GlamourerChangedMessage>(this, (msg) =>
+                {
+                    if (msg.Address == Address)
+                        _pendingTransientPublishAfterRedraw = true;
+                });
+
+                Mediator.Subscribe<CustomizePlusMessage>(this, (msg) =>
+                {
+                    if (msg.Address == null || msg.Address == Address)
+                        _pendingTransientPublishAfterRedraw = true;
+                });
+
+            }
         }
 
         Mediator.Subscribe<FrameworkUpdateMessage>(this, (_) => FrameworkUpdate());
@@ -55,16 +85,31 @@ public sealed class GameObjectHandler : DisposableMediatorSubscriberBase, IHighP
         Mediator.Subscribe<DalamudLogoutMessage>(this, (_) =>
         {
             _haltProcessing = true;
+            _pendingTransientPublishAfterRedraw = false;
+            _pendingPlayerPublishAfterRequestedRedraw = false;
+            _redrawPublishIssued = false;
+            _suppressNextSemanticDiffPublishAfterRedraw = false;
             Invalidate();
-            _nextUpdateUtc = DateTime.MinValue;
+            _nextUpdateTick = 0;
         });
 
         Mediator.Subscribe<ZoneSwitchEndMessage>(this, (_) => ZoneSwitchEnd());
-        Mediator.Subscribe<ZoneSwitchStartMessage>(this, (_) => ZoneSwitchStart());
+        Mediator.Subscribe<ZoneSwitchStartMessage>(this, (_) =>
+        {
+            _pendingTransientPublishAfterRedraw = false;
+            _pendingPlayerPublishAfterRequestedRedraw = false;
+            _redrawPublishIssued = false;
+            _suppressNextSemanticDiffPublishAfterRedraw = false;
+            ZoneSwitchStart();
+        });
 
         Mediator.Subscribe<CutsceneStartMessage>(this, (_) =>
         {
             _haltProcessing = false; //changed to false in efforts to stop issues with cutscene drawing
+            _pendingTransientPublishAfterRedraw = false;
+            _pendingPlayerPublishAfterRequestedRedraw = false;
+            _redrawPublishIssued = false;
+            _suppressNextSemanticDiffPublishAfterRedraw = false;
         });
         Mediator.Subscribe<CutsceneEndMessage>(this, (_) =>
         {
@@ -76,6 +121,8 @@ public sealed class GameObjectHandler : DisposableMediatorSubscriberBase, IHighP
             if (msg.Address == Address)
             {
                 _haltProcessing = true;
+                _redrawPublishIssued = false;
+                _suppressNextSemanticDiffPublishAfterRedraw = false;
             }
         });
         Mediator.Subscribe<PenumbraEndRedrawMessage>(this, (msg) =>
@@ -83,7 +130,27 @@ public sealed class GameObjectHandler : DisposableMediatorSubscriberBase, IHighP
             if (msg.Address == Address)
             {
                 _haltProcessing = false;
+                _nextUpdateTick = 0;
+
+                PublishImmediatePlayerStateAfterRedraw("GameObject:PenumbraEndRedraw", includeRequestedRedrawOnly: false);
             }
+        });
+
+        Mediator.Subscribe<PenumbraRedrawMessage>(this, (msg) =>
+        {
+            if (msg.Address != Address) return;
+
+            PublishImmediatePlayerStateAfterRedraw("GameObject:PenumbraRedraw", includeRequestedRedrawOnly: msg.WasRequested);
+        });
+
+        Mediator.Subscribe<ArmRequestedPlayerPublishAfterRedrawMessage>(this, (msg) =>
+        {
+            if (!_isOwnedObject || ObjectKind != ObjectKind.Player) return;
+            if (msg.Address != Address) return;
+
+            _pendingPlayerPublishAfterRequestedRedraw = true;
+            _redrawPublishIssued = false;
+            _nextUpdateTick = 0;
         });
 
         Mediator.Publish(new GameObjectHandlerCreatedMessage(this, _isOwnedObject));
@@ -142,7 +209,7 @@ public sealed class GameObjectHandler : DisposableMediatorSubscriberBase, IHighP
             return false;
         }).ConfigureAwait(false))
         {
-            await Task.Delay(250, token).ConfigureAwait(false);
+            await Task.Delay(50, token).ConfigureAwait(false);
         }
     }
 
@@ -179,6 +246,35 @@ public sealed class GameObjectHandler : DisposableMediatorSubscriberBase, IHighP
     {
         var owned = _isOwnedObject ? "Self" : "Other";
         return $"{owned}/{ObjectKind}:{Name} ({Address:X},{DrawObjectAddress:X})";
+    }
+
+    private void PublishImmediatePlayerStateAfterRedraw(string reason, bool includeRequestedRedrawOnly)
+    {
+        if (!_isOwnedObject || ObjectKind != ObjectKind.Player)
+            return;
+
+        if (!(_delayedZoningTask?.IsCompleted ?? true))
+            return;
+
+        var hasPendingPublish = _pendingTransientPublishAfterRedraw
+            || (includeRequestedRedrawOnly && _pendingPlayerPublishAfterRequestedRedraw);
+        if (!hasPendingPublish)
+            return;
+
+        if (_redrawPublishIssued)
+        {
+            if (Logger.IsEnabled(LogLevel.Trace))
+                Logger.LogTrace("[{this}] Suppressing duplicate redraw-triggered immediate player publish for {reason}", this, reason);
+
+            return;
+        }
+
+        _redrawPublishIssued = true;
+        _suppressNextSemanticDiffPublishAfterRedraw = true;
+        _pendingTransientPublishAfterRedraw = false;
+        _pendingPlayerPublishAfterRequestedRedraw = false;
+        _nextUpdateTick = 0;
+        Mediator.Publish(new ImmediatePlayerStatePublishMessage(this, reason));
     }
 
     protected override void Dispose(bool disposing)
@@ -292,6 +388,21 @@ public sealed class GameObjectHandler : DisposableMediatorSubscriberBase, IHighP
                 var semanticDiff = equipDiff || customizeDiff || nameChange;
                 if (semanticDiff)
                 {
+                    if (ObjectKind == ObjectKind.Player && (equipDiff || customizeDiff))
+                    {
+                        _pendingTransientPublishAfterRedraw = true;
+
+                        if (_suppressNextSemanticDiffPublishAfterRedraw)
+                        {
+                            _suppressNextSemanticDiffPublishAfterRedraw = false;
+
+                            if (Logger.IsEnabled(LogLevel.Trace))
+                                Logger.LogTrace("[{this}] Suppressing next post-redraw semantic diff publish", this);
+
+                            return;
+                        }
+                    }
+
                     Logger.LogDebug("[{this}] Changed, Sending CreateCacheObjectMessage", this);
                     Mediator.Publish(new CreateCacheForObjectMessage(this, $"GameObject:SemanticDiff(equip={equipDiff},customize={customizeDiff},name={nameChange})"));
                 }
@@ -383,10 +494,20 @@ public sealed class GameObjectHandler : DisposableMediatorSubscriberBase, IHighP
         if (_haltProcessing) return;
         if (!_delayedZoningTask?.IsCompleted ?? false) return;
 
-        var now = DateTime.UtcNow;
-        var interval = _isOwnedObject ? _ownedUpdateInterval : _otherUpdateInterval;
-        if (now < _nextUpdateUtc) return;
-        _nextUpdateUtc = now.Add(interval);
+        var nowTick = Environment.TickCount64;
+        var shouldUseFastCadence =
+            _pendingTransientPublishAfterRedraw
+            || CurrentDrawCondition != DrawCondition.None
+            || Address == IntPtr.Zero
+            || DrawObjectAddress == IntPtr.Zero
+            || string.IsNullOrEmpty(Name);
+
+        var intervalMs = shouldUseFastCadence
+            ? (_isOwnedObject ? OwnedUpdateIntervalMs : OtherUpdateIntervalMs)
+            : (_isOwnedObject ? OwnedStableUpdateIntervalMs : OtherStableUpdateIntervalMs);
+
+        if (nowTick < Interlocked.Read(ref _nextUpdateTick)) return;
+        Interlocked.Exchange(ref _nextUpdateTick, nowTick + intervalMs);
 
         try
         {
@@ -489,7 +610,7 @@ public sealed class GameObjectHandler : DisposableMediatorSubscriberBase, IHighP
             finally
             {
                 _haltProcessing = false;
-                _nextUpdateUtc = DateTime.MinValue;
+                _nextUpdateTick = 0;
                 Logger.LogDebug("[{this}] Delay after zoning complete", this);
                 _zoningCts.Dispose();
             }

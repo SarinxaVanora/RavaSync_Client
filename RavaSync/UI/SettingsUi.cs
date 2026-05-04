@@ -4,6 +4,7 @@ using Dalamud.Interface.Colors;
 using Dalamud.Interface.GameFonts;
 using Dalamud.Interface.Utility;
 using Dalamud.Interface.Utility.Raii;
+using Dalamud.Interface.Windowing;
 using Dalamud.Plugin;
 using Dalamud.Plugin.Services;
 using Dalamud.Utility;
@@ -155,8 +156,41 @@ public class SettingsUi : WindowMediatorSubscriberBase
         Mediator.Subscribe<CutsceneStartMessage>(this, (_) => UiSharedService_GposeStart());
         Mediator.Subscribe<CutsceneEndMessage>(this, (_) => UiSharedService_GposeEnd());
         Mediator.Subscribe<CharacterDataCreatedMessage>(this, (msg) => LastCreatedCharacterData = msg.CharacterData);
-        Mediator.Subscribe<DownloadStartedMessage>(this, (msg) => _currentDownloads[msg.DownloadId] = msg.DownloadStatus);
-        Mediator.Subscribe<DownloadFinishedMessage>(this, (msg) => _currentDownloads.TryRemove(msg.DownloadId, out _));
+        Mediator.Subscribe<DownloadStartedMessage>(this, (msg) =>
+        {
+            if (msg.DownloadId == null) return;
+            _currentDownloads[msg.DownloadId] = SnapshotStatus(msg.DownloadStatus);
+        });
+        Mediator.Subscribe<DownloadFinishedMessage>(this, (msg) =>
+        {
+            if (msg.DownloadId == null) return;
+            _currentDownloads.TryRemove(msg.DownloadId, out _);
+        });
+    }
+
+    private static Dictionary<string, FileDownloadStatus> SnapshotStatus(Dictionary<string, FileDownloadStatus>? src)
+    {
+        if (src is null || src.Count == 0)
+            return new Dictionary<string, FileDownloadStatus>(StringComparer.Ordinal);
+
+        var dst = new Dictionary<string, FileDownloadStatus>(src.Count, StringComparer.Ordinal);
+        foreach (var kv in src)
+        {
+            var s = kv.Value;
+            if (s == null)
+                continue;
+
+            dst[kv.Key] = new FileDownloadStatus
+            {
+                DownloadStatus = s.DownloadStatus,
+                TotalBytes = s.TotalBytes,
+                TotalFiles = s.TotalFiles,
+                TransferredBytes = s.TransferredBytes,
+                TransferredFiles = s.TransferredFiles,
+            };
+        }
+
+        return dst;
     }
 
     public CharacterData? LastCreatedCharacterData { private get; set; }
@@ -165,7 +199,6 @@ public class SettingsUi : WindowMediatorSubscriberBase
     public override void OnOpen()
     {
         _uiShared.ResetOAuthTasksState();
-        _speedTestCts = new();
     }
 
     public override void OnClose()
@@ -173,12 +206,6 @@ public class SettingsUi : WindowMediatorSubscriberBase
         _uiShared.EditTrackerPosition = false;
         _uidToAddForIgnore = string.Empty;
         _secretKeysConversionCts = _secretKeysConversionCts.CancelRecreate();
-        _downloadServersTask = null;
-        _speedTestTask = null;
-        _speedTestCts?.Cancel();
-        _speedTestCts?.Dispose();
-        _speedTestCts = null;
-
         base.OnClose();
     }
 
@@ -433,65 +460,6 @@ public class SettingsUi : WindowMediatorSubscriberBase
         ImGui.Unindent();
         if (!showUploading) ImGui.EndDisabled();
 
-
-        if (_apiController.IsConnected)
-        {
-            ImGuiHelpers.ScaledDummy(5);
-            ImGui.Separator();
-            ImGuiHelpers.ScaledDummy(10);
-            using var tree = ImRaii.TreeNode("Speed Test to Servers");
-            if (tree)
-            {
-                if (_downloadServersTask == null || ((_downloadServersTask?.IsCompleted ?? false) && (!_downloadServersTask?.IsCompletedSuccessfully ?? false)))
-                {
-                    if (_uiShared.IconTextButton(FontAwesomeIcon.GroupArrowsRotate, _uiShared.L("UI.SettingsUi.79d90b01", "Update Download Server List")))
-                    {
-                        _downloadServersTask = GetDownloadServerList();
-                    }
-                }
-                if (_downloadServersTask != null && _downloadServersTask.IsCompleted && !_downloadServersTask.IsCompletedSuccessfully)
-                {
-                    UiSharedService.ColorTextWrapped(_uiShared.L("UI.SettingsUi.49c6d1dc", "Failed to get download servers from service, see /xllog for more information"), ImGuiColors.DalamudRed);
-                }
-                if (_downloadServersTask != null && _downloadServersTask.IsCompleted && _downloadServersTask.IsCompletedSuccessfully)
-                {
-                    if (_speedTestTask == null || _speedTestTask.IsCompleted)
-                    {
-                        if (_uiShared.IconTextButton(FontAwesomeIcon.ArrowRight, _uiShared.L("UI.SettingsUi.999d1555", "Start Speedtest")))
-                        {
-                            _speedTestTask = RunSpeedTest(_downloadServersTask.Result!, _speedTestCts?.Token ?? CancellationToken.None);
-                        }
-                    }
-                    else if (!_speedTestTask.IsCompleted)
-                    {
-                        UiSharedService.ColorTextWrapped(_uiShared.L("UI.SettingsUi.c4d53e09", "Running Speedtest to File Servers..."), ImGuiColors.DalamudYellow);
-                        UiSharedService.ColorTextWrapped(_uiShared.L("UI.SettingsUi.ae3ed8e0", "Please be patient, depending on usage and load this can take a while."), ImGuiColors.DalamudYellow);
-                        if (_uiShared.IconTextButton(FontAwesomeIcon.Ban, _uiShared.L("UI.SettingsUi.0ae156b6", "Cancel speedtest")))
-                        {
-                            _speedTestCts?.Cancel();
-                            _speedTestCts?.Dispose();
-                            _speedTestCts = new();
-                        }
-                    }
-                    if (_speedTestTask != null && _speedTestTask.IsCompleted)
-                    {
-                        if (_speedTestTask.Result != null && _speedTestTask.Result.Count != 0)
-                        {
-                            foreach (var result in _speedTestTask.Result)
-                            {
-                                UiSharedService.TextWrapped(result);
-                            }
-                        }
-                        else
-                        {
-                            UiSharedService.ColorTextWrapped(_uiShared.L("UI.SettingsUi.3fd78cce", "Speedtest completed with no results"), ImGuiColors.DalamudYellow);
-                        }
-                    }
-                }
-            }
-            ImGuiHelpers.ScaledDummy(10);
-        }
-
         ImGui.Separator();
         _uiShared.BigText("Current Transfers");
 
@@ -569,87 +537,6 @@ public class SettingsUi : WindowMediatorSubscriberBase
         }
     }
 
-    private Task<List<string>?>? _downloadServersTask = null;
-    private Task<List<string>?>? _speedTestTask = null;
-    private CancellationTokenSource? _speedTestCts;
-
-    private async Task<List<string>?> RunSpeedTest(List<string> servers, CancellationToken token)
-    {
-        List<string> speedTestResults = new();
-        foreach (var server in servers)
-        {
-            HttpResponseMessage? result = null;
-            Stopwatch? st = null;
-            try
-            {
-                result = await _fileTransferOrchestrator.SendRequestAsync(HttpMethod.Get, new Uri(new Uri(server), "speedtest/run"), token, HttpCompletionOption.ResponseHeadersRead).ConfigureAwait(false);
-                result.EnsureSuccessStatusCode();
-                using CancellationTokenSource speedtestTimeCts = new();
-                speedtestTimeCts.CancelAfter(TimeSpan.FromSeconds(10));
-                using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(speedtestTimeCts.Token, token);
-                long readBytes = 0;
-                st = Stopwatch.StartNew();
-                try
-                {
-                    var stream = await result.Content.ReadAsStreamAsync(linkedCts.Token).ConfigureAwait(false);
-                    byte[] buffer = new byte[8192];
-                    while (!speedtestTimeCts.Token.IsCancellationRequested)
-                    {
-                        var currentBytes = await stream.ReadAsync(buffer, linkedCts.Token).ConfigureAwait(false);
-                        if (currentBytes == 0)
-                            break;
-                        readBytes += currentBytes;
-                    }
-                }
-                catch (OperationCanceledException)
-                {
-                    _logger.LogWarning("Speedtest to {server} cancelled", server);
-                }
-                st.Stop();
-                _logger.LogInformation("Downloaded {bytes} from {server} in {time}", UiSharedService.ByteToString(readBytes), server, st.Elapsed);
-                var bps = (long)((readBytes) / st.Elapsed.TotalSeconds);
-                speedTestResults.Add($"{server}: ~{UiSharedService.ByteToString(bps)}/s");
-            }
-            catch (HttpRequestException ex)
-            {
-                if (result != null)
-                {
-                    var res = await result!.Content.ReadAsStringAsync().ConfigureAwait(false);
-                    speedTestResults.Add($"{server}: {ex.Message} - {res}");
-                }
-            }
-            catch (OperationCanceledException)
-            {
-                _logger.LogWarning("Speedtest on {server} cancelled", server);
-                speedTestResults.Add($"{server}: Cancelled by user");
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "Some exception");
-            }
-            finally
-            {
-                st?.Stop();
-            }
-        }
-        return speedTestResults;
-    }
-
-    private async Task<List<string>?> GetDownloadServerList()
-    {
-        try
-        {
-            var result = await _fileTransferOrchestrator.SendRequestAsync(HttpMethod.Get, new Uri(_fileTransferOrchestrator.FilesCdnUri!, "/files/downloadServers"), CancellationToken.None).ConfigureAwait(false);
-            result.EnsureSuccessStatusCode();
-            return await JsonSerializer.DeserializeAsync<List<string>>(await result.Content.ReadAsStreamAsync().ConfigureAwait(false)).ConfigureAwait(false);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "Failed to get download server list");
-            throw;
-        }
-    }
-
     private void DrawDebug()
     {
         _lastTab = "Debug";
@@ -719,25 +606,6 @@ public class SettingsUi : WindowMediatorSubscriberBase
     private void DrawFileStorageSettings()
     {
         _lastTab = "FileCache";
-
-        _uiShared.BigText("Export MCDF");
-
-        ImGuiHelpers.ScaledDummy(10);
-
-        UiSharedService.ColorTextWrapped(_uiShared.L("UI.SettingsUi.df2b286b", "Exporting MCDF has moved."), ImGuiColors.DalamudYellow);
-        ImGuiHelpers.ScaledDummy(5);
-        UiSharedService.TextWrapped(_uiShared.L("UI.SettingsUi.5E116F99", "It is now found in the Main UI under \"Your User Menu\" ("));
-        ImGui.SameLine();
-        _uiShared.IconText(FontAwesomeIcon.UserCog);
-        ImGui.SameLine();
-        UiSharedService.TextWrapped(_uiShared.L("UI.SettingsUi.323BBFEE", ") -> \"Character Data Hub\"."));
-        if (_uiShared.IconTextButton(FontAwesomeIcon.Running, _uiShared.L("UI.SettingsUi.13a3810c", "Open RavaSync Character Data Hub")))
-        {
-            Mediator.Publish(new UiToggleMessage(typeof(CharaDataHubUi)));
-        }
-        UiSharedService.TextWrapped(_uiShared.L("UI.SettingsUi.1081763b", "Note: this entry will be removed in the near future. Please use the Main UI to open the Character Data Hub."));
-        ImGuiHelpers.ScaledDummy(5);
-        ImGui.Separator();
 
         _uiShared.BigText("Storage");
 
@@ -909,9 +777,20 @@ public class SettingsUi : WindowMediatorSubscriberBase
         {
             _ = Task.Run(() =>
             {
-                foreach (var file in Directory.GetFiles(_configService.Current.CacheFolder))
+                const string clearCacheScanLock = "SettingsUi.ClearLocalStorage";
+                Mediator.Publish(new HaltScanMessage(clearCacheScanLock));
+
+                try
                 {
-                    File.Delete(file);
+                    foreach (var file in Directory.GetFiles(_configService.Current.CacheFolder))
+                    {
+                        File.Delete(file);
+                    }
+                }
+                finally
+                {
+                    Mediator.Publish(new ResumeScanMessage(clearCacheScanLock));
+                    _cacheMonitor.InvokeScan();
                 }
             });
         }
@@ -1362,6 +1241,15 @@ public class SettingsUi : WindowMediatorSubscriberBase
         _uiShared.DrawHelpText(_uiShared.L("UI.SettingsUi.3f41de24", "When enabled, it will automatically pause all players without preferred permissions that exceed the thresholds defined below.") + Environment.NewLine
             + "Will print a warning in chat when a player got paused automatically."
             + UiSharedService.TooltipSeparator + _uiShared.L("UI.SettingsUi.a077ec42", "Warning: this will not automatically unpause those people again, you will have to do this manually."));
+
+        bool unpauseThresholdOnConnect = _playerPerformanceConfigService.Current.UnpauseThresholdAutoPausedPairsOnConnect;
+        if (ImGui.Checkbox(_uiShared.L("UI.SettingsUi.UnpauseThresholdAutoPausedPairsOnConnect", "On connect, unpause all threshold auto-paused pairs"), ref unpauseThresholdOnConnect))
+        {
+            _playerPerformanceConfigService.Current.UnpauseThresholdAutoPausedPairsOnConnect = unpauseThresholdOnConnect;
+            _playerPerformanceConfigService.Save();
+        }
+        _uiShared.DrawHelpText(_uiShared.L("UI.SettingsUi.UnpauseThresholdAutoPausedPairsOnConnect.Help", "When enabled, any pairs remembered as auto-paused by VRAM/triangle thresholds will be unpaused automatically after you connect."));
+
         using (ImRaii.Disabled(!autoPause))
         {
             using var indent = ImRaii.PushIndent();

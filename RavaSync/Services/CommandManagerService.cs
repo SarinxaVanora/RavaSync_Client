@@ -1,6 +1,5 @@
 ﻿using Dalamud.Game.Command;
 using Dalamud.Plugin.Services;
-using RavaSync.API.Dto.Group;
 using RavaSync.FileCache;
 using RavaSync.MareConfiguration;
 using RavaSync.MareConfiguration.Models;
@@ -24,14 +23,16 @@ public sealed class CommandManagerService : IDisposable
     private readonly CacheMonitor _cacheMonitor;
     private readonly ServerConfigurationManager _serverConfigurationManager;
 
-    // NEW: we need these to verify location + furnishings permission
     private readonly IGameGui _gameGui;
     private readonly DalamudUtilService _dalamudUtil;
+    private readonly StorageMaintenanceService _storageMaintenanceService;
+    private Task? _storageValidationTask;
+    private Task? _clearCacheTask;
 
     public CommandManagerService(ICommandManager commandManager, PerformanceCollectorService performanceCollectorService,
         ServerConfigurationManager serverConfigurationManager, CacheMonitor periodicFileScanner,
         ApiController apiController, MareMediator mediator, MareConfigService mareConfigService,
-        IGameGui gameGui, DalamudUtilService dalamudUtil)
+        IGameGui gameGui, DalamudUtilService dalamudUtil, StorageMaintenanceService storageMaintenanceService)
     {
         _commandManager = commandManager;
         _performanceCollectorService = performanceCollectorService;
@@ -42,6 +43,7 @@ public sealed class CommandManagerService : IDisposable
         _mareConfigService = mareConfigService;
         _gameGui = gameGui;
         _dalamudUtil = dalamudUtil;
+        _storageMaintenanceService = storageMaintenanceService;
 
         _commandManager.AddHandler(_commandName, new CommandInfo(OnCommand)
         {
@@ -54,7 +56,9 @@ public sealed class CommandManagerService : IDisposable
                 "\t /rava settings - Opens the RavaSync Settings window" + Environment.NewLine +
                 "\t /rava linktoshell - Opens the Venue Registration pane for the current interior (requires Indoor Furnishings)" + Environment.NewLine +
                 "\t /rava tools - Opens the Tools hub shortcuts window" + Environment.NewLine +
-                "\t /rava games - Opens the 'Toy Box games' window"
+                "\t /rava games - Opens the 'Toy Box games' window" + Environment.NewLine +
+                "\t /rava validate - Runs local storage validation" + Environment.NewLine +
+                "\t /rava clearcache - Clears local storage"
         });
     }
 
@@ -73,6 +77,7 @@ public sealed class CommandManagerService : IDisposable
                 _mediator.Publish(new UiToggleMessage(typeof(CompactUi)));
             else
                 _mediator.Publish(new UiToggleMessage(typeof(IntroUi)));
+
             return;
         }
 
@@ -148,6 +153,58 @@ public sealed class CommandManagerService : IDisposable
         else if (string.Equals(splitArgs[0], "games", StringComparison.OrdinalIgnoreCase))
         {
             _mediator.Publish(new UiToggleMessage(typeof(ToyBoxUi)));
+        }
+        else if (string.Equals(splitArgs[0], "validate", StringComparison.OrdinalIgnoreCase))
+        {
+            if (_storageValidationTask != null && !_storageValidationTask.IsCompleted)
+            {
+                _mediator.Publish(new NotificationMessage("Storage validation", "Local storage validation is already running.", NotificationType.Warning));
+                return;
+            }
+
+            _storageValidationTask = Task.Run(async () =>
+            {
+                _mediator.Publish(new NotificationMessage("Storage validation", "Started validating local storage.", NotificationType.Info));
+                try
+                {
+                    var broken = await _storageMaintenanceService.ValidateLocalStorageAsync().ConfigureAwait(false);
+                    _mediator.Publish(new NotificationMessage("Storage validation", $"Local storage validation completed. Removed {broken.Count} invalid file(s).", NotificationType.Info, TimeSpan.FromSeconds(8)));
+                }
+                catch (OperationCanceledException)
+                {
+                    _mediator.Publish(new NotificationMessage("Storage validation", "Local storage validation was cancelled.", NotificationType.Warning));
+                }
+                catch (Exception ex)
+                {
+                    _mediator.Publish(new NotificationMessage("Storage validation", $"Validation failed: {ex.Message}", NotificationType.Error, TimeSpan.FromSeconds(8)));
+                }
+            });
+        }
+        else if (string.Equals(splitArgs[0], "clearcache", StringComparison.OrdinalIgnoreCase))
+        {
+            if (_clearCacheTask != null && !_clearCacheTask.IsCompleted)
+            {
+                _mediator.Publish(new NotificationMessage("Clear cache", "Local storage clear is already running.", NotificationType.Warning));
+                return;
+            }
+
+            _clearCacheTask = Task.Run(async () =>
+            {
+                _mediator.Publish(new NotificationMessage("Clear cache", "Clearing local storage.", NotificationType.Warning));
+                try
+                {
+                    await _storageMaintenanceService.ClearLocalStorageAsync().ConfigureAwait(false);
+                    _mediator.Publish(new NotificationMessage("Clear cache", "Local storage has been cleared.", NotificationType.Warning, TimeSpan.FromSeconds(8)));
+                }
+                catch (OperationCanceledException)
+                {
+                    _mediator.Publish(new NotificationMessage("Clear cache", "Local storage clear was cancelled.", NotificationType.Warning));
+                }
+                catch (Exception ex)
+                {
+                    _mediator.Publish(new NotificationMessage("Clear cache", $"Clear cache failed: {ex.Message}", NotificationType.Error, TimeSpan.FromSeconds(8)));
+                }
+            });
         }
     }
 }

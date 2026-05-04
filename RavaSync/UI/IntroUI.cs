@@ -17,6 +17,7 @@ using Microsoft.Extensions.Logging;
 using System.Numerics;
 using System.Text.RegularExpressions;
 using static RavaSync.WebAPI.SignalR.TokenProvider;
+using Dalamud.Interface.Windowing;
 
 namespace RavaSync.UI;
 

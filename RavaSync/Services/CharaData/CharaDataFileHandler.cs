@@ -11,6 +11,7 @@ using RavaSync.Services.CharaData.Models;
 using RavaSync.Utils;
 using RavaSync.WebAPI.Files;
 using Microsoft.Extensions.Logging;
+using System.Buffers;
 
 namespace RavaSync.Services;
 
@@ -212,27 +213,42 @@ public sealed class CharaDataFileHandler : IDisposable
 
         long totalRead = 0;
         Dictionary<string, string> gamePathToFilePath = new(StringComparer.Ordinal);
-        foreach (var fileData in charaFileHeader.CharaFileData.Files)
+        var buffer = ArrayPool<byte>.Shared.Rent(128 * 1024);
+        try
         {
-            var fileName = Path.Combine(_fileCacheManager.CacheFolder, "mare_" + _globalFileCounter++ + ".tmp");
-            extractedFiles.Add(fileName);
-            var length = fileData.Length;
-            var bufferSize = length;
-            using var fs = File.OpenWrite(fileName);
-            using var wr = new BinaryWriter(fs);
-            _logger.LogTrace("Reading {length} of {fileName}", length.ToByteString(), fileName);
-            var buffer = reader.ReadBytes(bufferSize);
-            wr.Write(buffer);
-            wr.Flush();
-            wr.Close();
-            if (buffer.Length == 0) throw new EndOfStreamException("Unexpected EOF");
-            foreach (var path in fileData.GamePaths)
+            foreach (var fileData in charaFileHeader.CharaFileData.Files)
             {
-                gamePathToFilePath[path] = fileName;
-                _logger.LogTrace("{path} => {fileName} [{hash}]", path, fileName, fileData.Hash);
+                var fileName = Path.Combine(_fileCacheManager.CacheFolder, "mare_" + _globalFileCounter++ + ".tmp");
+                extractedFiles.Add(fileName);
+                var remaining = fileData.Length;
+                using var fs = File.OpenWrite(fileName);
+                _logger.LogTrace("Reading {length} of {fileName}", fileData.Length.ToByteString(), fileName);
+                while (remaining > 0)
+                {
+                    var chunkSize = Math.Min(buffer.Length, remaining);
+                    var read = reader.Read(buffer, 0, chunkSize);
+                    if (read <= 0)
+                    {
+                        throw new EndOfStreamException($"Unexpected EOF while extracting MCDF for hash {fileData.Hash}");
+                    }
+
+                    fs.Write(buffer, 0, read);
+                    remaining -= read;
+                    totalRead += read;
+                }
+
+                fs.Flush();
+                foreach (var path in fileData.GamePaths)
+                {
+                    gamePathToFilePath[path] = fileName;
+                    _logger.LogTrace("{path} => {fileName} [{hash}]", path, fileName, fileData.Hash);
+                }
+                _logger.LogTrace("Read {read}/{expected} bytes", totalRead.ToByteString(), expectedLength.ToByteString());
             }
-            totalRead += length;
-            _logger.LogTrace("Read {read}/{expected} bytes", totalRead.ToByteString(), expectedLength.ToByteString());
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buffer);
         }
 
         return gamePathToFilePath;
@@ -279,31 +295,52 @@ public sealed class CharaDataFileHandler : IDisposable
 
             var mareCharaFileData = _mareCharaFileDataFactory.Create(description, data);
             MareCharaFileHeader output = new(MareCharaFileHeader.CurrentVersion, mareCharaFileData);
+            var totalGamePaths = output.CharaFileData.Files.Sum(f => f.GamePaths.Count()) + output.CharaFileData.FileSwaps.Sum(f => f.GamePaths.Count());
+            _logger.LogInformation("Exporting MCDF with {fileCount} embedded files, {swapCount} file swaps, {gamePathCount} game paths", output.CharaFileData.Files.Count, output.CharaFileData.FileSwaps.Count, totalGamePaths);
 
             using var fs = new FileStream(tempFilePath, FileMode.Create, FileAccess.ReadWrite, FileShare.None);
             using var lz4 = new LZ4Stream(fs, LZ4StreamMode.Compress, LZ4StreamFlags.HighCompression);
             using var writer = new BinaryWriter(lz4);
             output.WriteToStream(writer);
 
-            foreach (var item in output.CharaFileData.Files)
+            var buffer = ArrayPool<byte>.Shared.Rent(128 * 1024);
+            try
             {
-                var file = _fileCacheManager.GetFileCacheByHash(item.Hash)!;
-                _logger.LogDebug("Saving to MCDF: {hash}:{file}", item.Hash, file.ResolvedFilepath);
-                _logger.LogDebug("\tAssociated GamePaths:");
-                foreach (var path in item.GamePaths)
+                foreach (var item in output.CharaFileData.Files)
                 {
-                    _logger.LogDebug("\t{path}", path);
-                }
+                    var file = _fileCacheManager.GetFileCacheByHash(item.Hash);
+                    if (file == null || string.IsNullOrWhiteSpace(file.ResolvedFilepath) || !File.Exists(file.ResolvedFilepath))
+                    {
+                        throw new FileNotFoundException($"MCDF export source missing for hash {item.Hash}", file?.ResolvedFilepath);
+                    }
 
-                var fsRead = File.OpenRead(file.ResolvedFilepath);
-                await using (fsRead.ConfigureAwait(false))
-                {
-                    using var br = new BinaryReader(fsRead);
-                    byte[] buffer = new byte[item.Length];
-                    br.Read(buffer, 0, item.Length);
-                    writer.Write(buffer);
+                    _logger.LogDebug("Saving to MCDF: {hash}:{file}", item.Hash, file.ResolvedFilepath);
+                    _logger.LogDebug("	Associated GamePaths:");
+                    foreach (var path in item.GamePaths)
+                    {
+                        _logger.LogDebug("	{path}", path);
+                    }
+
+                    await using var fsRead = File.OpenRead(file.ResolvedFilepath);
+                    var remaining = item.Length;
+                    while (remaining > 0)
+                    {
+                        var read = await fsRead.ReadAsync(buffer.AsMemory(0, Math.Min(buffer.Length, remaining))).ConfigureAwait(false);
+                        if (read <= 0)
+                        {
+                            throw new EndOfStreamException($"Unexpected EOF while exporting MCDF for hash {item.Hash}");
+                        }
+
+                        writer.Write(buffer, 0, read);
+                        remaining -= read;
+                    }
                 }
             }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(buffer);
+            }
+
             writer.Flush();
             await lz4.FlushAsync().ConfigureAwait(false);
             await fs.FlushAsync().ConfigureAwait(false);

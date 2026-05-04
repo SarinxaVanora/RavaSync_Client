@@ -19,6 +19,8 @@ public class PermissionWindowUI : WindowMediatorSubscriberBase
     private readonly UiSharedService _uiSharedService;
     private readonly ApiController _apiController;
     private UserPermissions _ownPermissions;
+    private bool _customizePlusEnabled;
+    private bool _metadataEnabled;
     protected override IDisposable? BeginThemeScope() => _uiSharedService.BeginThemed();
     public PermissionWindowUI(ILogger<PermissionWindowUI> logger, Pair pair, MareMediator mediator, UiSharedService uiSharedService,
         ApiController apiController, PerformanceCollectorService performanceCollectorService)
@@ -28,6 +30,8 @@ public class PermissionWindowUI : WindowMediatorSubscriberBase
         _uiSharedService = uiSharedService;
         _apiController = apiController;
         _ownPermissions = pair.UserPair.OwnPermissions.DeepClone();
+        _customizePlusEnabled = pair.IsCustomizePlusEnabled;
+        _metadataEnabled = pair.IsMetadataEnabled;
         Flags = ImGuiWindowFlags.NoScrollbar | ImGuiWindowFlags.NoResize;
         SizeConstraints = new()
         {
@@ -44,8 +48,8 @@ public class PermissionWindowUI : WindowMediatorSubscriberBase
         var disableSounds = _ownPermissions.IsDisableSounds();
         var disableAnimations = _ownPermissions.IsDisableAnimations();
         var disableVfx = _ownPermissions.IsDisableVFX();
-        var disableCustomize = _ownPermissions.IsDisableCustomizePlus();
-        var disableMetaData = _ownPermissions.IsDisableMetaData();
+        var disableCustomize = !_customizePlusEnabled;
+        var disableMetaData = !_metadataEnabled;
         var style = ImGui.GetStyle();
         var indentSize = ImGui.GetFrameHeight() + style.ItemSpacing.X;
 
@@ -130,34 +134,42 @@ public class PermissionWindowUI : WindowMediatorSubscriberBase
 
         if (ImGui.Checkbox(_uiSharedService.L("UI.PermissionWindowUI.f6eb9eee", "Disable Customize+"), ref disableCustomize))
         {
-            _ownPermissions.SetDisableCustomizePlus(disableCustomize);
+            _customizePlusEnabled = !disableCustomize;
         }
-        _uiSharedService.DrawHelpText(_uiSharedService.L("UI.PermissionWindowUI.def2d628", "Not all that down with the thiccness? PP Large enough to satisfy an elephant?") + UiSharedService.TooltipSeparator 
-            + "This will disable all that and more!");
+        _uiSharedService.DrawHelpText(_uiSharedService.L("UI.PermissionWindowUI.def2d628", "Not all that down with the thiccness? PP Large enough to satisfy an elephant?") + UiSharedService.TooltipSeparator
+            + "This is local only and will not notify the other user.");
 
         if (ImGui.Checkbox(_uiSharedService.L("UI.PermissionWindowUI.2ea5261a", "Disable Height Metadata"), ref disableMetaData))
         {
-            _ownPermissions.SetDisableMetaData(disableMetaData);
+            _metadataEnabled = !disableMetaData;
         }
-        _uiSharedService.DrawHelpText(_uiSharedService.L("UI.PermissionWindowUI.d9598eed", "Too tall? Too Small? Not anymore. This disables any height edits."));
+        _uiSharedService.DrawHelpText(_uiSharedService.L("UI.PermissionWindowUI.d9598eed", "Too tall? Too Small? Not anymore. This disables height edits only, locally, without notifying the other user."));
 
 
         ImGuiHelpers.ScaledDummy(0.5f);
         ImGui.Separator();
         ImGuiHelpers.ScaledDummy(0.5f);
 
-        bool hasChanges = _ownPermissions != Pair.UserPair.OwnPermissions;
+        bool serverPermissionChanges = _ownPermissions != Pair.UserPair.OwnPermissions;
+        bool localPermissionChanges = _customizePlusEnabled != Pair.IsCustomizePlusEnabled || _metadataEnabled != Pair.IsMetadataEnabled;
+        bool hasChanges = serverPermissionChanges || localPermissionChanges;
 
         using (ImRaii.Disabled(!hasChanges))
             if (_uiSharedService.IconTextButton(Dalamud.Interface.FontAwesomeIcon.Save, _uiSharedService.L("UI.PermissionWindowUI.28599bfe", "Save")))
             {
-                _ = _apiController.SetBulkPermissions(new(
-                    new(StringComparer.Ordinal)
-                    {
-                        { Pair.UserData.UID, _ownPermissions }
-                    },
-                    new(StringComparer.Ordinal)
-                ));
+                if (serverPermissionChanges)
+                {
+                    _ = _apiController.SetBulkPermissions(new(
+                        new(StringComparer.Ordinal)
+                        {
+                            { Pair.UserData.UID, _ownPermissions }
+                        },
+                        new(StringComparer.Ordinal)
+                    ));
+                }
+
+                Pair.SetCustomizePlusEnabled(_customizePlusEnabled);
+                Pair.SetMetadataEnabled(_metadataEnabled);
             }
         UiSharedService.AttachToolTip(_uiSharedService.L("UI.PermissionWindowUI.b33e9980", "Save and apply all changes"));
 
@@ -171,6 +183,8 @@ public class PermissionWindowUI : WindowMediatorSubscriberBase
             if (_uiSharedService.IconTextButton(Dalamud.Interface.FontAwesomeIcon.Undo, _uiSharedService.L("UI.PermissionWindowUI.9bc94c90", "Revert")))
             {
                 _ownPermissions = Pair.UserPair.OwnPermissions.DeepClone();
+                _customizePlusEnabled = Pair.IsCustomizePlusEnabled;
+                _metadataEnabled = Pair.IsMetadataEnabled;
             }
         UiSharedService.AttachToolTip(_uiSharedService.L("UI.PermissionWindowUI.661d908b", "Revert all changes"));
 
@@ -183,6 +197,10 @@ public class PermissionWindowUI : WindowMediatorSubscriberBase
             _ownPermissions.SetDisableVFX(Pair.IsDirectlyPaired ? defaultPermissions.DisableIndividualVFX : defaultPermissions.DisableGroupVFX);
             _ownPermissions.SetDisableSounds(Pair.IsDirectlyPaired ? defaultPermissions.DisableIndividualSounds : defaultPermissions.DisableGroupSounds);
             _ownPermissions.SetDisableAnimations(Pair.IsDirectlyPaired ? defaultPermissions.DisableIndividualAnimations : defaultPermissions.DisableGroupAnimations);
+            _customizePlusEnabled = true;
+            _metadataEnabled = true;
+            Pair.SetCustomizePlusEnabled(true);
+            Pair.SetMetadataEnabled(true);
             _ = _apiController.SetBulkPermissions(new(
                 new(StringComparer.Ordinal)
                 {

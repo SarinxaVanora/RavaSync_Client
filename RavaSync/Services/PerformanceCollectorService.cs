@@ -181,12 +181,19 @@ public sealed class PerformanceCollectorService : IHostedService
         {
             await Task.Delay(TimeSpan.FromMinutes(10), _periodicLogPruneTaskCts.Token).ConfigureAwait(false);
 
-            foreach (var entries in PerformanceCounters.ToList())
+            foreach (var entries in PerformanceCounters.ToArray())
             {
                 try
                 {
-                    var last = entries.Value.ToList().Last();
-                    if (last.Item1.AddMinutes(10) < TimeOnly.FromDateTime(DateTime.Now) && !PerformanceCounters.TryRemove(entries.Key, out _))
+                    var snapshot = entries.Value.Snapshot();
+
+                    if (snapshot.Count == 0)
+                        continue;
+
+                    var last = snapshot[^1];
+
+                    if (last.Item1.AddMinutes(10) < TimeOnly.FromDateTime(DateTime.Now)
+                        && !PerformanceCounters.TryRemove(entries.Key, out _))
                     {
                         _logger.LogDebug("Could not remove performance counter {counter}", entries.Key);
                     }

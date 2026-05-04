@@ -14,12 +14,13 @@ public sealed class FriendResolver : IFriendResolver, IDisposable
     private readonly IFramework _framework;
     private readonly IObjectTable _objects;
 
-    // live set of visible-friend names
-    private readonly ConcurrentDictionary<string, int> _friendNames = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, byte> _friendNames = new(StringComparer.Ordinal);
+    private readonly HashSet<string> _scanNames = new(StringComparer.Ordinal);
 
-    private int _friendScanId = 0;
-    private long _nextScanAtTick = 0;
-    private const int FriendScanIntervalMs = 250;
+    private int _scanCursor = -1;
+    private long _nextScanAtTick;
+    private const int FriendScanIntervalMs = 500;
+    private const int FriendScanSliceSize = 24;
 
 
     public FriendResolver(
@@ -42,16 +43,31 @@ public sealed class FriendResolver : IFriendResolver, IDisposable
         try
         {
             var nowTick = Environment.TickCount64;
-            if (nowTick < _nextScanAtTick)
+            if (_scanCursor < 0)
+            {
+                if (nowTick < _nextScanAtTick)
+                    return;
+
+                _scanCursor = 0;
+                _scanNames.Clear();
+            }
+
+            var objectCount = _objects.Length;
+            if (objectCount <= 0)
+            {
+                if (!_friendNames.IsEmpty)
+                    _friendNames.Clear();
+
+                _scanCursor = -1;
+                _nextScanAtTick = nowTick + FriendScanIntervalMs;
                 return;
+            }
 
-            _nextScanAtTick = nowTick + FriendScanIntervalMs;
-            var scanId = unchecked(++_friendScanId);
-
-            for (int i = 0; i < _objects.Length; i++)
+            var end = Math.Min(objectCount, _scanCursor + FriendScanSliceSize);
+            for (int i = _scanCursor; i < end; i++)
             {
                 var obj = _objects[i];
-                if (obj is null || obj.ObjectKind != ObjectKind.Player)
+                if (obj is null || obj.ObjectKind != ObjectKind.Pc)
                     continue;
 
                 unsafe
@@ -62,23 +78,30 @@ public sealed class FriendResolver : IFriendResolver, IDisposable
                 }
 
                 var name = obj.Name.ToString();
-                if (string.IsNullOrEmpty(name))
-                    continue;
-
-                _friendNames[name] = scanId;
+                if (!string.IsNullOrEmpty(name))
+                    _scanNames.Add(name);
             }
 
+            _scanCursor = end;
+            if (_scanCursor < objectCount)
+                return;
+
+            foreach (var name in _scanNames)
+                _friendNames[name] = 0;
 
             foreach (var kv in _friendNames)
             {
-                if (kv.Value != scanId)
+                if (!_scanNames.Contains(kv.Key))
                     _friendNames.TryRemove(kv.Key, out _);
             }
 
+            _scanCursor = -1;
+            _nextScanAtTick = nowTick + FriendScanIntervalMs;
         }
         catch (Exception ex)
         {
-            // keep it quiet; we’ll try again next frame
+            _scanCursor = -1;
+            _nextScanAtTick = Environment.TickCount64 + FriendScanIntervalMs;
             _logger.LogDebug(ex, "FriendResolver update failed (continuing).");
         }
     }

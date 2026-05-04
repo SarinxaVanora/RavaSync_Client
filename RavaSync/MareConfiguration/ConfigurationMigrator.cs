@@ -48,6 +48,17 @@ public class ConfigurationMigrator(ILogger<ConfigurationMigrator> logger,Transie
             serverConfigService.Current.Version = 2;
             serverConfigService.Save();
         }
+
+        if (!mareConfigService.Current.HasUpgradedTransientsSystemV3)
+        {
+            _logger.LogInformation("Upgrading transient system: clearing existing persisted transients for a clean rebuild");
+
+            transientConfigService.Current.TransientConfigs.Clear();
+            transientConfigService.Save();
+
+            mareConfigService.Current.HasUpgradedTransientsSystemV3 = true;
+            mareConfigService.Save();
+        }
     }
 
 

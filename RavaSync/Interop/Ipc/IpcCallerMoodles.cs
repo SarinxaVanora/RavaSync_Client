@@ -37,16 +37,38 @@ public sealed class IpcCallerMoodles : IIpcCaller
 
     private void OnMoodlesChange(nint address)
     {
-        try
+        if (address == nint.Zero)
+            return;
+
+        _ = Task.Run(async () =>
         {
-            var status = _moodlesGetStatus.InvokeFunc(address) ?? string.Empty;
-            _mareMediator.Publish(new MoodlesMessage(address, status));
-        }
-        catch (Exception e)
-        {
-            _logger.LogWarning(e, "Could not obtain Moodles status during change event");
-            _mareMediator.Publish(new MoodlesMessage(address, string.Empty));
-        }
+            try
+            {
+                var localPlayerAddress = await _dalamudUtil.RunOnFrameworkThread(_dalamudUtil.GetPlayerPtr).ConfigureAwait(false);
+                if (localPlayerAddress == nint.Zero || localPlayerAddress != address)
+                    return;
+
+                var status = _moodlesGetStatus.InvokeFunc(address) ?? string.Empty;
+                _mareMediator.Publish(new MoodlesMessage(address, status));
+            }
+            catch (Exception e)
+            {
+                _logger.LogWarning(e, "Could not obtain local Moodles status during change event");
+
+                try
+                {
+                    var localPlayerAddress = await _dalamudUtil.RunOnFrameworkThread(_dalamudUtil.GetPlayerPtr).ConfigureAwait(false);
+                    if (localPlayerAddress != nint.Zero && localPlayerAddress == address)
+                    {
+                        _mareMediator.Publish(new MoodlesMessage(address, string.Empty));
+                    }
+                }
+                catch
+                {
+                    // ignore secondary failure
+                }
+            }
+        });
     }
 
     public bool APIAvailable { get; private set; } = false;

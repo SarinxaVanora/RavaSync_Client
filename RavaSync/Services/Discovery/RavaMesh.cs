@@ -18,7 +18,7 @@ public sealed record RavaHelloAck(string FromSessionId, byte[] FromPeerKey) : IR
 public sealed record RavaPairRequest(PairRequestDto Request) : IRavaMeshMessage;
 public sealed record RavaGoodbye(string FromSessionId, byte[] FromPeerKey) : IRavaMeshMessage;
 
-public sealed record RavaYield(string FromSessionId, string FromUid, bool YieldToOtherSync, string Owner) : IRavaMeshMessage;
+public sealed record RavaYield(string FromSessionId, string FromUid, string AffectedUid, bool YieldToOtherSync, string Owner) : IRavaMeshMessage;
 
 public sealed record RavaGame(string FromSessionId, byte[] Payload) : IRavaMeshMessage;
 
@@ -48,9 +48,10 @@ public sealed class RavaMesh : IRavaMesh
     [MessagePackObject]
     public sealed class YieldPayload
     {
-        [Key(0)] public string FromUid { get; set; } = string.Empty;
+        [Key(0)] public string FromUid { get; set; } = string.Empty; // legacy fallback for older clients
         [Key(1)] public bool YieldToOtherSync { get; set; }
         [Key(2)] public string Owner { get; set; } = string.Empty;
+        [Key(3)] public string AffectedUid { get; set; } = string.Empty;
     }
 
     public RavaMesh(ILogger<RavaMesh> logger, ApiController api, MareMediator mediator)
@@ -127,7 +128,7 @@ public sealed class RavaMesh : IRavaMesh
                 FromSessionId: fromSession,
                 Type: MeshMessageType.Game,
                 PeerKey: Array.Empty<byte>(),
-                Payload: BuildYieldPayload(y.FromUid, y.YieldToOtherSync, y.Owner)
+                Payload: BuildYieldPayload(y.FromUid, y.AffectedUid, y.YieldToOtherSync, y.Owner)
             ),
 
             RavaGame game => new MeshMessageDto(
@@ -166,13 +167,14 @@ public sealed class RavaMesh : IRavaMesh
         }
     }
 
-    private static byte[] BuildYieldPayload(string fromUid, bool yield, string owner)
+    private static byte[] BuildYieldPayload(string fromUid, string affectedUid, bool yield, string owner)
     {
         var payload = MessagePackSerializer.Serialize(new YieldPayload
         {
             FromUid = fromUid ?? string.Empty,
             YieldToOtherSync = yield,
-            Owner = owner ?? string.Empty
+            Owner = owner ?? string.Empty,
+            AffectedUid = affectedUid ?? string.Empty
         });
 
         var buf = new byte[YieldMagic.Length + payload.Length];
@@ -244,7 +246,7 @@ public sealed class RavaMesh : IRavaMesh
                     new RavaGoodbye(dto.FromSessionId, dto.PeerKey),
 
                 MeshMessageType.Game when dto.Payload is not null && TryParseYieldPayload(dto.Payload, out var yp) && yp != null =>
-                    new RavaYield(dto.FromSessionId, yp.FromUid, yp.YieldToOtherSync, yp.Owner),
+                    new RavaYield(dto.FromSessionId, yp.FromUid, string.IsNullOrWhiteSpace(yp.AffectedUid) ? yp.FromUid : yp.AffectedUid, yp.YieldToOtherSync, yp.Owner),
 
                 MeshMessageType.Game when dto.Payload is not null =>
                     new RavaGame(dto.FromSessionId, dto.Payload),

@@ -13,6 +13,7 @@ using RavaSync.WebAPI;
 using Microsoft.Extensions.Logging;
 using System.Globalization;
 using System.Numerics;
+using Dalamud.Interface.Windowing;
 
 namespace RavaSync.UI.Components.Popup;
 

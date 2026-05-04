@@ -1,9 +1,11 @@
 ﻿using System;
+using System.Diagnostics;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Dalamud.Game.ClientState.Objects.Types;
 using Dalamud.Plugin;
+using Glamourer.Api.Enums;
 using Glamourer.Api.Helpers;
 using Glamourer.Api.IpcSubscribers;
 using RavaSync.MareConfiguration.Models;
@@ -24,6 +26,7 @@ public sealed class IpcCallerGlamourer : DisposableMediatorSubscriberBase, IIpcC
 
     private readonly ApiVersion _glamourerApiVersions;
     private readonly ApplyState? _glamourerApplyAll;
+    private readonly ReapplyState _glamourerReapply;
     private readonly GetStateBase64? _glamourerGetAllCustomization;
     private readonly RevertState _glamourerRevert;
     private readonly RevertStateName _glamourerRevertByName;
@@ -40,6 +43,7 @@ public sealed class IpcCallerGlamourer : DisposableMediatorSubscriberBase, IIpcC
         _glamourerApiVersions = new ApiVersion(pi);
         _glamourerGetAllCustomization = new GetStateBase64(pi);
         _glamourerApplyAll = new ApplyState(pi);
+        _glamourerReapply = new ReapplyState(pi);
         _glamourerRevert = new RevertState(pi);
         _glamourerRevertByName = new RevertStateName(pi);
         _glamourerUnlock = new UnlockState(pi);
@@ -54,8 +58,6 @@ public sealed class IpcCallerGlamourer : DisposableMediatorSubscriberBase, IIpcC
 
         _glamourerStateChanged = StateChanged.Subscriber(pi, GlamourerChanged);
         _glamourerStateChanged.Enable();
-
-        Mediator.Subscribe<DalamudLoginMessage>(this, s => _shownGlamourerUnavailable = false);
     }
 
     protected override void Dispose(bool disposing)
@@ -111,24 +113,83 @@ public sealed class IpcCallerGlamourer : DisposableMediatorSubscriberBase, IIpcC
     {
         if (!APIAvailable || string.IsNullOrEmpty(customization) || _dalamudUtil.IsZoning) return;
 
-        var task = _redrawManager.PenumbraRedrawInternalAsync(logger, handler, applicationId, (chara) =>
+        async Task ApplyCoreAsync()
         {
+            await SafeIpc.TryRun(Logger, "Glamourer.ApplyAll", TimeSpan.FromSeconds(2), async ct =>
+            {
+                await _dalamudUtil.RunOnFrameworkThread(() =>
+                {
+                    var frameworkStopwatch = Stopwatch.StartNew();
+                    try
+                    {
+                        logger.LogDebug("[{appid}] Calling on IPC: GlamourerApplyAll", applicationId);
+
+                        var gameObj = handler.GetGameObject();
+                        if (gameObj is not ICharacter chara)
+                            return 0;
+
+                        _glamourerApplyAll!.Invoke(customization, chara.ObjectIndex, LockCode);
+                        return 0;
+                    }
+                    catch (Exception ex)
+                    {
+                        logger.LogWarning(ex, "[{appid}] Failed to apply Glamourer data", applicationId);
+                        return 0;
+                    }
+                    finally
+                    {
+                        frameworkStopwatch.Stop();
+                        if (frameworkStopwatch.ElapsedMilliseconds >= 60)
+                        {
+                            logger.LogWarning("[{appid}] GlamourerApplyAll for {name} took {elapsed}ms on framework", applicationId, handler.Name, frameworkStopwatch.ElapsedMilliseconds);
+                        }
+                    }
+                }).ConfigureAwait(false);
+
+                await _dalamudUtil.RunOnFrameworkThread(() => 0).ConfigureAwait(false);
+
+                if (handler.Address != nint.Zero && handler.CurrentDrawCondition != GameObjectHandler.DrawCondition.None)
+                {
+                    await _dalamudUtil.WaitWhileCharacterIsDrawing(logger, handler, applicationId, 15000, ct).ConfigureAwait(false);
+                }
+            }).ConfigureAwait(false);
+        }
+
+        if (fireAndForget)
+        {
+            _ = ApplyCoreAsync();
+            return;
+        }
+
+        await ApplyCoreAsync().ConfigureAwait(false);
+    }
+
+    public async Task ReapplyDirectAsync(ILogger logger, GameObjectHandler handler, Guid applicationId, CancellationToken token)
+    {
+        if (!APIAvailable || _dalamudUtil.IsZoning)
+            return;
+
+        token.ThrowIfCancellationRequested();
+
+        await _dalamudUtil.RunOnFrameworkThread(() =>
+        {
+            if (handler.GetGameObject() is not ICharacter chara)
+                return 0;
+
             try
             {
-                logger.LogDebug("[{appid}] Calling on IPC: GlamourerApplyAll", applicationId);
-                _glamourerApplyAll!.Invoke(customization, chara.ObjectIndex, LockCode);
+                logger.LogDebug("[{appid}] Calling on IPC: GlamourerReapplyDirect", applicationId);
+                _glamourerReapply.Invoke(chara.ObjectIndex, LockCode, ApplyFlag.Once);
             }
             catch (Exception ex)
             {
-                logger.LogWarning(ex, "[{appid}] Failed to apply Glamourer data", applicationId);
+                logger.LogWarning(ex, "[{appid}] Error during GlamourerReapplyDirect", applicationId);
             }
-        }, token);
 
-        if (fireAndForget)
-            return;
-
-        await task.ConfigureAwait(false);
+            return 0;
+        }).ConfigureAwait(false);
     }
+
 
 
     public async Task<string> GetCharacterCustomizationAsync(IntPtr character)

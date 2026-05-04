@@ -1,7 +1,8 @@
-using Microsoft.Extensions.DependencyInjection;
+ï»¿using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using RavaSync.API.Data;
 using RavaSync.API.Data.Extensions;
+using RavaSync.API.Data.Enum;
 using RavaSync.FileCache;
 using RavaSync.MareConfiguration;
 using RavaSync.MareConfiguration.Configurations;
@@ -45,6 +46,10 @@ public class PlayerPerformanceService : MediatorSubscriberBase
     private readonly ConcurrentDictionary<string, long> _autoCapPausedVramByUid = new();
     private readonly ConcurrentDictionary<string, UserData> _autoCapPausedUsers = new();
     private readonly ConcurrentDictionary<string, UserData> _knownUsersByUid = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, StableMetricCacheEntry> _stableVramByDataHash = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, StableMetricCacheEntry> _stableTrisByDataHash = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, StableMetricCacheEntry> _receivedVramByDataHash = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, StableMetricCacheEntry> _receivedTrisByDataHash = new(StringComparer.Ordinal);
 
     private readonly string _statePath =
     Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
@@ -56,11 +61,19 @@ public class PlayerPerformanceService : MediatorSubscriberBase
     private int _stateSaveInFlight; // 0/1 via Interlocked
     private DateTime _nextStateSaveAttemptUtc = DateTime.MinValue;
 
-    private static readonly TimeSpan AutoCapCheckInterval = TimeSpan.FromMilliseconds(500);
+    private static readonly TimeSpan AutoCapCheckInterval = TimeSpan.FromMilliseconds(75);
     private DateTime _nextAutoCapCheckUtc = DateTime.MinValue;
+
+    private readonly ConcurrentDictionary<string, UserData> _pendingThresholdResumeOnConnect = new(StringComparer.Ordinal);
+    private long _pendingThresholdResumeReadyTick;
+    private long _pendingThresholdResumeDeadlineTick;
 
     private int _autoCapCandidatesDirty = 1;
     private long _lastObservedAutoCapBytes = -1;
+
+    private long _nextStableMetricCachePruneTick;
+    private const long StableMetricCachePruneIntervalMs = 30000;
+    private const long StableMetricCacheTtlMs = 10 * 60 * 1000;
 
     public PlayerPerformanceService(ILogger<PlayerPerformanceService> logger, MareMediator mediator,
         PlayerPerformanceConfigService playerPerformanceConfigService, FileCacheManager fileCacheManager,
@@ -79,26 +92,179 @@ public class PlayerPerformanceService : MediatorSubscriberBase
         _mediator.Subscribe<FrameworkUpdateMessage>(this, _ => AutoPauseHandler());
         _mediator.Subscribe<DelayedFrameworkUpdateMessage>(this, _ => AutoPauseHandler());
         LoadAutoCapState();
-        Mediator.Subscribe<FrameworkUpdateMessage>(this, _ => TryKickAutoCapStateSave());
         Mediator.Subscribe<DelayedFrameworkUpdateMessage>(this, _ => TryKickAutoCapStateSave());
         _mediator.Subscribe<CombatOrPerformanceStartMessage>(this, _ => HandleCombatAutoPauseStart());
         _mediator.Subscribe<CombatOrPerformanceEndMessage>(this, _ => HandleCombatAutoPauseEnd());
+        _mediator.Subscribe<ConnectedMessage>(this, _ => HandleConnected());
+        _mediator.Subscribe<DisconnectedMessage>(this, _ => ClearPendingThresholdResumeOnConnect());
+        _mediator.Subscribe<DelayedFrameworkUpdateMessage>(this, _ => ProcessPendingThresholdResumeOnConnect(Environment.TickCount64));
+        _mediator.Subscribe<DelayedFrameworkUpdateMessage>(this, _ => PruneRememberedThresholdPausedUsers());
+        _mediator.Subscribe<ResumeMessage>(this, msg => HandleExplicitResume(msg.UserData));
 
+    }
+
+    public void StoreReceivedPerformanceMetrics(string? dataHash, long vramBytes, long triangles)
+    {
+        StoreStableMetricCache(_receivedVramByDataHash, dataHash, Math.Max(0, vramBytes));
+        StoreStableMetricCache(_receivedTrisByDataHash, dataHash, Math.Max(0, triangles));
+    }
+
+    public void HandleIncomingPerformanceMetrics(Pair? pair, string? dataHash, long vramBytes, long triangles)
+    {
+        vramBytes = Math.Max(0, vramBytes);
+        triangles = Math.Max(0, triangles);
+
+        StoreReceivedPerformanceMetrics(dataHash, vramBytes, triangles);
+
+        if (pair == null)
+            return;
+
+        var uid = pair.UserData?.UID;
+        if (string.IsNullOrWhiteSpace(uid))
+            return;
+
+        if (!(pair.UserPair?.OwnPermissions.IsPaused() ?? false))
+        {
+            if (_autoThresholdPausedUsers.ContainsKey(uid))
+                RemoveThresholdPausedUser(uid);
+
+            return;
+        }
+
+        if (!_autoThresholdPausedUsers.ContainsKey(uid))
+            return;
+
+        pair.LastAppliedApproximateVRAMBytes = vramBytes;
+        pair.LastAppliedDataTris = triangles;
+        _mediator.Publish(new RefreshUiMessage());
+
+        if (pair.AutoPausedByCap)
+            return;
+
+        var config = _playerPerformanceConfigService.Current;
+        if (IsIgnored(config, pair.UserData))
+            return;
+
+        bool isPrefPerm = pair.UserPair.OwnPermissions.HasFlag(API.Data.Enum.UserPermissions.Sticky);
+        bool exceedsVramAutoPause = CheckForThreshold(
+            config.AutoPausePlayersExceedingThresholds,
+            config.VRAMSizeAutoPauseThresholdMiB * 1024L * 1024L,
+            vramBytes,
+            config.AutoPausePlayersWithPreferredPermissionsExceedingThresholds,
+            isPrefPerm);
+
+        bool exceedsTrisAutoPause = CheckForThreshold(
+            config.AutoPausePlayersExceedingThresholds,
+            config.TrisAutoPauseThresholdThousands * 1000L,
+            triangles,
+            config.AutoPausePlayersWithPreferredPermissionsExceedingThresholds,
+            isPrefPerm);
+
+        if (exceedsVramAutoPause || exceedsTrisAutoPause)
+            return;
+
+        RemoveThresholdPausedUser(uid);
+        _mediator.Publish(new ResumeMessage(pair.UserData));
+
+        if (_logger.IsEnabled(LogLevel.Information))
+        {
+            _logger.LogInformation("Auto-unpaused {user} from received sidecar metrics - now under thresholds (VRAM={vram}, Tris={tris})",
+                pair.UserData.AliasOrUID,
+                UiSharedService.ByteToString(vramBytes, addSuffix: true),
+                triangles);
+        }
+    }
+
+    public bool IsThresholdAutoPaused(Pair? pair)
+    {
+        if (pair == null)
+            return false;
+
+        var uid = pair.UserData?.UID;
+        if (string.IsNullOrWhiteSpace(uid))
+            return false;
+
+        return pair.UserPair?.OwnPermissions.IsPaused() == true
+            && _autoThresholdPausedUsers.ContainsKey(uid);
+    }
+
+    public bool IsRememberedThresholdAutoPaused(Pair? pair)
+    {
+        if (pair == null)
+            return false;
+
+        var uid = pair.UserData?.UID;
+        if (string.IsNullOrWhiteSpace(uid))
+            return false;
+
+        return _autoThresholdPausedUsers.ContainsKey(uid);
+    }
+
+
+    private void HandleExplicitResume(UserData? user)
+    {
+        if (user == null || string.IsNullOrWhiteSpace(user.UID))
+            return;
+
+        if (_autoThresholdPausedUsers.TryRemove(user.UID, out _))
+        {
+            MarkStateDirty();
+            _mediator.Publish(new RefreshUiMessage());
+        }
+    }
+
+    private void PruneRememberedThresholdPausedUsers()
+    {
+        if (_autoThresholdPausedUsers.IsEmpty)
+            return;
+
+        bool removedAny = false;
+        foreach (var kv in _autoThresholdPausedUsers.ToArray())
+        {
+            var uid = kv.Key;
+            if (string.IsNullOrWhiteSpace(uid))
+                continue;
+
+            var pair = _services.GetService<PairManager>()?.GetPairByUID(uid);
+            if (pair == null)
+                continue;
+
+            if (!(pair.UserPair?.OwnPermissions.IsPaused() ?? false))
+            {
+                if (_autoThresholdPausedUsers.TryRemove(uid, out _))
+                    removedAny = true;
+            }
+        }
+
+        if (removedAny)
+        {
+            MarkStateDirty();
+            _mediator.Publish(new RefreshUiMessage());
+        }
     }
 
     public async Task<bool> CheckBothThresholds(PairHandler pairHandler, CharacterData charaData)
     {
         var config = _playerPerformanceConfigService.Current;
 
-        var moddedTextureHashes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        var moddedModelHashes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var stableDataHash = charaData.DataHash.Value;
+        HashSet<string>? moddedTextureHashes = null;
+        HashSet<string>? moddedModelHashes = null;
 
-        CollectReplacementHashesAllKinds(charaData, moddedTextureHashes, moddedModelHashes);
+        var hasStableVram = TryGetStableMetricCache(_receivedVramByDataHash, stableDataHash, out _) || TryGetStableMetricCache(_stableVramByDataHash, stableDataHash, out _);
+        var hasStableTris = TryGetStableMetricCache(_receivedTrisByDataHash, stableDataHash, out _) || TryGetStableMetricCache(_stableTrisByDataHash, stableDataHash, out _);
 
-        bool notPausedAfterVram = ComputeAndAutoPauseOnVRAMUsageThresholds(pairHandler, charaData, [], moddedTextureHashes, moddedModelHashes);
+        if (!hasStableVram || !hasStableTris)
+        {
+            moddedTextureHashes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            moddedModelHashes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            CollectVisiblePlayerStateHashes(charaData, moddedTextureHashes, moddedModelHashes);
+        }
+
+        bool notPausedAfterVram = ComputeAndAutoPauseOnVRAMUsageThresholds(pairHandler, charaData, [], moddedTextureHashes, moddedModelHashes, stableDataHash);
         if (!notPausedAfterVram) return false;
 
-        bool notPausedAfterTris = await CheckTriangleUsageThresholds(pairHandler, charaData, moddedModelHashes).ConfigureAwait(false);
+        bool notPausedAfterTris = await CheckTriangleUsageThresholds(pairHandler, charaData, moddedModelHashes, stableDataHash).ConfigureAwait(false);
         if (!notPausedAfterTris) return false;
 
         var vramUsage = pairHandler.Pair.LastAppliedApproximateVRAMBytes;
@@ -110,7 +276,7 @@ public class PlayerPerformanceService : MediatorSubscriberBase
 
             if (!pairHandler.Pair.UserPair.OwnPermissions.IsPaused())
             {
-                _autoThresholdPausedUsers.TryRemove(uid, out _);
+                RemoveThresholdPausedUser(uid);
             }
             else
             {
@@ -136,13 +302,13 @@ public class PlayerPerformanceService : MediatorSubscriberBase
 
                     if (!exceedsVramAutoPause && !exceedsTrisAutoPause)
                     {
-                        _autoThresholdPausedUsers.TryRemove(uid, out _);
+                        RemoveThresholdPausedUser(uid);
 
                         _mediator.Publish(new ResumeMessage(pairHandler.Pair.UserData));
 
                         if (_logger.IsEnabled(LogLevel.Information))
                         {
-                            _logger.LogInformation("Auto-unpaused {user} — now under thresholds (VRAM={vram}, Tris={tris})",
+                            _logger.LogInformation("Auto-unpaused {user} Â— now under thresholds (VRAM={vram}, Tris={tris})",
                                 pairHandler.Pair.UserData.AliasOrUID,
                                 UiSharedService.ByteToString(vramUsage, addSuffix: true),
                                 triUsage);
@@ -212,6 +378,61 @@ public class PlayerPerformanceService : MediatorSubscriberBase
 
         return true;
     }
+    private sealed record StableMetricCacheEntry(long Value, long LastAccessTick);
+
+    private bool TryGetStableMetricCache(ConcurrentDictionary<string, StableMetricCacheEntry> cache, string? dataHash, out long value)
+    {
+        value = 0;
+        if (string.IsNullOrWhiteSpace(dataHash))
+            return false;
+
+        PruneStableMetricCachesIfNeeded();
+
+        if (!cache.TryGetValue(dataHash, out var entry))
+            return false;
+
+        var refreshed = entry with { LastAccessTick = Environment.TickCount64 };
+        cache.TryUpdate(dataHash, refreshed, entry);
+        value = entry.Value;
+        return true;
+    }
+
+    private void StoreStableMetricCache(ConcurrentDictionary<string, StableMetricCacheEntry> cache, string? dataHash, long value)
+    {
+        if (string.IsNullOrWhiteSpace(dataHash))
+            return;
+
+        PruneStableMetricCachesIfNeeded();
+        cache[dataHash] = new StableMetricCacheEntry(value, Environment.TickCount64);
+    }
+
+    private void PruneStableMetricCachesIfNeeded()
+    {
+        var now = Environment.TickCount64;
+        var next = Interlocked.Read(ref _nextStableMetricCachePruneTick);
+        if (now < next)
+            return;
+
+        if (Interlocked.CompareExchange(ref _nextStableMetricCachePruneTick, now + StableMetricCachePruneIntervalMs, next) != next)
+            return;
+
+        PruneStableMetricCache(_stableVramByDataHash, now);
+        PruneStableMetricCache(_stableTrisByDataHash, now);
+        PruneStableMetricCache(_receivedVramByDataHash, now);
+        PruneStableMetricCache(_receivedTrisByDataHash, now);
+    }
+
+    private static void PruneStableMetricCache(ConcurrentDictionary<string, StableMetricCacheEntry> cache, long now)
+    {
+        foreach (var kv in cache)
+        {
+            if (now - kv.Value.LastAccessTick <= StableMetricCacheTtlMs)
+                continue;
+
+            cache.TryRemove(kv.Key, out _);
+        }
+    }
+
     private void TryKickAutoCapStateSave()
     {
         if (Interlocked.CompareExchange(ref _stateDirty, 0, 0) == 0)
@@ -229,24 +450,48 @@ public class PlayerPerformanceService : MediatorSubscriberBase
             Interlocked.Exchange(ref _stateSaveInFlight, 0);
         }, TaskScheduler.Default);
     }
-    public async Task<bool> CheckTriangleUsageThresholds(PairHandler pairHandler, CharacterData charaData, HashSet<string>? precomputedModelHashes = null)
+    public async Task<bool> CheckTriangleUsageThresholds(PairHandler pairHandler, CharacterData charaData, HashSet<string>? precomputedModelHashes = null, string? stableDataHash = null)
     {
         var config = _playerPerformanceConfigService.Current;
         var pair = pairHandler.Pair;
 
         long triUsage = 0;
 
-        var moddedModelHashes = precomputedModelHashes ?? new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
-        if (precomputedModelHashes == null)
+        if (!TryGetStableMetricCache(_receivedTrisByDataHash, stableDataHash, out triUsage)
+            && !TryGetStableMetricCache(_stableTrisByDataHash, stableDataHash, out triUsage))
         {
-            var tmpTex = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            CollectReplacementHashesAllKinds(charaData, tmpTex, moddedModelHashes);
-        }
+            var moddedModelHashes = precomputedModelHashes ?? new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-        foreach (var hash in moddedModelHashes)
-        {
-            triUsage += await _xivDataAnalyzer.GetTrianglesByHash(hash).ConfigureAwait(false);
+            if (precomputedModelHashes == null)
+            {
+                var tmpTex = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                CollectVisiblePlayerStateHashes(charaData, tmpTex, moddedModelHashes);
+            }
+
+            List<(string Hash, long Triangles)>? debugContributors = _logger.IsEnabled(LogLevel.Debug)
+                ? new List<(string Hash, long Triangles)>()
+                : null;
+
+            foreach (var hash in moddedModelHashes)
+            {
+                var trianglesForHash = await _xivDataAnalyzer.GetTrianglesByHash(hash).ConfigureAwait(false);
+                triUsage += trianglesForHash;
+
+                if (debugContributors != null && trianglesForHash > 0)
+                    debugContributors.Add((hash, trianglesForHash));
+            }
+
+            if (debugContributors != null)
+            {
+                foreach (var item in debugContributors
+                    .OrderByDescending(v => v.Triangles)
+                    .Take(20))
+                {
+                    _logger.LogDebug("Triangle contributor: {hash} => {triangles}", item.Hash, item.Triangles);
+                }
+            }
+
+            StoreStableMetricCache(_stableTrisByDataHash, stableDataHash, triUsage);
         }
 
         pair.LastAppliedDataTris = triUsage;
@@ -273,7 +518,8 @@ public class PlayerPerformanceService : MediatorSubscriberBase
             _mediator.Publish(new EventMessage(new Event(pair.PlayerName, pair.UserData, nameof(PlayerPerformanceService), EventSeverity.Warning,
                 $"Exceeds triangle threshold: automatically paused ({triUsage}/{config.TrisAutoPauseThresholdThousands * 1000} triangles)")));
 
-            _autoThresholdPausedUsers[pair.UserData.UID] = pair.UserData;
+            AddThresholdPausedUser(pair.UserData);
+            pair.EnterPausedVanillaState();
             _mediator.Publish(new PauseMessage(pair.UserData));
 
             return false;
@@ -282,78 +528,103 @@ public class PlayerPerformanceService : MediatorSubscriberBase
         return true;
     }
 
-    public bool ComputeAndAutoPauseOnVRAMUsageThresholds(PairHandler pairHandler, CharacterData charaData, List<DownloadFileTransfer> toDownloadFiles, HashSet<string>? precomputedTextureHashes = null, HashSet<string>? precomputedModelHashes = null)
+    public bool ComputeAndAutoPauseOnVRAMUsageThresholds(PairHandler pairHandler, CharacterData charaData, List<DownloadFileTransfer> toDownloadFiles, HashSet<string>? precomputedTextureHashes = null, HashSet<string>? precomputedModelHashes = null, string? stableDataHash = null)
     {
         var config = _playerPerformanceConfigService.Current;
         var pair = pairHandler.Pair;
 
         long vramUsage = 0;
+        var hasPendingDownloads = toDownloadFiles != null && toDownloadFiles.Count > 0;
 
-        Dictionary<string, long>? pendingDownloadSizes = null;
-        if (toDownloadFiles != null && toDownloadFiles.Count > 0)
+        if (TryGetStableMetricCache(_receivedVramByDataHash, stableDataHash, out vramUsage))
         {
-            pendingDownloadSizes = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
-            foreach (var f in toDownloadFiles)
-            {
-                if (!pendingDownloadSizes.ContainsKey(f.Hash))
-                    pendingDownloadSizes[f.Hash] = f.TotalRaw;
-            }
+            pair.LastAppliedApproximateVRAMBytes = vramUsage;
         }
-
-        HashSet<string> hashes;
-        if (precomputedTextureHashes == null && precomputedModelHashes == null)
+        else if (!hasPendingDownloads && TryGetStableMetricCache(_stableVramByDataHash, stableDataHash, out vramUsage))
         {
-            hashes = CollectReplacementHashesUnique(charaData);
+            pair.LastAppliedApproximateVRAMBytes = vramUsage;
         }
         else
         {
-            hashes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            if (precomputedTextureHashes != null) foreach (var h in precomputedTextureHashes) if (!string.IsNullOrWhiteSpace(h)) hashes.Add(h);
-            if (precomputedModelHashes != null) foreach (var h in precomputedModelHashes) if (!string.IsNullOrWhiteSpace(h)) hashes.Add(h);
-
-            if (hashes.Count == 0)
-                hashes = CollectReplacementHashesUnique(charaData);
-        }
-
-        foreach (var hash in hashes)
-        {
-            long bytes = 0;
-
-            if (pendingDownloadSizes != null && pendingDownloadSizes.TryGetValue(hash, out var pendingSize))
+            Dictionary<string, long>? pendingDownloadSizes = null;
+            if (hasPendingDownloads)
             {
-                bytes = pendingSize;
-                vramUsage += Math.Max(0, bytes);
-                continue;
+                pendingDownloadSizes = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
+                foreach (var f in toDownloadFiles)
+                {
+                    if (!pendingDownloadSizes.ContainsKey(f.Hash))
+                        pendingDownloadSizes[f.Hash] = f.TotalRaw;
+                }
             }
 
-            var fileEntry = _fileCacheManager.GetFileCacheByHash(hash);
-            if (fileEntry == null) continue;
-            if (!fileEntry.IsCacheEntry) continue;
-
-            var path = fileEntry.ResolvedFilepath;
-            if (string.IsNullOrWhiteSpace(path) || !File.Exists(path)) continue;
-
-            var ext = Path.GetExtension(path);
-
-            if (ext.Equals(".tex", StringComparison.OrdinalIgnoreCase))
+            HashSet<string> hashes;
+            if (precomputedTextureHashes == null && precomputedModelHashes == null)
             {
-                if (!TryGetCachedTexVram(hash, path, out bytes))
-                    continue;
-            }
-            else if (ext.Equals(".mdl", StringComparison.OrdinalIgnoreCase))
-            {
-                if (!TryGetCachedMdlVram(hash, path, out bytes))
-                    continue;
+                hashes = CollectVisiblePlayerStateHashesUnique(charaData);
             }
             else
             {
-                continue;
+                hashes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                if (precomputedTextureHashes != null) foreach (var h in precomputedTextureHashes) if (!string.IsNullOrWhiteSpace(h)) hashes.Add(h);
+                if (precomputedModelHashes != null) foreach (var h in precomputedModelHashes) if (!string.IsNullOrWhiteSpace(h)) hashes.Add(h);
+
+                if (hashes.Count == 0)
+                    hashes = CollectVisiblePlayerStateHashesUnique(charaData);
             }
 
-            vramUsage += Math.Max(0, bytes);
-        }
+            foreach (var hash in hashes)
+            {
+                long bestBytesForHash = 0;
 
-        pair.LastAppliedApproximateVRAMBytes = vramUsage;
+                if (pendingDownloadSizes != null && pendingDownloadSizes.TryGetValue(hash, out var pendingSize))
+                {
+                    vramUsage += Math.Max(0, pendingSize);
+                    continue;
+                }
+
+                var fileEntries = _fileCacheManager
+                    .GetAllFileCachesByHash(hash, ignoreCacheEntries: false, validate: true)
+                    .Where(e => !string.IsNullOrWhiteSpace(e.ResolvedFilepath) && File.Exists(e.ResolvedFilepath))
+                    .GroupBy(e => e.ResolvedFilepath, StringComparer.OrdinalIgnoreCase)
+                    .Select(g => g.First());
+
+                foreach (var fileEntry in fileEntries)
+                {
+                    var path = fileEntry.ResolvedFilepath;
+                    var ext = Path.GetExtension(path);
+                    long candidateBytes = 0;
+
+                    var cacheKey = hash + "|" + path;
+
+                    if (ext.Equals(".tex", StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (!TryGetCachedTexVram(cacheKey, path, out candidateBytes))
+                            continue;
+                    }
+                    else if (ext.Equals(".mdl", StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (!TryGetCachedMdlVram(cacheKey, path, out candidateBytes))
+                            continue;
+                    }
+                    else
+                    {
+                        continue;
+                    }
+
+                    if (candidateBytes > bestBytesForHash)
+                        bestBytesForHash = candidateBytes;
+                }
+
+                vramUsage += Math.Max(0, bestBytesForHash);
+            }
+
+            if (!hasPendingDownloads)
+            {
+                StoreStableMetricCache(_stableVramByDataHash, stableDataHash, vramUsage);
+            }
+
+            pair.LastAppliedApproximateVRAMBytes = vramUsage;
+        }
 
         _logger.LogDebug("Calculated VRAM usage for {p}", pairHandler);
 
@@ -371,7 +642,8 @@ public class PlayerPerformanceService : MediatorSubscriberBase
                 $" and has been automatically paused.",
                 MareConfiguration.Models.NotificationType.Warning));
 
-            _autoThresholdPausedUsers[pair.UserData.UID] = pair.UserData;
+            AddThresholdPausedUser(pair.UserData);
+            pair.EnterPausedVanillaState();
 
             _mediator.Publish(new PauseMessage(pair.UserData));
 
@@ -410,8 +682,9 @@ public class PlayerPerformanceService : MediatorSubscriberBase
                 if (!pair.AutoPausedByCap)
                 {
                     pair.AutoPausedByCap = true;
+                    pair.EnterPausedVanillaState();
                     _mediator.Publish(new PauseMessage(pair.UserData));
-                    _logger.LogInformation("Auto-paused {user} — pool {total}/{cap}",
+                    _logger.LogInformation("Auto-paused {user} Â— pool {total}/{cap}",
                         pair.UserData.AliasOrUID,
                         UiSharedService.ByteToString(totalBytes, addSuffix: true),
                         UiSharedService.ByteToString(capBytes, addSuffix: true));
@@ -484,6 +757,15 @@ public class PlayerPerformanceService : MediatorSubscriberBase
                 _autoCapPausedUsers[nextUid] = user;
                 _autoCapPausedVramByUid[nextUid] = last;
 
+                foreach (var pausedPair in EnumerateAllPairs())
+                {
+                    if (!string.Equals(pausedPair.UserData?.UID, nextUid, StringComparison.Ordinal))
+                        continue;
+
+                    pausedPair.AutoPausedByCap = true;
+                    pausedPair.EnterPausedVanillaState();
+                }
+
                 _mediator.Publish(new PauseMessage(user));
                 RemoveSyncshellVram(nextUid);
                 MarkAutoCapCandidatesDirty();
@@ -540,57 +822,158 @@ public class PlayerPerformanceService : MediatorSubscriberBase
             MarkStateDirty();
         }
     }
-    private static void CollectReplacementHashesAllKinds(CharacterData charaData,HashSet<string> moddedTextureHashes,HashSet<string> moddedModelHashes)
+    private void CollectVisiblePlayerStateHashes(CharacterData charaData, HashSet<string> moddedTextureHashes, HashSet<string> moddedModelHashes)
     {
         moddedTextureHashes.Clear();
         moddedModelHashes.Clear();
 
-        foreach (var kv in charaData.FileReplacements)
+        if (!charaData.FileReplacements.TryGetValue(ObjectKind.Player, out var list) || list == null)
+            return;
+
+        var semiTransientByKind = new Dictionary<ObjectKind, HashSet<string>>();
+
+        foreach (var replacement in list)
         {
-            var list = kv.Value;
-            if (list == null) continue;
+            if (!ShouldCountForVisiblePlayerState(ObjectKind.Player, replacement, semiTransientByKind))
+                continue;
 
-            foreach (var replacement in list)
+            bool hasTex = false;
+            bool hasMdl = false;
+
+            foreach (var gamePath in replacement.GamePaths ?? Enumerable.Empty<string>())
             {
-                if (replacement == null) continue;
-                if (string.IsNullOrEmpty(replacement.Hash)) continue;
+                if (!hasTex && IsVisiblePlayerTextureGamePath(gamePath))
+                    hasTex = true;
 
-                if (!string.IsNullOrEmpty(replacement.FileSwapPath))
-                    continue;
+                if (!hasMdl && IsVisiblePlayerModelGamePath(gamePath))
+                    hasMdl = true;
 
-                bool hasTex = false;
-                bool hasMdl = false;
-
-                if (replacement.GamePaths != null)
-                {
-                    foreach (var gamePath in replacement.GamePaths)
-                    {
-                        if (!hasTex && gamePath.EndsWith(".tex", StringComparison.OrdinalIgnoreCase))
-                            hasTex = true;
-
-                        if (!hasMdl && gamePath.EndsWith(".mdl", StringComparison.OrdinalIgnoreCase))
-                            hasMdl = true;
-
-                        if (hasTex && hasMdl)
-                            break;
-                    }
-                }
-
-                if (hasTex) moddedTextureHashes.Add(replacement.Hash);
-                if (hasMdl) moddedModelHashes.Add(replacement.Hash);
+                if (hasTex && hasMdl)
+                    break;
             }
+
+            if (hasTex) moddedTextureHashes.Add(replacement.Hash);
+            if (hasMdl) moddedModelHashes.Add(replacement.Hash);
         }
     }
-    private void MarkAutoCapCandidatesDirty() => Interlocked.Exchange(ref _autoCapCandidatesDirty, 1);
+
+
+    private bool ShouldCountForVisiblePlayerState(ObjectKind objectKind, FileReplacementData? replacement, Dictionary<ObjectKind, HashSet<string>> semiTransientByKind)
+    {
+        if (replacement == null)
+            return false;
+
+        if (string.IsNullOrWhiteSpace(replacement.Hash))
+            return false;
+
+        if (!string.IsNullOrWhiteSpace(replacement.FileSwapPath))
+            return false;
+
+        if (IsSemiTransientOnly(objectKind, replacement.GamePaths, semiTransientByKind))
+            return false;
+
+        return replacement.GamePaths != null && replacement.GamePaths.Any(IsVisiblePlayerStateGamePath);
+    }
+
+    private static bool IsVisiblePlayerTextureGamePath(string? gamePath)
+        => IsVisiblePlayerStateGamePath(gamePath, ".tex");
+
+    private static bool IsVisiblePlayerModelGamePath(string? gamePath)
+        => IsVisiblePlayerStateGamePath(gamePath, ".mdl");
+
+    private static bool IsVisiblePlayerStateGamePath(string? gamePath)
+        => IsVisiblePlayerStateGamePath(gamePath, requiredExtension: null);
+
+    private static bool IsVisiblePlayerStateGamePath(string? gamePath, string? requiredExtension)
+    {
+        if (string.IsNullOrWhiteSpace(gamePath))
+            return false;
+
+        var path = NormalizePerformanceGamePath(gamePath);
+
+        var extension = Path.GetExtension(path);
+        if (string.IsNullOrWhiteSpace(extension))
+            return false;
+
+        if (requiredExtension != null && !extension.Equals(requiredExtension, StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        if (!extension.Equals(".mdl", StringComparison.OrdinalIgnoreCase)
+            && !extension.Equals(".tex", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        return path.StartsWith("chara/human/", StringComparison.OrdinalIgnoreCase)
+            || path.StartsWith("chara/equipment/", StringComparison.OrdinalIgnoreCase)
+            || path.StartsWith("chara/accessory/", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string NormalizePerformanceGamePath(string? gamePath)
+    {
+        if (string.IsNullOrWhiteSpace(gamePath))
+            return string.Empty;
+
+        return gamePath.ToLowerInvariant().Replace("\\", "/", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private bool IsSemiTransientOnly(ObjectKind objectKind, IEnumerable<string>? gamePaths, Dictionary<ObjectKind, HashSet<string>> semiTransientByKind)
+    {
+        if (gamePaths == null)
+            return false;
+
+        if (!semiTransientByKind.TryGetValue(objectKind, out var semiTransientPaths))
+            semiTransientByKind[objectKind] = semiTransientPaths = _transientResourceManager.GetSemiTransientResources(objectKind);
+
+        if (semiTransientPaths.Count == 0)
+            return false;
+
+        bool any = false;
+        foreach (var gamePath in gamePaths)
+        {
+            any = true;
+
+            var normalizedGamePath = NormalizePerformanceGamePath(gamePath);
+            if (string.IsNullOrWhiteSpace(normalizedGamePath) || !semiTransientPaths.Contains(normalizedGamePath))
+                return false;
+        }
+
+        return any;
+    }
+
+    private void MarkAutoCapCandidatesDirty()
+    {
+        Interlocked.Exchange(ref _autoCapCandidatesDirty, 1);
+        _nextAutoCapCheckUtc = DateTime.MinValue;
+    }
     private static bool CheckForThreshold(bool thresholdEnabled, long threshold, long value, bool checkForPrefPerm, bool isPrefPerm) =>
         thresholdEnabled && threshold > 0 && threshold < value && ((checkForPrefPerm && isPrefPerm) || !isPrefPerm);
 
     private sealed class AutoCapState
     {
-        public int Version { get; set; } = 1;
+        public int Version { get; set; } = 2;
         public DateTime SavedUtc { get; set; }
         public Dictionary<string, long> PausedVramBytes { get; set; } = new(StringComparer.Ordinal);
         public Dictionary<string, string> Aliases { get; set; } = new(StringComparer.Ordinal); // optional, nice for logs
+        public Dictionary<string, string> ThresholdPausedAliases { get; set; } = new(StringComparer.Ordinal);
+    }
+
+    private void AddThresholdPausedUser(UserData user)
+    {
+        if (string.IsNullOrWhiteSpace(user?.UID))
+            return;
+
+        _autoThresholdPausedUsers[user.UID] = user;
+        MarkStateDirty();
+    }
+
+    private void RemoveThresholdPausedUser(string? uid)
+    {
+        if (string.IsNullOrWhiteSpace(uid))
+            return;
+
+        if (_autoThresholdPausedUsers.TryRemove(uid, out _))
+            MarkStateDirty();
     }
 
     private static bool IsIgnored(PlayerPerformanceConfig config, UserData userData)
@@ -631,13 +1014,15 @@ public class PlayerPerformanceService : MediatorSubscriberBase
             // snapshot to avoid racing ConcurrentDictionary during serialization
             var paused = _autoCapPausedVramByUid.ToArray();
             var aliases = _autoCapPausedUsers.ToArray();
+            var thresholdAliases = _autoThresholdPausedUsers.ToArray();
 
             var state = new AutoCapState
             {
-                Version = 1,
+                Version = 2,
                 SavedUtc = DateTime.UtcNow,
                 PausedVramBytes = paused.ToDictionary(kv => kv.Key, kv => kv.Value, StringComparer.Ordinal),
                 Aliases = aliases.ToDictionary(kv => kv.Key, kv => kv.Value.AliasOrUID, StringComparer.Ordinal),
+                ThresholdPausedAliases = thresholdAliases.ToDictionary(kv => kv.Key, kv => kv.Value.AliasOrUID, StringComparer.Ordinal),
             };
 
             var json = JsonSerializer.Serialize(state, new JsonSerializerOptions
@@ -710,14 +1095,14 @@ public class PlayerPerformanceService : MediatorSubscriberBase
         }
     }
 
-    private bool TryGetCachedTexVram(string hash, string path, out long bytes)
+    private bool TryGetCachedTexVram(string cacheKey, string path, out long bytes)
     {
         bytes = 0;
         long stamp;
         try { stamp = GetStamp(path); }
         catch { return false; }
 
-        if (_textureVramByHash.TryGetValue(hash, out var cached) && cached.Stamp == stamp)
+        if (_textureVramByHash.TryGetValue(cacheKey, out var cached) && cached.Stamp == stamp)
         {
             bytes = cached.Bytes;
             return true;
@@ -726,17 +1111,18 @@ public class PlayerPerformanceService : MediatorSubscriberBase
         if (!VramEstimator.TryEstimateTexVramBytes(path, out bytes))
             return false;
 
-        _textureVramByHash[hash] = (bytes, stamp);
+        _textureVramByHash[cacheKey] = (bytes, stamp);
         return true;
     }
-    private bool TryGetCachedMdlVram(string hash, string path, out long bytes)
+
+    private bool TryGetCachedMdlVram(string cacheKey, string path, out long bytes)
     {
         bytes = 0;
         long stamp;
         try { stamp = GetStamp(path); }
         catch { return false; }
 
-        if (_modelVramByHash.TryGetValue(hash, out var cached) && cached.Stamp == stamp)
+        if (_modelVramByHash.TryGetValue(cacheKey, out var cached) && cached.Stamp == stamp)
         {
             bytes = cached.Bytes;
             return true;
@@ -745,32 +1131,19 @@ public class PlayerPerformanceService : MediatorSubscriberBase
         if (!VramEstimator.TryEstimateMdlVramBytes(path, out bytes))
             return false;
 
-        _modelVramByHash[hash] = (bytes, stamp);
+        _modelVramByHash[cacheKey] = (bytes, stamp);
         return true;
     }
 
-    private static HashSet<string> CollectReplacementHashesUnique(CharacterData charaData)
+    private HashSet<string> CollectVisiblePlayerStateHashesUnique(CharacterData charaData)
     {
-        var hashes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var textureHashes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var modelHashes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-        foreach (var kv in charaData.FileReplacements)
-        {
-            var list = kv.Value;
-            if (list == null) continue;
+        CollectVisiblePlayerStateHashes(charaData, textureHashes, modelHashes);
 
-            foreach (var replacement in list)
-            {
-                if (replacement == null) continue;
-                if (string.IsNullOrEmpty(replacement.Hash)) continue;
-
-                if (!string.IsNullOrEmpty(replacement.FileSwapPath))
-                    continue;
-
-                hashes.Add(replacement.Hash);
-            }
-        }
-
-        return hashes;
+        textureHashes.UnionWith(modelHashes);
+        return textureHashes;
     }
 
     private IEnumerable<Pair> EnumerateAllPairs()
@@ -788,12 +1161,118 @@ public class PlayerPerformanceService : MediatorSubscriberBase
         if (pm == null)
             yield break;
 
-        foreach (var p in pm.DirectPairs)
-            yield return p;
+        var seenUids = new HashSet<string>(StringComparer.Ordinal);
+        var pairs = new List<Pair>();
 
-        foreach (var group in pm.GroupPairs.Values)
-            foreach (var p in group)
-                yield return p;
+        pm.ForEachPair(pair =>
+        {
+            if (pair?.UserData?.UID is string uid && !string.IsNullOrWhiteSpace(uid))
+            {
+                if (seenUids.Add(uid))
+                    pairs.Add(pair);
+
+                return;
+            }
+
+            if (pair != null)
+                pairs.Add(pair);
+        });
+
+        foreach (var pair in pairs)
+            yield return pair;
+    }
+
+    private void ClearPendingThresholdResumeOnConnect()
+    {
+        _pendingThresholdResumeOnConnect.Clear();
+        _pendingThresholdResumeReadyTick = 0;
+        _pendingThresholdResumeDeadlineTick = 0;
+    }
+
+    private void ProcessPendingThresholdResumeOnConnect(long nowTick)
+    {
+        if (_pendingThresholdResumeOnConnect.IsEmpty)
+            return;
+
+        if (nowTick < _pendingThresholdResumeReadyTick)
+            return;
+
+        var pairManager = _services.GetService<PairManager>();
+        if (pairManager == null)
+            return;
+
+        var forceDispatch = _pendingThresholdResumeDeadlineTick > 0 && nowTick >= _pendingThresholdResumeDeadlineTick;
+
+        foreach (var kv in _pendingThresholdResumeOnConnect.ToArray())
+        {
+            var uid = kv.Key;
+            var user = kv.Value;
+
+            if (string.IsNullOrWhiteSpace(uid) || user == null)
+            {
+                _pendingThresholdResumeOnConnect.TryRemove(uid, out _);
+                continue;
+            }
+
+            var pair = pairManager.GetPairByUID(uid);
+            var pairReady = pair?.UserPair != null;
+
+            if (!pairReady && !forceDispatch)
+                continue;
+
+            try
+            {
+                _mediator.Publish(new ResumeMessage(user));
+            }
+            catch
+            {
+                // best effort
+            }
+            finally
+            {
+                _pendingThresholdResumeOnConnect.TryRemove(uid, out _);
+            }
+        }
+
+        if (_pendingThresholdResumeOnConnect.IsEmpty)
+        {
+            _pendingThresholdResumeReadyTick = 0;
+            _pendingThresholdResumeDeadlineTick = 0;
+            _mediator.Publish(new RefreshUiMessage());
+        }
+    }
+
+    private void HandleConnected()
+    {
+        var cfg = _playerPerformanceConfigService.Current;
+        if (!cfg.UnpauseThresholdAutoPausedPairsOnConnect)
+        {
+            ClearPendingThresholdResumeOnConnect();
+            return;
+        }
+
+        var thresholdPausedUsers = _autoThresholdPausedUsers.ToArray();
+        if (thresholdPausedUsers.Length == 0)
+        {
+            ClearPendingThresholdResumeOnConnect();
+            return;
+        }
+
+        _pendingThresholdResumeOnConnect.Clear();
+        foreach (var kv in thresholdPausedUsers)
+        {
+            if (!string.IsNullOrWhiteSpace(kv.Key))
+                _pendingThresholdResumeOnConnect[kv.Key] = kv.Value;
+        }
+
+        var nowTick = Environment.TickCount64;
+        _pendingThresholdResumeReadyTick = nowTick + 1500;
+        _pendingThresholdResumeDeadlineTick = nowTick + 10000;
+
+        _mediator.Publish(new RefreshUiMessage());
+
+        if (_logger.IsEnabled(LogLevel.Information))
+            _logger.LogInformation("Queued auto-unpause for {count} remembered threshold-paused users on connect after state warmup", _pendingThresholdResumeOnConnect.Count);
     }
 
     private void HandleCombatAutoPauseStart()
@@ -825,6 +1304,7 @@ public class PlayerPerformanceService : MediatorSubscriberBase
                 if (IsIgnored(cfg, pair.UserData)) continue;
 
                 _autoCombatPausedUsers[pair.UserData.UID] = pair.UserData;
+                pair.EnterPausedVanillaState();
                 _mediator.Publish(new PauseMessage(pair.UserData));
             }
             catch
@@ -862,7 +1342,12 @@ public class PlayerPerformanceService : MediatorSubscriberBase
                 if (_autoThresholdPausedUsers.ContainsKey(uid)) continue;
                 if (_autoCapPausedUsers.ContainsKey(uid)) continue;
 
-                if (liveByUid.TryGetValue(uid, out var livePair) && livePair.AutoPausedByCap) continue;
+                if (liveByUid.TryGetValue(uid, out var livePair))
+                {
+                    if (livePair.AutoPausedByCap) continue;
+                    if (livePair.AutoPausedByOtherSync && !livePair.EffectiveOverrideOtherSync) continue;
+                    if (!(livePair.UserPair?.OwnPermissions.IsPaused() ?? false)) continue;
+                }
 
                 _mediator.Publish(new ResumeMessage(user));
             }
@@ -883,9 +1368,9 @@ public class PlayerPerformanceService : MediatorSubscriberBase
             if (!File.Exists(_statePath)) return;
             var json = File.ReadAllText(_statePath);
             var state = JsonSerializer.Deserialize<AutoCapState>(json);
-            if (state is null || state.Version != 1) return;
+            if (state is null || (state.Version != 1 && state.Version != 2)) return;
 
-            // Merge: only add entries we’re not already tracking
+            // Merge: only add entries we're not already tracking
             foreach (var kv in state.PausedVramBytes)
             {
                 if (!_autoCapPausedVramByUid.ContainsKey(kv.Key))
@@ -896,9 +1381,14 @@ public class PlayerPerformanceService : MediatorSubscriberBase
                 if (!_autoCapPausedUsers.ContainsKey(kv.Key))
                     _autoCapPausedUsers[kv.Key] = new UserData(kv.Key, kv.Value); // UID, alias
             }
+            foreach (var kv in state.ThresholdPausedAliases)
+            {
+                if (!_autoThresholdPausedUsers.ContainsKey(kv.Key))
+                    _autoThresholdPausedUsers[kv.Key] = new UserData(kv.Key, kv.Value); // UID, alias
+            }
 
-            _logger.LogInformation("Loaded auto-cap state: {count} entries from {when:u}",
-                _autoCapPausedUsers.Count, state.SavedUtc);
+            _logger.LogInformation("Loaded persisted performance pause state: auto-cap={autoCapCount}, threshold={thresholdCount} from {when:u}",
+                _autoCapPausedUsers.Count, _autoThresholdPausedUsers.Count, state.SavedUtc);
         }
         catch (Exception ex)
         {

@@ -8,6 +8,7 @@ using Microsoft.Extensions.Logging;
 using System;
 using System.Globalization;
 using System.Linq;
+using System.Threading;
 
 namespace RavaSync.Services;
 
@@ -55,6 +56,7 @@ public sealed class VenueInviteService : IDisposable
 
     private string _lastPlotKey = string.Empty;
     private DateTime _nextPollUtc = DateTime.MinValue;
+    private int _lookupInFlight;
 
     public VenueInviteService(
         ILogger<VenueInviteService> logger,
@@ -82,6 +84,9 @@ public sealed class VenueInviteService : IDisposable
 
     private async void OnUpdate(IFramework fw)
     {
+        if (Interlocked.Exchange(ref _lookupInFlight, 1) != 0)
+            return;
+
         try
         {
             var now = DateTime.UtcNow;
@@ -146,6 +151,10 @@ public sealed class VenueInviteService : IDisposable
         catch (Exception ex)
         {
             _log.LogWarning(ex, "[RavaSync] VenueInviteService polling failed");
+        }
+        finally
+        {
+            Interlocked.Exchange(ref _lookupInFlight, 0);
         }
     }
 }

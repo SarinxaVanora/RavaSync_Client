@@ -13,37 +13,50 @@ public class FileReplacementDataComparer : IEqualityComparer<FileReplacementData
 
     public bool Equals(FileReplacementData? x, FileReplacementData? y)
     {
+        if (ReferenceEquals(x, y)) return true;
         if (x == null || y == null) return false;
-        return x.Hash.Equals(y.Hash) && CompareHashSets(x.GamePaths.ToHashSet(StringComparer.Ordinal), y.GamePaths.ToHashSet(StringComparer.Ordinal)) && string.Equals(x.FileSwapPath, y.FileSwapPath, StringComparison.Ordinal);
+
+        return string.Equals(x.Hash ?? string.Empty, y.Hash ?? string.Empty, StringComparison.OrdinalIgnoreCase)
+            && string.Equals(x.FileSwapPath ?? string.Empty, y.FileSwapPath ?? string.Empty, StringComparison.OrdinalIgnoreCase)
+            && ComparePathSets(x.GamePaths, y.GamePaths);
     }
 
     public int GetHashCode(FileReplacementData obj)
     {
-        return HashCode.Combine(obj.Hash.GetHashCode(StringComparison.OrdinalIgnoreCase), GetOrderIndependentHashCode(obj.GamePaths), StringComparer.Ordinal.GetHashCode(obj.FileSwapPath));
+        return HashCode.Combine(
+            StringComparer.OrdinalIgnoreCase.GetHashCode(obj.Hash ?? string.Empty),
+            StringComparer.OrdinalIgnoreCase.GetHashCode(obj.FileSwapPath ?? string.Empty),
+            GetOrderIndependentPathHashCode(obj.GamePaths));
     }
 
-    private static bool CompareHashSets(HashSet<string> list1, HashSet<string> list2)
+    private static bool ComparePathSets(IEnumerable<string>? first, IEnumerable<string>? second)
     {
-        if (list1.Count != list2.Count)
-            return false;
+        var firstSet = BuildPathSet(first);
+        var secondSet = BuildPathSet(second);
 
-        for (int i = 0; i < list1.Count; i++)
-        {
-            if (!string.Equals(list1.ElementAt(i), list2.ElementAt(i), StringComparison.OrdinalIgnoreCase))
-                return false;
-        }
-
-        return true;
+        return firstSet.SetEquals(secondSet);
     }
 
-    private static int GetOrderIndependentHashCode<T>(IEnumerable<T> source) where T : notnull
+    private static HashSet<string> BuildPathSet(IEnumerable<string>? source)
     {
-        int hash = 0;
-        foreach (T element in source)
+        var result = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (source == null) return result;
+
+        foreach (var path in source)
         {
-            hash = unchecked(hash +
-                EqualityComparer<T>.Default.GetHashCode(element));
+            if (!string.IsNullOrWhiteSpace(path))
+                result.Add(path.Replace('\\', '/').Trim());
         }
+
+        return result;
+    }
+
+    private static int GetOrderIndependentPathHashCode(IEnumerable<string>? source)
+    {
+        var hash = 0;
+        foreach (var path in BuildPathSet(source))
+            hash = unchecked(hash + StringComparer.OrdinalIgnoreCase.GetHashCode(path));
+
         return hash;
     }
 }

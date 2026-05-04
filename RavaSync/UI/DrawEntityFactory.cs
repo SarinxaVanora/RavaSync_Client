@@ -21,6 +21,7 @@ public class DrawEntityFactory
     private readonly ServerConfigurationManager _serverConfigurationManager;
     private readonly UiSharedService _uiSharedService;
     private readonly PlayerPerformanceConfigService _playerPerformanceConfigService;
+    private readonly PlayerPerformanceService _playerPerformanceService;
     private readonly CharaDataManager _charaDataManager;
     private readonly SelectTagForPairUi _selectTagForPairUi;
     private readonly TagHandler _tagHandler;
@@ -30,7 +31,7 @@ public class DrawEntityFactory
         SelectTagForPairUi selectTagForPairUi, MareMediator mediator,
         TagHandler tagHandler, SelectPairForTagUi selectPairForTagUi,
         ServerConfigurationManager serverConfigurationManager, UiSharedService uiSharedService,
-        PlayerPerformanceConfigService playerPerformanceConfigService, CharaDataManager charaDataManager, PairManager pairManager)
+        PlayerPerformanceConfigService playerPerformanceConfigService, PlayerPerformanceService playerPerformanceService, CharaDataManager charaDataManager, PairManager pairManager)
     {
         _logger = logger;
         _apiController = apiController;
@@ -42,6 +43,7 @@ public class DrawEntityFactory
         _serverConfigurationManager = serverConfigurationManager;
         _uiSharedService = uiSharedService;
         _playerPerformanceConfigService = playerPerformanceConfigService;
+        _playerPerformanceService = playerPerformanceService;
         _charaDataManager = charaDataManager;
         _pairManager = pairManager;
 
@@ -97,6 +99,6 @@ public class DrawEntityFactory
     {
         return new DrawUserPair(id + user.UserData.UID, user, groups, currentGroup, _apiController, _uidDisplayHandler,
             _mediator, _selectTagForPairUi, _serverConfigurationManager, _uiSharedService, _playerPerformanceConfigService,
-            _charaDataManager);
+            _playerPerformanceService, _charaDataManager);
     }
 }

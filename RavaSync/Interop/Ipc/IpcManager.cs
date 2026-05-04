@@ -1,10 +1,17 @@
 ﻿using RavaSync.Services.Mediator;
 using Microsoft.Extensions.Logging;
+using System;
+using System.Threading;
+using System.Threading.Tasks;
 
 namespace RavaSync.Interop.Ipc;
 
 public sealed partial class IpcManager : DisposableMediatorSubscriberBase
 {
+    private static readonly TimeSpan PeriodicApiStateCheckInterval = TimeSpan.FromSeconds(1);
+    private long _nextPeriodicApiStateCheckTick;
+    private int _periodicApiStateCheckRunning;
+    private int _periodicApiStateCheckSlot;
     public IpcManager(ILogger<IpcManager> logger, MareMediator mediator,
         IpcCallerPenumbra penumbraIpc, IpcCallerGlamourer glamourerIpc, IpcCallerCustomize customizeIpc, IpcCallerHeels heelsIpc,
         IpcCallerHonorific honorificIpc, IpcCallerMoodles moodlesIpc, IpcCallerPetNames ipcCallerPetNames, IpcCallerBrio ipcCallerBrio,
@@ -19,22 +26,15 @@ public sealed partial class IpcManager : DisposableMediatorSubscriberBase
         PetNames = ipcCallerPetNames;
         Brio = ipcCallerBrio;
         OtherSync = otherSyncIpc;
-
         if (Initialized)
         {
             Mediator.Publish(new PenumbraInitializedMessage());
         }
 
-        Mediator.Subscribe<DelayedFrameworkUpdateMessage>(this, (_) => PeriodicApiStateCheck());
+        Interlocked.Exchange(ref _nextPeriodicApiStateCheckTick,
+            Environment.TickCount64 + (long)PeriodicApiStateCheckInterval.TotalMilliseconds);
 
-        try
-        {
-            PeriodicApiStateCheck();
-        }
-        catch (Exception ex)
-        {
-            logger.LogWarning(ex, "Failed to check for some IPC, plugin not installed?");
-        }
+        Mediator.Subscribe<DelayedFrameworkUpdateMessage>(this, (_) => PeriodicApiStateCheck());
     }
 
     public bool Initialized => Penumbra.APIAvailable && Glamourer.APIAvailable;
@@ -51,15 +51,62 @@ public sealed partial class IpcManager : DisposableMediatorSubscriberBase
 
     private void PeriodicApiStateCheck()
     {
-        Penumbra.CheckAPI();
-        Penumbra.CheckModDirectory();
-        Glamourer.CheckAPI();
-        Heels.CheckAPI();
-        CustomizePlus.CheckAPI();
-        Honorific.CheckAPI();
-        Moodles.CheckAPI();
-        PetNames.CheckAPI();
-        Brio.CheckAPI();
-        OtherSync.CheckAPI();
+        var nowTick = Environment.TickCount64;
+        if (nowTick < Interlocked.Read(ref _nextPeriodicApiStateCheckTick))
+            return;
+
+        if (Interlocked.Exchange(ref _periodicApiStateCheckRunning, 1) != 0)
+            return;
+
+        Interlocked.Exchange(ref _nextPeriodicApiStateCheckTick, nowTick + (long)PeriodicApiStateCheckInterval.TotalMilliseconds);
+
+        var slot = _periodicApiStateCheckSlot;
+        _periodicApiStateCheckSlot = (_periodicApiStateCheckSlot + 1) % 9;
+
+        _ = Task.Run(() =>
+        {
+            try
+            {
+                switch (slot)
+                {
+                    case 0:
+                        Penumbra.CheckAPI();
+                        Penumbra.CheckModDirectory();
+                        break;
+                    case 1:
+                        Glamourer.CheckAPI();
+                        break;
+                    case 2:
+                        Heels.CheckAPI();
+                        break;
+                    case 3:
+                        CustomizePlus.CheckAPI();
+                        break;
+                    case 4:
+                        Honorific.CheckAPI();
+                        break;
+                    case 5:
+                        Moodles.CheckAPI();
+                        break;
+                    case 6:
+                        PetNames.CheckAPI();
+                        break;
+                    case 7:
+                        Brio.CheckAPI();
+                        break;
+                    default:
+                        OtherSync.CheckAPI();
+                        break;
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.LogTrace(ex, "Periodic IPC API state check failed");
+            }
+            finally
+            {
+                Interlocked.Exchange(ref _periodicApiStateCheckRunning, 0);
+            }
+        });
     }
 }

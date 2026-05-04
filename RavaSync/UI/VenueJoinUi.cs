@@ -41,6 +41,7 @@ public sealed class VenueJoinUi : WindowMediatorSubscriberBase
     private GroupJoinInfoDto? _groupJoinInfo = null;
     private DefaultPermissionsDto _ownPermissions = null!;
     private string _previousPassword = string.Empty;
+    private Task<GroupJoinInfoDto?>? _joinTask;
 
     protected override IDisposable? BeginThemeScope() => _uiSharedService.BeginThemed();
 
@@ -78,6 +79,7 @@ public sealed class VenueJoinUi : WindowMediatorSubscriberBase
 
         // clone the exact JoinSyncshellUI init semantics
         _groupJoinInfo = null;
+        _joinTask = null;
         _ownPermissions = _api.DefaultPermissions.DeepClone()!;
         _previousPassword = DummyPassword;
         _askJoinFirst = true;
@@ -93,6 +95,25 @@ public sealed class VenueJoinUi : WindowMediatorSubscriberBase
             Position = vp.GetCenter() - (Size / 2f);
             _centerOnAppear = false;
         }
+
+        if (_joinTask is { IsCompleted: true })
+        {
+            try
+            {
+                _groupJoinInfo = _joinTask.GetAwaiter().GetResult();
+            }
+            catch
+            {
+                _groupJoinInfo = null;
+            }
+            finally
+            {
+                _joinTask = null;
+                _askJoinFirst = false;
+            }
+        }
+
+        var joinInProgress = _joinTask is { IsCompleted: false };
 
         // HEADER
         using (_uiSharedService.UidFont.Push())
@@ -113,24 +134,25 @@ public sealed class VenueJoinUi : WindowMediatorSubscriberBase
             UiSharedService.TextWrapped(_uiSharedService.L("UI.VenueJoinUi.18c5a737", "Would you like to join this venue's public shell?"));
             ImGuiHelpers.ScaledDummy(6f);
 
+            using (ImRaii.Disabled(joinInProgress))
             using (ImRaii.Group())
             {
                 if (_uiSharedService.IconTextButton(Dalamud.Interface.FontAwesomeIcon.PlusCircle, _uiSharedService.L("UI.VenueJoinUi.d05f5d3c", "Yes")))
                 {
-                    // Mirror JoinSyncshellUI "Join" click
-                    try
+                    _previousPassword = DummyPassword;
+                    _joinTask = Task.Run(async () =>
                     {
-                        _previousPassword = DummyPassword;
-                        _groupJoinInfo = _api.VenueJoin(
-                            new GroupPasswordDto(new RavaSync.API.Data.GroupData(_shellGid), _previousPassword)
-                        ).Result;
-                    }
-                    catch
-                    {
-                        _groupJoinInfo = null;
-                    }
-
-                    _askJoinFirst = false; // advance to finalize/failure screens
+                        try
+                        {
+                            return await _api.VenueJoin(
+                                new GroupPasswordDto(new RavaSync.API.Data.GroupData(_shellGid), _previousPassword)
+                            ).ConfigureAwait(false);
+                        }
+                        catch
+                        {
+                            return null;
+                        }
+                    });
                 }
 
                 ImGui.SameLine();
@@ -139,6 +161,12 @@ public sealed class VenueJoinUi : WindowMediatorSubscriberBase
                 {
                     IsOpen = false;
                 }
+            }
+
+            if (joinInProgress)
+            {
+                ImGuiHelpers.ScaledDummy(4f);
+                UiSharedService.ColorText(_uiSharedService.L("UI.VenueJoinUi.3ec8eb7c", "Joining shell..."), ImGuiColors.DalamudYellow);
             }
 
             return;

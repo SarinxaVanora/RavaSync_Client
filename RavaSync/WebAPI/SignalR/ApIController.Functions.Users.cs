@@ -12,21 +12,23 @@ namespace RavaSync.WebAPI;
 #pragma warning disable MA0040
 public partial class ApiController
 {
-    public async Task PushCharacterData(CharacterData data, List<UserData> visibleCharacters)
+    public async Task<bool> PushCharacterData(CharacterData data, List<UserData> visibleCharacters)
     {
-        if (!IsConnected) return;
+        if (!IsConnected) return false;
 
         try
         {
-            await PushCharacterDataInternal(data, [.. visibleCharacters]).ConfigureAwait(false);
+            return await PushCharacterDataInternal(data, [.. visibleCharacters]).ConfigureAwait(false);
         }
         catch (OperationCanceledException)
         {
             Logger.LogDebug("Upload operation was cancelled");
+            return false;
         }
         catch (Exception ex)
         {
             Logger.LogWarning(ex, "Error during upload of files");
+            return false;
         }
     }
 
@@ -83,6 +85,20 @@ public partial class ApiController
         }
     }
 
+    private async Task<bool> TryUserPushData(UserCharaDataMessageDto dto)
+    {
+        try
+        {
+            await _mareHub!.InvokeAsync(nameof(UserPushData), dto).ConfigureAwait(false);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Logger.LogWarning(ex, "Failed to Push character data");
+            return false;
+        }
+    }
+
     public async Task SetBulkPermissions(BulkPermissionsDto dto)
     {
         CheckConnection();
@@ -123,7 +139,7 @@ public partial class ApiController
         await _mareHub!.InvokeAsync(nameof(UserUpdateDefaultPermissions), defaultPermissionsDto).ConfigureAwait(false);
     }
 
-    private async Task PushCharacterDataInternal(CharacterData character, List<UserData> visibleCharacters)
+    private async Task<bool> PushCharacterDataInternal(CharacterData character, List<UserData> visibleCharacters)
     {
         Logger.LogInformation("Pushing character data for {hash} to {charas}", character.DataHash.Value, string.Join(", ", visibleCharacters.Select(c => c.AliasOrUID)));
         StringBuilder sb = new();
@@ -145,7 +161,7 @@ public partial class ApiController
             Logger.LogDebug("Attaching Census Data: {data}", censusDto);
         }
 
-        await UserPushData(new(visibleCharacters, character, censusDto)).ConfigureAwait(false);
+        return await TryUserPushData(new(visibleCharacters, character, censusDto)).ConfigureAwait(false);
     }
 
 }

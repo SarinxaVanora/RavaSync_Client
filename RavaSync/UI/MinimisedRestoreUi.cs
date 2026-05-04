@@ -45,7 +45,7 @@ public sealed class MinimisedRestoreUi : WindowMediatorSubscriberBase
         _apiController = apiController;
         _serverManager = serverManager;
 
-        IsOpen = _config.Current.HasValidSetup() && _config.Current.ShowMinimizedRestoreIcon;
+        IsOpen = _config.Current.HasValidSetup() && _config.Current.ShowMinimizedRestoreIcon && _config.Current.CompactUiLastMinimized;
 
         try
         {
@@ -65,6 +65,11 @@ public sealed class MinimisedRestoreUi : WindowMediatorSubscriberBase
 
         AllowPinning = false;
         AllowClickthrough = false;
+
+        Mediator.Subscribe<RestoreCompactUiStateMessage>(this, (_) =>
+        {
+            IsOpen = _config.Current.HasValidSetup() && _config.Current.ShowMinimizedRestoreIcon && _config.Current.CompactUiLastMinimized;
+        });
 
         Mediator.Subscribe<MainUiMinimizedMessage>(this, (_) =>
         {
@@ -175,8 +180,12 @@ public sealed class MinimisedRestoreUi : WindowMediatorSubscriberBase
         {
             if (!ImGui.IsMouseReleased(ImGuiMouseButton.Right) && !ImGui.IsMouseReleased(ImGuiMouseButton.Middle))
             {
+                var vp = ImGui.GetMainViewport();
                 var pos = ImGui.GetWindowPos();
-                Mediator.Publish(new RestoreMainUiAtPositionMessage(pos));
+                var iconCenterX = pos.X + (size.X * 0.5f);
+                var viewportCenterX = vp.WorkPos.X + (vp.WorkSize.X * 0.5f);
+                var openToLeft = iconCenterX >= viewportCenterX;
+                Mediator.Publish(new RestoreMainUiAtPositionMessage(pos, openToLeft));
                 IsOpen = false;
             }
         }

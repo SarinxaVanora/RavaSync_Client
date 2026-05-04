@@ -18,6 +18,9 @@ public sealed class UiService : DisposableMediatorSubscriberBase
     private readonly MareConfigService _mareConfigService;
     private readonly WindowSystem _windowSystem;
     private readonly UiFactory _uiFactory;
+    private static readonly TimeSpan DrawExceptionLogCooldown = TimeSpan.FromSeconds(30);
+    private DateTime _lastWindowSystemDrawExceptionUtc = DateTime.MinValue;
+    private DateTime _lastFileDialogDrawExceptionUtc = DateTime.MinValue;
 
     public UiService(ILogger<UiService> logger, IUiBuilder uiBuilder,
         MareConfigService mareConfigService, WindowSystem windowSystem,
@@ -120,7 +123,37 @@ public sealed class UiService : DisposableMediatorSubscriberBase
 
     private void Draw()
     {
-        _windowSystem.Draw();
-        _fileDialogManager.Draw();
+        try
+        {
+            _windowSystem.Draw();
+        }
+        catch (Exception ex)
+        {
+            LogDrawException(ref _lastWindowSystemDrawExceptionUtc, ex, "WindowSystem");
+        }
+
+        try
+        {
+            _fileDialogManager.Draw();
+        }
+        catch (Exception ex)
+        {
+            LogDrawException(ref _lastFileDialogDrawExceptionUtc, ex, "FileDialogManager");
+        }
+    }
+
+    private void LogDrawException(ref DateTime lastLoggedUtc, Exception ex, string source)
+    {
+        var now = DateTime.UtcNow;
+
+        if (now - lastLoggedUtc >= DrawExceptionLogCooldown)
+        {
+            lastLoggedUtc = now;
+            _logger.LogWarning(ex, "Ignoring UI draw exception from {source}; draw will retry next frame", source);
+        }
+        else
+        {
+            _logger.LogTrace(ex, "Ignoring repeated UI draw exception from {source}", source);
+        }
     }
 }

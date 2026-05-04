@@ -16,6 +16,8 @@ using RavaSync.PlayerData.Services;
 using RavaSync.Services;
 using RavaSync.Services.CharaData;
 using RavaSync.Services.Events;
+using RavaSync.Services.Gpu;
+using RavaSync.Services.Optimisation;
 using RavaSync.Services.Mediator;
 using RavaSync.Services.ServerConfiguration;
 using RavaSync.Themes;
@@ -35,13 +37,17 @@ using System.Net.Http.Headers;
 using System.Reflection;
 using RavaSync.Services.Discovery;
 using RavaSync.FileCache;
+using RavaSync.Utils;
 
 
 namespace RavaSync;
 
-public sealed class Plugin : IDalamudPlugin
+public sealed class Plugin : IAsyncDalamudPlugin
 {
     private readonly IHost _host;
+    private readonly string _configDirectory;
+    private readonly string _traceDir;
+    private bool _hostStarted;
 
     public Plugin(IDalamudPluginInterface pluginInterface, ICommandManager commandManager, IDataManager gameData,
         IFramework framework, IObjectTable objectTable, IClientState clientState, ICondition condition, IChatGui chatGui,
@@ -50,56 +56,36 @@ public sealed class Plugin : IDalamudPlugin
         ISigScanner sigScanner, IPartyList partyList, INamePlateGui nameplate)
     {
 
-        if (!Directory.Exists(pluginInterface.ConfigDirectory.FullName))
-            Directory.CreateDirectory(pluginInterface.ConfigDirectory.FullName);
-        var traceDir = Path.Join(pluginInterface.ConfigDirectory.FullName, "tracelog");
-        if (!Directory.Exists(traceDir))
-            Directory.CreateDirectory(traceDir);
+        _configDirectory = pluginInterface.ConfigDirectory.FullName;
+        _traceDir = Path.Join(_configDirectory, "tracelog");
 
-        foreach (var file in Directory.EnumerateFiles(traceDir)
-            .Select(f => new FileInfo(f))
-            .OrderByDescending(f => f.LastWriteTimeUtc).Skip(9))
-        {
-            int attempts = 0;
-            bool deleted = false;
-            while (!deleted && attempts < 5)
-            {
-                try
-                {
-                    file.Delete();
-                    deleted = true;
-                }
-                catch
-                {
-                    attempts++;
-                    Thread.Sleep(500);
-                }
-            }
-        }
+        Directory.CreateDirectory(_configDirectory);
+        Directory.CreateDirectory(_traceDir);
 
         _host = new HostBuilder()
-        .UseContentRoot(pluginInterface.ConfigDirectory.FullName)
+        .UseContentRoot(_configDirectory)
         .ConfigureLogging(lb =>
         {
             lb.ClearProviders();
             lb.AddDalamudLogging(pluginLog, gameData.HasModifiedGameDataFiles);
-            lb.AddFile(Path.Combine(traceDir, $"mare-trace-{DateTime.Now:yyyy-MM-dd-HH-mm-ss}.log"), (opt) =>
+            lb.AddFile(Path.Combine(_traceDir, $"mare-trace-{DateTime.Now:yyyy-MM-dd-HH-mm-ss}.log"), (opt) =>
             {
                 opt.Append = true;
                 opt.RollingFilesConvention = FileLoggerOptions.FileRollingConvention.Ascending;
-                opt.MinLevel = LogLevel.Trace;
+                opt.MinLevel = LogLevel.Information;
                 opt.FileSizeLimitBytes = 50 * 1024 * 1024;
             });
-            lb.SetMinimumLevel(LogLevel.Trace);
+            lb.SetMinimumLevel(LogLevel.Information);
         })
         .ConfigureServices(collection =>
         {
-            CdnPrewarmHelper.Initialize(pluginInterface.ConfigDirectory.FullName);
             collection.AddSingleton(new WindowSystem("RavaSync"));
             collection.AddSingleton<FileDialogManager>();
             collection.AddSingleton(new Dalamud.Localization("RavaSync.Localization.", "", useEmbedded: true));
 
             collection.AddSingleton<IFramework>(framework);
+            collection.AddSingleton<IGameInteropProvider>(gameInteropProvider);
+            collection.AddSingleton<ISigScanner>(sigScanner);
             collection.AddSingleton<IObjectTable>(objectTable);
             collection.AddSingleton<IPartyList>(partyList);
             collection.AddSingleton<IGameGui>(gameGui);
@@ -124,15 +110,34 @@ public sealed class Plugin : IDalamudPlugin
             collection.AddSingleton<PairHandlerFactory>();
             collection.AddSingleton<PairFactory>();
             collection.AddSingleton<XivDataAnalyzer>();
+            collection.AddSingleton<PapSanitisationService>();
+            collection.AddSingleton<LocalPapSafetyModService>();
             collection.AddSingleton<CharacterAnalyzer>();
+            collection.AddSingleton<CharacterRavaSidecarUtility>();
+            collection.AddSingleton<GpuCapabilityService>();
+            collection.AddSingleton<GpuTelemetry>();
+            collection.AddSingleton<GpuResourcePool>();
+            collection.AddSingleton<GpuDeviceService>();
+            collection.AddSingleton<D3D11SharedDeviceService>();
+            collection.AddSingleton<D3D11ShaderBytecodeCache>();
+            collection.AddSingleton<D3D11ComputeService>();
+            collection.AddSingleton<D3D11MeshAnalysisService>();
+            collection.AddSingleton<D3D11TextureCompressionService>();
+            collection.AddSingleton<OptimisationPolicyService>();
+            collection.AddSingleton<TextureOptimisationService>();
+            collection.AddSingleton<MeshOptimisationService>();
             collection.AddSingleton<TokenProvider>();
             collection.AddSingleton<PluginWarningNotificationService>();
             collection.AddSingleton<FileCompactor>();
             collection.AddSingleton<TagHandler>();
             collection.AddSingleton<IdDisplayHandler>();
             collection.AddSingleton<PlayerPerformanceService>();
+            collection.AddSingleton<ThresholdPerfMeshRelayService>();
+            collection.AddSingleton<MissingFileMeshService>();
             collection.AddSingleton<TransientResourceManager>();
             collection.AddSingleton<ToyBox>();
+            collection.AddSingleton<ModPathResolver>();
+            collection.AddSingleton<ObjectIndexCleanupService>();
 
 
             collection.AddSingleton<CharaDataManager>();
@@ -158,7 +163,8 @@ public sealed class Plugin : IDalamudPlugin
             collection.AddSingleton((s) => new DtrEntry(s.GetRequiredService<ILogger<DtrEntry>>(), dtrBar, s.GetRequiredService<MareConfigService>(),
                 s.GetRequiredService<MareMediator>(), s.GetRequiredService<PairManager>(), s.GetRequiredService<ApiController>(), s.GetRequiredService<UiSharedService>()));
             collection.AddSingleton(s => new PairManager(s.GetRequiredService<ILogger<PairManager>>(), s.GetRequiredService<PairFactory>(),
-                s.GetRequiredService<MareConfigService>(), s.GetRequiredService<MareMediator>(), contextMenu,s.GetRequiredService<DalamudUtilService>()));
+                s.GetRequiredService<MareConfigService>(), s.GetRequiredService<MareMediator>(), contextMenu, s.GetRequiredService<DalamudUtilService>(), s.GetRequiredService<IpcManager>(),
+                s.GetRequiredService<CharacterRavaSidecarUtility>(), s.GetRequiredService<PlayerPerformanceService>()));
             collection.AddSingleton<RedrawManager>();
             collection.AddSingleton((s) => new IpcCallerPenumbra(s.GetRequiredService<ILogger<IpcCallerPenumbra>>(), pluginInterface,
                 s.GetRequiredService<DalamudUtilService>(), s.GetRequiredService<MareMediator>(), s.GetRequiredService<RedrawManager>()));
@@ -187,6 +193,7 @@ public sealed class Plugin : IDalamudPlugin
                 s.GetRequiredService<MareMediator>(), s.GetRequiredService<DalamudUtilService>(),
                 notificationManager, chatGui, s.GetRequiredService<MareConfigService>()));
             collection.AddSingleton<CrashRecoveryService>();
+            collection.AddSingleton<StorageMaintenanceService>();
             collection.AddSingleton(s => new PcpExportGuard(s.GetRequiredService<ILogger<PcpExportGuard>>(),pluginInterface,
                 s.GetRequiredService<PairManager>(),s.GetRequiredService<IpcCallerPenumbra>(),s.GetRequiredService<DalamudUtilService>(), s.GetRequiredService<MareMediator>()));
             collection.AddSingleton((s) => new PairRequestService(
@@ -220,17 +227,15 @@ public sealed class Plugin : IDalamudPlugin
             {
                 var handler = new SocketsHttpHandler
                 {
-                    // Keep sockets fresh and fast
                     PooledConnectionLifetime = TimeSpan.FromMinutes(10),
                     PooledConnectionIdleTimeout = TimeSpan.FromMinutes(2),
                     MaxConnectionsPerServer = 256,
                     EnableMultipleHttp2Connections = true,
-                    AutomaticDecompression = DecompressionMethods.None, //DecompressionMethods.GZip | DecompressionMethods.Deflate,
+                    AutomaticDecompression = DecompressionMethods.None,
                     Expect100ContinueTimeout = TimeSpan.Zero,
                     UseCookies = false,
                     ConnectTimeout = TimeSpan.FromSeconds(10),
 
-                    // Keep-alive pings so long transfers don’t stall
                     KeepAlivePingPolicy = HttpKeepAlivePingPolicy.Always,
                     KeepAlivePingDelay = TimeSpan.FromSeconds(20),
                     KeepAlivePingTimeout = TimeSpan.FromSeconds(10),
@@ -241,7 +246,7 @@ public sealed class Plugin : IDalamudPlugin
 
                 var httpClient = new HttpClient(handler, disposeHandler: true)
                 {
-                    Timeout = Timeout.InfiniteTimeSpan // we’ll cancel per-request
+                    Timeout = Timeout.InfiniteTimeSpan
                 };
 
                 httpClient.DefaultRequestVersion = HttpVersion.Version20;
@@ -284,7 +289,6 @@ public sealed class Plugin : IDalamudPlugin
 
                 var cfg = s.GetRequiredService<MareConfigService>().Current;
 
-                // First run → default UI (no theme)
                 if (string.IsNullOrWhiteSpace(cfg.SelectedThemeId))
                 {
                     cfg.SelectedThemeId = ThemeManager.NoneId;
@@ -307,7 +311,6 @@ public sealed class Plugin : IDalamudPlugin
             collection.AddSingleton<IFriendResolver, FriendResolver>();
             collection.AddSingleton<ScopeAutoPauseService>();
 
-            // --- RavaSync Venue Services ---
             collection.AddSingleton((s) => new VenueInviteService(
                 s.GetRequiredService<ILogger<VenueInviteService>>(),
                 s.GetRequiredService<DalamudUtilService>(),
@@ -319,7 +322,6 @@ public sealed class Plugin : IDalamudPlugin
                 s.GetRequiredService<PairManager>()
                 ));
 
-            // Opens the VenueRegistrationUi
             collection.AddSingleton((s) => new VenueRegistrationService(
                 s.GetRequiredService<ILogger<VenueRegistrationService>>(),
                 s.GetRequiredService<DalamudUtilService>(),
@@ -332,9 +334,6 @@ public sealed class Plugin : IDalamudPlugin
                 ));
 
 
-
-
-            // add scoped services
             collection.AddScoped<DrawEntityFactory>();
             collection.AddScoped<CacheMonitor>();
             collection.AddScoped<UiFactory>();
@@ -376,7 +375,8 @@ public sealed class Plugin : IDalamudPlugin
                 s.GetRequiredService<FileDialogManager>(), s.GetRequiredService<MareMediator>()));
             collection.AddScoped((s) => new CommandManagerService(commandManager, s.GetRequiredService<PerformanceCollectorService>(),
                 s.GetRequiredService<ServerConfigurationManager>(), s.GetRequiredService<CacheMonitor>(), s.GetRequiredService<ApiController>(),
-                s.GetRequiredService<MareMediator>(),s.GetRequiredService<MareConfigService>(), gameGui,s.GetRequiredService<DalamudUtilService>()));
+                s.GetRequiredService<MareMediator>(), s.GetRequiredService<MareConfigService>(), gameGui, s.GetRequiredService<DalamudUtilService>(),
+                s.GetRequiredService<StorageMaintenanceService>()));
             collection.AddScoped((s) => new UiSharedService(
                 s.GetRequiredService<ILogger<UiSharedService>>(),
                 s.GetRequiredService<IpcManager>(),
@@ -399,8 +399,9 @@ public sealed class Plugin : IDalamudPlugin
             collection.AddHostedService(p => p.GetRequiredService<MareMediator>());
             collection.AddHostedService(p => p.GetRequiredService<NotificationService>());
             collection.AddHostedService(p => p.GetRequiredService<CrashRecoveryService>());
-            collection.AddHostedService(p => p.GetRequiredService<FileCacheManager>());
             collection.AddHostedService(p => p.GetRequiredService<ConfigurationMigrator>());
+            collection.AddHostedService(p => p.GetRequiredService<FileCacheManager>());
+            collection.AddHostedService(p => p.GetRequiredService<PapSanitisationService>());
             collection.AddHostedService(p => p.GetRequiredService<DalamudUtilService>());
             collection.AddHostedService(p => p.GetRequiredService<PerformanceCollectorService>());
             collection.AddHostedService(p => p.GetRequiredService<DtrEntry>());
@@ -413,22 +414,89 @@ public sealed class Plugin : IDalamudPlugin
 
         })
         .Build();
+    }
 
+    public async Task LoadAsync(CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+
+        CdnPrewarmHelper.Initialize(_configDirectory);
+
+        _ = Task.Run(() => DeleteOldTraceFilesBestEffortAsync(_traceDir), CancellationToken.None);
+
+        // These are intentionally activated before hosted services start because they register
+        // long-lived behaviours, mediator subscribers, context menus, or plugin-scoped handlers.
         _ = _host.Services.GetRequiredService<VenueInviteService>();
         _ = _host.Services.GetRequiredService<VenueRegistrationService>();
         _ = _host.Services.GetRequiredService<PcpExportGuard>();
         _ = _host.Services.GetRequiredService<PairRequestService>();
         _ = _host.Services.GetRequiredService<PairRequestContextMenuService>();
         _ = _host.Services.GetRequiredService<FriendshapedMarkerService>();
-
+        _ = _host.Services.GetRequiredService<ThresholdPerfMeshRelayService>();
+        _ = _host.Services.GetRequiredService<MissingFileMeshService>();
         _ = _host.Services.GetRequiredService<ScopeAutoPauseService>();
 
-        _ = _host.StartAsync();
+        await _host.StartAsync(cancellationToken).ConfigureAwait(false);
+        _hostStarted = true;
     }
 
-    public void Dispose()
+    public async ValueTask DisposeAsync()
     {
-        _host.StopAsync().GetAwaiter().GetResult();
-        _host.Dispose();
+        try
+        {
+            if (_hostStarted)
+            {
+                await _host.StopAsync(CancellationToken.None).ConfigureAwait(false);
+                _hostStarted = false;
+            }
+        }
+        finally
+        {
+            if (_host is IAsyncDisposable asyncDisposable)
+            {
+                await asyncDisposable.DisposeAsync().ConfigureAwait(false);
+            }
+            else
+            {
+                _host.Dispose();
+            }
+        }
+    }
+
+    private static async Task DeleteOldTraceFilesBestEffortAsync(string traceDir)
+    {
+        try
+        {
+            if (!Directory.Exists(traceDir))
+                return;
+
+            var oldFiles = Directory.EnumerateFiles(traceDir)
+                .Select(f => new FileInfo(f))
+                .OrderByDescending(f => f.LastWriteTimeUtc)
+                .Skip(9)
+                .ToArray();
+
+            foreach (var file in oldFiles)
+            {
+                for (var attempt = 0; attempt < 5; attempt++)
+                {
+                    try
+                    {
+                        file.Delete();
+                        break;
+                    }
+                    catch
+                    {
+                        await Task.Delay(500).ConfigureAwait(false);
+                    }
+                }
+
+                await Task.Yield();
+            }
+        }
+        catch
+        {
+            // Best-effort cleanup only. Never fail plugin load because old logs were locked.
+        }
     }
 }

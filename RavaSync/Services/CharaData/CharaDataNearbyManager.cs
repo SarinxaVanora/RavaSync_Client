@@ -323,11 +323,23 @@ public sealed class CharaDataNearbyManager : DisposableMediatorSubscriberBase
             return;
         }
 
+        if (!_dalamudUtilService.IsLoggedIn)
+        {
+            if (_nearbyData.Any())
+                _nearbyData.Clear();
+            if (_poseVfx.Any())
+                ClearAllVfx();
+            return;
+        }
+
         if ((!_charaDataConfigService.Current.NearbyDrawWisps || _dalamudUtilService.IsInGpose || _dalamudUtilService.IsInCombatOrPerforming)
             && _poseVfx.Any())
         {
             ClearAllVfx();
         }
+
+        if (_metaInfoCache.Count == 0 && !_poseVfx.Any())
+            return;
 
         var camera = CameraManager.Instance()->CurrentCamera;
         Vector3 cameraPos = new(camera->Position.X, camera->Position.Y, camera->Position.Z);

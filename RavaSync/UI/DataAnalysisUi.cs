@@ -7,11 +7,14 @@ using RavaSync.API.Data.Enum;
 using RavaSync.Interop.Ipc;
 using RavaSync.MareConfiguration;
 using RavaSync.Services;
+using RavaSync.Services.Gpu;
+using RavaSync.Services.Optimisation;
 using RavaSync.Services.Mediator;
 using RavaSync.Utils;
 using Microsoft.Extensions.Logging;
 using RavaSync.FileCache;
 using System.Numerics;
+using System.IO;
 
 namespace RavaSync.UI;
 
@@ -24,6 +27,11 @@ public class DataAnalysisUi : WindowMediatorSubscriberBase
     private readonly PlayerPerformanceConfigService _playerPerformanceConfig;
     private readonly TransientResourceManager _transientResourceManager;
     private readonly TransientConfigService _transientConfigService;
+    private readonly GpuCapabilityService _gpuCapabilityService;
+    private readonly GpuTelemetry _gpuTelemetry;
+    private readonly OptimisationPolicyService _optimizationPolicyService;
+    private readonly TextureOptimisationService _textureOptimizationService;
+    private readonly MeshOptimisationService _meshOptimizationService;
     private readonly Dictionary<string, string[]> _texturesToConvert = new(StringComparer.Ordinal);
     private Dictionary<ObjectKind, Dictionary<string, CharacterAnalyzer.FileDataEntry>>? _cachedAnalysis;
     private CancellationTokenSource _conversionCancellationTokenSource = new();
@@ -37,13 +45,18 @@ public class DataAnalysisUi : WindowMediatorSubscriberBase
     private string _selectedHash = string.Empty;
     private ObjectKind _selectedObjectTab;
     private bool _showModal = false;
+    private bool _openOptimisationTabNextDraw = false;
+    private bool _selectOptimisationTexturesNextDraw = false;
+    private bool _selectOptimisationMeshesNextDraw = false;
     private CancellationTokenSource _transientRecordCts = new();
     protected override IDisposable? BeginThemeScope() => _uiSharedService.BeginThemed();
     public DataAnalysisUi(ILogger<DataAnalysisUi> logger, MareMediator mediator,
         CharacterAnalyzer characterAnalyzer, IpcManager ipcManager,
         PerformanceCollectorService performanceCollectorService, UiSharedService uiSharedService,
         PlayerPerformanceConfigService playerPerformanceConfig, TransientResourceManager transientResourceManager,
-        TransientConfigService transientConfigService)
+        TransientConfigService transientConfigService, GpuCapabilityService gpuCapabilityService,
+        GpuTelemetry gpuTelemetry, OptimisationPolicyService optimizationPolicyService, TextureOptimisationService textureOptimizationService,
+        MeshOptimisationService meshOptimizationService)
         : base(logger, mediator, "RavaSync Character Data Analysis", performanceCollectorService)
     {
         _characterAnalyzer = characterAnalyzer;
@@ -52,9 +65,21 @@ public class DataAnalysisUi : WindowMediatorSubscriberBase
         _playerPerformanceConfig = playerPerformanceConfig;
         _transientResourceManager = transientResourceManager;
         _transientConfigService = transientConfigService;
+        _gpuCapabilityService = gpuCapabilityService;
+        _gpuTelemetry = gpuTelemetry;
+        _optimizationPolicyService = optimizationPolicyService;
+        _textureOptimizationService = textureOptimizationService;
+        _meshOptimizationService = meshOptimizationService;
         Mediator.Subscribe<CharacterDataAnalyzedMessage>(this, (_) =>
         {
             _hasUpdate = true;
+        });
+        Mediator.Subscribe<OpenDataAnalysisOptimisationTabMessage>(this, (msg) =>
+        {
+            IsOpen = true;
+            _openOptimisationTabNextDraw = true;
+            _selectOptimisationTexturesNextDraw = msg.Tab == DataAnalysisOptimisationTab.Textures;
+            _selectOptimisationMeshesNextDraw = msg.Tab == DataAnalysisOptimisationTab.Meshes;
         });
         SizeConstraints = new()
         {
@@ -71,6 +96,112 @@ public class DataAnalysisUi : WindowMediatorSubscriberBase
         };
 
         _conversionProgress.ProgressChanged += ConversionProgress_ProgressChanged;
+    }
+
+    private Dictionary<string, string> BuildTextureTargetMap(IEnumerable<string> primaries)
+    {
+        var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var wanted = new HashSet<string>(primaries ?? Array.Empty<string>(), StringComparer.OrdinalIgnoreCase);
+        if (wanted.Count == 0 || _cachedAnalysis == null)
+            return result;
+
+        foreach (var byObj in _cachedAnalysis.Values)
+        {
+            foreach (var entry in byObj.Values)
+            {
+                if (entry == null) continue;
+                if (!string.Equals(entry.FileType, "tex", StringComparison.OrdinalIgnoreCase)) continue;
+                if (entry.FilePaths == null || entry.FilePaths.Count == 0) continue;
+
+                var primary = entry.FilePaths[0];
+                if (!wanted.Contains(primary) || result.ContainsKey(primary))
+                    continue;
+
+                if (!TextureCompressionPlanner.TryParseFormat(entry.Format.Value, out var srcFmt))
+                    continue;
+
+                var hint = entry.GamePaths.FirstOrDefault() ?? primary;
+                if (!TextureCompressionPlanner.TryChooseTarget(hint, srcFmt, out var target) || target == TextureCompressionPlanner.Target.None)
+                    continue;
+
+                result[primary] = target.ToString();
+            }
+        }
+
+        return result;
+    }
+
+    private IEnumerable<string> GetAllMeshPrimariesFromCachedAnalysis()
+    {
+        if (_cachedAnalysis == null || _cachedAnalysis.Count == 0)
+            yield break;
+
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var byObj in _cachedAnalysis.Values)
+        {
+            foreach (var entry in byObj.Values)
+            {
+                if (entry?.FilePaths == null || entry.FilePaths.Count == 0)
+                    continue;
+
+                bool isModel = string.Equals(entry.FileType, "mdl", StringComparison.OrdinalIgnoreCase)
+                    || (entry.GamePaths?.Any(p => p.EndsWith(".mdl", StringComparison.OrdinalIgnoreCase)) ?? false);
+                if (!isModel)
+                    continue;
+
+                var primary = entry.FilePaths[0];
+                if (string.IsNullOrWhiteSpace(primary) || !seen.Add(primary))
+                    continue;
+
+                yield return primary;
+            }
+        }
+    }
+
+    private static Dictionary<string, string[]> BuildTextureModelReferenceMap(IEnumerable<string> texturePrimaries, IEnumerable<string> meshPrimaries)
+    {
+        var textures = (texturePrimaries ?? Array.Empty<string>()).Where(static p => !string.IsNullOrWhiteSpace(p)).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+        var meshes = (meshPrimaries ?? Array.Empty<string>()).Where(static p => !string.IsNullOrWhiteSpace(p)).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+        var result = new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase);
+        if (textures.Length == 0 || meshes.Length == 0)
+            return result;
+
+        foreach (var texture in textures)
+        {
+            string textureDir = Path.GetDirectoryName(texture) ?? string.Empty;
+            var ranked = meshes
+                .Select(mesh => new { Path = mesh, Score = ComputeSharedDirectoryDepth(textureDir, Path.GetDirectoryName(mesh) ?? string.Empty) })
+                .Where(static x => x.Score > 0)
+                .OrderByDescending(static x => x.Score)
+                .ThenBy(static x => x.Path.Length)
+                .Take(8)
+                .Select(static x => x.Path)
+                .ToArray();
+
+            if (ranked.Length > 0)
+                result[texture] = ranked;
+        }
+
+        return result;
+    }
+
+    private static int ComputeSharedDirectoryDepth(string a, string b)
+    {
+        if (string.IsNullOrWhiteSpace(a) || string.IsNullOrWhiteSpace(b))
+            return 0;
+
+        var aParts = a.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        var bParts = b.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        int depth = 0;
+        int length = Math.Min(aParts.Length, bParts.Length);
+        for (int i = 0; i < length; i++)
+        {
+            if (!string.Equals(aParts[i], bParts[i], StringComparison.OrdinalIgnoreCase))
+                break;
+            depth++;
+        }
+
+        return depth;
     }
 
     protected override void DrawInternal()
@@ -124,6 +255,18 @@ public class DataAnalysisUi : WindowMediatorSubscriberBase
                 DrawAnalysis();
             }
         }
+
+        var optimisationTopLevelFlags = _openOptimisationTabNextDraw ? ImGuiTabItemFlags.SetSelected : ImGuiTabItemFlags.None;
+        using (var tabItem = ImRaii.TabItem("Optimisation##optimisation", optimisationTopLevelFlags))
+        {
+            if (tabItem)
+            {
+                using var id = ImRaii.PushId("optimisation");
+                DrawOptimization();
+            }
+        }
+
+        _openOptimisationTabNextDraw = false;
         using (var tabItem = ImRaii.TabItem(string.Concat(_uiSharedService.L("UI.DataAnalysisUi.2cebfef2", "Transient Files"), "##2cebfef2")))
         {
             if (tabItem)
@@ -151,6 +294,312 @@ public class DataAnalysisUi : WindowMediatorSubscriberBase
             }
         }
     }
+
+
+    private void DrawOptimization()
+    {
+        UiSharedService.DrawTree(_uiSharedService.L("UI.CharaDataHubUi.843fc806", "What is this? (Explanation / Help)"), () =>
+        {
+            UiSharedService.TextWrapped("This tab shows whether local GPU texture processing is available and highlights the textures and meshes most worth reviewing.");
+            UiSharedService.TextWrapped("Use this page as a guide. It helps you spot the files most likely to benefit from optimisation before you commit to any changes.");
+        });
+
+        var snapshot = _gpuCapabilityService.Current;
+        UiSharedService.ColorTextWrapped(snapshot.IsSupported ? "GPU texture processing: Ready" : "GPU texture processing: Unavailable",
+            snapshot.IsSupported ? ImGuiColors.HealerGreen : ImGuiColors.DalamudYellow);
+        UiSharedService.TextWrapped(snapshot.IsSupported ? "Your PC supports local GPU texture processing for this feature." : "This PC cannot use the local GPU texture path right now, so RavaSync will stay on its safer fallback path.");
+        UiSharedService.TextWrapped(snapshot.SupportSummary);
+
+        ImGui.Separator();
+
+        var analysis = _cachedAnalysis ?? _characterAnalyzer.LastAnalysis;
+        var optimisation = _optimizationPolicyService.Analyze(analysis);
+        var meshCandidates = FilterActionableMeshCandidates(optimisation.MeshCandidates);
+
+        ImGui.TextUnformatted($"Textures worth reviewing: {optimisation.TextureCandidates.Count}");
+        ImGui.SameLine();
+        ImGui.TextUnformatted($"Meshes worth reviewing: {meshCandidates.Count}");
+
+        var recentJobs = _gpuTelemetry.GetRecentResults();
+        if (recentJobs.Count > 0)
+        {
+            ImGuiHelpers.ScaledDummy(5);
+            ImGui.TextUnformatted("Recent activity:");
+            foreach (var job in recentJobs.Take(5))
+            {
+                UiSharedService.TextWrapped($"- {job.OperationName}: {(job.WasSuccessful ? "Completed" : "Failed")} in {job.Duration.TotalMilliseconds:F1}ms{(string.IsNullOrWhiteSpace(job.Detail) ? string.Empty : $" ({job.Detail})")}");
+            }
+        }
+
+        ImGui.Separator();
+        using var tabBar = ImRaii.TabBar("optimisationCandidatesTabBar");
+
+        var textureTabFlags = _selectOptimisationTexturesNextDraw ? ImGuiTabItemFlags.SetSelected : ImGuiTabItemFlags.None;
+        using (var textureTab = ImRaii.TabItem("Textures##optimisationTextures", textureTabFlags))
+        {
+            if (textureTab)
+            {
+                DrawTextureOptimizationCandidates(optimisation.TextureCandidates);
+            }
+        }
+
+        var meshTabFlags = _selectOptimisationMeshesNextDraw ? ImGuiTabItemFlags.SetSelected : ImGuiTabItemFlags.None;
+        using (var meshTab = ImRaii.TabItem("Meshes##optimisationMeshes", meshTabFlags))
+        {
+            if (meshTab)
+            {
+                DrawMeshOptimizationCandidates(meshCandidates);
+            }
+        }
+
+        _selectOptimisationTexturesNextDraw = false;
+        _selectOptimisationMeshesNextDraw = false;
+    }
+
+    private IReadOnlyList<MeshOptimisationCandidate> FilterActionableMeshCandidates(IReadOnlyList<MeshOptimisationCandidate> candidates)
+    {
+        if (candidates == null || candidates.Count == 0)
+            return Array.Empty<MeshOptimisationCandidate>();
+
+        var actionable = new List<MeshOptimisationCandidate>(candidates.Count);
+        var queue = new List<(string PrimaryPath, long CurrentTriangles)>();
+        foreach (var candidate in candidates)
+        {
+            var primaryPath = candidate.FilePaths?.FirstOrDefault();
+            if (string.IsNullOrWhiteSpace(primaryPath))
+                continue;
+
+            if (_meshOptimizationService.TryGetCachedEstimateFast(primaryPath, out var estimate) && estimate.HasSavings)
+            {
+                actionable.Add(candidate);
+                continue;
+            }
+
+            if (_meshOptimizationService.ShouldOfferReduction(primaryPath, candidate.Triangles))
+                queue.Add((primaryPath, Math.Max(0, candidate.Triangles)));
+        }
+
+        if (queue.Count > 0)
+            _meshOptimizationService.QueueEstimates(queue);
+
+        return actionable;
+    }
+
+    private void DrawTextureOptimizationCandidates(IReadOnlyList<TextureOptimisationCandidate> candidates)
+    {
+        if (candidates.Count == 0)
+        {
+            UiSharedService.TextWrapped("No texture suggestions to show right now. Run analysis first if this looks unexpected.");
+            return;
+        }
+
+        using var table = ImRaii.Table("##textureOptimizationCandidates", 4, ImGuiTableFlags.RowBg | ImGuiTableFlags.ScrollY | ImGuiTableFlags.SizingStretchProp);
+        if (!table) return;
+
+        ImGui.TableSetupColumn("Target", ImGuiTableColumnFlags.WidthFixed, 90f * ImGuiHelpers.GlobalScale);
+        ImGui.TableSetupColumn("Format", ImGuiTableColumnFlags.WidthFixed, 110f * ImGuiHelpers.GlobalScale);
+        ImGui.TableSetupColumn("VRAM", ImGuiTableColumnFlags.WidthFixed, 110f * ImGuiHelpers.GlobalScale);
+        ImGui.TableSetupColumn("Reason", ImGuiTableColumnFlags.WidthStretch);
+        ImGui.TableHeadersRow();
+
+        foreach (var candidate in candidates.Take(20))
+        {
+            ImGui.TableNextRow();
+            ImGui.TableNextColumn();
+            ImGui.TextUnformatted(candidate.SuggestedTarget.ToString());
+            ImGui.TableNextColumn();
+            ImGui.TextUnformatted(candidate.SourceFormat);
+            ImGui.TableNextColumn();
+            ImGui.TextUnformatted(UiSharedService.ByteToString(candidate.VramBytes));
+            ImGui.TableNextColumn();
+            UiSharedService.TextWrapped(BuildFriendlyTextureReason(candidate));
+        }
+    }
+
+    private void DrawMeshOptimizationCandidates(IReadOnlyList<MeshOptimisationCandidate> candidates)
+    {
+        if (candidates.Count == 0)
+        {
+            UiSharedService.TextWrapped("No mesh suggestions to show right now. Run analysis first if this looks unexpected.");
+            return;
+        }
+
+        using var table = ImRaii.Table("##meshOptimizationCandidates", 3, ImGuiTableFlags.RowBg | ImGuiTableFlags.ScrollY | ImGuiTableFlags.SizingStretchProp);
+        if (!table) return;
+
+        ImGui.TableSetupColumn("Triangles", ImGuiTableColumnFlags.WidthFixed, 110f * ImGuiHelpers.GlobalScale);
+        ImGui.TableSetupColumn("Size", ImGuiTableColumnFlags.WidthFixed, 110f * ImGuiHelpers.GlobalScale);
+        ImGui.TableSetupColumn("Reason", ImGuiTableColumnFlags.WidthStretch);
+        ImGui.TableHeadersRow();
+
+        foreach (var candidate in candidates.Take(20))
+        {
+            ImGui.TableNextRow();
+            ImGui.TableNextColumn();
+            ImGui.TextUnformatted(candidate.Triangles.ToString());
+            ImGui.TableNextColumn();
+            ImGui.TextUnformatted(UiSharedService.ByteToString(candidate.OriginalSize));
+            ImGui.TableNextColumn();
+            UiSharedService.TextWrapped(BuildFriendlyMeshReason(candidate));
+        }
+    }
+
+    private string BuildFriendlyTextureReason(TextureOptimisationCandidate candidate)
+    {
+        string root = TryGetModRootName(candidate.FilePaths?.FirstOrDefault() ?? string.Empty);
+        return string.IsNullOrWhiteSpace(root)
+            ? "Worth a look for texture cleanup."
+            : $"Worth a look for texture cleanup inside {root}.";
+    }
+
+    private string BuildFriendlyMeshReason(MeshOptimisationCandidate candidate)
+    {
+        string location = BuildFriendlyMeshLocation(candidate.FilePaths, candidate.GamePaths);
+        return string.IsNullOrWhiteSpace(location)
+            ? "Worth a look for mesh cleanup."
+            : $"Worth a look for mesh cleanup. {location}";
+    }
+
+    private string BuildFriendlyMeshLocation(IReadOnlyList<string> filePaths, IReadOnlyList<string> gamePaths)
+    {
+        string localPath = filePaths?.FirstOrDefault() ?? string.Empty;
+        string gamePath = gamePaths?.FirstOrDefault() ?? string.Empty;
+        string root = TryGetModRootName(localPath);
+        string insidePath = TryGetInsidePath(localPath, gamePath);
+        string itemLabel = TryGetFriendlyItemLabel(insidePath);
+
+        if (!string.IsNullOrWhiteSpace(itemLabel) && !string.IsNullOrWhiteSpace(root))
+            return $"{itemLabel} inside {root}.";
+
+        if (!string.IsNullOrWhiteSpace(itemLabel))
+            return $"{itemLabel}.";
+
+        if (!string.IsNullOrWhiteSpace(root))
+            return $"Inside {root}.";
+
+        return string.Empty;
+    }
+
+    private static string TryGetFriendlyItemLabel(string insidePath)
+    {
+        if (string.IsNullOrWhiteSpace(insidePath))
+            return string.Empty;
+
+        string normalized = insidePath.Replace('\\', '/').ToLowerInvariant();
+
+        if (normalized.Contains("/weapon/"))
+            return "Weapon";
+
+        string fileName = Path.GetFileNameWithoutExtension(normalized);
+        string[] tokens = string.IsNullOrWhiteSpace(fileName)
+            ? Array.Empty<string>()
+            : fileName.Split('_', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+        bool HasToken(params string[] values)
+            => tokens.Any(t => values.Any(v => string.Equals(t, v, StringComparison.OrdinalIgnoreCase)));
+
+        if (normalized.Contains("/accessory/"))
+        {
+            if (HasToken("ear")) return "Earrings";
+            if (HasToken("nek")) return "Necklace";
+            if (HasToken("wrs")) return "Wrists";
+            if (HasToken("rir", "ril")) return "Ring";
+            return "Accessory";
+        }
+
+        if (normalized.Contains("/equipment/"))
+        {
+            if (HasToken("top")) return "Top";
+            if (HasToken("glv")) return "Gloves";
+            if (HasToken("dwn")) return "Bottom";
+            if (HasToken("sho")) return "Shoes";
+            if (HasToken("met")) return "Head";
+            return "Equipment";
+        }
+
+        return string.Empty;
+    }
+
+    private string TryGetModRootName(string localPath)
+    {
+        if (string.IsNullOrWhiteSpace(localPath))
+            return string.Empty;
+
+        string normalized = localPath.Replace('\\', '/').TrimEnd('/');
+        if (string.IsNullOrWhiteSpace(normalized))
+            return string.Empty;
+
+        string? modDirectory = _ipcManager.Penumbra.ModDirectory;
+        if (!string.IsNullOrWhiteSpace(modDirectory))
+        {
+            string normalizedModDirectory = modDirectory.Replace('\\', '/').TrimEnd('/');
+            if (!string.IsNullOrWhiteSpace(normalizedModDirectory))
+            {
+                if (normalized.StartsWith(normalizedModDirectory + "/", StringComparison.OrdinalIgnoreCase))
+                {
+                    string relative = normalized[(normalizedModDirectory.Length + 1)..];
+                    return relative.Split('/', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).FirstOrDefault() ?? string.Empty;
+                }
+
+                if (string.Equals(normalized, normalizedModDirectory, StringComparison.OrdinalIgnoreCase))
+                    return string.Empty;
+            }
+        }
+
+        if (normalized.StartsWith(FileCacheManager.PenumbraPrefix + "/", StringComparison.OrdinalIgnoreCase)
+            || normalized.StartsWith(FileCacheManager.PenumbraPrefix + "\\", StringComparison.OrdinalIgnoreCase))
+        {
+            string relative = normalized[(FileCacheManager.PenumbraPrefix.Length + 1)..];
+            return relative.Split('/', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).FirstOrDefault() ?? string.Empty;
+        }
+
+        int markerIndex = normalized.IndexOf("/chara/", StringComparison.OrdinalIgnoreCase);
+        if (markerIndex > 0)
+        {
+            string before = normalized[..markerIndex].TrimEnd('/');
+            string[] segments = before.Split('/', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            if (segments.Length >= 2)
+                return segments[1];
+
+            if (segments.Length == 1)
+                return segments[0];
+        }
+
+        return string.Empty;
+    }
+
+    private static string TryGetInsidePath(string localPath, string gamePath)
+    {
+        if (!string.IsNullOrWhiteSpace(localPath))
+        {
+            string normalized = localPath.Replace('\\', '/');
+            int markerIndex = normalized.IndexOf("/chara/", StringComparison.OrdinalIgnoreCase);
+            if (markerIndex >= 0)
+                return normalized[(markerIndex + 1)..];
+        }
+
+        if (!string.IsNullOrWhiteSpace(gamePath))
+            return gamePath.Replace('\\', '/');
+
+        return string.Empty;
+    }
+
+    private static string GetFriendlyPriorityLabel(OptimisationTier tier)
+        => tier switch
+        {
+            OptimisationTier.Aggressive => "High",
+            OptimisationTier.Conservative => "Medium",
+            OptimisationTier.Observe => "Low",
+            _ => "None",
+        };
+
+    private static string GetFriendlyObjectLabel(ObjectKind objectKind)
+        => objectKind switch
+        {
+            ObjectKind.Player => "Player",
+            ObjectKind.Pet => "Pet",
+            _ => objectKind.ToString(),
+        };
 
     private bool _showAlreadyAddedTransients = false;
     private bool _acknowledgeReview = false;
@@ -634,12 +1083,10 @@ public class DataAnalysisUi : WindowMediatorSubscriberBase
                     {
                         fileGroupText += " (!)";
                     }
-                    ImRaii.IEndObject fileTab;
-                    using (var textcol = ImRaii.PushColor(ImGuiCol.Text, UiSharedService.Color(new(0, 0, 0, 1)),
-                        requiresCompute && !string.Equals(_selectedFileTypeTab, fileGroup.Key, StringComparison.Ordinal)))
-                    {
-                        fileTab = ImRaii.TabItem(fileGroupText + "###" + fileGroup.Key);
-                    }
+                    var textcol = ImRaii.PushColor(ImGuiCol.Text, UiSharedService.Color(new(0, 0, 0, 1)),
+                        requiresCompute && !string.Equals(_selectedFileTypeTab, fileGroup.Key, StringComparison.Ordinal));
+                    var fileTab = ImRaii.TabItem(fileGroupText + "###" + fileGroup.Key);
+                    textcol.Dispose();
 
                     if (!fileTab) { fileTab.Dispose(); continue; }
 
@@ -680,7 +1127,13 @@ public class DataAnalysisUi : WindowMediatorSubscriberBase
                             if (_texturesToConvert.Count > 0 && _uiSharedService.IconTextButton(FontAwesomeIcon.PlayCircle, _uiSharedService.L("UI.DataAnalysisUi.640d82d9", "Start conversion of ") + _texturesToConvert.Count + _uiSharedService.L("UI.DataAnalysisUi.ef5c7e65", " texture(s)")))
                             {
                                 _conversionCancellationTokenSource = _conversionCancellationTokenSource.CancelRecreate();
-                                _conversionTask = _ipcManager.Penumbra.ConvertTextureFiles(_logger, _texturesToConvert, _conversionProgress, _conversionCancellationTokenSource.Token);
+                                _conversionTask = _textureOptimizationService.RunPlannedOptimizationAsync(
+                                    _logger,
+                                    _texturesToConvert,
+                                    BuildTextureTargetMap(_texturesToConvert.Keys),
+                                    _conversionProgress,
+                                    _conversionCancellationTokenSource.Token,
+                                    BuildTextureModelReferenceMap(_texturesToConvert.Keys, GetAllMeshPrimariesFromCachedAnalysis()));
                             }
                         }
                     }

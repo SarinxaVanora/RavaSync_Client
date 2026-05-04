@@ -1,6 +1,7 @@
 ﻿using FFXIVClientStructs.FFXIV.Client.Game.Character;
 using FFXIVClientStructs.FFXIV.Client.Graphics.Scene;
 using FFXIVClientStructs.Havok.Animation;
+using FFXIVClientStructs.Havok.Common.Base.Math.QsTransform;
 using FFXIVClientStructs.Havok.Common.Base.Types;
 using FFXIVClientStructs.Havok.Common.Serialize.Util;
 using RavaSync.FileCache;
@@ -31,32 +32,33 @@ public sealed class XivDataAnalyzer
         _configService = configService;
     }
 
-    public unsafe Dictionary<string, List<ushort>>? GetSkeletonBoneIndices(GameObjectHandler handler)
+    public unsafe IReadOnlyList<TargetSkeletonSnapshot> GetTargetSkeletonSnapshots(GameObjectHandler handler)
     {
-        if (handler == null) return null;
-        if (handler.Address == nint.Zero) return null;
+        if (handler == null || handler.Address == nint.Zero)
+            return Array.Empty<TargetSkeletonSnapshot>();
 
         var character = (Character*)handler.Address;
-        if (character == null) return null;
+        if (character == null)
+            return Array.Empty<TargetSkeletonSnapshot>();
 
         var drawObject = character->GameObject.DrawObject;
-        if (drawObject == null) return null;
+        if (drawObject == null)
+            return Array.Empty<TargetSkeletonSnapshot>();
 
         var chara = (CharacterBase*)drawObject;
-        if (chara == null) return null;
-
-        if (chara->GetModelType() != CharacterBase.ModelType.Human) return null;
-
-        if (chara->Skeleton == null) return null;
+        if (chara == null || chara->GetModelType() != CharacterBase.ModelType.Human || chara->Skeleton == null)
+            return Array.Empty<TargetSkeletonSnapshot>();
 
         var skeleton = chara->Skeleton;
         var resHandles = skeleton->SkeletonResourceHandles;
-        if (resHandles == null) return null;
+        if (resHandles == null)
+            return Array.Empty<TargetSkeletonSnapshot>();
 
         var partialCount = skeleton->PartialSkeletonCount;
-        if (partialCount <= 0 || partialCount > 64) return null;
+        if (partialCount <= 0 || partialCount > 64)
+            return Array.Empty<TargetSkeletonSnapshot>();
 
-        Dictionary<string, List<ushort>> outputIndices = [];
+        List<TargetSkeletonSnapshot> output = [];
 
         try
         {
@@ -65,30 +67,52 @@ public sealed class XivDataAnalyzer
                 var handle = *(resHandles + i);
                 _logger.LogTrace("Iterating over SkeletonResourceHandle #{i}:{x}", i, ((nint)handle).ToString("X"));
 
-                if ((nint)handle == nint.Zero) continue;
+                if ((nint)handle == nint.Zero)
+                    continue;
 
                 var curBones = handle->BoneCount;
-                if (curBones <= 0 || curBones > 4096) continue;
+                if (curBones <= 0 || curBones > 4096)
+                    continue;
 
-                if (handle->FileName.Length > 1024) continue;
+                if (handle->FileName.Length > 1024 || handle->HavokSkeleton == null)
+                    continue;
 
-                var skeletonName = handle->FileName.ToString();
-                if (string.IsNullOrEmpty(skeletonName)) continue;
+                var resourcePath = handle->FileName.ToString();
+                if (string.IsNullOrWhiteSpace(resourcePath))
+                    continue;
 
-                if (handle->HavokSkeleton == null) continue;
+                var internalSkeletonName = handle->HavokSkeleton->Name.String;
+                var skeletonName = string.IsNullOrWhiteSpace(internalSkeletonName)
+                    ? resourcePath
+                    : internalSkeletonName;
 
-                var list = new List<ushort>((int)curBones);
+                var boneNamesByIndex = new string?[curBones];
+                var boneNameToIndex = new Dictionary<string, short>(StringComparer.OrdinalIgnoreCase);
 
-                for (ushort boneIdx = 0; boneIdx < curBones; boneIdx++)
+                for (short boneIdx = 0; boneIdx < curBones; boneIdx++)
                 {
                     var boneName = handle->HavokSkeleton->Bones[boneIdx].Name.String;
-                    if (boneName == null) continue;
+                    if (string.IsNullOrWhiteSpace(boneName))
+                        continue;
 
-                    list.Add((ushort)(boneIdx + 1));
+                    boneNamesByIndex[boneIdx] = boneName;
+                    boneNameToIndex.TryAdd(boneName, boneIdx);
                 }
 
-                if (list.Count > 0)
-                    outputIndices[skeletonName] = list;
+                hkQsTransformf[] referencePoseByIndex = Array.Empty<hkQsTransformf>();
+                var referencePose = handle->HavokSkeleton->ReferencePose;
+                if (referencePose.Data != null && referencePose.Length > 0 && referencePose.Length <= 4096)
+                {
+                    referencePoseByIndex = new hkQsTransformf[referencePose.Length];
+                    new ReadOnlySpan<hkQsTransformf>(referencePose.Data, referencePose.Length).CopyTo(referencePoseByIndex);
+                }
+
+                output.Add(new TargetSkeletonSnapshot(
+                    resourcePath,
+                    skeletonName,
+                    boneNamesByIndex,
+                    boneNameToIndex,
+                    referencePoseByIndex));
             }
         }
         catch (Exception ex)
@@ -96,12 +120,52 @@ public sealed class XivDataAnalyzer
             _logger.LogWarning(ex, "Could not process skeleton data");
         }
 
-        return (outputIndices.Count != 0 && outputIndices.Values.All(u => u.Count > 0)) ? outputIndices : null;
+        return output;
+    }
+
+    public unsafe Dictionary<string, List<ushort>>? GetSkeletonBoneIndices(GameObjectHandler handler)
+    {
+        var snapshots = GetTargetSkeletonSnapshots(handler);
+        if (snapshots.Count == 0)
+            return null;
+
+        Dictionary<string, List<ushort>> outputIndices = new(StringComparer.OrdinalIgnoreCase);
+        foreach (var snapshot in snapshots)
+        {
+            if (snapshot.BoneCount <= 0)
+                continue;
+
+            var list = new List<ushort>(snapshot.BoneCount);
+            for (ushort boneIdx = 0; boneIdx < snapshot.BoneCount; boneIdx++)
+                list.Add((ushort)(boneIdx + 1));
+
+            outputIndices[snapshot.ResourcePath] = list;
+        }
+
+        return outputIndices.Count > 0 ? outputIndices : null;
+    }
+
+    private static bool LooksLikeSupportedPapHavokPayload(byte[] havokData)
+    {
+        if (havokData.Length < 32)
+            return false;
+
+        ReadOnlySpan<byte> tagfileSignature = stackalloc byte[] { 0x1E, 0x0D, 0xB0, 0xCA, 0xCE, 0xFA, 0x11, 0xD0 };
+        if (!havokData.AsSpan(0, tagfileSignature.Length).SequenceEqual(tagfileSignature))
+            return false;
+
+        for (int i = 0; i <= Math.Min(havokData.Length - 3, 64); i++)
+        {
+            if (havokData[i] == (byte)'h' && havokData[i + 1] == (byte)'k' && havokData[i + 2] == (byte)'_')
+                return true;
+        }
+
+        return false;
     }
 
     public unsafe Dictionary<string, List<ushort>>? GetBoneIndicesFromPap(string hash)
     {
-        if (_configService.Current.BonesDictionary.TryGetValue(hash, out var bones)) return bones;
+        if (_configService.Current.BonesDictionary.TryGetValue(hash, out var bones) && bones.Count > 0) return bones;
 
         var output = new Dictionary<string, List<ushort>>(StringComparer.OrdinalIgnoreCase);
 
@@ -126,27 +190,30 @@ public sealed class XivDataAnalyzer
             var streamLen = reader.BaseStream.Length;
             if (streamLen < 64) return output;
 
-            reader.ReadInt32();
-            reader.ReadInt32();
-            reader.ReadInt16();
-            reader.ReadInt16();
+            if (reader.ReadUInt32() != 0x20706170) return output;
+
+            reader.ReadUInt16();
+            reader.ReadUInt16();
+            reader.ReadUInt16();
+            reader.ReadUInt16();
 
             var type = reader.ReadByte();
             // We only validate human-style PAP for player safety.
             if (type != 0) return output;
 
             reader.ReadByte();
-            reader.ReadInt32();
 
+            var headerSize = reader.ReadInt32();
             var havokPosition = reader.ReadInt32();
             var footerPosition = reader.ReadInt32();
 
+            if (headerSize <= 0 || headerSize > havokPosition) return output;
             if (havokPosition <= 0 || footerPosition <= 0) return output;
             if (footerPosition <= havokPosition) return output;
             if (havokPosition >= streamLen || footerPosition > streamLen) return output;
 
             var havokDataSize = footerPosition - havokPosition;
-            if (havokDataSize <= 8) return output;
+            if (havokDataSize <= 32) return output;
 
             const int maxHavokBytes = 32 * 1024 * 1024;
             if (havokDataSize > maxHavokBytes) return output;
@@ -155,7 +222,7 @@ public sealed class XivDataAnalyzer
             var havokData = reader.ReadBytes(havokDataSize);
             if (havokData.Length != havokDataSize) return output;
 
-            if (havokData.Length < 16)
+            if (!LooksLikeSupportedPapHavokPayload(havokData))
                 return output;
 
             var tempHavokDataPath = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName()) + ".hkx";
@@ -230,22 +297,33 @@ public sealed class XivDataAnalyzer
         }
         finally
         {
-            // Cache even failures (empty) to avoid repeatedly hitting Havok for the same hash.
-            _configService.Current.BonesDictionary[hash] = output;
-            _configService.Save();
+            if (output.Count > 0)
+            {
+                _configService.Current.BonesDictionary[hash] = output;
+                _configService.Save();
+            }
         }
     }
 
     public async Task<long> GetTrianglesByHash(string hash)
     {
+        if (string.IsNullOrWhiteSpace(hash))
+            return 0;
+
+        var path = _fileCacheManager.GetFileCacheByHash(hash);
+        if (path == null
+            || string.IsNullOrWhiteSpace(path.ResolvedFilepath)
+            || !path.ResolvedFilepath.EndsWith(".mdl", StringComparison.OrdinalIgnoreCase))
+        {
+            _configService.Current.TriangleDictionary.TryRemove(hash, out _);
+            _failedCalculatedTris.Remove(hash);
+            return 0;
+        }
+
         if (_configService.Current.TriangleDictionary.TryGetValue(hash, out var cachedTris) && cachedTris > 0)
             return cachedTris;
 
         if (_failedCalculatedTris.Contains(hash))
-            return 0;
-
-        var path = _fileCacheManager.GetFileCacheByHash(hash);
-        if (path == null || !path.ResolvedFilepath.EndsWith(".mdl", StringComparison.OrdinalIgnoreCase))
             return 0;
 
         var filePath = path.ResolvedFilepath;

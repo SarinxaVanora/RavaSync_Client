@@ -15,5 +15,6 @@ public class PlayerPerformanceConfig : IMareConfiguration
     public List<string> UIDsToIgnore { get; set; } = new();
     public int SyncshellVramCapMiB { get; set; } = 0;
     public bool AutoPauseWhileInCombat { get; set; } = false;
+    public bool UnpauseThresholdAutoPausedPairsOnConnect { get; set; } = false;
 
 }

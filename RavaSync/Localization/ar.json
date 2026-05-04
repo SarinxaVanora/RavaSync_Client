@@ -1578,5 +1578,7 @@
   "UI.VenueRegistrationUi.567b566d": "اسم Venue:",
   "UI.VenueRegistrationUi.77dfd213": "إلغاء",
   "UI.VenueRegistrationUi.a6a95932": "اربط هذا الـ plot بإحدى Syncshells الخاصة بك.",
-  "UI.VenueRegistrationUi.fac9bd39": "لم يتم تطبيق بيانات"
+  "UI.VenueRegistrationUi.fac9bd39": "لم يتم تطبيق بيانات",
+  "UI.DrawUserPair.RedrawTarget": "Redraw target",
+  "UI.DrawUserPair.RedrawTarget.Tooltip": "Executes a Penumbra redraw on this visible target."
 }

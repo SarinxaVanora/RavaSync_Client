@@ -1,4 +1,4 @@
-﻿using Dalamud.Game.ClientState.Objects.Types;
+using Dalamud.Game.ClientState.Objects.Types;
 using RavaSync.PlayerData.Handlers;
 using RavaSync.Services;
 using RavaSync.Services.Mediator;
@@ -33,6 +33,7 @@ public class RedrawManager : IMediatorSubscriber
         public required Action<ICharacter> Action;
         public required TaskCompletionSource<bool> Tcs;
         public required CancellationToken Token;
+        public bool IsExplicitRedraw;
     }
 
     public MareMediator Mediator => _mareMediator;
@@ -77,7 +78,7 @@ public class RedrawManager : IMediatorSubscriber
         return false;
     }
 
-    public async Task ExternalPenumbraRedrawAsync(ILogger logger, ICharacter character, Guid applicationId, Action<ICharacter> action, CancellationToken token)
+    public async Task ExternalPenumbraRedrawAsync(ILogger logger, ICharacter character, Guid applicationId, Action<ICharacter> action, CancellationToken token, bool isExplicitRedraw = false)
     {
         if (character == null) return;
 
@@ -86,7 +87,7 @@ public class RedrawManager : IMediatorSubscriber
 
         if (TryGetHandler(addr, out var handler))
         {
-            await PenumbraRedrawInternalAsync(logger, handler, applicationId, action, token).ConfigureAwait(false);
+            await PenumbraRedrawInternalAsync(logger, handler, applicationId, action, token, isExplicitRedraw).ConfigureAwait(false);
             return;
         }
         await _dalamudUtil.RunOnFrameworkThread(() =>
@@ -107,8 +108,22 @@ public class RedrawManager : IMediatorSubscriber
     public Task PenumbraAfterGPoseAsync(ILogger logger, ICharacter character, Guid applicationId, Action<ICharacter> action, CancellationToken token)
         => ExternalPenumbraRedrawAsync(logger, character, applicationId, action, token);
 
+    public bool TryConsumeRequestedRedraw(nint address)
+    {
+        if (address == nint.Zero)
+            return false;
 
-    public async Task PenumbraRedrawInternalAsync(ILogger logger, GameObjectHandler handler, Guid applicationId, Action<ICharacter> action, CancellationToken token)
+        if (_penumbraRedrawRequests.TryGetValue(address, out var requested) && requested)
+        {
+            _penumbraRedrawRequests[address] = false;
+            return true;
+        }
+
+        return false;
+    }
+
+
+    public async Task<bool> PenumbraRedrawInternalAsync(ILogger logger, GameObjectHandler handler, Guid applicationId, Action<ICharacter> action, CancellationToken token, bool isExplicitRedraw = false)
     {
         var queue = _redrawQueues.GetOrAdd(handler.Address, _ => new RedrawQueue());
 
@@ -123,7 +138,8 @@ public class RedrawManager : IMediatorSubscriber
             ApplicationId = applicationId,
             Action = action,
             Tcs = tcs,
-            Token = token
+            Token = token,
+            IsExplicitRedraw = isExplicitRedraw
         });
 
         if (Interlocked.CompareExchange(ref queue.RunnerActive, 1, 0) == 0)
@@ -131,7 +147,7 @@ public class RedrawManager : IMediatorSubscriber
             _ = Task.Run(() => ProcessQueueAsync(handler.Address, queue));
         }
 
-        await tcs.Task.ConfigureAwait(false);
+        return await tcs.Task.ConfigureAwait(false);
     }
 
     private async Task ProcessQueueAsync(nint address, RedrawQueue queue)
@@ -165,14 +181,23 @@ public class RedrawManager : IMediatorSubscriber
                     localTimeout.CancelAfter(TimeSpan.FromSeconds(15));
                     var linkedToken = linked.Token;
 
+                    var actionRan = false;
                     await handler.ActOnFrameworkAfterEnsureNoDrawAsync(chara =>
                     {
+                        actionRan = true;
+                        WorkItem? explicitRedrawToRun = null;
                         foreach (var wi in batch)
+                        {
+                            if (wi.IsExplicitRedraw && !wi.Tcs.Task.IsCompleted && !wi.Token.IsCancellationRequested)
+                                explicitRedrawToRun = wi;
+                        }
+
+                        void RunWorkItem(WorkItem wi)
                         {
                             if (wi.Tcs.Task.IsCompleted || wi.Token.IsCancellationRequested)
                             {
                                 wi.Tcs.TrySetCanceled(wi.Token);
-                                continue;
+                                return;
                             }
 
                             try
@@ -186,9 +211,41 @@ public class RedrawManager : IMediatorSubscriber
                                 wi.Tcs.TrySetResult(false);
                             }
                         }
+
+                        foreach (var wi in batch)
+                        {
+                            if (wi.IsExplicitRedraw)
+                                continue;
+
+                            RunWorkItem(wi);
+                        }
+
+                        if (explicitRedrawToRun != null)
+                            RunWorkItem(explicitRedrawToRun);
+
+                        foreach (var wi in batch)
+                        {
+                            if (!wi.IsExplicitRedraw || ReferenceEquals(wi, explicitRedrawToRun) || wi.Tcs.Task.IsCompleted)
+                                continue;
+
+                            if (wi.Token.IsCancellationRequested)
+                                wi.Tcs.TrySetCanceled(wi.Token);
+                            else
+                                wi.Tcs.TrySetResult(false);
+                        }
                     }, linkedToken).ConfigureAwait(false);
 
-                    if (!_disposalCts.IsCancellationRequested)
+                    if (!actionRan)
+                    {
+                        logger.LogTrace("[{appid}] Redraw batch for addr {addr} did not resolve a character; marking items as not fired", applicationId, address);
+                        foreach (var wi in batch)
+                        {
+                            if (!wi.Tcs.Task.IsCompleted)
+                                wi.Tcs.TrySetResult(false);
+                        }
+                    }
+
+                    if (!_disposalCts.IsCancellationRequested && actionRan)
                     {
                         await _dalamudUtil
                             .WaitWhileCharacterIsDrawing(logger, handler, applicationId, 15000, linkedToken)
@@ -201,6 +258,16 @@ public class RedrawManager : IMediatorSubscriber
 
                     foreach (var wi in batch)
                         wi.Tcs.TrySetCanceled();
+                }
+                catch (Exception ex)
+                {
+                    logger.LogDebug(ex, "[{appid}] Penumbra redraw batch failed for addr {addr}", applicationId, address);
+
+                    foreach (var wi in batch)
+                    {
+                        if (!wi.Tcs.Task.IsCompleted)
+                            wi.Tcs.TrySetResult(false);
+                    }
                 }
                 finally
                 {

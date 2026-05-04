@@ -1578,5 +1578,7 @@
   "UI.VenueRegistrationUi.567b566d": "Venue-Name:",
   "UI.VenueRegistrationUi.77dfd213": "Abbrechen",
   "UI.VenueRegistrationUi.a6a95932": "Verknüpfe diesen Plot mit einer deiner Syncshells.",
-  "UI.VenueRegistrationUi.fac9bd39": "Keine Daten angewendet"
+  "UI.VenueRegistrationUi.fac9bd39": "Keine Daten angewendet",
+  "UI.DrawUserPair.RedrawTarget": "Redraw target",
+  "UI.DrawUserPair.RedrawTarget.Tooltip": "Executes a Penumbra redraw on this visible target."
 }

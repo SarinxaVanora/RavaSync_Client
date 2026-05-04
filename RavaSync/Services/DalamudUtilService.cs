@@ -79,7 +79,7 @@ public class DalamudUtilService : IHostedService, IMediatorSubscriber
     private int _playerCharaScanId = 0;
     private DateTime _nextPlayerCharaScan = DateTime.MinValue;
     private DateTime _nextPlayerCharaPrune = DateTime.MinValue;
-    private static readonly TimeSpan _playerCharaScanInterval = TimeSpan.FromMilliseconds(250);
+    private static readonly TimeSpan _playerCharaScanInterval = TimeSpan.FromMilliseconds(350);
     private static readonly TimeSpan _playerCharaPruneInterval = TimeSpan.FromSeconds(2);
 
 
@@ -248,6 +248,7 @@ public class DalamudUtilService : IHostedService, IMediatorSubscriber
     public bool IsLoggedIn { get; private set; }
     public bool IsOnFrameworkThread => _framework.IsInFrameworkUpdateThread;
     public bool IsZoning => _condition[ConditionFlag.BetweenAreas] || _condition[ConditionFlag.BetweenAreas51];
+    public bool IsInCombat { get; private set; } = false;
     public bool IsInCombatOrPerforming { get; private set; } = false;
     public bool HasModifiedGameFiles => _gameData.HasModifiedGameDataFiles;
     public uint ClassJobId => _classJobId!.Value;
@@ -280,7 +281,7 @@ public class DalamudUtilService : IHostedService, IMediatorSubscriber
     {
         EnsureIsOnFramework();
         var objTableObj = _objectTable[index];
-        if (objTableObj!.ObjectKind != Dalamud.Game.ClientState.Objects.Enums.ObjectKind.Player) return null;
+        if (objTableObj!.ObjectKind != Dalamud.Game.ClientState.Objects.Enums.ObjectKind.Pc) return null;
         return (ICharacter)objTableObj;
     }
 
@@ -312,13 +313,13 @@ public class DalamudUtilService : IHostedService, IMediatorSubscriber
 
     public IEnumerable<ICharacter?> GetGposeCharactersFromObjectTable()
     {
-        return _objectTable.Where(o => o.ObjectIndex > 200 && o.ObjectKind == Dalamud.Game.ClientState.Objects.Enums.ObjectKind.Player).Cast<ICharacter>();
+        return _objectTable.Where(o => o.ObjectIndex > 200 && o.ObjectKind == Dalamud.Game.ClientState.Objects.Enums.ObjectKind.Pc).Cast<ICharacter>();
     }
 
     public bool GetIsPlayerPresent()
     {
         EnsureIsOnFramework();
-        return _clientState.LocalPlayer != null && _clientState.LocalPlayer.IsValid();
+        return _objectTable.LocalPlayer != null && _objectTable.LocalPlayer.IsValid();
     }
 
     public async Task<bool> GetIsPlayerPresentAsync()
@@ -331,7 +332,49 @@ public class DalamudUtilService : IHostedService, IMediatorSubscriber
         EnsureIsOnFramework();
         playerPointer ??= GetPlayerPtr();
         if (playerPointer == IntPtr.Zero) return IntPtr.Zero;
-        return _objectTable.GetObjectAddress(((GameObject*)playerPointer)->ObjectIndex + 1);
+
+        var playerCharacter = (Character*)playerPointer;
+        if (playerCharacter == null) return IntPtr.Zero;
+
+        var companionObject = (IntPtr)playerCharacter->CompanionObject;
+        if (IsOwnedMinionOrMount(playerPointer.Value, companionObject)) return companionObject;
+
+        var playerObject = (GameObject*)playerPointer;
+        if (playerObject == null) return IntPtr.Zero;
+
+        var startIndex = Math.Max(0, playerObject->ObjectIndex + 1);
+        var endIndex = Math.Min(199, playerObject->ObjectIndex + 8);
+        for (var idx = startIndex; idx <= endIndex; idx++)
+        {
+            var candidate = _objectTable.GetObjectAddress(idx);
+            if (IsOwnedMinionOrMount(playerPointer.Value, candidate)) return candidate;
+        }
+
+        for (var idx = 0; idx < 200; idx++)
+        {
+            var candidate = _objectTable.GetObjectAddress(idx);
+            if (IsOwnedMinionOrMount(playerPointer.Value, candidate)) return candidate;
+        }
+
+        return IntPtr.Zero;
+    }
+
+    private static unsafe bool IsOwnedMinionOrMount(IntPtr playerPointer, IntPtr candidate)
+    {
+        if (playerPointer == IntPtr.Zero || candidate == IntPtr.Zero || candidate == playerPointer) return false;
+
+        try
+        {
+            var candidateCharacter = (Character*)candidate;
+            if (candidateCharacter == null) return false;
+
+            var parent = candidateCharacter->GetParentCharacter();
+            return (IntPtr)parent == playerPointer;
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     public async Task<IntPtr> GetMinionOrMountAsync(IntPtr? playerPointer = null)
@@ -362,25 +405,99 @@ public class DalamudUtilService : IHostedService, IMediatorSubscriber
     public IPlayerCharacter GetPlayerCharacter()
     {
         EnsureIsOnFramework();
-        return _clientState.LocalPlayer!;
+        return _objectTable.LocalPlayer!;
+    }
+
+    public unsafe string? GetIdentFromAddress(nint address)
+    {
+        EnsureIsOnFramework();
+
+        if (address == nint.Zero)
+            return null;
+
+        try
+        {
+            var gameObject = (GameObject*)address;
+            if (gameObject == null || gameObject->ObjectKind != ObjectKind.Pc)
+                return null;
+
+            var cid = ((BattleChara*)address)->Character.ContentId;
+            if (cid == 0)
+                return null;
+
+            if (!_cidHashCache.TryGetValue(cid, out var ident))
+            {
+                ident = cid.GetHash256();
+
+                if (_cidHashCache.Count > _cidHashCacheMax)
+                    _cidHashCache.Clear();
+
+                _cidHashCache[cid] = ident;
+            }
+
+            return string.IsNullOrEmpty(ident) ? null : ident;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    public bool AddressMatchesPlayerIdent(string? characterIdent, nint address)
+    {
+        EnsureIsOnFramework();
+
+        if (string.IsNullOrEmpty(characterIdent) || address == nint.Zero)
+            return false;
+
+        var liveIdent = GetIdentFromAddress(address);
+        return !string.IsNullOrEmpty(liveIdent) && string.Equals(liveIdent, characterIdent, StringComparison.Ordinal);
     }
 
     public IntPtr GetPlayerCharacterFromCachedTableByIdent(string characterName)
     {
-        if (_playerCharas.TryGetValue(characterName, out var pchar)) return pchar.Address;
+        EnsureIsOnFramework();
+
+        if (_playerCharas.TryGetValue(characterName, out var pchar) && pchar.Address != nint.Zero
+            && AddressMatchesPlayerIdent(characterName, pchar.Address))
+        {
+            return pchar.Address;
+        }
+
         return IntPtr.Zero;
+    }
+
+    public nint ResolvePlayerAddress(string? characterIdent, nint fallbackAddress = 0)
+    {
+        EnsureIsOnFramework();
+
+        if (!string.IsNullOrEmpty(characterIdent)
+            && _playerCharas.TryGetValue(characterIdent, out var pchar)
+            && pchar.Address != nint.Zero
+            && AddressMatchesPlayerIdent(characterIdent, pchar.Address))
+        {
+            return pchar.Address;
+        }
+
+        if (!string.IsNullOrEmpty(characterIdent)
+            && fallbackAddress != nint.Zero
+            && AddressMatchesPlayerIdent(characterIdent, fallbackAddress))
+        {
+            return fallbackAddress;
+        }
+
+        return nint.Zero;
     }
 
     public unsafe IntPtr GetGameObjectAddressByEntityId(uint entityId)
     {
         EnsureIsOnFramework();
 
-        // Scan the object table; you already do similar loops elsewhere
         for (int i = 0; i < 200; i++)
         {
             var obj = _objectTable[i];
             if (obj == null) continue;
-            if (obj.ObjectKind != Dalamud.Game.ClientState.Objects.Enums.ObjectKind.Player)
+            if (obj.ObjectKind != Dalamud.Game.ClientState.Objects.Enums.ObjectKind.Pc)
                 continue;
 
             var gameObj = (GameObject*)obj.Address;
@@ -404,7 +521,7 @@ public class DalamudUtilService : IHostedService, IMediatorSubscriber
     public string GetPlayerName()
     {
         EnsureIsOnFramework();
-        return _clientState.LocalPlayer?.Name.ToString() ?? "--";
+        return _objectTable.LocalPlayer?.Name.ToString() ?? "--";
     }
 
     public async Task<string> GetPlayerNameAsync()
@@ -437,7 +554,7 @@ public class DalamudUtilService : IHostedService, IMediatorSubscriber
     public IntPtr GetPlayerPtr()
     {
         EnsureIsOnFramework();
-        return _clientState.LocalPlayer?.Address ?? IntPtr.Zero;
+        return _objectTable.LocalPlayer?.Address ?? IntPtr.Zero;
     }
 
     public async Task<IntPtr> GetPlayerPointerAsync()
@@ -448,13 +565,13 @@ public class DalamudUtilService : IHostedService, IMediatorSubscriber
     public uint GetHomeWorldId()
     {
         EnsureIsOnFramework();
-        return _clientState.LocalPlayer?.HomeWorld.RowId ?? 0;
+        return _objectTable.LocalPlayer?.HomeWorld.RowId ?? 0;
     }
 
     public uint GetWorldId()
     {
         EnsureIsOnFramework();
-        return _clientState.LocalPlayer!.CurrentWorld.RowId;
+        return _objectTable.LocalPlayer!.CurrentWorld.RowId;
     }
 
     public unsafe LocationInfo GetMapData()
@@ -463,27 +580,12 @@ public class DalamudUtilService : IHostedService, IMediatorSubscriber
         var agentMap = AgentMap.Instance();
         var houseMan = HousingManager.Instance();
         uint serverId = 0;
-        if (_clientState.LocalPlayer == null) serverId = 0;
-        else serverId = _clientState.LocalPlayer.CurrentWorld.RowId;
+        if (_objectTable.LocalPlayer == null) serverId = 0;
+        else serverId = _objectTable.LocalPlayer.CurrentWorld.RowId;
         uint mapId = agentMap == null ? 0 : agentMap->CurrentMapId;
         uint territoryId = agentMap == null ? 0 : agentMap->CurrentTerritoryId;
         uint divisionId = houseMan == null ? 0 : (uint)(houseMan->GetCurrentDivision());
         uint wardId = houseMan == null ? 0 : (uint)(houseMan->GetCurrentWard() + 1);
-        //uint houseId = 0;
-        //var tempHouseId = houseMan == null ? 0 : (houseMan->GetCurrentPlot());
-        //if (!houseMan->IsInside()) tempHouseId = 0;
-        //if (tempHouseId < -1)
-        //{
-        //    divisionId = tempHouseId == -127 ? 2 : (uint)1;
-        //    tempHouseId = 100;
-        //}
-        //if (tempHouseId == -1) tempHouseId = 0;
-        //houseId = (uint)tempHouseId;
-        //if (houseId != 0)
-        //{
-        //    territoryId = HousingManager.GetOriginalHouseTerritoryTypeId();
-        //}
-        //uint roomId = houseMan == null ? 0 : (uint)(houseMan->GetCurrentRoom());
 
         uint houseId = 0;
         var tempHouseId = houseMan == null ? 0 : (houseMan->GetCurrentPlot());
@@ -577,7 +679,6 @@ public class DalamudUtilService : IHostedService, IMediatorSubscriber
             return;
         }
 
-        // Fast path: no perf logging, no extra allocations.
         if (_framework.IsInFrameworkUpdateThread)
         {
             act();
@@ -608,7 +709,6 @@ public class DalamudUtilService : IHostedService, IMediatorSubscriber
                 }).ConfigureAwait(false);
         }
 
-        // Fast path: no perf logging, no extra allocations.
         if (_framework.IsInFrameworkUpdateThread)
             return func.Invoke();
 
@@ -621,7 +721,7 @@ public class DalamudUtilService : IHostedService, IMediatorSubscriber
         _framework.Update += FrameworkOnUpdate;
         if (IsLoggedIn)
         {
-            _classJobId = _clientState.LocalPlayer!.ClassJob.RowId;
+            _classJobId = _objectTable.LocalPlayer!.ClassJob.RowId;
         }
 
         _logger.LogInformation("Started DalamudUtilService");
@@ -642,9 +742,9 @@ public class DalamudUtilService : IHostedService, IMediatorSubscriber
         if (!_clientState.IsLoggedIn) return;
 
         var token = ct ?? CancellationToken.None;
-        const int tick = 250;
+        const int tick = 50;
         var curWaitTime = 0;
-        var nextLogAtMs = 1000; // log at most once per second
+        var nextLogAtMs = 1000;
 
         try
         {
@@ -699,7 +799,7 @@ public class DalamudUtilService : IHostedService, IMediatorSubscriber
     {
         Thread.Sleep(500);
         var obj = (GameObject*)characterAddress;
-        const int tick = 250;
+        const int tick = 50;
         int curWaitTime = 0;
         _logger.LogTrace("RenderFlags: {flags}", obj->RenderFlags.ToString("X"));
         while (obj->RenderFlags != 0x00 && curWaitTime < timeOut)
@@ -746,12 +846,27 @@ public class DalamudUtilService : IHostedService, IMediatorSubscriber
 
     internal (string Name, nint Address) FindPlayerByNameHash(string ident)
     {
-        if (_playerCharas.TryGetValue(ident, out var info))
+        EnsureIsOnFramework();
+
+        if (_playerCharas.TryGetValue(ident, out var info)
+            && info.Address != nint.Zero
+            && AddressMatchesPlayerIdent(ident, info.Address))
+        {
             return (info.Name, info.Address);
+        }
 
         return default;
     }
 
+
+    private void ClearPlayerCharaCacheForZoneSwitch()
+    {
+        _playerCharas.Clear();
+        _identByAddress.Clear();
+        _addressBySessionId.Clear();
+        _nextPlayerCharaScan = DateTime.MinValue;
+        _nextPlayerCharaPrune = DateTime.MinValue;
+    }
 
     private void UpdatePlayerCharaCache()
     {
@@ -799,7 +914,6 @@ public class DalamudUtilService : IHostedService, IMediatorSubscriber
 
                 _identByAddress[chara.Address] = hash;
 
-                // Precompute session id mapping so UI doesn’t do N^2 scans every frame
                 var sid = RavaSync.Services.Discovery.RavaSessionId.FromIdent(hash);
                 if (!string.IsNullOrEmpty(sid))
                     _addressBySessionId[sid] = chara.Address;
@@ -904,7 +1018,7 @@ public class DalamudUtilService : IHostedService, IMediatorSubscriber
 
     private unsafe void FrameworkOnUpdateInternal()
     {
-        if ((_clientState.LocalPlayer?.IsDead ?? false) && _condition[ConditionFlag.BoundByDuty])
+        if ((_objectTable.LocalPlayer?.IsDead ?? false) && _condition[ConditionFlag.BoundByDuty])
         {
             return;
         }
@@ -940,14 +1054,19 @@ public class DalamudUtilService : IHostedService, IMediatorSubscriber
                 Mediator.Publish(new GposeEndMessage());
             }
 
-            if ((_condition[ConditionFlag.Performing] || _condition[ConditionFlag.InCombat]) && !IsInCombatOrPerforming)
+            var isPerforming = _condition[ConditionFlag.Performing];
+            var isInCombat = _condition[ConditionFlag.InCombat];
+
+            IsInCombat = isInCombat;
+
+            if ((isPerforming || isInCombat) && !IsInCombatOrPerforming)
             {
                 _logger.LogDebug("Combat/Performance start");
                 IsInCombatOrPerforming = true;
                 Mediator.Publish(new CombatOrPerformanceStartMessage());
                 Mediator.Publish(new HaltScanMessage(nameof(IsInCombatOrPerforming)));
             }
-            else if ((!_condition[ConditionFlag.Performing] && !_condition[ConditionFlag.InCombat]) && IsInCombatOrPerforming)
+            else if ((!isPerforming && !isInCombat) && IsInCombatOrPerforming)
             {
                 _logger.LogDebug("Combat/Performance end");
                 IsInCombatOrPerforming = false;
@@ -980,18 +1099,20 @@ public class DalamudUtilService : IHostedService, IMediatorSubscriber
             if (_condition[ConditionFlag.BetweenAreas] || _condition[ConditionFlag.BetweenAreas51])
             {
                 var zone = _clientState.TerritoryType;
-                
+
                 if (_lastZone != zone)
                 {
-                    _lastZone = zone;
-                    CurrentTerritoryId = _clientState.TerritoryType;
-                    if (!_sentBetweenAreas)
-                    {
-                        _logger.LogDebug("Zone switch start");
-                        _sentBetweenAreas = true;
-                        Mediator.Publish(new ZoneSwitchStartMessage());
-                        Mediator.Publish(new HaltScanMessage(nameof(ConditionFlag.BetweenAreas)));
-                    }
+                    _lastZone = (ushort)zone;
+                    CurrentTerritoryId = zone;
+                }
+
+                if (!_sentBetweenAreas)
+                {
+                    _logger.LogDebug("Zone switch start for territory {territory}", zone);
+                    _sentBetweenAreas = true;
+                    ClearPlayerCharaCacheForZoneSwitch();
+                    Mediator.Publish(new ZoneSwitchStartMessage());
+                    Mediator.Publish(new HaltScanMessage(nameof(ConditionFlag.BetweenAreas)));
                 }
 
                 return;
@@ -999,13 +1120,21 @@ public class DalamudUtilService : IHostedService, IMediatorSubscriber
 
             if (_sentBetweenAreas)
             {
-                _logger.LogDebug("Zone switch end");
+                var zone = _clientState.TerritoryType;
+                if (_lastZone != zone)
+                {
+                    _lastZone = (ushort)zone;
+                    CurrentTerritoryId = zone;
+                }
+
+                _logger.LogDebug("Zone switch end for territory {territory}", zone);
                 _sentBetweenAreas = false;
+                ClearPlayerCharaCacheForZoneSwitch();
                 Mediator.Publish(new ZoneSwitchEndMessage());
                 Mediator.Publish(new ResumeScanMessage(nameof(ConditionFlag.BetweenAreas)));
             }
 
-            var localPlayer = _clientState.LocalPlayer;
+            var localPlayer = _objectTable.LocalPlayer;
             var clientLoggedIn = _clientState.IsLoggedIn;
 
             if (!clientLoggedIn && IsLoggedIn)
@@ -1018,7 +1147,7 @@ public class DalamudUtilService : IHostedService, IMediatorSubscriber
             {
                 _logger.LogDebug("Logged in");
                 IsLoggedIn = true;
-                _lastZone = _clientState.TerritoryType;
+                _lastZone = (ushort)_clientState.TerritoryType;
                 _cid = RebuildCID();
                 Mediator.Publish(new DalamudLoginMessage());
             }
@@ -1060,7 +1189,7 @@ public class DalamudUtilService : IHostedService, IMediatorSubscriber
         address = null!;
         denyReason = string.Empty;
 
-        var map = GetMapData(); // your existing location info
+        var map = GetMapData();
         bool isInterior = map.HouseId != 0 || map.RoomId != 0;
         if (!isInterior)
         {
@@ -1094,7 +1223,6 @@ public class DalamudUtilService : IHostedService, IMediatorSubscriber
             return false;
         }
 
-        // Basic kind inference
         string areaKind = (map.HouseId != 0 && map.RoomId == 0) ? "EstateInterior"
             : (map.HouseId == 0 && map.RoomId != 0) ? "ApartmentRoom"
             : "FreeCompanyRoom";
@@ -1122,7 +1250,10 @@ public class DalamudUtilService : IHostedService, IMediatorSubscriber
         if (gameObject == null || gameObject.Address == IntPtr.Zero)
             return null;
 
-        return _identByAddress.TryGetValue(gameObject.Address, out var ident) ? ident : null;
+        if (_identByAddress.TryGetValue(gameObject.Address, out var ident) && !string.IsNullOrEmpty(ident))
+            return ident;
+
+        return GetIdentFromAddress(gameObject.Address);
     }
 
     public IGameObject? GetGameObjectBySessionId(string sessionId)

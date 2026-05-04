@@ -8,6 +8,7 @@ using RavaSync.WebAPI;
 using Microsoft.Extensions.Logging;
 using System;
 using System.Linq;
+using System.Threading;
 
 namespace RavaSync.Services;
 
@@ -30,6 +31,7 @@ public sealed class VenueRegistrationService : IDisposable
     private DateTime _nextPollUtc = DateTime.MinValue;
     private string _lastKey = string.Empty;
     private DateTime _lastUiOpenUtc = DateTime.MinValue;
+    private int _lookupInFlight;
 
     public VenueRegistrationService(
         ILogger<VenueRegistrationService> logger,
@@ -72,6 +74,9 @@ public sealed class VenueRegistrationService : IDisposable
 
         if (_cfg.Current.VenueAskSuppressKeys.Contains(addr.CanonicalKey)) return;
 
+        if (Interlocked.Exchange(ref _lookupInFlight, 1) != 0)
+            return;
+
         try
         {
             // If linked, invite service handles join UI
@@ -99,6 +104,10 @@ public sealed class VenueRegistrationService : IDisposable
         catch (Exception ex)
         {
             _log.LogWarning(ex, "VenueRegistrationService polling failed");
+        }
+        finally
+        {
+            Interlocked.Exchange(ref _lookupInFlight, 0);
         }
     }
 }

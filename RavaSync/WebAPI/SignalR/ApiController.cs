@@ -193,7 +193,7 @@ public sealed partial class ApiController : DisposableMediatorSubscriberBase, IM
             }
         }
 
-        await StopConnectionAsync(ServerState.Disconnected).ConfigureAwait(false);
+        await StopConnectionAsync(ServerState.Disconnected, waitForHubDispose: true).ConfigureAwait(false);
 
         Logger.LogInformation("Recreating Connection");
         Mediator.Publish(new EventMessage(new Services.Events.Event(nameof(ApiController), Services.Events.EventSeverity.Informational,
@@ -207,7 +207,7 @@ public sealed partial class ApiController : DisposableMediatorSubscriberBase, IM
         {
             AuthFailureMessage = string.Empty;
 
-            await StopConnectionAsync(ServerState.Disconnected).ConfigureAwait(false);
+            await StopConnectionAsync(ServerState.Disconnected, waitForHubDispose: true).ConfigureAwait(false);
             ServerState = ServerState.Connecting;
 
             try
@@ -340,32 +340,63 @@ public sealed partial class ApiController : DisposableMediatorSubscriberBase, IM
     public Task CyclePauseAsync(UserData userData)
     {
         CancellationTokenSource cts = new();
-        cts.CancelAfter(TimeSpan.FromSeconds(5));
+        cts.CancelAfter(TimeSpan.FromSeconds(8));
 
         _ = Task.Run(async () =>
         {
-            var pair = _pairManager.PairsWithGroups.Keys
-                .FirstOrDefault(p => string.Equals(p.UserData.UID, userData.UID, StringComparison.Ordinal));
-
-            if (pair == null)
+            try
             {
-                Logger.LogInformation("{AliasorUID} — Not Found or offline, cycle pause failed", userData.AliasOrUID);
-                return;
+                var pair = _pairManager.PairsWithGroups.Keys
+                    .FirstOrDefault(p => string.Equals(p.UserData.UID, userData.UID, StringComparison.Ordinal));
+
+                if (pair == null)
+                {
+                    Logger.LogInformation("{AliasorUID} — Not Found or offline, cycle pause failed", userData.AliasOrUID);
+                    return;
+                }
+
+                var pausedPermissions = pair.UserPair!.OwnPermissions;
+                pausedPermissions.SetPaused(paused: true);
+                await UserSetPairPermissions(new UserPermissionsDto(pair.UserData, pausedPermissions)).ConfigureAwait(false);
+
+                await WaitForOwnPauseStateAsync(userData.UID, paused: true, cts.Token).ConfigureAwait(false);
+                await Task.Delay(250, cts.Token).ConfigureAwait(false);
+
+                var resumedPermissions = pair.UserPair!.OwnPermissions;
+                resumedPermissions.SetPaused(paused: false);
+                await UserSetPairPermissions(new UserPermissionsDto(pair.UserData, resumedPermissions)).ConfigureAwait(false);
+
+                await WaitForOwnPauseStateAsync(userData.UID, paused: false, cts.Token).ConfigureAwait(false);
+
+                pair.ApplyLastReceivedData(forced: true);
             }
-
-            var perm = pair.UserPair!.OwnPermissions;
-
-            perm.SetPaused(paused: true);
-            await UserSetPairPermissions(new UserPermissionsDto(pair.UserData, perm)).ConfigureAwait(false);
-
-            await Task.Delay(150, cts.Token).ConfigureAwait(false);
-
-            perm.SetPaused(paused: false);
-            await UserSetPairPermissions(new UserPermissionsDto(pair.UserData, perm)).ConfigureAwait(false);
-
+            catch (OperationCanceledException)
+            {
+                Logger.LogDebug("{AliasorUID} — Cycle pause timed out", userData.AliasOrUID);
+            }
+            catch (Exception ex)
+            {
+                Logger.LogWarning(ex, "{AliasorUID} — Cycle pause failed", userData.AliasOrUID);
+            }
         }, cts.Token).ContinueWith(_ => cts.Dispose());
 
         return Task.CompletedTask;
+    }
+
+    private async Task WaitForOwnPauseStateAsync(string uid, bool paused, CancellationToken token)
+    {
+        var started = Environment.TickCount64;
+
+        while (!token.IsCancellationRequested && (Environment.TickCount64 - started) < 2500)
+        {
+            var pair = _pairManager.PairsWithGroups.Keys
+                .FirstOrDefault(p => string.Equals(p.UserData.UID, uid, StringComparison.Ordinal));
+
+            if (pair != null && pair.UserPair!.OwnPermissions.IsPaused() == paused)
+                return;
+
+            await Task.Delay(25, token).ConfigureAwait(false);
+        }
     }
 
     public async Task PauseAsync(UserData userData)
@@ -723,26 +754,54 @@ public sealed partial class ApiController : DisposableMediatorSubscriberBase, IM
     }
 
 
-    private async Task StopConnectionAsync(ServerState state)
+    private async Task StopConnectionAsync(ServerState state, bool waitForHubDispose = false)
     {
         ServerState = ServerState.Disconnecting;
 
         Logger.LogInformation("Stopping existing connection");
-        await _hubFactory.DisposeHubAsync().ConfigureAwait(false);
 
-        if (_mareHub is not null)
-        {
-            Mediator.Publish(new EventMessage(new Services.Events.Event(nameof(ApiController), Services.Events.EventSeverity.Informational,
-                $"Stopping existing connection to {_serverManager.CurrentServer.ServerName}")));
+        var hadHub = _mareHub is not null;
+        var hadLiveState = hadHub || _initialized || _connectionDto is not null;
+        var serverName = _serverManager.CurrentServer?.ServerName ?? "server";
 
-            _initialized = false;
-            _healthCheckTokenSource?.Cancel();
-            Mediator.Publish(new DisconnectedMessage());
-            _mareHub = null;
-            _connectionDto = null;
-        }
+        // Disconnect must feel instant to the user. Do not wait for SignalR StopAsync/DisposeAsync
+        // before clearing pair state; those calls can take several seconds when the socket is slow
+        // to close. Null local hub state first, publish DisconnectedMessage immediately, and let
+        // HubFactory tear down the old connection in the background unless a reconnect explicitly
+        // asks us to wait.
+        _initialized = false;
+        _healthCheckTokenSource?.Cancel();
+        _mareHub = null;
+        _connectionDto = null;
 
         ServerState = state;
+
+        if (hadLiveState)
+        {
+            Mediator.Publish(new EventMessage(new Services.Events.Event(nameof(ApiController), Services.Events.EventSeverity.Informational,
+                $"Stopping existing connection to {serverName}")));
+            Mediator.Publish(new DisconnectedMessage());
+        }
+
+        var disposeTask = _hubFactory.DisposeHubAsync();
+        if (waitForHubDispose)
+        {
+            await disposeTask.ConfigureAwait(false);
+        }
+        else
+        {
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await disposeTask.ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    Logger.LogDebug(ex, "Background HubConnection dispose failed");
+                }
+            });
+        }
     }
 }
 #pragma warning restore MA0040

@@ -10,6 +10,7 @@ public class TagHandler
     public const string CustomOnlineTag = "Mare_Online";
     public const string CustomUnpairedTag = "Mare_Unpaired";
     public const string CustomVisibleTag = "Mare_Visible";
+    public const string CustomAutoPausedTag = "Rava_AutoPaused";
     public const string CustomOtherSyncTag = "Rava_OtherSync";
     public const string CustomOtherSyncLightlessTag = "Rava_OtherSync_Lightless";
     public const string CustomOtherSyncSnowcloakTag = "Rava_OtherSync_Snowcloak";

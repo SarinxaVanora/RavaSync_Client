@@ -27,4 +27,10 @@ public class GameObjectHandlerFactory
         return await _dalamudUtilService.RunOnFrameworkThread(() => new GameObjectHandler(_loggerFactory.CreateLogger<GameObjectHandler>(),
             _performanceCollectorService, _mareMediator, _dalamudUtilService, objectKind, getAddressFunc, isWatched)).ConfigureAwait(false);
     }
+
+    public GameObjectHandler CreateDeferred(ObjectKind objectKind, Func<nint> getAddressFunc, bool isWatched = false)
+    {
+        return new GameObjectHandler(_loggerFactory.CreateLogger<GameObjectHandler>(),
+            _performanceCollectorService, _mareMediator, _dalamudUtilService, objectKind, getAddressFunc, isWatched);
+    }
 }

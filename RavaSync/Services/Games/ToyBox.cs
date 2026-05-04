@@ -1,4 +1,5 @@
-﻿using Dalamud.Game.ClientState;
+﻿using Dalamud.Game.Chat;
+using Dalamud.Game.ClientState;
 using Dalamud.Game.ClientState.Objects;
 using Dalamud.Game.ClientState.Objects.SubKinds;
 using Dalamud.Game.Text;
@@ -202,16 +203,15 @@ public sealed partial class ToyBox : DisposableMediatorSubscriberBase, IHostedSe
         {
         }
     }
-    private void ChatGuiOnChatMessage(XivChatType type, int timestamp, ref SeString sender, ref SeString message, ref bool isHandled)
+    private void ChatGuiOnChatMessage(IHandleableChatMessage chatMessage)
     {
         try
         {
-            TryHandleTournamentRoll(type, sender, message);
+            TryHandleTournamentRoll(chatMessage.LogKind, chatMessage.Sender, chatMessage.Message);
         }
         catch (Exception ex)
         {
-            Logger.LogWarning(ex, "ToyBox chat handler failed. type={type} sender={sender} msg={msg}",
-                type, sender.TextValue ?? "<null>", message.TextValue ?? "<null>");
+            Logger.LogWarning(ex, "ToyBox chat handler failed. type={type} sender={sender} msg={msg}", chatMessage.LogKind, chatMessage.Sender.TextValue ?? "<null>", chatMessage.Message.TextValue ?? "<null>");
         }
     }
 
@@ -226,7 +226,7 @@ public sealed partial class ToyBox : DisposableMediatorSubscriberBase, IHostedSe
         var mySessionId = GetMySessionId();
         if (string.IsNullOrEmpty(mySessionId)) return;
 
-        var myName = _clientState.LocalPlayer?.Name.TextValue ?? "Player";
+        var myName = _objects.LocalPlayer?.Name.TextValue ?? "Player";
         _cachedMySessionId = mySessionId;
         _cachedMyName = myName;
 
@@ -455,7 +455,7 @@ public sealed partial class ToyBox : DisposableMediatorSubscriberBase, IHostedSe
         var env = new SyncshellGameEnvelope(gameId, kind, SyncshellGameOp.Invite, MessagePackSerializer.Serialize(payload));
         var bytes = MessagePackSerializer.Serialize(env);
 
-        var local = _clientState.LocalPlayer;
+        var local = _objects.LocalPlayer;
         if (local is null) return;
 
         var players = _objects.OfType<IPlayerCharacter>()
@@ -730,7 +730,7 @@ public sealed partial class ToyBox : DisposableMediatorSubscriberBase, IHostedSe
         var env = new SyncshellGameEnvelope(gameId, kind, SyncshellGameOp.LobbyClosed);
         var bytes = MessagePackSerializer.Serialize(env);
 
-        var local = _clientState.LocalPlayer;
+        var local = _objects.LocalPlayer;
         if (local is null) return;
 
         var players = _objects.OfType<IPlayerCharacter>()
@@ -847,17 +847,17 @@ public sealed partial class ToyBox : DisposableMediatorSubscriberBase, IHostedSe
         if (!string.IsNullOrEmpty(_cachedMySessionId))
             return _cachedMySessionId;
 
-        if (!_clientState.IsLoggedIn || _clientState.LocalPlayer is null) return null;
+        if (!_clientState.IsLoggedIn || _objects.LocalPlayer is null) return null;
 
         try
         {
-            var ident = _dalamudUtil.GetIdentFromGameObject(_clientState.LocalPlayer);
+            var ident = _dalamudUtil.GetIdentFromGameObject(_objects.LocalPlayer);
             if (string.IsNullOrEmpty(ident)) return null;
 
             var sid = RavaSessionId.FromIdent(ident);
             _cachedMySessionId = sid;
 
-            var name = _clientState.LocalPlayer?.Name.TextValue;
+            var name = _objects.LocalPlayer?.Name.TextValue;
             if (!string.IsNullOrEmpty(name))
                 _cachedMyName = name;
 

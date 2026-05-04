@@ -5,6 +5,7 @@ using RavaSync.PlayerData.Handlers;
 using RavaSync.Services.CharaData.Models;
 using RavaSync.Services.Mediator;
 using Microsoft.Extensions.Logging;
+using System.Collections.Concurrent;
 
 namespace RavaSync.Services;
 
@@ -14,6 +15,7 @@ public sealed class CharaDataCharacterHandler : DisposableMediatorSubscriberBase
     private readonly DalamudUtilService _dalamudUtilService;
     private readonly IpcManager _ipcManager;
     private readonly HashSet<HandledCharaDataEntry> _handledCharaData = [];
+    private readonly ConcurrentDictionary<string, byte> _pendingCutsceneReverts = new(StringComparer.Ordinal);
 
     public IEnumerable<HandledCharaDataEntry> HandledCharaData => _handledCharaData;
 
@@ -43,11 +45,25 @@ public sealed class CharaDataCharacterHandler : DisposableMediatorSubscriberBase
         foreach (var entry in _handledCharaData.ToList())
         {
             var chara = _dalamudUtilService.GetGposeCharacterFromObjectTableByName(entry.Name, onlyGposeCharacters: true);
-            if (chara is null)
+            if (chara is not null) continue;
+            if (!_handledCharaData.Remove(entry)) continue;
+            if (!_pendingCutsceneReverts.TryAdd(entry.Name, 0)) continue;
+
+            _ = Task.Run(async () =>
             {
-                RevertChara(entry.Name, entry.CustomizePlus).GetAwaiter().GetResult();
-                _handledCharaData.Remove(entry);
-            }
+                try
+                {
+                    await RevertChara(entry.Name, entry.CustomizePlus).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    Logger.LogDebug(ex, "Best-effort cutscene revert failed for {name}", entry.Name);
+                }
+                finally
+                {
+                    _pendingCutsceneReverts.TryRemove(entry.Name, out _);
+                }
+            });
         }
     }
 

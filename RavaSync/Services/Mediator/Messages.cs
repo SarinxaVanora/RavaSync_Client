@@ -45,7 +45,7 @@ public record CutsceneEndMessage : MessageBase;
 public record CutsceneFrameworkUpdateMessage : SameThreadMessage;
 public record ConnectedMessage(ConnectionDto Connection) : MessageBase;
 public record DisconnectedMessage : SameThreadMessage;
-public record PenumbraModSettingChangedMessage : MessageBase;
+public record PenumbraModSettingChangedMessage(Guid CollectionId, string ModName, bool Inherited, string Change) : MessageBase;
 public record PenumbraInitializedMessage : MessageBase;
 public record PenumbraDisposedMessage : MessageBase;
 public record PenumbraRedrawMessage(IntPtr Address, int ObjTblIdx, bool WasRequested) : SameThreadMessage;
@@ -64,9 +64,16 @@ public record ResumeScanMessage(string Source) : MessageBase;
 public record NotificationMessage
     (string Title, string Message, NotificationType Type, TimeSpan? TimeShownOnScreen = null) : MessageBase;
 public record CreateCacheForObjectMessage(GameObjectHandler ObjectToCreateFor, string Reason = "Unspecified") : SameThreadMessage;
+public record ImmediatePlayerStatePublishMessage(GameObjectHandler ObjectToCreateFor, string Reason = "Unspecified") : SameThreadMessage;
 public record ClearCacheForObjectMessage(GameObjectHandler ObjectToCreateFor) : SameThreadMessage;
-public record CharacterDataCreatedMessage(CharacterData CharacterData) : SameThreadMessage;
+public record CharacterDataCreatedMessage(CharacterData CharacterData, bool ForceOutbound = false, string Reason = "") : SameThreadMessage;
 public record CharacterDataAnalyzedMessage : MessageBase;
+public enum DataAnalysisOptimisationTab
+{
+    Textures = 0,
+    Meshes = 1,
+}
+public record OpenDataAnalysisOptimisationTabMessage(DataAnalysisOptimisationTab Tab) : MessageBase;
 public record PenumbraStartRedrawMessage(IntPtr Address) : MessageBase;
 public record PenumbraEndRedrawMessage(IntPtr Address) : MessageBase;
 public record HubReconnectingMessage(Exception? Exception) : SameThreadMessage;
@@ -76,15 +83,17 @@ public record DownloadReadyMessage(Guid RequestId) : MessageBase;
 public record DownloadStartedMessage(GameObjectHandler DownloadId, Dictionary<string, FileDownloadStatus> DownloadStatus) : MessageBase;
 public record DownloadFinishedMessage(GameObjectHandler DownloadId) : MessageBase;
 public record UiToggleMessage(Type UiType) : MessageBase;
+public record RestoreCompactUiStateMessage : MessageBase;
 public record MainUiMinimizedMessage : MessageBase;
 public record MainUiRestoredMessage : MessageBase;
-public record RestoreMainUiAtPositionMessage(Vector2 Position) : MessageBase;
+public record RestoreMainUiAtPositionMessage(Vector2 Position, bool OpenToLeft = false) : MessageBase;
 public record MainUiMinimizedAtPositionMessage(Vector2 Position) : MessageBase;
 public record PlayerUploadingMessage(GameObjectHandler Handler, bool IsUploading) : MessageBase;
 public record ClearProfileDataMessage(UserData? UserData = null) : MessageBase;
 public record CyclePauseMessage(UserData UserData) : MessageBase;
 public record PauseMessage(UserData UserData) : MessageBase;
 public record ResumeMessage(UserData UserData) : MessageBase;
+public record ResumeThresholdAutoPausedOnConnectMessage(UserData UserData) : MessageBase;
 public record ProfilePopoutToggle(Pair? Pair) : MessageBase;
 public record CompactUiChange(Vector2 Size, Vector2 Position) : MessageBase;
 public record ProfileOpenStandaloneMessage(Pair Pair) : MessageBase;
@@ -101,7 +110,10 @@ public record CombatOrPerformanceStartMessage : MessageBase;
 public record CombatOrPerformanceEndMessage : MessageBase;
 public record EventMessage(Event Event) : MessageBase;
 public record PenumbraDirectoryChangedMessage(string? ModDirectory) : MessageBase;
+public record PenumbraFileCacheChangedMessage(IReadOnlyCollection<string> Paths) : MessageBase;
 public record PenumbraRedrawCharacterMessage(ICharacter Character) : SameThreadMessage;
+public record PenumbraRedrawAddressMessage(nint Address) : MessageBase;
+public record ArmRequestedPlayerPublishAfterRedrawMessage(nint Address) : MessageBase;
 public record GameObjectHandlerCreatedMessage(GameObjectHandler GameObjectHandler, bool OwnedObject) : SameThreadMessage;
 public record GameObjectHandlerDestroyedMessage(GameObjectHandler GameObjectHandler, bool OwnedObject) : SameThreadMessage;
 public record HaltCharaDataCreation(bool Resume = false) : SameThreadMessage;
@@ -111,18 +123,15 @@ public record GPoseLobbyReceiveCharaData(CharaDataDownloadDto CharaDataDownloadD
 public record GPoseLobbyReceivePoseData(UserData UserData, PoseData PoseData) : MessageBase;
 public record GPoseLobbyReceiveWorldData(UserData UserData, WorldData WorldData) : MessageBase;
 public record OpenCharaDataHubWithFilterMessage(UserData UserData) : MessageBase;
-
 public record PairRequestReceivedMessage(PairRequestDto Request) : MessageBase;
 public record PairRequestResultMessage(PairRequestResultDto Result) : MessageBase;
 public record ContextMenuPairRequestMessage(string TargetIdent, string charName) : MessageBase;
 public record DirectPairRequestMessage(string TargetIdent, string TargetName) : MessageBase;
 public record SyncshellGameMeshMessage(string LocalSessionId, string FromSessionId, byte[] Payload) : MessageBase;
-
-public record RemoteOtherSyncYieldMessage(string AffectedUid, bool YieldToOtherSync, string Owner, TimeSpan Ttl) : MessageBase;
-public record LocalOtherSyncYieldStateChangedMessage(bool YieldToOtherSync, string Owner) : MessageBase;
-
+public record RemoteMissingFileMessage(string TargetUid, string TargetIdent, string DataHash, IReadOnlyCollection<string> Hashes, string Reason) : MessageBase;
+public record RemoteOtherSyncYieldMessage(string FromUid, bool YieldToOtherSync, string Owner, TimeSpan Ttl) : MessageBase;
+public record LocalOtherSyncYieldStateChangedMessage(string AffectedUid, bool YieldToOtherSync, string Owner) : MessageBase;
 public record PrimeTransientPathsMessage(IntPtr Address, ObjectKind Kind, IReadOnlyCollection<string> GamePaths) : SameThreadMessage;
-
 public record RemoteOtherSyncConnectedMessage(string? Owner) : MessageBase;
 public record RemoteOtherSyncDisconnectedMessage(string? Owner) : MessageBase;
 public sealed record InitialFinalRedrawConsumedMessage(nint ActorAddress) : SameThreadMessage;

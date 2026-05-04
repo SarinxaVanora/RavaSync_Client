@@ -29,6 +29,7 @@ public class DrawUserPair
     private readonly ServerConfigurationManager _serverConfigurationManager;
     private readonly UiSharedService _uiSharedService;
     private readonly PlayerPerformanceConfigService _performanceConfigService;
+    private readonly PlayerPerformanceService _playerPerformanceService;
     private readonly CharaDataManager _charaDataManager;
     private float _menuWidth = -1;
     private bool _wasHovered = false;
@@ -39,7 +40,7 @@ public class DrawUserPair
         MareMediator mareMediator, SelectTagForPairUi selectTagForPairUi,
         ServerConfigurationManager serverConfigurationManager,
         UiSharedService uiSharedService, PlayerPerformanceConfigService performanceConfigService,
-        CharaDataManager charaDataManager)
+        PlayerPerformanceService playerPerformanceService, CharaDataManager charaDataManager)
     {
         _id = id;
         _pair = entry;
@@ -52,6 +53,7 @@ public class DrawUserPair
         _serverConfigurationManager = serverConfigurationManager;
         _uiSharedService = uiSharedService;
         _performanceConfigService = performanceConfigService;
+        _playerPerformanceService = playerPerformanceService;
         _charaDataManager = charaDataManager;
     }
 
@@ -140,6 +142,16 @@ public class DrawUserPair
             _ = _apiController.CyclePauseAsync(_pair.UserData);
             ImGui.CloseCurrentPopup();
         }
+
+        if (_pair.IsVisible)
+        {
+            if (_uiSharedService.IconTextButton(FontAwesomeIcon.SyncAlt, _uiSharedService.L("UI.DrawUserPair.RedrawTarget", "Redraw target"), _menuWidth, true))
+            {
+                _pair.RequestTargetRedraw();
+                ImGui.CloseCurrentPopup();
+            }
+            UiSharedService.AttachToolTip(_uiSharedService.L("UI.DrawUserPair.RedrawTarget.Tooltip", "Executes a Penumbra redraw on this visible target."));
+        }
         ImGui.Separator();
 
         ImGui.TextUnformatted(_uiSharedService.L("UI.DrawUserPair.0703d4ea", "Pair Permission Functions"));
@@ -205,18 +217,16 @@ public class DrawUserPair
         }
         UiSharedService.AttachToolTip(_uiSharedService.L("UI.DrawUserPair.d9f7dfb0", "Changes VFX sync permissions with this user.") + (individual ? individualText : string.Empty));
 
-        var isDisableCustomizePlus = _pair.UserPair!.OwnPermissions.IsDisableCustomizePlus();
+        var isDisableCustomizePlus = !_pair.IsCustomizePlusEnabled;
         string disableCustomizePlusText = isDisableCustomizePlus
             ? _uiSharedService.L("UI.DrawUserPair.CustomizePlusSync.Enable", "Enable Customize+ sync")
             : _uiSharedService.L("UI.DrawUserPair.CustomizePlusSync.Disable", "Disable Customize+ sync");
         var disableCustomizePlusIcon = isDisableCustomizePlus ? FontAwesomeIcon.Palette : FontAwesomeIcon.Ban;
         if (_uiSharedService.IconTextButton(disableCustomizePlusIcon, disableCustomizePlusText, _menuWidth, true))
         {
-            var permissions = _pair.UserPair.OwnPermissions;
-            permissions.SetDisableCustomizePlus(!isDisableCustomizePlus);
-            _ = _apiController.UserSetPairPermissions(new UserPermissionsDto(_pair.UserData, permissions));
+            _pair.ToggleCustomizePlusAndReapply();
         }
-        UiSharedService.AttachToolTip(_uiSharedService.L("UI.DrawUserPair.c8cd2dba", "Changes Customize+ sync permissions with this user.") + (individual ? individualText : string.Empty));
+        UiSharedService.AttachToolTip(_uiSharedService.L("UI.DrawUserPair.c8cd2dba", "Locally changes Customize+ sync handling for this user without notifying them.") + (individual ? individualText : string.Empty));
 
         bool isDisableMetadata = !_pair.IsMetadataEnabled;
         string disableMetadataText = isDisableMetadata
@@ -226,14 +236,11 @@ public class DrawUserPair
 
         if (_uiSharedService.IconTextButton(disableMetadataIcon, disableMetadataText, _menuWidth, true))
         {
-            var permissions = _pair.UserPair.OwnPermissions;
-            permissions.SetDisableMetaData(!isDisableMetadata);
-            _ = _apiController.UserSetPairPermissions(new UserPermissionsDto(_pair.UserData, permissions));
             _pair.ToggleMetadataAndReapply();
         }
 
         UiSharedService.AttachToolTip(
-            _uiSharedService.L("UI.DrawUserPair.d41d8cd9", "Changes height metadata permissions with this user.")
+            _uiSharedService.L("UI.DrawUserPair.d41d8cd9", "Locally changes height metadata handling for this user without notifying them.")
             + (individual ? individualText : string.Empty));
     }
 
@@ -285,7 +292,12 @@ public class DrawUserPair
             // Pause reason indicators (distinct icon + text)
             using var _ = ImRaii.PushColor(ImGuiCol.Text, ImGuiColors.DalamudYellow);
 
-            if (pair.UserPair?.OwnPermissions.IsPaused() ?? false)
+            if (_playerPerformanceService.IsThresholdAutoPaused(pair))
+            {
+                _uiSharedService.IconText(FontAwesomeIcon.ExclamationTriangle);
+                userPairText = aliasOrUid + " is auto-paused (VRAM / triangle thresholds)";
+            }
+            else if (pair.UserPair?.OwnPermissions.IsPaused() ?? false)
             {
                 _uiSharedService.IconText(FontAwesomeIcon.PauseCircle);
                 userPairText = aliasOrUid + " is paused";
@@ -293,12 +305,12 @@ public class DrawUserPair
             else if (pair.AutoPausedByCap)
             {
                 _uiSharedService.IconText(FontAwesomeIcon.ExclamationTriangle);
-                userPairText = aliasOrUid + " is auto-paused (VRAM / triangle thresholds)";
+                userPairText = aliasOrUid + " is auto-paused (syncshell cap)";
             }
             else if (pair.AutoPausedByScope)
             {
                 _uiSharedService.IconText(FontAwesomeIcon.UserCog);
-                userPairText = aliasOrUid + " is auto-paused (syncshell cap / scope)";
+                userPairText = aliasOrUid + " is auto-paused (scope)";
             }
             else if (pair.AutoPausedByOtherSync && !pair.OverrideOtherSync)
             {
@@ -345,42 +357,19 @@ public class DrawUserPair
             }
             else
             {
-                var dl = pair.CurrentDownloadStatus;
+                var dl = pair.CurrentDownloadSummary;
 
                 try
                 {
-                    if (dl != null && dl.Count > 0)
+                    if (dl != null && dl.HasAny)
                     {
-                        bool hasDownloading = false;
-                        bool hasLoading = false;
-
-                        foreach (var s in dl.Values)
-                        {
-                            switch (s.DownloadStatus)
-                            {
-                                case RavaSync.WebAPI.Files.Models.DownloadStatus.Downloading:
-                                case RavaSync.WebAPI.Files.Models.DownloadStatus.WaitingForQueue:
-                                case RavaSync.WebAPI.Files.Models.DownloadStatus.WaitingForSlot:
-                                    hasDownloading = true;
-                                    break;
-
-                                case RavaSync.WebAPI.Files.Models.DownloadStatus.Initializing:
-                                case RavaSync.WebAPI.Files.Models.DownloadStatus.Decompressing:
-                                    hasLoading = true;
-                                    break;
-                            }
-
-                            if (hasDownloading)
-                                break;
-                        }
-
-                        if (hasDownloading)
+                        if (dl.AnyDownloading)
                         {
                             icon = FontAwesomeIcon.Download;
                             color = ImGuiColors.ParsedBlue;
                             stateText = "Visible - Downloading";
                         }
-                        else if (hasLoading)
+                        else if (dl.AnyLoading)
                         {
                             icon = FontAwesomeIcon.Sync;
                             color = ImGuiColors.DalamudViolet;

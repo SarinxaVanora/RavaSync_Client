@@ -15,6 +15,7 @@ using RavaSync.PlayerData.Factories;
 using ObjectKind = RavaSync.API.Data.Enum.ObjectKind;
 using Dalamud.Plugin.Services;
 using Dalamud.Game.ClientState.Objects.Types;
+using Dalamud.Interface.Windowing;
 
 namespace RavaSync.UI;
 
@@ -98,6 +99,8 @@ public class DownloadUi : WindowMediatorSubscriberBase
 
         Mediator.Subscribe<DownloadStartedMessage>(this, (msg) =>
         {
+            if (msg.DownloadId == null) return;
+
             var now = DateTime.UtcNow;
 
             var snap = SnapshotStatus(msg.DownloadStatus);
@@ -116,15 +119,29 @@ public class DownloadUi : WindowMediatorSubscriberBase
                 {
                     if (existing.Finished && (now - existing.LastUpdateUtc) <= DownloadUiHoldWindow)
                     {
-                        var prevTotalBytes = existing.Status.Values.Sum(s => s.TotalBytes);
-                        var prevTransferredBytes = existing.Status.Values.Sum(s => s.TransferredBytes);
-                        var prevTotalFiles = existing.Status.Values.Sum(s => s.TotalFiles);
-                        var prevTransferredFiles = existing.Status.Values.Sum(s => s.TransferredFiles);
+                        var prevTotalBytes = existing.Status.Values.Sum(s => Math.Max(0, s.TotalBytes));
+                        var prevTransferredBytes = existing.Status.Values.Sum(s => Math.Max(0, s.TransferredBytes));
+                        var prevTotalFiles = existing.Status.Values.Sum(s => Math.Max(0, s.TotalFiles));
+                        var prevTransferredFiles = existing.Status.Values.Sum(s => Math.Max(0, s.TransferredFiles));
 
-                        existing.AccTotalBytes += prevTotalBytes;
-                        existing.AccTransferredBytes += prevTransferredBytes;
-                        existing.AccTotalFiles += prevTotalFiles;
-                        existing.AccTransferredFiles += prevTransferredFiles;
+                        var previousLooksComplete = prevTotalFiles > 0
+                            ? prevTransferredFiles >= prevTotalFiles
+                            : prevTotalBytes > 0 && prevTransferredBytes >= prevTotalBytes;
+
+                        if (previousLooksComplete)
+                        {
+                            existing.AccTotalBytes += prevTotalBytes;
+                            existing.AccTransferredBytes += prevTransferredBytes;
+                            existing.AccTotalFiles += prevTotalFiles;
+                            existing.AccTransferredFiles += prevTransferredFiles;
+                        }
+                        else
+                        {
+                            existing.AccTotalBytes = 0;
+                            existing.AccTransferredBytes = 0;
+                            existing.AccTotalFiles = 0;
+                            existing.AccTransferredFiles = 0;
+                        }
                     }
 
                     existing.Status = snap;
@@ -136,6 +153,8 @@ public class DownloadUi : WindowMediatorSubscriberBase
 
         Mediator.Subscribe<DownloadFinishedMessage>(this, (msg) =>
         {
+            if (msg.DownloadId == null) return;
+
             if (_currentDownloads.TryGetValue(msg.DownloadId, out var agg))
             {
                 agg.Finished = true;
@@ -1412,7 +1431,7 @@ public class DownloadUi : WindowMediatorSubscriberBase
 
                 if ((IntPtr)o.Address != addr) continue;
 
-                if (o.ObjectKind != Dalamud.Game.ClientState.Objects.Enums.ObjectKind.Player)
+                if (o.ObjectKind != Dalamud.Game.ClientState.Objects.Enums.ObjectKind.Pc)
                     return false;
 
                 go = o;

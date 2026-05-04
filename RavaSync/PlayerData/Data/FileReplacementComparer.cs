@@ -1,4 +1,4 @@
-﻿namespace RavaSync.PlayerData.Data;
+namespace RavaSync.PlayerData.Data;
 
 public class FileReplacementComparer : IEqualityComparer<FileReplacement>
 {
@@ -12,7 +12,8 @@ public class FileReplacementComparer : IEqualityComparer<FileReplacement>
     public bool Equals(FileReplacement? x, FileReplacement? y)
     {
         if (x == null || y == null) return false;
-        return x.ResolvedPath.Equals(y.ResolvedPath) && CompareLists(x.GamePaths, y.GamePaths);
+        return string.Equals(x.ResolvedPath, y.ResolvedPath, StringComparison.OrdinalIgnoreCase)
+            && CompareLists(x.GamePaths, y.GamePaths);
     }
 
     public int GetHashCode(FileReplacement obj)
@@ -22,25 +23,17 @@ public class FileReplacementComparer : IEqualityComparer<FileReplacement>
 
     private static bool CompareLists(HashSet<string> list1, HashSet<string> list2)
     {
-        if (list1.Count != list2.Count)
-            return false;
-
-        for (int i = 0; i < list1.Count; i++)
-        {
-            if (!string.Equals(list1.ElementAt(i), list2.ElementAt(i), StringComparison.OrdinalIgnoreCase))
-                return false;
-        }
-
-        return true;
+        return list1.Count == list2.Count
+            && list1.All(v => list2.Contains(v, StringComparer.OrdinalIgnoreCase));
     }
 
-    private static int GetOrderIndependentHashCode<T>(IEnumerable<T> source) where T : notnull
+    private static int GetOrderIndependentHashCode(IEnumerable<string> source)
     {
         int hash = 0;
-        foreach (T element in source)
+        foreach (var element in source)
         {
-            hash = unchecked(hash +
-                EqualityComparer<T>.Default.GetHashCode(element));
+            if (string.IsNullOrEmpty(element)) continue;
+            hash = unchecked(hash + StringComparer.OrdinalIgnoreCase.GetHashCode(element));
         }
         return hash;
     }

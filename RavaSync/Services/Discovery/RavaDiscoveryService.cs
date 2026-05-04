@@ -39,7 +39,7 @@ public sealed class RavaDiscoveryService : DisposableMediatorSubscriberBase, IHo
     private static readonly TimeSpan HelloInterval = TimeSpan.FromSeconds(3);
     private static readonly TimeSpan PeerTtl = TimeSpan.FromSeconds(9);
     private static readonly TimeSpan PruneInterval = TimeSpan.FromSeconds(1);
-    private static readonly TimeSpan HelloScanInterval = TimeSpan.FromMilliseconds(250);
+    private static readonly TimeSpan HelloScanInterval = TimeSpan.FromMilliseconds(750);
     private DateTime _nextHelloScanUtc = DateTime.MinValue;
 
     private const int MaxHellosPerTick = 6;
@@ -49,11 +49,11 @@ public sealed class RavaDiscoveryService : DisposableMediatorSubscriberBase, IHo
     private int _roundRobinStartIndex = 0;
     private bool _isMeshListening = false;
 
-    private bool _localYieldToOtherSync = false;
-    private string _localYieldOwner = string.Empty;
     private readonly object _yieldBroadcastGate = new();
-    private bool? _lastYieldBroadcast;
-    private string _lastYieldBroadcastOwner = string.Empty;
+    private sealed record LocalYieldStateEntry(bool Yield, string Owner);
+    private sealed record YieldBroadcastStateEntry(bool Yield, string Owner);
+    private readonly ConcurrentDictionary<string, LocalYieldStateEntry> _localYieldStatesByUid = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, YieldBroadcastStateEntry> _lastYieldBroadcastByUid = new(StringComparer.Ordinal);
 
     private sealed record RemoteYieldCacheEntry(bool Yield, string Owner, DateTime LastSeenUtc);
     private readonly ConcurrentDictionary<string, RemoteYieldCacheEntry> _lastRemoteYieldByUid = new(StringComparer.Ordinal);
@@ -66,6 +66,9 @@ public sealed class RavaDiscoveryService : DisposableMediatorSubscriberBase, IHo
     private static readonly TimeSpan ObjectSessionCacheTtl = TimeSpan.FromSeconds(10);
     private static readonly TimeSpan ObjectSessionCachePruneInterval = TimeSpan.FromSeconds(5);
     private DateTime _lastObjectSessionPruneUtc = DateTime.MinValue;
+
+    private readonly ConcurrentQueue<SyncshellGameMeshMessage> _pendingGameMeshMessages = new();
+    private const int MaxGameMeshMessagesPerTick = 8;
 
     public sealed record RavaPeerInfo(string SessionId,byte[] PeerKey,DateTime FirstSeenUtc,DateTime LastSeenUtc);
     public sealed record RavaYieldByIdentReceivedMessage(string FromIdent, bool YieldToOtherSync, string Owner, TimeSpan Ttl);
@@ -106,17 +109,16 @@ public sealed class RavaDiscoveryService : DisposableMediatorSubscriberBase, IHo
 
         _mediator.Subscribe<LocalOtherSyncYieldStateChangedMessage>(this, msg =>
         {
-            var yield = msg.YieldToOtherSync;
-            var owner = msg.Owner ?? string.Empty;
-
-            if (!yield) owner = string.Empty;
-            if (_localYieldToOtherSync == yield && string.Equals(_localYieldOwner, owner, StringComparison.OrdinalIgnoreCase))
+            var affectedUid = msg.AffectedUid ?? string.Empty;
+            if (string.IsNullOrWhiteSpace(affectedUid))
                 return;
 
-            _localYieldToOtherSync = yield;
-            _localYieldOwner = owner;
+            var yield = msg.YieldToOtherSync;
+            var owner = yield ? (msg.Owner ?? string.Empty) : string.Empty;
 
-            BroadcastLocalOtherSyncState(_localYieldToOtherSync, _localYieldOwner);
+            _localYieldStatesByUid[affectedUid] = new LocalYieldStateEntry(yield, owner);
+
+            BroadcastLocalOtherSyncState(affectedUid, yield, owner);
         });
     }
 
@@ -139,11 +141,7 @@ public sealed class RavaDiscoveryService : DisposableMediatorSubscriberBase, IHo
         _lastHelloSentUtc.Clear();
         _objectSessionCache.Clear();
 
-        lock (_yieldBroadcastGate)
-        {
-            _lastYieldBroadcast = null;
-            _lastYieldBroadcastOwner = string.Empty;
-        }
+        _lastYieldBroadcastByUid.Clear();
         _lastRemoteYieldByUid.Clear();
     }
 
@@ -169,15 +167,24 @@ public sealed class RavaDiscoveryService : DisposableMediatorSubscriberBase, IHo
         return _knownPeers.ContainsKey(sessionId);
     }
 
+    public string[] GetKnownPeerSessionIds()
+    {
+        if (_knownPeers.IsEmpty)
+            return Array.Empty<string>();
+
+        return _knownPeers.Keys.ToArray();
+    }
+
+
     private void OnFrameworkUpdate()
     {
-        if (!_clientState.IsLoggedIn || _clientState.LocalPlayer is null) return;
+        if (!_clientState.IsLoggedIn || _objects.LocalPlayer is null) return;
 
         if (_mySessionId == null)
         {
             try
             {
-                var me = _clientState.LocalPlayer;
+                var me = _objects.LocalPlayer;
                 var myIdent = _dalamudUtil.GetIdentFromGameObject(me);
                 if (string.IsNullOrEmpty(myIdent)) return;
 
@@ -202,8 +209,8 @@ public sealed class RavaDiscoveryService : DisposableMediatorSubscriberBase, IHo
                 _mesh.Listen(_mySessionId, OnMeshMessageAsync);
                 _isMeshListening = true;
 
-                // Re-broadcast current local yield state on mesh start (reconnect case)
-                BroadcastLocalOtherSyncState(_localYieldToOtherSync, _localYieldOwner);
+                // Re-broadcast current local yield states on mesh start (reconnect case)
+                BroadcastAllLocalOtherSyncStates();
             }
             catch (Exception ex)
             {
@@ -215,6 +222,9 @@ public sealed class RavaDiscoveryService : DisposableMediatorSubscriberBase, IHo
         if (!_api.IsConnected) return;
 
         var discoveryEnabled = _configService.Current.EnableRavaDiscoveryPresence;
+
+        if (!discoveryEnabled && _pendingGameMeshMessages.IsEmpty && !_lastDiscoveryPresence)
+            return;
 
         if (!discoveryEnabled && _lastDiscoveryPresence)
         {
@@ -229,11 +239,23 @@ public sealed class RavaDiscoveryService : DisposableMediatorSubscriberBase, IHo
         _lastDiscoveryPresence = discoveryEnabled;
 
         HandleTerritoryChange();
+        FlushPendingGameMeshMessages();
         if (!discoveryEnabled) return;
 
         var now = DateTime.UtcNow;
-        PrunePeers(now);
-        PruneObjectSessionCache(now);
+        if (_objects.Length == 0)
+        {
+            if (!_knownPeers.IsEmpty)
+                PrunePeers(now);
+            if (!_objectSessionCache.IsEmpty)
+                PruneObjectSessionCache(now);
+            return;
+        }
+
+        if (!_knownPeers.IsEmpty)
+            PrunePeers(now);
+        if (!_objectSessionCache.IsEmpty)
+            PruneObjectSessionCache(now);
 
         if (now < _nextHelloScanUtc) return;
         _nextHelloScanUtc = now + HelloScanInterval;
@@ -241,7 +263,6 @@ public sealed class RavaDiscoveryService : DisposableMediatorSubscriberBase, IHo
         int sent = 0;
 
         var len = _objects.Length;
-        if (len == 0) return;
 
         if (_roundRobinStartIndex >= len)
             _roundRobinStartIndex = 0;
@@ -252,7 +273,7 @@ public sealed class RavaDiscoveryService : DisposableMediatorSubscriberBase, IHo
 
             if (_objects[idx] is not IPlayerCharacter pc) continue;
             if (pc.Address == IntPtr.Zero) continue;
-            if (_clientState.LocalPlayer!.Address == pc.Address) continue;
+            if (_objects.LocalPlayer!.Address == pc.Address) continue;
 
             if (!TryGetSessionIdForPlayer(pc, now, out var sessionId))
                 continue;
@@ -305,17 +326,26 @@ public sealed class RavaDiscoveryService : DisposableMediatorSubscriberBase, IHo
                     {
                         var now = DateTime.UtcNow;
 
-                        var uid = y.FromUid ?? string.Empty;
-                        if (string.IsNullOrWhiteSpace(uid))
+                        var targetUid = y.AffectedUid ?? string.Empty;
+                        if (string.IsNullOrWhiteSpace(targetUid))
+                            break;
+
+                        var ownUid = _ownUser?.UID ?? string.Empty;
+                        if (string.IsNullOrWhiteSpace(ownUid) || !string.Equals(targetUid, ownUid, StringComparison.Ordinal))
+                            break;
+
+                        var fromUid = y.FromUid ?? string.Empty;
+                        if (string.IsNullOrWhiteSpace(fromUid))
                             break;
 
                         var owner = y.Owner ?? string.Empty;
                         if (!y.YieldToOtherSync)
                             owner = string.Empty;
 
+                        var cacheKey = fromUid;
                         var incoming = new RemoteYieldCacheEntry(y.YieldToOtherSync, owner, now);
 
-                        if (_lastRemoteYieldByUid.TryGetValue(uid, out var last))
+                        if (_lastRemoteYieldByUid.TryGetValue(cacheKey, out var last))
                         {
                             var same =
                                 last.Yield == incoming.Yield
@@ -323,21 +353,20 @@ public sealed class RavaDiscoveryService : DisposableMediatorSubscriberBase, IHo
 
                             if (same && (now - last.LastSeenUtc) < RemoteYieldDedupWindow)
                             {
-                                _lastRemoteYieldByUid[uid] = last with { LastSeenUtc = now };
+                                _lastRemoteYieldByUid[cacheKey] = last with { LastSeenUtc = now };
                                 break;
                             }
                         }
 
-                        _lastRemoteYieldByUid[uid] = incoming;
+                        _lastRemoteYieldByUid[cacheKey] = incoming;
 
-                        _mediator.Publish(new RemoteOtherSyncYieldMessage( AffectedUid: uid,YieldToOtherSync: incoming.Yield,Owner: incoming.Owner,Ttl: TimeSpan.FromSeconds(12)));
+                        _mediator.Publish(new RemoteOtherSyncYieldMessage( FromUid: fromUid,YieldToOtherSync: incoming.Yield,Owner: incoming.Owner,Ttl: TimeSpan.FromSeconds(12)));
 
                         break;
                     }
 
                 case RavaGame game:
-                    _ = _dalamudUtil.RunOnFrameworkThread(() =>
-                        _mediator.Publish(new SyncshellGameMeshMessage(sessionId, game.FromSessionId, game.Payload)));
+                    _pendingGameMeshMessages.Enqueue(new SyncshellGameMeshMessage(sessionId, game.FromSessionId, game.Payload));
                     break;
 
                 case RavaHello hello:
@@ -367,6 +396,20 @@ public sealed class RavaDiscoveryService : DisposableMediatorSubscriberBase, IHo
         }
 
         return Task.CompletedTask;
+    }
+
+    private void FlushPendingGameMeshMessages()
+    {
+        if (_pendingGameMeshMessages.IsEmpty)
+            return;
+
+        for (var i = 0; i < MaxGameMeshMessagesPerTick; i++)
+        {
+            if (!_pendingGameMeshMessages.TryDequeue(out var msg))
+                break;
+
+            _mediator.Publish(msg);
+        }
     }
 
     private void TouchPeer(string sessionId, byte[]? peerKey)
@@ -407,6 +450,8 @@ public sealed class RavaDiscoveryService : DisposableMediatorSubscriberBase, IHo
 
         _knownPeers.AddOrUpdate(from, info, (_, existing) => existing with { LastSeenUtc = now });
 
+        BroadcastLocalOtherSyncStatesToPeer(from);
+
         var ack = new RavaHelloAck(_mySessionId, _myPeerKey);
         _ = _mesh.SendAsync(from, ack);
     }
@@ -426,6 +471,8 @@ public sealed class RavaDiscoveryService : DisposableMediatorSubscriberBase, IHo
             LastSeenUtc: now);
 
         _knownPeers.AddOrUpdate(from, info, (_, existing) => existing with { LastSeenUtc = now });
+
+        BroadcastLocalOtherSyncStatesToPeer(from);
     }
 
     private void HandlePairRequest(string localSessionId, RavaPairRequest pr)
@@ -465,11 +512,7 @@ public sealed class RavaDiscoveryService : DisposableMediatorSubscriberBase, IHo
 
         _mySessionId = null;
 
-        lock (_yieldBroadcastGate)
-        {
-            _lastYieldBroadcast = null;
-            _lastYieldBroadcastOwner = string.Empty;
-        }
+        _lastYieldBroadcastByUid.Clear();
 
         if (!string.IsNullOrEmpty(oldSession))
         {
@@ -491,6 +534,9 @@ public sealed class RavaDiscoveryService : DisposableMediatorSubscriberBase, IHo
 
     private void PruneObjectSessionCache(DateTime nowUtc)
     {
+        if (_objectSessionCache.IsEmpty)
+            return;
+
         if ((nowUtc - _lastObjectSessionPruneUtc) < ObjectSessionCachePruneInterval)
             return;
 
@@ -544,6 +590,9 @@ public sealed class RavaDiscoveryService : DisposableMediatorSubscriberBase, IHo
 
     private void PrunePeers(DateTime nowUtc)
     {
+        if (_knownPeers.IsEmpty)
+            return;
+
         if ((nowUtc - _lastPruneUtc) < PruneInterval)
             return;
 
@@ -560,37 +609,67 @@ public sealed class RavaDiscoveryService : DisposableMediatorSubscriberBase, IHo
         }
     }
 
-    public void BroadcastLocalOtherSyncState(bool yieldToOtherSync, string owner)
+    private void BroadcastLocalOtherSyncStatesToPeer(string sessionId)
     {
         if (!_api.IsConnected) return;
         if (!_isMeshListening) return;
         if (_mySessionId == null) return;
-        if (_ownUser == null) return;
+        if (string.IsNullOrWhiteSpace(sessionId)) return;
+
+        foreach (var kvp in _localYieldStatesByUid)
+        {
+            var msg = new RavaYield(
+                FromSessionId: _mySessionId,
+                FromUid: _ownUser?.UID ?? string.Empty,
+                AffectedUid: kvp.Key,
+                YieldToOtherSync: kvp.Value.Yield,
+                Owner: kvp.Value.Yield ? (kvp.Value.Owner ?? string.Empty) : string.Empty);
+
+            _ = _mesh.SendAsync(sessionId, msg);
+        }
+    }
+
+    private void BroadcastAllLocalOtherSyncStates()
+    {
+        if (!_api.IsConnected) return;
+        if (!_isMeshListening) return;
+        if (_mySessionId == null) return;
+
+        foreach (var kvp in _localYieldStatesByUid)
+        {
+            BroadcastLocalOtherSyncState(kvp.Key,kvp.Value.Yield,kvp.Value.Yield ? kvp.Value.Owner : string.Empty);
+        }
+    }
+
+    public void BroadcastLocalOtherSyncState(string affectedUid, bool yieldToOtherSync, string owner)
+    {
+        if (!_api.IsConnected) return;
+        if (!_isMeshListening) return;
+        if (_mySessionId == null) return;
+        if (string.IsNullOrWhiteSpace(affectedUid)) return;
 
         owner ??= string.Empty;
 
         if (!yieldToOtherSync)
             owner = string.Empty;
 
-        lock (_yieldBroadcastGate)
+        var outgoing = new YieldBroadcastStateEntry(yieldToOtherSync, owner);
+        if (_lastYieldBroadcastByUid.TryGetValue(affectedUid, out var last)
+            && last.Yield == outgoing.Yield
+            && string.Equals(last.Owner, outgoing.Owner, StringComparison.OrdinalIgnoreCase))
         {
-            if (_lastYieldBroadcast.HasValue
-                && _lastYieldBroadcast.Value == yieldToOtherSync
-                && string.Equals(_lastYieldBroadcastOwner, owner, StringComparison.OrdinalIgnoreCase))
-            {
-                return;
-            }
-
-            _lastYieldBroadcast = yieldToOtherSync;
-            _lastYieldBroadcastOwner = owner;
+            return;
         }
+
+        _lastYieldBroadcastByUid[affectedUid] = outgoing;
 
         var peers = _knownPeers.Keys.ToArray();
         if (peers.Length == 0) return;
 
         var msg = new RavaYield(
             FromSessionId: _mySessionId,
-            FromUid: _ownUser.UID,
+            FromUid: _ownUser?.UID ?? string.Empty,
+            AffectedUid: affectedUid,
             YieldToOtherSync: yieldToOtherSync,
             Owner: owner);
 

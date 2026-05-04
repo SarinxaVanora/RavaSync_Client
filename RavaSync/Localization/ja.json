@@ -1578,5 +1578,7 @@
   "UI.VenueRegistrationUi.567b566d": "Venue 名:",
   "UI.VenueRegistrationUi.77dfd213": "キャンセル",
   "UI.VenueRegistrationUi.a6a95932": "この区画をあなたの Syncshell の1つにリンクします。",
-  "UI.VenueRegistrationUi.fac9bd39": "適用されたデータはありません"
+  "UI.VenueRegistrationUi.fac9bd39": "適用されたデータはありません",
+  "UI.DrawUserPair.RedrawTarget": "Redraw target",
+  "UI.DrawUserPair.RedrawTarget.Tooltip": "Executes a Penumbra redraw on this visible target."
 }

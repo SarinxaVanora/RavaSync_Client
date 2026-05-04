@@ -1,4 +1,4 @@
-﻿using Dalamud.Game.ClientState.Objects.Enums;
+using Dalamud.Game.ClientState.Objects.Enums;
 using Dalamud.Game.Gui.ContextMenu;
 using Dalamud.Game.Text.SeStringHandling;
 using Dalamud.Plugin.Services;
@@ -8,6 +8,7 @@ using RavaSync.API.Data.Comparer;
 using RavaSync.API.Data.Extensions;
 using RavaSync.API.Dto.Group;
 using RavaSync.API.Dto.User;
+using RavaSync.Interop.Ipc;
 using RavaSync.MareConfiguration;
 using RavaSync.MareConfiguration.Models;
 using RavaSync.PlayerData.Factories;
@@ -15,10 +16,10 @@ using RavaSync.Services;
 using RavaSync.Services.Discovery;
 using RavaSync.Services.Events;
 using RavaSync.Services.Mediator;
+using RavaSync.Utils;
 using RavaSync.WebAPI;
 using System.Collections.Concurrent;
-
-
+using System.Text.Json;
 
 namespace RavaSync.PlayerData.Pairs;
 
@@ -31,29 +32,38 @@ public sealed class PairManager : DisposableMediatorSubscriberBase
     private readonly PairFactory _pairFactory;
     private readonly MareMediator _mediator;
     private readonly DalamudUtilService _dalamudUtil;
+    private readonly IpcManager _ipcManager;
+    private readonly CharacterRavaSidecarUtility _characterRavaSidecarUtility;
+    private readonly PlayerPerformanceService _playerPerformanceService;
     private sealed record PendingOtherSyncLatch(bool YieldToOtherSync, string Owner);
     private readonly ConcurrentDictionary<string, PendingOtherSyncLatch> _pendingOtherSyncLatchByUid = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, Pair> _pairsByUid = new(StringComparer.Ordinal);
+    private readonly object _refreshUiGate = new();
+    private long _lastOtherSyncCleanupTick;
+    private bool _refreshUiPending;
+    private long _refreshUiPublishTick;
     private Lazy<List<Pair>> _directPairsInternal;
     private Lazy<Dictionary<GroupFullInfoDto, List<Pair>>> _groupPairsInternal;
     private Lazy<Dictionary<Pair, List<GroupFullInfoDto>>> _pairsWithGroupsInternal;
 
-    public PairManager(
-        ILogger<PairManager> logger,
-        PairFactory pairFactory,
-        MareConfigService configurationService,
-        MareMediator mediator,
-        IContextMenu dalamudContextMenu,
-        DalamudUtilService dalamudUtil)
-        : base(logger, mediator)
+    public PairManager(ILogger<PairManager> logger,PairFactory pairFactory,MareConfigService configurationService,MareMediator mediator,IContextMenu dalamudContextMenu,DalamudUtilService dalamudUtil,IpcManager ipcManager, CharacterRavaSidecarUtility characterRavaSidecarUtility, PlayerPerformanceService playerPerformanceService) : base(logger, mediator)
     {
         _pairFactory = pairFactory;
         _configurationService = configurationService;
         _dalamudContextMenu = dalamudContextMenu;
         _mediator = mediator;
         _dalamudUtil = dalamudUtil;
+        _ipcManager = ipcManager;
+        _characterRavaSidecarUtility = characterRavaSidecarUtility;
+        _playerPerformanceService = playerPerformanceService;
         
         Mediator.Subscribe<DisconnectedMessage>(this, (_) => ClearPairs());
         Mediator.Subscribe<CutsceneEndMessage>(this, (_) => ReapplyPairData());
+        Mediator.Subscribe<DelayedFrameworkUpdateMessage>(this, _ =>
+        {
+            PeriodicOtherSyncCleanup();
+            FlushScheduledRefreshUi();
+        });
         Mediator.Subscribe<RemoteOtherSyncConnectedMessage>(this, msg =>
         {
             HandleRemoteOtherSyncConnected(msg.Owner ?? "OtherSync");
@@ -65,13 +75,26 @@ public sealed class PairManager : DisposableMediatorSubscriberBase
         });
         Mediator.Subscribe<RemoteOtherSyncYieldMessage>(this, msg =>
         {
-            var uid = msg.AffectedUid;
-            var owner = msg.Owner ?? string.Empty;
+            var uid = msg.FromUid;
+            var owner = msg.YieldToOtherSync ? NormalizeOtherSyncOwner(msg.Owner) : string.Empty;
 
-            if (_pendingOtherSyncLatchByUid.TryGetValue(uid, out var existing)
-                && existing.YieldToOtherSync == msg.YieldToOtherSync
-                && string.Equals(existing.Owner, owner, StringComparison.OrdinalIgnoreCase))
+            if (!CanTrackRemoteOtherSyncLatch(msg.YieldToOtherSync, owner))
             {
+                _pendingOtherSyncLatchByUid.TryRemove(uid, out _);
+
+                var unavailablePair = GetPairByUID(uid);
+                if (unavailablePair != null && unavailablePair.RemoteOtherSyncOverrideActive && MatchesOtherSyncOwner(unavailablePair.RemoteOtherSyncOwner, owner))
+                {
+                    var wasYielded = unavailablePair.AutoPausedByOtherSync;
+
+                    unavailablePair.ExpireRemoteOtherSyncOverride(requestApplyIfPossible: true);
+
+                    if (wasYielded && !unavailablePair.AutoPausedByOtherSync)
+                        Mediator.Publish(new LocalOtherSyncYieldStateChangedMessage(unavailablePair.UserData.UID, false, string.Empty));
+
+                    ScheduleRefreshUi();
+                }
+
                 return;
             }
 
@@ -81,7 +104,7 @@ public sealed class PairManager : DisposableMediatorSubscriberBase
             if (pair == null) return;
 
             ApplyPendingOtherSyncLatchIfAny(pair);
-            Mediator.Publish(new RefreshUiMessage());
+            ScheduleRefreshUi();
         });
         _directPairsInternal = DirectPairsLazy();
         _groupPairsInternal = GroupPairsLazy();
@@ -110,6 +133,7 @@ public sealed class PairManager : DisposableMediatorSubscriberBase
                 [dto.Group.GID], dto.SelfToOtherPermissions, dto.OtherToSelfPermissions));
 
             _allClientPairs[dto.User] = created;
+            IndexPair(created);
             ApplyPendingOtherSyncLatchIfAny(created);
         }
         else
@@ -122,21 +146,107 @@ public sealed class PairManager : DisposableMediatorSubscriberBase
 
     public Pair? GetPairByUID(string uid)
     {
-        var existingPair = _allClientPairs.FirstOrDefault(f => f.Key.UID == uid);
-        if (!Equals(existingPair, default(KeyValuePair<UserData, Pair>)))
-        {
-            return existingPair.Value;
-        }
+        if (string.IsNullOrWhiteSpace(uid))
+            return null;
 
-        return null;
+        return _pairsByUid.TryGetValue(uid, out var pair) ? pair : null;
     }
+
+    private void CleanupExpiredOtherSyncLatches()
+    {
+        // OtherSync ownership is now fully flag-driven and remains latched until an
+        // explicit remote change or disconnect says otherwise. No TTL/periodic expiry.
+    }
+
+    private static bool SyncRelevantPermissionsChanged(RavaSync.API.Data.Enum.UserPermissions previousPermissions, RavaSync.API.Data.Enum.UserPermissions nextPermissions)
+    {
+        if (previousPermissions == nextPermissions)
+            return false;
+
+        return previousPermissions.IsPaused() != nextPermissions.IsPaused()
+            || previousPermissions.IsDisableAnimations() != nextPermissions.IsDisableAnimations()
+            || previousPermissions.IsDisableSounds() != nextPermissions.IsDisableSounds()
+            || previousPermissions.IsDisableVFX() != nextPermissions.IsDisableVFX();
+    }
+
+    private static string NormalizeOtherSyncOwner(string? owner)
+    {
+        if (string.IsNullOrWhiteSpace(owner))
+            return "OtherSync";
+
+        var normalized = owner.Trim();
+
+        if (string.Equals(normalized, "LightlessSync", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(normalized, "LightlessClient", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(normalized, "Lightless-Sync", StringComparison.OrdinalIgnoreCase))
+            return "Lightless";
+
+        if (string.Equals(normalized, "SnowcloakSync", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(normalized, "SnowcloakClient", StringComparison.OrdinalIgnoreCase))
+            return "Snowcloak";
+
+        if (string.Equals(normalized, "MareSynchronos", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(normalized, "MareSempiterne", StringComparison.OrdinalIgnoreCase))
+            return "PlayerSync";
+
+        return normalized;
+    }
+
+    private static bool CanTrackRemoteOtherSyncOwner(string? owner)
+    {
+        var normalizedOwner = NormalizeOtherSyncOwner(owner);
+        return !string.IsNullOrWhiteSpace(normalizedOwner)
+            && !string.Equals(normalizedOwner, "RavaSync", StringComparison.OrdinalIgnoreCase)
+            && !string.Equals(normalizedOwner, "OtherSync", StringComparison.OrdinalIgnoreCase)
+            && !string.Equals(normalizedOwner, "Other", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool CanTrackRemoteOtherSyncLatch(bool yieldToOtherSync, string? owner)
+    {
+        if (!yieldToOtherSync)
+            return true;
+
+        return CanTrackRemoteOtherSyncOwner(owner);
+    }
+
+    private static bool MatchesOtherSyncOwner(string currentOwner, string targetOwner)
+        => string.Equals(currentOwner ?? string.Empty, targetOwner ?? string.Empty, StringComparison.OrdinalIgnoreCase);
 
     private void ApplyPendingOtherSyncLatchIfAny(Pair pair)
     {
         var uid = pair.UserData.UID;
         if (!_pendingOtherSyncLatchByUid.TryGetValue(uid, out var pending))
             return;
+
+        if (!CanTrackRemoteOtherSyncLatch(pending.YieldToOtherSync, pending.Owner))
+        {
+            _pendingOtherSyncLatchByUid.TryRemove(uid, out _);
+
+            var wasYielded = pair.AutoPausedByOtherSync;
+
+            pair.ExpireRemoteOtherSyncOverride(requestApplyIfPossible: true);
+
+            if (wasYielded && !pair.AutoPausedByOtherSync)
+                Mediator.Publish(new LocalOtherSyncYieldStateChangedMessage(pair.UserData.UID, false, string.Empty));
+
+            return;
+        }
+
         pair.ApplyRemoteOtherSyncOverride(pending.YieldToOtherSync, pending.Owner);
+    }
+
+    private void IndexPair(Pair pair)
+    {
+        var uid = pair.UserData.UID;
+        if (!string.IsNullOrWhiteSpace(uid))
+            _pairsByUid[uid] = pair;
+    }
+
+    private void UnindexPair(UserData user)
+    {
+        var uid = user.UID;
+        if (!string.IsNullOrWhiteSpace(uid))
+            _pairsByUid.TryRemove(uid, out _);
     }
 
     public void AddUserPair(UserFullPairDto dto)
@@ -145,13 +255,15 @@ public sealed class PairManager : DisposableMediatorSubscriberBase
         {
             var created = _pairFactory.Create(dto);
             _allClientPairs[dto.User] = created;
+            IndexPair(created);
 
             ApplyPendingOtherSyncLatchIfAny(created);
         }
         else
         {
-            _allClientPairs[dto.User].UserPair.IndividualPairStatus = dto.IndividualPairStatus;
-            _allClientPairs[dto.User].ApplyLastReceivedData();
+            var existingPair = _allClientPairs[dto.User];
+            existingPair.UserPair.IndividualPairStatus = dto.IndividualPairStatus;
+            existingPair.ApplyLastReceivedData();
         }
 
         RecreateLazy();
@@ -163,6 +275,7 @@ public sealed class PairManager : DisposableMediatorSubscriberBase
         {
             var created = _pairFactory.Create(dto);
             _allClientPairs[dto.User] = created;
+            IndexPair(created);
 
             ApplyPendingOtherSyncLatchIfAny(created);
         }
@@ -171,20 +284,37 @@ public sealed class PairManager : DisposableMediatorSubscriberBase
             addToLastAddedUser = false;
         }
 
-        _allClientPairs[dto.User].UserPair.IndividualPairStatus = dto.IndividualPairStatus;
-        _allClientPairs[dto.User].UserPair.OwnPermissions = dto.OwnPermissions;
-        _allClientPairs[dto.User].UserPair.OtherPermissions = dto.OtherPermissions;
+        var existingPair = _allClientPairs[dto.User];
+        existingPair.UserPair.IndividualPairStatus = dto.IndividualPairStatus;
+        existingPair.UserPair.OwnPermissions = dto.OwnPermissions;
+        existingPair.UserPair.OtherPermissions = dto.OtherPermissions;
         if (addToLastAddedUser)
-            LastAddedUser = _allClientPairs[dto.User];
-        _allClientPairs[dto.User].ApplyLastReceivedData();
+            LastAddedUser = existingPair;
+        existingPair.ApplyLastReceivedData();
         RecreateLazy();
     }
 
     public void ClearPairs()
     {
         Logger.LogDebug("Clearing all Pairs");
-        DisposePairs();
+
+        var pairs = _allClientPairs.Values.ToArray();
+
+        Parallel.ForEach(pairs, pair =>
+        {
+            try
+            {
+                pair.EnterPausedVanillaState();
+            }
+            catch (Exception ex)
+            {
+                Logger.LogTrace(ex, "Fast vanilla restore failed while clearing pair {uid}", pair.UserData.UID);
+            }
+        });
+
+        DisposePairs(pairs);
         _allClientPairs.Clear();
+        _pairsByUid.Clear();
         _allGroups.Clear();
         _pendingOtherSyncLatchByUid.Clear();
         RecreateLazy();
@@ -213,14 +343,99 @@ public sealed class PairManager : DisposableMediatorSubscriberBase
         return count;
     }
 
-    public List<UserData> GetVisibleUsers()
+    public void FillVisibleUsers(List<UserData> target)
     {
-        var list = new List<UserData>(_allClientPairs.Count);
+        ArgumentNullException.ThrowIfNull(target);
+
+        target.Clear();
+        if (target.Capacity < _allClientPairs.Count)
+            target.Capacity = _allClientPairs.Count;
+
         foreach (var kvp in _allClientPairs)
         {
             if (kvp.Value.IsVisible)
-                list.Add(kvp.Key);
+                target.Add(kvp.Key);
         }
+    }
+
+    public void ForEachVisibleUser(Action<UserData> action)
+    {
+        ArgumentNullException.ThrowIfNull(action);
+
+        foreach (var kvp in _allClientPairs)
+        {
+            if (kvp.Value.IsVisible)
+                action(kvp.Key);
+        }
+    }
+
+    public void ForEachPair(Action<Pair> action)
+    {
+        ArgumentNullException.ThrowIfNull(action);
+
+        foreach (var kvp in _allClientPairs)
+        {
+            action(kvp.Value);
+        }
+    }
+
+    public void ForEachVisiblePair(Action<Pair> action)
+    {
+        ArgumentNullException.ThrowIfNull(action);
+
+        foreach (var kvp in _allClientPairs)
+        {
+            var pair = kvp.Value;
+            if (pair.IsVisible)
+                action(pair);
+        }
+    }
+
+    public void ClearDisplayedPerformanceMetrics(IEnumerable<UserData> users)
+    {
+        ArgumentNullException.ThrowIfNull(users);
+
+        var changed = false;
+        foreach (var user in users)
+        {
+            if (user == null)
+                continue;
+
+            if (!_allClientPairs.TryGetValue(user, out var pair))
+                continue;
+
+            if (pair.LastAppliedApproximateVRAMBytes < 0 && pair.LastAppliedDataTris < 0)
+                continue;
+
+            pair.ClearDisplayedPerformanceMetrics();
+            changed = true;
+        }
+
+        if (changed)
+            ScheduleRefreshUi();
+    }
+
+    public void ClearDisplayedPerformanceMetricsForAllPairs()
+    {
+        var changed = false;
+        foreach (var kvp in _allClientPairs)
+        {
+            var pair = kvp.Value;
+            if (pair.LastAppliedApproximateVRAMBytes < 0 && pair.LastAppliedDataTris < 0)
+                continue;
+
+            pair.ClearDisplayedPerformanceMetrics();
+            changed = true;
+        }
+
+        if (changed)
+            ScheduleRefreshUi();
+    }
+
+    public List<UserData> GetVisibleUsers()
+    {
+        var list = new List<UserData>(_allClientPairs.Count);
+        FillVisibleUsers(list);
         return list;
     }
 
@@ -269,10 +484,57 @@ public sealed class PairManager : DisposableMediatorSubscriberBase
 
     public void ReceiveCharaData(OnlineUserCharaDataDto dto)
     {
-        if (!_allClientPairs.TryGetValue(dto.User, out var pair)) throw new InvalidOperationException("No user found for " + dto.User);
+        if (!_allClientPairs.TryGetValue(dto.User, out var pair))
+            throw new InvalidOperationException("No user found for " + dto.User);
+
+        var previousManifestFingerprint = pair.LastReceivedSyncManifest?.mf ?? string.Empty;
+        var hasSyncManifest = _characterRavaSidecarUtility.TryExtractSyncManifest(dto.CharaData, out var syncManifest);
+        var hasPerformance = _characterRavaSidecarUtility.TryExtractPerformance(dto.CharaData, out var sidecarVramBytes, out var sidecarTriangles);
+
+        if (hasPerformance)
+            _playerPerformanceService.HandleIncomingPerformanceMetrics(pair, dto.CharaData?.DataHash.Value, sidecarVramBytes, sidecarTriangles);
+
+        var merged = 0;
+        if (hasSyncManifest)
+        {
+            merged = _characterRavaSidecarUtility.MergeManifestIntoCharacterData(dto.CharaData, syncManifest);
+            pair.SetLastReceivedSyncManifest(syncManifest);
+        }
+
+        var currentManifestFingerprint = hasSyncManifest ? syncManifest?.mf ?? string.Empty : previousManifestFingerprint;
+        var manifestUnchanged = string.Equals(previousManifestFingerprint, currentManifestFingerprint, StringComparison.Ordinal);
+
+        if (pair.IsDuplicateIncomingPayload(dto.CharaData) && manifestUnchanged)
+        {
+            if (Logger.IsEnabled(LogLevel.Trace))
+            {
+                Logger.LogTrace(
+                    "Ignoring duplicate/sidecar-only character data for {uid}; perf={perf}, manifest={manifest}, merged={merged}",
+                    dto.User.UID,
+                    hasPerformance,
+                    currentManifestFingerprint,
+                    merged);
+            }
+
+            return;
+        }
+
+        if (!hasSyncManifest)
+            pair.SetLastReceivedSyncManifest(null);
+
+        if (hasSyncManifest && Logger.IsEnabled(LogLevel.Trace))
+        {
+            Logger.LogTrace(
+                "Received sync manifest from {uid}: {total} assets, {critical} critical, {merged} merged into payload, manifest {manifestFingerprint}",
+                dto.User.UID,
+                syncManifest?.total ?? 0,
+                syncManifest?.critical ?? 0,
+                merged,
+                currentManifestFingerprint);
+        }
 
         Mediator.Publish(new EventMessage(new Event(pair.UserData, nameof(PairManager), EventSeverity.Informational, "Received Character Data")));
-        _allClientPairs[dto.User].ApplyData(dto);
+        pair.ApplyData(dto);
     }
 
     public void RemoveGroup(GroupData data)
@@ -287,6 +549,7 @@ public sealed class PairManager : DisposableMediatorSubscriberBase
             {
                 item.Value.MarkOffline();
                 _allClientPairs.TryRemove(item.Key, out _);
+                UnindexPair(item.Key);
             }
         }
 
@@ -303,6 +566,7 @@ public sealed class PairManager : DisposableMediatorSubscriberBase
             {
                 pair.MarkOffline();
                 _allClientPairs.TryRemove(dto.User, out _);
+                UnindexPair(dto.User);
             }
         }
 
@@ -319,6 +583,7 @@ public sealed class PairManager : DisposableMediatorSubscriberBase
             {
                 pair.MarkOffline();
                 _allClientPairs.TryRemove(dto.User, out _);
+                UnindexPair(dto.User);
             }
         }
 
@@ -343,7 +608,10 @@ public sealed class PairManager : DisposableMediatorSubscriberBase
 
         if (pair.UserPair == null) throw new InvalidOperationException("No direct pair for " + dto);
 
-        if (pair.UserPair.OtherPermissions.IsPaused() != dto.Permissions.IsPaused())
+        var previousPermissions = pair.UserPair.OtherPermissions;
+        var permissionsChanged = SyncRelevantPermissionsChanged(previousPermissions, dto.Permissions);
+
+        if (previousPermissions.IsPaused() != dto.Permissions.IsPaused())
         {
             Mediator.Publish(new ClearProfileDataMessage(dto.User));
         }
@@ -356,9 +624,7 @@ public sealed class PairManager : DisposableMediatorSubscriberBase
             pair.UserPair.OtherPermissions.IsDisableSounds(),
             pair.UserPair.OtherPermissions.IsDisableVFX());
 
-        if (pair.IsPaused)
-        { }
-        else
+        if (permissionsChanged && !pair.IsPaused)
             pair.ApplyLastReceivedData();
 
         RecreateLazy();
@@ -371,12 +637,21 @@ public sealed class PairManager : DisposableMediatorSubscriberBase
             throw new InvalidOperationException("No such pair for " + dto);
         }
 
-        if (pair.UserPair.OwnPermissions.IsPaused() != dto.Permissions.IsPaused())
+        var previousPermissions = pair.UserPair.OwnPermissions;
+        var permissionsChanged = SyncRelevantPermissionsChanged(previousPermissions, dto.Permissions);
+
+        var pauseStateChanged = previousPermissions.IsPaused() != dto.Permissions.IsPaused();
+        if (pauseStateChanged)
         {
             Mediator.Publish(new ClearProfileDataMessage(dto.User));
         }
 
         pair.UserPair.OwnPermissions = dto.Permissions;
+
+        if (dto.Permissions.IsPaused())
+        {
+            pair.EnterPausedVanillaState();
+        }
 
         Logger.LogTrace("Paused: {paused}, Anims: {anims}, Sounds: {sounds}, VFX: {vfx}",
             pair.UserPair.OwnPermissions.IsPaused(),
@@ -384,9 +659,7 @@ public sealed class PairManager : DisposableMediatorSubscriberBase
             pair.UserPair.OwnPermissions.IsDisableSounds(),
             pair.UserPair.OwnPermissions.IsDisableVFX());
 
-        if (pair.IsPaused)
-        { }
-        else
+        if (permissionsChanged && !pair.IsPaused)
             pair.ApplyLastReceivedData();
 
         RecreateLazy();
@@ -430,12 +703,22 @@ public sealed class PairManager : DisposableMediatorSubscriberBase
         if (_allClientPairs.TryGetValue(dto.User, out var pair))
         {
             pair.UserPair.IndividualPairStatus = dto.IndividualPairStatus;
+            pair.ApplyLastReceivedData();
             RecreateLazy();
         }
     }
 
     protected override void Dispose(bool disposing)
     {
+        if (disposing)
+        {
+            lock (_refreshUiGate)
+            {
+                _refreshUiPending = false;
+                _refreshUiPublishTick = 0;
+            }
+        }
+
         base.Dispose(disposing);
 
         _dalamudContextMenu.OnMenuOpened -= DalamudContextMenuOnOnOpenGameObjectContextMenu;
@@ -474,10 +757,15 @@ public sealed class PairManager : DisposableMediatorSubscriberBase
 
     private void DisposePairs()
     {
+        DisposePairs(_allClientPairs.Values.ToArray());
+    }
+
+    private void DisposePairs(IEnumerable<Pair> pairs)
+    {
         Logger.LogDebug("Disposing all Pairs");
-        Parallel.ForEach(_allClientPairs, item =>
+        Parallel.ForEach(pairs, pair =>
         {
-            item.Value.MarkOffline(wait: true);
+            pair.MarkOffline(wait: true);
         });
 
         RecreateLazy();
@@ -540,6 +828,38 @@ public sealed class PairManager : DisposableMediatorSubscriberBase
         });
     }
 
+    private void ScheduleRefreshUi(bool immediate = false)
+    {
+        lock (_refreshUiGate)
+        {
+            var dueTick = immediate ? Environment.TickCount64 : Environment.TickCount64 + 50;
+            if (!_refreshUiPending || dueTick < _refreshUiPublishTick)
+                _refreshUiPublishTick = dueTick;
+
+            _refreshUiPending = true;
+        }
+    }
+
+    private void FlushScheduledRefreshUi()
+    {
+        var publish = false;
+        lock (_refreshUiGate)
+        {
+            if (!_refreshUiPending)
+                return;
+
+            if (Environment.TickCount64 < _refreshUiPublishTick)
+                return;
+
+            _refreshUiPending = false;
+            _refreshUiPublishTick = 0;
+            publish = true;
+        }
+
+        if (publish)
+            Mediator.Publish(new RefreshUiMessage());
+    }
+
     private void ReapplyPairData()
     {
         foreach (var pair in _allClientPairs.Select(k => k.Value))
@@ -568,37 +888,46 @@ public sealed class PairManager : DisposableMediatorSubscriberBase
 
     private void HandleRemoteOtherSyncDisconnected(string owner)
     {
-        foreach (var pair in _allClientPairs.Values)
+        Logger.LogDebug("Remote other-sync disconnected: {owner}. Clearing matching per-UID latch state.", owner);
+
+        foreach (var kvp in _pendingOtherSyncLatchByUid.ToArray())
         {
-            pair.ApplyRemoteOtherSyncOverride(yieldToOtherSync: false, owner: owner);
-            pair.ClearRemoteOtherSyncOverride();
+            if (!string.Equals(kvp.Value.Owner, owner, StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            _pendingOtherSyncLatchByUid.TryRemove(kvp.Key, out _);
+
+            if (_pairsByUid.TryGetValue(kvp.Key, out var pair))
+            {
+                var wasYielded = pair.AutoPausedByOtherSync;
+
+                pair.ExpireRemoteOtherSyncOverride(requestApplyIfPossible: true);
+
+                if (wasYielded && !pair.AutoPausedByOtherSync)
+                    Mediator.Publish(new LocalOtherSyncYieldStateChangedMessage(pair.UserData.UID, false, string.Empty));
+            }
         }
 
-        Mediator.Publish(new RefreshUiMessage());
+        ScheduleRefreshUi();
     }
 
     private void HandleRemoteOtherSyncConnected(string owner)
     {
-        foreach (var pair in _allClientPairs.Values)
-        {
-            if (pair.OverrideOtherSync)
-            {
-                pair.ApplyRemoteOtherSyncOverride(yieldToOtherSync: false, owner: owner);
-                pair.ClearRemoteOtherSyncOverride();
-                continue;
-            }
+        Logger.LogDebug("Remote other-sync connected: {owner}. Keeping per-UID latch state unchanged.", owner);
+        ScheduleRefreshUi();
+    }
 
-            pair.ApplyRemoteOtherSyncOverride(yieldToOtherSync: true, owner: owner);
-        }
-
-        Mediator.Publish(new RefreshUiMessage());
+    private void PeriodicOtherSyncCleanup()
+    {
+        // Intentionally no-op. OtherSync state is explicit/latching now.
     }
 
     private void RecreateLazy()
     {
+        CleanupExpiredOtherSyncLatches();
         _directPairsInternal = DirectPairsLazy();
         _groupPairsInternal = GroupPairsLazy();
         _pairsWithGroupsInternal = PairsWithGroupsLazy();
-        Mediator.Publish(new RefreshUiMessage());
+        ScheduleRefreshUi();
     }
 }

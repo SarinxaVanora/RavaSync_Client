@@ -11,6 +11,7 @@ using RavaSync.Services.Mediator;
 using Dalamud.Interface.Textures.TextureWraps;
 using System.IO;
 using System.Numerics;
+using Dalamud.Interface.Windowing;
 
 namespace RavaSync.UI;
 

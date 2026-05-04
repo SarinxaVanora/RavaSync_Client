@@ -10,6 +10,8 @@ using Microsoft.AspNetCore.SignalR.Client;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using System.Net.WebSockets;
+using System.Threading;
+using System.Threading.Tasks;
 
 namespace RavaSync.WebAPI.SignalR;
 
@@ -35,20 +37,51 @@ public class HubFactory : MediatorSubscriberBase
 
     public async Task DisposeHubAsync()
     {
-        if (_instance == null || _isDisposed) return;
+        var instance = _instance;
+        if (instance == null || _isDisposed) return;
 
         Logger.LogDebug("Disposing current HubConnection");
 
         _isDisposed = true;
 
-        _instance.Closed -= HubOnClosed;
-        _instance.Reconnecting -= HubOnReconnecting;
-        _instance.Reconnected -= HubOnReconnected;
+        instance.Closed -= HubOnClosed;
+        instance.Reconnecting -= HubOnReconnecting;
+        instance.Reconnected -= HubOnReconnected;
 
-        await _instance.StopAsync().ConfigureAwait(false);
-        await _instance.DisposeAsync().ConfigureAwait(false);
+        try
+        {
+            using var stopCts = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+            await instance.StopAsync(stopCts.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            Logger.LogWarning("Timed out while stopping HubConnection; continuing with dispose");
+        }
+        catch (Exception ex)
+        {
+            Logger.LogDebug(ex, "HubConnection stop failed during dispose");
+        }
 
-        _instance = null;
+        try
+        {
+            var disposeTask = instance.DisposeAsync().AsTask();
+            var completedTask = await Task.WhenAny(disposeTask, Task.Delay(TimeSpan.FromSeconds(3))).ConfigureAwait(false);
+            if (completedTask == disposeTask)
+            {
+                await disposeTask.ConfigureAwait(false);
+            }
+            else
+            {
+                Logger.LogWarning("Timed out while disposing HubConnection");
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.LogDebug(ex, "HubConnection dispose failed");
+        }
+
+        if (ReferenceEquals(_instance, instance))
+            _instance = null;
 
         Logger.LogDebug("Current HubConnection disposed");
     }

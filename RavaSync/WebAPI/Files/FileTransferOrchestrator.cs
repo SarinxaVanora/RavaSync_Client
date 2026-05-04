@@ -140,7 +140,8 @@ public class FileTransferOrchestrator : DisposableMediatorSubscriberBase
             cpu <= 4 ? 2 :
             cpu <= 8 ? 3 :
             cpu <= 16 ? 4 :
-                        6;
+            cpu <= 24 ? 6 :
+                        8;
 
         return Math.Clamp(auto, 1, 12);
     }

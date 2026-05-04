@@ -73,7 +73,7 @@ public class TopTabMenu
     {
         var availableWidth = ImGui.GetWindowContentRegionMax().X - ImGui.GetWindowContentRegionMin().X;
         var spacing = ImGui.GetStyle().ItemSpacing;
-        var buttonCount = 4;
+        var buttonCount = 7;
         var buttonX = (availableWidth - spacing.X * (buttonCount - 1)) / buttonCount;
         var buttonY = _uiSharedService.GetIconButtonSize(FontAwesomeIcon.Pause).Y;
         var buttonSize = new Vector2(buttonX, buttonY);
@@ -137,6 +137,36 @@ public class TopTabMenu
             }
         }
         UiSharedService.AttachToolTip(_uiSharedService.L("UI.TopTabMenu.2601204c", "Tools Hub"));
+
+        ImGui.SameLine();
+        using (ImRaii.PushFont(UiBuilder.IconFont))
+        {
+            if (ImGui.Button(FontAwesomeIcon.Running.ToIconString(), buttonSize))
+            {
+                _mareMediator.Publish(new UiToggleMessage(typeof(CharaDataHubUi)));
+            }
+        }
+        UiSharedService.AttachToolTip(_uiSharedService.L("UI.TopTabMenu.9ec98c1e", "Character Data Hub"));
+
+        ImGui.SameLine();
+        using (ImRaii.PushFont(UiBuilder.IconFont))
+        {
+            if (ImGui.Button(FontAwesomeIcon.Search.ToIconString(), buttonSize))
+            {
+                _mareMediator.Publish(new UiToggleMessage(typeof(DataAnalysisUi)));
+            }
+        }
+        UiSharedService.AttachToolTip(_uiSharedService.L("UI.TopTabMenu.8a912f4d", "Character Analysis"));
+
+        ImGui.SameLine();
+        using (ImRaii.PushFont(UiBuilder.IconFont))
+        {
+            if (ImGui.Button(FontAwesomeIcon.Cog.ToIconString(), buttonSize))
+            {
+                _mareMediator.Publish(new UiToggleMessage(typeof(SettingsUi)));
+            }
+        }
+        UiSharedService.AttachToolTip(_uiSharedService.L("UI.TopTabMenu.3cf1d7f3", "Settings"));
 
         // --- Below-tab content ---
         ImGuiHelpers.ScaledDummy(spacing);

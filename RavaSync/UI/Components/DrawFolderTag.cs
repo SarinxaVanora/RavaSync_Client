@@ -30,6 +30,7 @@ public class DrawFolderTag : DrawFolderBase
         TagHandler.CustomOnlineTag => false,
         TagHandler.CustomOfflineTag => false,
         TagHandler.CustomVisibleTag => false,
+        TagHandler.CustomAutoPausedTag => false,
         TagHandler.CustomAllTag => true,
         TagHandler.CustomOfflineSyncshellTag => false,
 
@@ -46,6 +47,7 @@ public class DrawFolderTag : DrawFolderBase
         TagHandler.CustomOnlineTag => false,
         TagHandler.CustomOfflineTag => false,
         TagHandler.CustomVisibleTag => false,
+        TagHandler.CustomAutoPausedTag => false,
         TagHandler.CustomAllTag => false,
         TagHandler.CustomOfflineSyncshellTag => false,
 
@@ -62,6 +64,7 @@ public class DrawFolderTag : DrawFolderBase
         TagHandler.CustomOnlineTag => false,
         TagHandler.CustomOfflineTag => false,
         TagHandler.CustomVisibleTag => false,
+        TagHandler.CustomAutoPausedTag => false,
         TagHandler.CustomAllTag => false,
         TagHandler.CustomOfflineSyncshellTag => false,
 
@@ -79,6 +82,7 @@ public class DrawFolderTag : DrawFolderBase
         TagHandler.CustomOnlineTag => false,
         TagHandler.CustomOfflineTag => false,
         TagHandler.CustomVisibleTag => false,
+        TagHandler.CustomAutoPausedTag => true,
         TagHandler.CustomAllTag => false,
         TagHandler.CustomOfflineSyncshellTag => false,
         _ => true
@@ -93,6 +97,7 @@ public class DrawFolderTag : DrawFolderBase
             TagHandler.CustomOfflineTag => FontAwesomeIcon.Unlink,
             TagHandler.CustomOfflineSyncshellTag => FontAwesomeIcon.Unlink,
             TagHandler.CustomVisibleTag => FontAwesomeIcon.Eye,
+            TagHandler.CustomAutoPausedTag => FontAwesomeIcon.ExclamationTriangle,
             TagHandler.CustomAllTag => FontAwesomeIcon.User,
 
             TagHandler.CustomOtherSyncTag => FontAwesomeIcon.Sync,
@@ -110,16 +115,25 @@ public class DrawFolderTag : DrawFolderBase
             var style = ImGui.GetStyle();
             var onlinePairs = OnlinePairs;
             var totalPairs = TotalPairs;
+            var countToDisplay = _id == TagHandler.CustomAutoPausedTag ? DrawPairs.Count : onlinePairs;
 
             using (ImRaii.PushStyle(ImGuiStyleVar.ItemSpacing, style.ItemSpacing with { X = style.ItemSpacing.X / 2f }))
             {
                 ImGui.SameLine();
                 ImGui.AlignTextToFramePadding();
-                ImGui.TextUnformatted($"[{onlinePairs}]");
+                ImGui.TextUnformatted($"[{countToDisplay}]");
             }
 
-            UiSharedService.AttachToolTip(string.Format(_uiSharedService.L("UI.DrawFolderTag.Tooltip.PairCounts", "{0} online\n{1} total"), onlinePairs, totalPairs));
+            if (_id == TagHandler.CustomAutoPausedTag)
+            {
+                UiSharedService.AttachToolTip(string.Format(_uiSharedService.L("UI.DrawFolderTag.Tooltip.AutoPausedCount", "{0} pairs\n{1} total"), countToDisplay, totalPairs));
+            }
+            else
+            {
+                UiSharedService.AttachToolTip(string.Format(_uiSharedService.L("UI.DrawFolderTag.Tooltip.PairCounts", "{0} online\n{1} total"), onlinePairs, totalPairs));
+            }
         }
+
         ImGui.SameLine();
         return ImGui.GetCursorPosX();
     }
@@ -151,6 +165,7 @@ public class DrawFolderTag : DrawFolderBase
             TagHandler.CustomOfflineTag => _uiSharedService.L("UI.DrawFolderTag.Name.OfflinePausedByOther", "Offline / Paused by other"),
             TagHandler.CustomOfflineSyncshellTag => _uiSharedService.L("UI.DrawFolderTag.Name.OfflineSyncshellUsers", "Offline Syncshell Users"),
             TagHandler.CustomVisibleTag => _uiSharedService.L("UI.DrawFolderTag.Name.Visible", "Visible"),
+            TagHandler.CustomAutoPausedTag => _uiSharedService.L("UI.DrawFolderTag.Name.AutoPaused", "Auto-Paused"),
             TagHandler.CustomAllTag => _uiSharedService.L("UI.DrawFolderTag.Name.Users", "Users"),
 
             TagHandler.CustomOtherSyncRootTag => _uiSharedService.L("UI.DrawFolderTag.Name.OtherSync", "Handled by other sync"),

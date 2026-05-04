@@ -1,4 +1,5 @@
-﻿using Dalamud.Plugin;
+using Dalamud.Game.ClientState.Objects.SubKinds;
+using Dalamud.Plugin;
 using RavaSync.MareConfiguration.Models;
 using RavaSync.PlayerData.Handlers;
 using RavaSync.Services;
@@ -8,6 +9,9 @@ using Penumbra.Api.Enums;
 using Penumbra.Api.Helpers;
 using Penumbra.Api.IpcSubscribers;
 using System.Collections.Concurrent;
+using Dalamud.Game.ClientState.Objects.Types;
+using System.Diagnostics;
+using RavaSync.Services.Optimisation;
 
 namespace RavaSync.Interop.Ipc;
 
@@ -24,9 +28,31 @@ public sealed class IpcCallerPenumbra : DisposableMediatorSubscriberBase, IIpcCa
     {
         public int InFlight;
         public int Pending;
+        public long LastCompletedTick;
+    }
+
+    private sealed class PendingRedrawAck
+    {
+        public PendingRedrawAck(Guid id, nint address, int objectIndex)
+        {
+            Id = id;
+            Address = address;
+            ObjectIndex = objectIndex;
+        }
+
+        public Guid Id { get; }
+        public nint Address { get; }
+        public int ObjectIndex { get; }
+        public TaskCompletionSource<bool> Completion { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
     }
 
     private readonly ConcurrentDictionary<nint, RedrawGate> _redrawGates = new();
+    private readonly ConcurrentDictionary<Guid, PendingRedrawAck> _pendingRedrawAcks = new();
+    private static readonly SemaphoreSlim PenumbraFrameworkIpcGate = new(1, 1);
+    private static long _nextPenumbraFrameworkIpcTick;
+    // Keep Penumbra framework IPC serialized, but do not add a near-frame of idle time
+    // between every pair during cached room-entry applies. If hitches return, raise to 30.
+    private const int PenumbraFrameworkIpcSpacingMs = 20;
 
     public string? ModDirectory
     {
@@ -41,8 +67,6 @@ public sealed class IpcCallerPenumbra : DisposableMediatorSubscriberBase, IIpcCa
         }
     }
 
-    private readonly ConcurrentDictionary<IntPtr, bool> _penumbraRedrawRequests = new();
-
     private readonly EventSubscriber _penumbraDispose;
     private readonly EventSubscriber<nint, string, string> _penumbraGameObjectResourcePathResolved;
     private readonly EventSubscriber _penumbraInit;
@@ -51,13 +75,21 @@ public sealed class IpcCallerPenumbra : DisposableMediatorSubscriberBase, IIpcCa
 
     private readonly AddTemporaryMod _penumbraAddTemporaryMod;
     private readonly AssignTemporaryCollection _penumbraAssignTemporaryCollection;
+    private readonly AddMod _penumbraAddMod;
     private readonly ConvertTextureFile _penumbraConvertTextureFile;
     private readonly CreateTemporaryCollection _penumbraCreateNamedTemporaryCollection;
     private readonly GetEnabledState _penumbraEnabled;
+    private readonly GetCollectionForObject _penumbraGetCollectionForObject;
+    private readonly GetAllModSettings _penumbraGetAllModSettings;
     private readonly GetPlayerMetaManipulations _penumbraGetMetaManipulations;
     private readonly RedrawObject _penumbraRedraw;
+    private readonly ReloadMod _penumbraReloadMod;
     private readonly DeleteTemporaryCollection _penumbraRemoveTemporaryCollection;
     private readonly RemoveTemporaryMod _penumbraRemoveTemporaryMod;
+    private readonly TrySetMod _penumbraTrySetMod;
+    private readonly TrySetModPriority _penumbraTrySetModPriority;
+    private readonly TrySetModSetting _penumbraTrySetModSetting;
+    private readonly TrySetModSettings _penumbraTrySetModSettings;
     private readonly GetModDirectory _penumbraResolveModDir;
     private readonly ResolvePlayerPathsAsync _penumbraResolvePaths;
     private readonly GetGameObjectResourcePaths _penumbraResourcePaths;
@@ -76,23 +108,29 @@ public sealed class IpcCallerPenumbra : DisposableMediatorSubscriberBase, IIpcCa
         _penumbraDispose = Disposed.Subscriber(pi, PenumbraDispose);
         _penumbraResolveModDir = new GetModDirectory(pi);
         _penumbraRedraw = new RedrawObject(pi);
+        _penumbraReloadMod = new ReloadMod(pi);
         _penumbraObjectIsRedrawn = GameObjectRedrawn.Subscriber(pi, RedrawEvent);
         _penumbraGetMetaManipulations = new GetPlayerMetaManipulations(pi);
         _penumbraRemoveTemporaryMod = new RemoveTemporaryMod(pi);
         _penumbraAddTemporaryMod = new AddTemporaryMod(pi);
+        _penumbraAddMod = new AddMod(pi);
         _penumbraCreateNamedTemporaryCollection = new CreateTemporaryCollection(pi);
         _penumbraRemoveTemporaryCollection = new DeleteTemporaryCollection(pi);
         _penumbraAssignTemporaryCollection = new AssignTemporaryCollection(pi);
         _penumbraResolvePaths = new ResolvePlayerPathsAsync(pi);
         _penumbraEnabled = new GetEnabledState(pi);
+        _penumbraGetCollectionForObject = new GetCollectionForObject(pi);
+        _penumbraGetAllModSettings = new GetAllModSettings(pi);
+        _penumbraTrySetMod = new TrySetMod(pi);
+        _penumbraTrySetModPriority = new TrySetModPriority(pi);
+        _penumbraTrySetModSetting = new TrySetModSetting(pi);
+        _penumbraTrySetModSettings = new TrySetModSettings(pi);
         _penumbraConvertTextureFile = new ConvertTextureFile(pi);
         _penumbraResourcePaths = new GetGameObjectResourcePaths(pi);
         _penumbraModSettingChanged = ModSettingChanged.Subscriber(pi, OnPenumbraModSettingChanged);
         _penumbraGameObjectResourcePathResolved = GameObjectResourcePathResolved.Subscriber(pi, ResourceLoaded);
         CheckAPI();
         CheckModDirectory();
-
-
 
 
         Mediator.Subscribe<PenumbraRedrawCharacterMessage>(this, (msg) =>
@@ -102,12 +140,78 @@ public sealed class IpcCallerPenumbra : DisposableMediatorSubscriberBase, IIpcCa
                 return _redrawManager.ExternalPenumbraRedrawAsync(Logger, msg.Character, Guid.NewGuid(), c =>
                 {
                     _penumbraRedraw.Invoke(c.ObjectIndex, RedrawType.Redraw);
-                }, ct);
+                }, ct, isExplicitRedraw: true);
             });
         });
 
+        Mediator.Subscribe<PenumbraRedrawAddressMessage>(this, (msg) =>
+        {
+            _ = SafeIpc.TryRun(Logger, "Penumbra.Redraw.Address", TimeSpan.FromSeconds(2), async ct =>
+            {
+                var obj = await _dalamudUtil.CreateGameObjectAsync(msg.Address).ConfigureAwait(false);
+                if (obj is not ICharacter character) return;
+                await _redrawManager.ExternalPenumbraRedrawAsync(Logger, character, Guid.NewGuid(), c =>
+                {
+                    _penumbraRedraw.Invoke(c.ObjectIndex, RedrawType.Redraw);
+                }, ct, isExplicitRedraw: true).ConfigureAwait(false);
+            });
+        });
+    }
 
-        Mediator.Subscribe<DalamudLoginMessage>(this, (msg) => _shownPenumbraUnavailable = false);
+
+    public sealed record PenumbraModSettingState(bool Enabled, int Priority, Dictionary<string, List<string>> Settings, bool Inherited, bool Temporary);
+
+    public sealed record PenumbraCollectionModSettings(Guid CollectionId, string CollectionName,
+        Dictionary<string, PenumbraModSettingState> Mods);
+
+    public async Task<PenumbraCollectionModSettings?> GetLocalPlayerCollectionModSettingsAsync(ILogger logger, int gameObjectIndex)
+    {
+        if (!APIAvailable || gameObjectIndex < 0) return null;
+
+        PenumbraCollectionModSettings? result = null;
+
+        await SafeIpc.TryRun(Logger, "Penumbra.GetLocalPlayerCollectionModSettings", TimeSpan.FromSeconds(2), async ct =>
+        {
+            var collectionInfo = await _dalamudUtil.RunOnFrameworkThread(() =>
+            {
+                return _penumbraGetCollectionForObject.Invoke(gameObjectIndex);
+            }).ConfigureAwait(false);
+
+            if (!collectionInfo.ObjectValid || collectionInfo.EffectiveCollection.Id == Guid.Empty)
+            {
+                logger.LogTrace("[Penumbra] No valid effective collection for object index {index}", gameObjectIndex);
+                return;
+            }
+
+            var (ec, settings) = await _dalamudUtil.RunOnFrameworkThread(() =>
+            {
+                return _penumbraGetAllModSettings.Invoke(collectionInfo.EffectiveCollection.Id);
+            }).ConfigureAwait(false);
+
+            if (ec != PenumbraApiEc.Success || settings == null)
+            {
+                logger.LogDebug("[Penumbra] GetAllModSettings failed for collection {collection} ({ec})", collectionInfo.EffectiveCollection.Id, ec);
+                return;
+            }
+
+            var mapped = new Dictionary<string, PenumbraModSettingState>(StringComparer.OrdinalIgnoreCase);
+            foreach (var kv in settings)
+            {
+                mapped[kv.Key] = new PenumbraModSettingState(
+                    kv.Value.Item1,
+                    kv.Value.Item2,
+                    kv.Value.Item3 ?? new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase),
+                    kv.Value.Item4,
+                    kv.Value.Item5);
+            }
+
+            result = new PenumbraCollectionModSettings(
+                collectionInfo.EffectiveCollection.Id,
+                collectionInfo.EffectiveCollection.Name ?? string.Empty,
+                mapped);
+        }).ConfigureAwait(false);
+
+        return result;
     }
 
     public bool APIAvailable { get; private set; } = false;
@@ -171,30 +275,54 @@ public sealed class IpcCallerPenumbra : DisposableMediatorSubscriberBase, IIpcCa
         _penumbraObjectIsRedrawn.Dispose();
         _penumbraModSettingChanged.Dispose();
     }
-    private void OnPenumbraModSettingChanged(ModSettingChange change,Guid collectionId,string modName,bool inherited)
+    private void OnPenumbraModSettingChanged(ModSettingChange change, Guid collectionId, string modName, bool inherited)
     {
-
-        if (change == ModSettingChange.EnableState)
-        {
+        if (LocalPapSafetyModService.IsManagedRuntimeModIdentifier(modName))
             return;
-        }
 
-        _mareMediator.Publish(new PenumbraModSettingChangedMessage());
+        _mareMediator.Publish(new PenumbraModSettingChangedMessage(collectionId, modName, inherited, change.ToString()));
     }
-    //public async Task AssignTemporaryCollectionAsync(ILogger logger, Guid collName, int idx)
-    //{
-    //    if (!APIAvailable) return;
 
-    //    await SafeIpc.TryRun(Logger, "Penumbra.AssignTemporaryCollection", TimeSpan.FromSeconds(2), async ct =>
-    //    {
-    //        await _dalamudUtil.RunOnFrameworkThread(() =>
-    //        {
-    //            var retAssign = _penumbraAssignTemporaryCollection.Invoke(collName, idx, forceAssignment: true);
-    //            logger.LogTrace("Assigning Temp Collection {collName} to index {idx}, Success: {ret}", collName, idx, retAssign);
-    //            return collName;
-    //        }).ConfigureAwait(false);
-    //    }).ConfigureAwait(false);
-    //}
+    private async Task<T> RunPacedPenumbraFrameworkIpcAsync<T>(ILogger logger, string operationName, Func<T> action, CancellationToken token, int warnAfterMs = 60)
+    {
+        await PenumbraFrameworkIpcGate.WaitAsync(token).ConfigureAwait(false);
+
+        try
+        {
+            var delayMs = unchecked(Interlocked.Read(ref _nextPenumbraFrameworkIpcTick) - Environment.TickCount64);
+            if (delayMs > 0 && delayMs < 1000)
+                await Task.Delay((int)delayMs, token).ConfigureAwait(false);
+
+            return await _dalamudUtil.RunOnFrameworkThread(() =>
+            {
+                var sw = Stopwatch.StartNew();
+                try
+                {
+                    return action();
+                }
+                finally
+                {
+                    sw.Stop();
+                    if (sw.ElapsedMilliseconds >= warnAfterMs)
+                        logger.LogWarning("[Penumbra IPC HitchGuard] {operation} took {elapsed}ms on framework", operationName, sw.ElapsedMilliseconds);
+                    else
+                        logger.LogTrace("[Penumbra IPC HitchGuard] {operation} took {elapsed}ms on framework", operationName, sw.ElapsedMilliseconds);
+                }
+            }).ConfigureAwait(false);
+        }
+        finally
+        {
+            Interlocked.Exchange(ref _nextPenumbraFrameworkIpcTick, Environment.TickCount64 + PenumbraFrameworkIpcSpacingMs);
+            PenumbraFrameworkIpcGate.Release();
+        }
+    }
+
+    private Task RunPacedPenumbraFrameworkIpcAsync(ILogger logger, string operationName, Action action, CancellationToken token, int warnAfterMs = 60)
+        => RunPacedPenumbraFrameworkIpcAsync(logger, operationName, () =>
+        {
+            action();
+            return true;
+        }, token, warnAfterMs);
 
     public async Task<bool> AssignTemporaryCollectionAsync(ILogger logger, Guid collName, int idx)
     {
@@ -204,15 +332,8 @@ public sealed class IpcCallerPenumbra : DisposableMediatorSubscriberBase, IIpcCa
 
         await SafeIpc.TryRun(Logger, "Penumbra.AssignTemporaryCollection", TimeSpan.FromSeconds(2), async ct =>
         {
-            assigned = await _dalamudUtil.RunOnFrameworkThread(() =>
+            assigned = await RunPacedPenumbraFrameworkIpcAsync(logger, "Penumbra.AssignTemporaryCollection(force)", () =>
             {
-                var ec = _penumbraAssignTemporaryCollection.Invoke(collName, idx, forceAssignment: false);
-                if (ec == PenumbraApiEc.Success)
-                {
-                    logger.LogTrace("[Penumbra] Assigned temp collection {collection} to idx {idx} (polite)", collName, idx);
-                    return true;
-                }
-
                 var ecForce = _penumbraAssignTemporaryCollection.Invoke(collName, idx, forceAssignment: true);
                 if (ecForce == PenumbraApiEc.Success)
                 {
@@ -220,12 +341,9 @@ public sealed class IpcCallerPenumbra : DisposableMediatorSubscriberBase, IIpcCa
                     return true;
                 }
 
-                logger.LogDebug(
-                    "[Penumbra] Temp collection assign failed for idx {idx} (polite={ec}, forced={ecForce}). This is a temporary claim failure only.",
-                    idx, ec, ecForce);
-
+                logger.LogDebug("[Penumbra] Failed to assign temp collection {collection} to idx {idx}, ret={ret}", collName, idx, ecForce);
                 return false;
-            }).ConfigureAwait(false);
+            }, ct).ConfigureAwait(false);
         }).ConfigureAwait(false);
 
         return assigned;
@@ -314,14 +432,21 @@ public sealed class IpcCallerPenumbra : DisposableMediatorSubscriberBase, IIpcCa
         }
         finally
         {
-            _mareMediator.Publish(new ResumeScanMessage(nameof(ConvertTextureFiles)));
-
-            await _dalamudUtil.RunOnFrameworkThread(async () =>
-            {
-                var gameObject = await _dalamudUtil.CreateGameObjectAsync(await _dalamudUtil.GetPlayerPointerAsync().ConfigureAwait(false)).ConfigureAwait(false);
-                _penumbraRedraw.Invoke(gameObject!.ObjectIndex, setting: RedrawType.Redraw);
-            }).ConfigureAwait(false);
+            await FinalizeTextureWriteAsync(nameof(ConvertTextureFiles)).ConfigureAwait(false);
         }
+    }
+
+    public async Task FinalizeTextureWriteAsync(string source)
+    {
+        if (!APIAvailable) return;
+
+        _mareMediator.Publish(new ResumeScanMessage(source));
+
+        await _dalamudUtil.RunOnFrameworkThread(async () =>
+        {
+            var gameObject = await _dalamudUtil.CreateGameObjectAsync(await _dalamudUtil.GetPlayerPointerAsync().ConfigureAwait(false)).ConfigureAwait(false);
+            _penumbraRedraw.Invoke(gameObject!.ObjectIndex, setting: RedrawType.Redraw);
+        }).ConfigureAwait(false);
     }
     public async Task<Guid> CreateTemporaryCollectionAsync(ILogger logger, string uid)
     {
@@ -384,59 +509,217 @@ public sealed class IpcCallerPenumbra : DisposableMediatorSubscriberBase, IIpcCa
         }
     }
 
-    public async Task RedrawAsync(ILogger logger, GameObjectHandler handler, Guid applicationId, CancellationToken token)
+    public async Task<bool> RedrawAsync(ILogger logger, GameObjectHandler handler, Guid applicationId, CancellationToken token, bool criticalRedraw = false)
     {
-        if (!APIAvailable || _dalamudUtil.IsZoning) return;
+        if (!APIAvailable || _dalamudUtil.IsZoning)
+        {
+            logger.LogTrace("[{appid}] Penumbra redraw skipped for {name}: APIAvailable={apiAvailable}, IsZoning={isZoning}", applicationId, handler.Name, APIAvailable, _dalamudUtil.IsZoning);
+            return false;
+        }
 
-        // Coalesce redraws per-actor:
         var gate = _redrawGates.GetOrAdd(handler.Address, _ => new RedrawGate());
 
-        if (Interlocked.Exchange(ref gate.InFlight, 1) == 1)
+        if (!criticalRedraw)
         {
-            Interlocked.Exchange(ref gate.Pending, 1);
-            logger.LogTrace("[{appid}] Redraw already in flight for {name}, marking pending", applicationId, handler.Name);
-            return;
+            var nowTick = Environment.TickCount64;
+            var lastCompletedTick = Interlocked.Read(ref gate.LastCompletedTick);
+            if (lastCompletedTick > 0 && unchecked(nowTick - lastCompletedTick) >= 0 && unchecked(nowTick - lastCompletedTick) < 350)
+            {
+                logger.LogTrace("[{appid}] Redraw completed very recently for {name}, coalescing late duplicate request", applicationId, handler.Name);
+                return false;
+            }
+
+            if (Interlocked.Exchange(ref gate.InFlight, 1) == 1)
+            {
+                Interlocked.Exchange(ref gate.Pending, 1);
+                logger.LogTrace("[{appid}] Redraw already scheduled/in flight for {name}, coalescing duplicate request", applicationId, handler.Name);
+                return false;
+            }
         }
+        else
+        {
+            while (Interlocked.CompareExchange(ref gate.InFlight, 1, 0) != 0)
+            {
+                Interlocked.Exchange(ref gate.Pending, 1);
+                await Task.Delay(15, token).ConfigureAwait(false);
+            }
+        }
+
+        var redrawFired = false;
 
         try
         {
-            while (!token.IsCancellationRequested && !_dalamudUtil.IsZoning)
+            Interlocked.Exchange(ref gate.Pending, 0);
+
+            try
             {
-                // Clear pending for this run.
-                Interlocked.Exchange(ref gate.Pending, 0);
-                try
+                redrawFired = await _redrawManager.PenumbraRedrawInternalAsync(logger, handler, applicationId, chara =>
                 {
-                    await _redrawManager.PenumbraRedrawInternalAsync(logger, handler, applicationId, chara =>
+                    logger.LogDebug("[{appid}] Calling on IPC: PenumbraRedraw", applicationId);
+                    var frameworkStopwatch = Stopwatch.StartNew();
+
+                    try
                     {
-                        logger.LogDebug("[{appid}] Calling on IPC: PenumbraRedraw", applicationId);
-
-                        try
+                        _penumbraRedraw!.Invoke(chara.ObjectIndex, RedrawType.Redraw);
+                        redrawFired = true;
+                    }
+                    catch (Exception ex)
+                    {
+                        redrawFired = false;
+                        logger.LogError(ex, "Penumbra.Redraw threw");
+                    }
+                    finally
+                    {
+                        frameworkStopwatch.Stop();
+                        if (frameworkStopwatch.ElapsedMilliseconds >= 60)
                         {
-                            _penumbraRedraw!.Invoke(chara.ObjectIndex, RedrawType.Redraw);
+                            logger.LogWarning("[{appid}] PenumbraRedraw for {name} took {elapsed}ms on framework", applicationId, handler.Name, frameworkStopwatch.ElapsedMilliseconds);
                         }
-                        catch (Exception ex)
-                        {
-                            logger.LogError(ex, "Penumbra.Redraw threw");
-                        }
+                    }
 
-                    }, token).ConfigureAwait(false);
-                }
-                catch (OperationCanceledException)
-                {
-                    logger.LogDebug("[{appid}] Penumbra redraw cancelled for {name}", applicationId, handler.Name);
-                    break;
-                }
-
-                if (Interlocked.CompareExchange(ref gate.Pending, 0, 0) != 1)
-                    break;
+                }, token, isExplicitRedraw: true).ConfigureAwait(false) && redrawFired;
             }
+            catch (OperationCanceledException)
+            {
+                logger.LogDebug("[{appid}] Penumbra redraw cancelled for {name}", applicationId, handler.Name);
+                redrawFired = false;
+            }
+
+            return redrawFired;
         }
         finally
         {
+            Interlocked.Exchange(ref gate.Pending, 0);
+            if (redrawFired)
+                Interlocked.Exchange(ref gate.LastCompletedTick, Environment.TickCount64);
             Interlocked.Exchange(ref gate.InFlight, 0);
         }
     }
 
+
+
+    public async Task<bool> RedrawDirectAsync(ILogger logger, GameObjectHandler handler, Guid applicationId, CancellationToken token)
+    {
+        if (!APIAvailable || _dalamudUtil.IsZoning)
+        {
+            logger.LogTrace("[{appid}] Direct Penumbra redraw skipped for {name}: APIAvailable={apiAvailable}, IsZoning={isZoning}", applicationId, handler.Name, APIAvailable, _dalamudUtil.IsZoning);
+            return false;
+        }
+
+        token.ThrowIfCancellationRequested();
+
+        return await _dalamudUtil.RunOnFrameworkThread(() =>
+        {
+            var frameworkStopwatch = Stopwatch.StartNew();
+            try
+            {
+                if (handler.GetGameObject() is not ICharacter chara)
+                {
+                    logger.LogTrace("[{appid}] Direct Penumbra redraw skipped for {name}: no live character", applicationId, handler.Name);
+                    return false;
+                }
+
+                logger.LogDebug("[{appid}] Calling on IPC: PenumbraRedrawDirect idx={idx} addr={addr:X}", applicationId, chara.ObjectIndex, (nint)chara.Address);
+                _penumbraRedraw!.Invoke(chara.ObjectIndex, RedrawType.Redraw);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                logger.LogWarning(ex, "[{appid}] Direct Penumbra redraw failed for {name}", applicationId, handler.Name);
+                return false;
+            }
+            finally
+            {
+                frameworkStopwatch.Stop();
+                if (frameworkStopwatch.ElapsedMilliseconds >= 60)
+                {
+                    logger.LogWarning("[{appid}] PenumbraRedrawDirect for {name} took {elapsed}ms on framework", applicationId, handler.Name, frameworkStopwatch.ElapsedMilliseconds);
+                }
+            }
+        }).ConfigureAwait(false);
+    }
+
+    public async Task<bool> RedrawDirectAndWaitAsync(ILogger logger, GameObjectHandler handler, Guid applicationId, CancellationToken token)
+    {
+        if (!APIAvailable || _dalamudUtil.IsZoning)
+        {
+            logger.LogTrace("[{appid}] Confirmed direct Penumbra redraw skipped for {name}: APIAvailable={apiAvailable}, IsZoning={isZoning}", applicationId, handler.Name, APIAvailable, _dalamudUtil.IsZoning);
+            return false;
+        }
+
+        token.ThrowIfCancellationRequested();
+
+        PendingRedrawAck? pending = null;
+        var invoked = await _dalamudUtil.RunOnFrameworkThread(() =>
+        {
+            var frameworkStopwatch = Stopwatch.StartNew();
+            try
+            {
+                if (handler.GetGameObject() is not ICharacter chara)
+                {
+                    logger.LogTrace("[{appid}] Confirmed direct Penumbra redraw skipped for {name}: no live character", applicationId, handler.Name);
+                    return false;
+                }
+
+                var address = (nint)chara.Address;
+                var objectIndex = chara.ObjectIndex;
+                pending = RegisterRedrawAckWaiter(address, objectIndex);
+
+                logger.LogDebug("[{appid}] Calling on IPC: PenumbraRedrawDirectConfirmed idx={idx} addr={addr:X}", applicationId, objectIndex, address);
+                _penumbraRedraw!.Invoke(objectIndex, RedrawType.Redraw);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                if (pending != null)
+                {
+                    _pendingRedrawAcks.TryRemove(pending.Id, out _);
+                    pending = null;
+                }
+
+                logger.LogWarning(ex, "[{appid}] Confirmed direct Penumbra redraw failed for {name}", applicationId, handler.Name);
+                return false;
+            }
+            finally
+            {
+                frameworkStopwatch.Stop();
+                if (frameworkStopwatch.ElapsedMilliseconds >= 60)
+                {
+                    logger.LogWarning("[{appid}] PenumbraRedrawDirectConfirmed for {name} took {elapsed}ms on framework", applicationId, handler.Name, frameworkStopwatch.ElapsedMilliseconds);
+                }
+            }
+        }).ConfigureAwait(false);
+
+        if (!invoked || pending == null)
+            return false;
+
+        try
+        {
+            var timeoutTask = Task.Delay(TimeSpan.FromMilliseconds(900), token);
+            var completed = await Task.WhenAny(pending.Completion.Task, timeoutTask).ConfigureAwait(false);
+            token.ThrowIfCancellationRequested();
+
+            if (completed == pending.Completion.Task && await pending.Completion.Task.ConfigureAwait(false))
+            {
+                logger.LogDebug("[{appid}] Penumbra redraw acknowledged for {name}: idx={idx} addr={addr:X}", applicationId, handler.Name, pending.ObjectIndex, pending.Address);
+                return true;
+            }
+
+            logger.LogTrace("[{appid}] Penumbra redraw acknowledgement timed out for {name}: idx={idx} addr={addr:X}", applicationId, handler.Name, pending.ObjectIndex, pending.Address);
+            return false;
+        }
+        finally
+        {
+            _pendingRedrawAcks.TryRemove(pending.Id, out _);
+        }
+    }
+
+    private PendingRedrawAck RegisterRedrawAckWaiter(nint address, int objectIndex)
+    {
+        var pending = new PendingRedrawAck(Guid.NewGuid(), address, objectIndex);
+        _pendingRedrawAcks[pending.Id] = pending;
+        return pending;
+    }
 
 
     public async Task RemoveTemporaryCollectionAsync(ILogger logger, Guid applicationId, Guid collId)
@@ -463,51 +746,250 @@ public sealed class IpcCallerPenumbra : DisposableMediatorSubscriberBase, IIpcCa
     {
         if (!APIAvailable) return;
 
-        await SafeIpc.TryRun(Logger, "Penumbra.SetManipulationData", TimeSpan.FromSeconds(2), ct =>
+        await SafeIpc.TryRun(Logger, "Penumbra.SetManipulationData", TimeSpan.FromSeconds(2), async ct =>
         {
             logger.LogTrace("[{applicationId}] Manip: {data}", applicationId, manipulationData);
-            var retAdd = _penumbraAddTemporaryMod.Invoke("MareChara_Meta", collId, [], manipulationData, 0);
-            logger.LogTrace("[{applicationId}] Setting temp meta mod for {collId}, Success: {ret}", applicationId, collId, retAdd);
 
-            return Task.CompletedTask;
+            await RunPacedPenumbraFrameworkIpcAsync(logger, "Penumbra.AddTemporaryMod(Meta)", () =>
+            {
+                var retAdd = _penumbraAddTemporaryMod.Invoke("MareChara_Meta", collId, [], manipulationData, 0);
+                logger.LogTrace("[{applicationId}] Setting temp meta mod for {collId}, Success: {ret}", applicationId, collId, retAdd);
+
+                if (retAdd == PenumbraApiEc.Success)
+                    return;
+                var retRem = _penumbraRemoveTemporaryMod.Invoke("MareChara_Meta", collId, 0);
+                logger.LogTrace("[{applicationId}] Replace fallback: removing existing temp meta mod for {collId}, ret={ret}", applicationId, collId, retRem);
+
+                retAdd = _penumbraAddTemporaryMod.Invoke("MareChara_Meta", collId, [], manipulationData, 0);
+                logger.LogTrace("[{applicationId}] Replace fallback: setting temp meta mod for {collId}, Success: {ret}", applicationId, collId, retAdd);
+            }, ct).ConfigureAwait(false);
         }).ConfigureAwait(false);
     }
     public async Task ClearManipulationDataAsync(ILogger logger, Guid applicationId, Guid collId)
     {
         if (!APIAvailable) return;
 
-        await SafeIpc.TryRun(Logger, "Penumbra.RemoveTemporaryMod(Meta)", TimeSpan.FromSeconds(2), ct =>
+        await SafeIpc.TryRun(Logger, "Penumbra.RemoveTemporaryMod(Meta)", TimeSpan.FromSeconds(2), async ct =>
         {
-            var retRem = _penumbraRemoveTemporaryMod.Invoke("MareChara_Meta", collId, 0);
-            logger.LogTrace("[{applicationId}] Cleared meta (height) from temp collection {collId}, ret={ret}", applicationId, collId, retRem);
-
-            return Task.CompletedTask;
+            await RunPacedPenumbraFrameworkIpcAsync(logger, "Penumbra.RemoveTemporaryMod(Meta)", () =>
+            {
+                var retRem = _penumbraRemoveTemporaryMod.Invoke("MareChara_Meta", collId, 0);
+                logger.LogTrace("[{applicationId}] Cleared meta (height) from temp collection {collId}, ret={ret}", applicationId, collId, retRem);
+            }, ct).ConfigureAwait(false);
         }).ConfigureAwait(false);
     }
 
+    public Task<bool> SetTemporaryModsAsync(ILogger logger, Guid applicationId, Guid collId, Dictionary<string, string> modPaths)
+        => SetNamedTemporaryModsAsync(logger, applicationId, collId, "MareChara_Files", modPaths, 0);
 
-    public async Task SetTemporaryModsAsync(ILogger logger, Guid applicationId, Guid collId, Dictionary<string, string> modPaths)
+    public Task<bool> SetNamedTemporaryModsAsync(ILogger logger, Guid applicationId, Guid collId, string tempModName, Dictionary<string, string> modPaths)
+        => SetNamedTemporaryModsAsync(logger, applicationId, collId, tempModName, modPaths, 0);
+
+    public async Task<bool> SetNamedTemporaryModsAsync(ILogger logger, Guid applicationId, Guid collId, string tempModName, Dictionary<string, string> modPaths, int priority)
     {
-        if (!APIAvailable) return;
+        if (!APIAvailable) return false;
+        if (string.IsNullOrWhiteSpace(tempModName)) return false;
 
-        await SafeIpc.TryRun(Logger, "Penumbra.SetTemporaryMods", TimeSpan.FromSeconds(2), ct =>
+        var applied = false;
+
+        var ipcOk = await SafeIpc.TryRun(Logger, "Penumbra.SetTemporaryMods", TimeSpan.FromSeconds(2), async ct =>
         {
             if (logger.IsEnabled(LogLevel.Trace))
             {
                 foreach (var mod in modPaths)
                 {
-                    logger.LogTrace("[{applicationId}] Change: {from} => {to}", applicationId, mod.Key, mod.Value);
+                    logger.LogTrace("[{applicationId}] {tempModName}: {from} => {to}", applicationId, tempModName, mod.Key, mod.Value);
                 }
             }
 
-            var retRemove = _penumbraRemoveTemporaryMod.Invoke("MareChara_Files", collId, 0);
-            logger.LogTrace("[{applicationId}] Removing temp files mod for {collId}, Success: {ret}", applicationId, collId, retRemove);
+            var retAdd = await RunPacedPenumbraFrameworkIpcAsync(logger, $"Penumbra.AddTemporaryMod({tempModName})", () =>
+            {
+                var ret = _penumbraAddTemporaryMod.Invoke(tempModName, collId, modPaths, string.Empty, priority);
+                logger.LogTrace("[{applicationId}] Setting temp files mod {tempModName} for {collId} at priority {priority}, Success: {ret}", applicationId, tempModName, collId, priority, ret);
+                return ret;
+            }, ct).ConfigureAwait(false);
 
-            var retAdd = _penumbraAddTemporaryMod.Invoke("MareChara_Files", collId, modPaths, string.Empty, 0);
-            logger.LogTrace("[{applicationId}] Setting temp files mod for {collId}, Success: {ret}", applicationId, collId, retAdd);
+            if (retAdd != PenumbraApiEc.Success)
+            {
+                await RunPacedPenumbraFrameworkIpcAsync(logger, $"Penumbra.RemoveTemporaryMod({tempModName})", () =>
+                {
+                    var retRemove = _penumbraRemoveTemporaryMod.Invoke(tempModName, collId, priority);
+                    logger.LogTrace("[{applicationId}] Replace fallback: removing temp files mod {tempModName} for {collId} at priority {priority}, Success: {ret}", applicationId, tempModName, collId, priority, retRemove);
+                }, ct).ConfigureAwait(false);
 
+                retAdd = await RunPacedPenumbraFrameworkIpcAsync(logger, $"Penumbra.AddTemporaryMod({tempModName})Fallback", () =>
+                {
+                    var ret = _penumbraAddTemporaryMod.Invoke(tempModName, collId, modPaths, string.Empty, priority);
+                    logger.LogTrace("[{applicationId}] Replace fallback: setting temp files mod {tempModName} for {collId} at priority {priority}, Success: {ret}", applicationId, tempModName, collId, priority, ret);
+                    return ret;
+                }, ct).ConfigureAwait(false);
+            }
+
+            applied = retAdd == PenumbraApiEc.Success;
+        }).ConfigureAwait(false);
+
+        return ipcOk && applied;
+    }
+
+    public async Task ClearNamedTemporaryModsAsync(ILogger logger, Guid applicationId, Guid collId, string tempModName, int priority = 0)
+    {
+        if (!APIAvailable) return;
+        if (string.IsNullOrWhiteSpace(tempModName)) return;
+
+        await SafeIpc.TryRun(Logger, "Penumbra.ClearTemporaryMods", TimeSpan.FromSeconds(2), async ct =>
+        {
+            await RunPacedPenumbraFrameworkIpcAsync(logger, $"Penumbra.ClearTemporaryMods({tempModName}@{priority})", () =>
+            {
+                var retRemove = _penumbraRemoveTemporaryMod.Invoke(tempModName, collId, priority);
+                logger.LogTrace("[{applicationId}] Clearing temp files mod {tempModName} for {collId} at priority {priority}, Success: {ret}", applicationId, tempModName, collId, priority, retRemove);
+            }, ct).ConfigureAwait(false);
+        }).ConfigureAwait(false);
+    }
+
+    public async Task ClearNamedTemporaryModsPriorityRangeAsync(ILogger logger, Guid applicationId, Guid collId, IReadOnlyCollection<string> tempModNames, int fromPriorityInclusive, int toPriorityInclusive, string? keepTempModName = null, int keepPriority = int.MinValue)
+    {
+        if (!APIAvailable) return;
+        if (collId == Guid.Empty) return;
+        if (tempModNames == null || tempModNames.Count == 0) return;
+
+        var fromPriority = Math.Max(0, fromPriorityInclusive);
+        var toPriority = Math.Max(fromPriority, toPriorityInclusive);
+
+        await SafeIpc.TryRun(Logger, "Penumbra.ClearTemporaryModsPriorityRange", TimeSpan.FromSeconds(5), async ct =>
+        {
+            await RunPacedPenumbraFrameworkIpcAsync(logger, $"Penumbra.ClearTemporaryModsRange({fromPriority}-{toPriority})", () =>
+            {
+                var removed = 0;
+                var attempted = 0;
+
+                foreach (var tempModName in tempModNames)
+                {
+                    if (string.IsNullOrWhiteSpace(tempModName))
+                        continue;
+
+                    for (var priority = fromPriority; priority <= toPriority; priority++)
+                    {
+                        if (priority == keepPriority && string.Equals(tempModName, keepTempModName, StringComparison.Ordinal))
+                            continue;
+
+                        attempted++;
+
+                        var retRemove = _penumbraRemoveTemporaryMod.Invoke(tempModName, collId, priority);
+                        if (retRemove == PenumbraApiEc.Success)
+                            removed++;
+                    }
+                }
+
+                logger.LogDebug(
+                    "[{applicationId}] Swept legacy temp files mods for {collId}: names=[{names}], priorities={from}-{to}, keep={keepName}@{keepPriority}, attempted={attempted}, removed={removed}",
+                    applicationId,
+                    collId,
+                    string.Join(", ", tempModNames),
+                    fromPriority,
+                    toPriority,
+                    keepTempModName ?? string.Empty,
+                    keepPriority,
+                    attempted,
+                    removed);
+            }, ct, warnAfterMs: 100).ConfigureAwait(false);
+        }).ConfigureAwait(false);
+    }
+
+    public async Task<PenumbraApiEc> AddModAsync(ILogger logger, string modDirectory)
+    {
+        if (!APIAvailable || string.IsNullOrWhiteSpace(modDirectory)) return PenumbraApiEc.UnknownError;
+
+        PenumbraApiEc result = PenumbraApiEc.UnknownError;
+        await SafeIpc.TryRun(Logger, "Penumbra.AddMod", TimeSpan.FromSeconds(2), ct =>
+        {
+            result = _penumbraAddMod.Invoke(modDirectory);
+            logger.LogTrace("[Penumbra] AddMod {modDirectory} => {result}", modDirectory, result);
             return Task.CompletedTask;
         }).ConfigureAwait(false);
+
+        return result;
+    }
+
+    public async Task<PenumbraApiEc> ReloadModAsync(ILogger logger, string modDirectory, string modName = "")
+    {
+        if (!APIAvailable || string.IsNullOrWhiteSpace(modDirectory)) return PenumbraApiEc.UnknownError;
+
+        PenumbraApiEc result = PenumbraApiEc.UnknownError;
+        await SafeIpc.TryRun(Logger, "Penumbra.ReloadMod", TimeSpan.FromSeconds(2), ct =>
+        {
+            result = _penumbraReloadMod.Invoke(modDirectory, modName);
+            logger.LogTrace("[Penumbra] ReloadMod {modDirectory} ({modName}) => {result}", modDirectory, modName, result);
+            return Task.CompletedTask;
+        }).ConfigureAwait(false);
+
+        return result;
+    }
+
+    public async Task<PenumbraApiEc> SetModStateAsync(ILogger logger, Guid collectionId, string modDirectory, bool enabled, string modName = "")
+    {
+        if (!APIAvailable || collectionId == Guid.Empty || string.IsNullOrWhiteSpace(modDirectory)) return PenumbraApiEc.UnknownError;
+
+        PenumbraApiEc result = PenumbraApiEc.UnknownError;
+        await SafeIpc.TryRun(Logger, "Penumbra.TrySetMod", TimeSpan.FromSeconds(2), ct =>
+        {
+            result = _penumbraTrySetMod.Invoke(collectionId, modDirectory, enabled, modName);
+            logger.LogTrace("[Penumbra] TrySetMod {modDirectory} enabled={enabled} collection={collectionId} => {result}", modDirectory, enabled, collectionId, result);
+            return Task.CompletedTask;
+        }).ConfigureAwait(false);
+
+        return result;
+    }
+
+    public async Task<PenumbraApiEc> SetModPriorityAsync(ILogger logger, Guid collectionId, string modDirectory, int priority, string modName = "")
+    {
+        if (!APIAvailable || collectionId == Guid.Empty || string.IsNullOrWhiteSpace(modDirectory)) return PenumbraApiEc.UnknownError;
+
+        PenumbraApiEc result = PenumbraApiEc.UnknownError;
+        await SafeIpc.TryRun(Logger, "Penumbra.TrySetModPriority", TimeSpan.FromSeconds(2), ct =>
+        {
+            result = _penumbraTrySetModPriority.Invoke(collectionId, modDirectory, priority, modName);
+            logger.LogTrace("[Penumbra] TrySetModPriority {modDirectory} priority={priority} collection={collectionId} => {result}", modDirectory, priority, collectionId, result);
+            return Task.CompletedTask;
+        }).ConfigureAwait(false);
+
+        return result;
+    }
+
+    public async Task<PenumbraApiEc> SetModSettingAsync(ILogger logger, Guid collectionId, string modDirectory, string optionGroupName, string optionName, string modName = "")
+    {
+        if (!APIAvailable || collectionId == Guid.Empty || string.IsNullOrWhiteSpace(modDirectory) || string.IsNullOrWhiteSpace(optionGroupName))
+            return PenumbraApiEc.UnknownError;
+
+        PenumbraApiEc result = PenumbraApiEc.UnknownError;
+        await SafeIpc.TryRun(Logger, "Penumbra.TrySetModSetting", TimeSpan.FromSeconds(2), ct =>
+        {
+            result = _penumbraTrySetModSetting.Invoke(collectionId, modDirectory, optionGroupName, optionName, modName);
+            logger.LogTrace("[Penumbra] TrySetModSetting {modDirectory} {group}={option} collection={collectionId} => {result}", modDirectory, optionGroupName, optionName, collectionId, result);
+            return Task.CompletedTask;
+        }).ConfigureAwait(false);
+
+        return result;
+    }
+
+    public async Task<PenumbraApiEc> SetModSettingsAsync(ILogger logger, Guid collectionId, string modDirectory, string optionGroupName, IReadOnlyCollection<string> optionNames, string modName = "")
+    {
+        if (!APIAvailable || collectionId == Guid.Empty || string.IsNullOrWhiteSpace(modDirectory) || string.IsNullOrWhiteSpace(optionGroupName))
+            return PenumbraApiEc.UnknownError;
+
+        var selectedOptions = optionNames
+            .Where(o => !string.IsNullOrWhiteSpace(o))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+        PenumbraApiEc result = PenumbraApiEc.UnknownError;
+        await SafeIpc.TryRun(Logger, "Penumbra.TrySetModSettings", TimeSpan.FromSeconds(2), ct =>
+        {
+            result = _penumbraTrySetModSettings.Invoke(collectionId, modDirectory, optionGroupName, selectedOptions, modName);
+            logger.LogTrace("[Penumbra] TrySetModSettings {modDirectory} {group}=[{options}] collection={collectionId} => {result}", modDirectory, optionGroupName, string.Join(", ", selectedOptions), collectionId, result);
+            return Task.CompletedTask;
+        }).ConfigureAwait(false);
+
+        return result;
     }
 
     public async Task<Guid> GetOrCreateEmptyCollectionAsync(ILogger logger)
@@ -531,15 +1013,18 @@ public sealed class IpcCallerPenumbra : DisposableMediatorSubscriberBase, IIpcCa
 
     private void RedrawEvent(IntPtr objectAddress, int objectTableIndex)
     {
-        bool wasRequested = false;
-        if (_penumbraRedrawRequests.TryGetValue(objectAddress, out var redrawRequest) && redrawRequest)
+        var address = (nint)objectAddress;
+        foreach (var waiter in _pendingRedrawAcks.Values)
         {
-            _penumbraRedrawRequests[objectAddress] = false;
+            if ((waiter.ObjectIndex >= 0 && waiter.ObjectIndex == objectTableIndex)
+                || (waiter.Address != nint.Zero && waiter.Address == address))
+            {
+                waiter.Completion.TrySetResult(true);
+            }
         }
-        else
-        {
-            _mareMediator.Publish(new PenumbraRedrawMessage(objectAddress, objectTableIndex, wasRequested));
-        }
+
+        var wasRequested = _redrawManager.TryConsumeRequestedRedraw(objectAddress);
+        _mareMediator.Publish(new PenumbraRedrawMessage(objectAddress, objectTableIndex, wasRequested));
     }
 
 

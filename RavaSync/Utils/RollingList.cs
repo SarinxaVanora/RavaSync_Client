@@ -15,17 +15,30 @@ public class RollingList<T> : IEnumerable<T>
         MaximumCount = maximumCount;
     }
 
-    public int Count => _list.Count;
+    public int Count
+    {
+        get
+        {
+            lock (_addLock)
+            {
+                return _list.Count;
+            }
+        }
+    }
+
     public int MaximumCount { get; }
 
     public T this[int index]
     {
         get
         {
-            if (index < 0 || index >= Count)
-                throw new ArgumentOutOfRangeException(nameof(index));
+            lock (_addLock)
+            {
+                if (index < 0 || index >= _list.Count)
+                    throw new ArgumentOutOfRangeException(nameof(index));
 
-            return _list.Skip(index).First();
+                return _list.Skip(index).First();
+            }
         }
     }
 
@@ -34,14 +47,24 @@ public class RollingList<T> : IEnumerable<T>
         lock (_addLock)
         {
             if (_list.Count == MaximumCount)
-            {
                 _list.RemoveFirst();
-            }
+
             _list.AddLast(value);
         }
     }
 
-    public IEnumerator<T> GetEnumerator() => _list.GetEnumerator();
+    public List<T> Snapshot()
+    {
+        lock (_addLock)
+        {
+            return _list.ToList();
+        }
+    }
+
+    public IEnumerator<T> GetEnumerator()
+    {
+        return Snapshot().GetEnumerator();
+    }
 
     IEnumerator IEnumerable.GetEnumerator() => GetEnumerator();
 }

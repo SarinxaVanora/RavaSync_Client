@@ -63,7 +63,7 @@ public sealed partial class ToyBox
         var hostSessionId = GetMySessionId();
         if (string.IsNullOrEmpty(hostSessionId)) return Guid.Empty;
 
-        var hostName = _clientState.LocalPlayer?.Name.TextValue ?? "Host";
+        var hostName = _objects.LocalPlayer?.Name.TextValue ?? "Host";
         _cachedMySessionId = hostSessionId;
         _cachedMyName = hostName;
 

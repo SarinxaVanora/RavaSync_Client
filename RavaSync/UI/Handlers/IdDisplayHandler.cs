@@ -16,6 +16,13 @@ namespace RavaSync.UI.Handlers;
 
 public class IdDisplayHandler
 {
+    private static string FormatTrianglesThousands(long triangles)
+    {
+        if (triangles <= 0) return "0K";
+        long roundedThousands = (long)Math.Round(triangles / 1000d, MidpointRounding.AwayFromZero);
+        return $"{roundedThousands:N0}K";
+    }
+
     private readonly MareConfigService _mareConfigService;
     private readonly MareMediator _mediator;
     private readonly ServerConfigurationManager _serverManager;
@@ -118,50 +125,15 @@ public class IdDisplayHandler
 
             // If this pair is actively downloading/loading, show progress where VRAM normally sits.
             // Once downloads finish (PairHandler clears it), this naturally falls back to VRAM.
-            var dl = pair.CurrentDownloadStatus;
-            if (dl != null && dl.Count > 0)
+            var dl = pair.CurrentDownloadSummary;
+            if (dl != null && dl.HasAny)
             {
-                // Snapshot defensively: the underlying dictionary updates during the pipeline.
-                var snapshot = new List<FileDownloadStatus>(dl.Count);
-                try
-                {
-                    foreach (var s in dl.Values)
-                        snapshot.Add(s);
-                }
-                catch
-                {
-                    snapshot.Clear();
-                }
-
-                bool anyDownloading = false;
-                bool anyLoading = false;
-
-                long totalBytes = 0;
-                long transferredBytes = 0;
-                int totalFiles = 0;
-                int transferredFiles = 0;
-
-                foreach (var s in snapshot)
-                {
-                    switch (s.DownloadStatus)
-                    {
-                        case DownloadStatus.Downloading:
-                        case DownloadStatus.WaitingForQueue:
-                        case DownloadStatus.WaitingForSlot:
-                            anyDownloading = true;
-                            break;
-
-                        case DownloadStatus.Initializing:
-                        case DownloadStatus.Decompressing:
-                            anyLoading = true;
-                            break;
-                    }
-
-                    if (s.TotalBytes > 0) totalBytes += s.TotalBytes;
-                    if (s.TransferredBytes > 0) transferredBytes += s.TransferredBytes;
-                    if (s.TotalFiles > 0) totalFiles += s.TotalFiles;
-                    if (s.TransferredFiles > 0) transferredFiles += s.TransferredFiles;
-                }
+                bool anyDownloading = dl.AnyDownloading;
+                bool anyLoading = dl.AnyLoading;
+                long totalBytes = dl.TotalBytes;
+                long transferredBytes = dl.TransferredBytes;
+                int totalFiles = dl.TotalFiles;
+                int transferredFiles = dl.TransferredFiles;
 
                 string label = anyLoading && !anyDownloading ? "Loading" : "DL";
                 string text;
@@ -208,7 +180,7 @@ public class IdDisplayHandler
                 var roundedBytes = (long)(Math.Round(pair.LastAppliedApproximateVRAMBytes / 1048576d) * 1048576d);
                 var vramText = NoDot00(UiSharedService.ByteToString(roundedBytes, addSuffix: true));
                 var trisText = pair.LastAppliedDataTris > 0
-                    ? pair.LastAppliedDataTris.ToString("N0")
+                    ? FormatTrianglesThousands(pair.LastAppliedDataTris)
                     : "—";
 
                 var line1 = $"VRAM: {vramText} | Tris: {trisText}";

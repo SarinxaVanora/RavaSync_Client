@@ -48,9 +48,32 @@ public class MdlFile
     public BoundingBoxStruct[] BoneBoundingBoxes = [];
     public LodStruct[] Lods = [];
     public ExtraLodStruct[] ExtraLods = [];
+    public long DataSectionOffset;
+    public long LodTableOffset;
+    public long[] LodOffsets = [];
+    public int LodStructSize;
+    public long MeshTableOffset;
+    public long[] MeshOffsets = [];
+    public int MeshStructSize;
+    public ushort BoneCount;
+    public ushort MaterialCount;
+    public ushort AttributeCount;
+    public ushort ShapeCount;
+    public ushort ShapeMeshCount;
+    public ushort ShapeValueCount;
+    public ushort TotalSubmeshCount;
+    public SubmeshStruct[] SubMeshes = [];
+    public long SubMeshTableOffset;
+    public long[] SubMeshOffsets = [];
+    public int SubMeshStructSize;
+    public string[] Strings = [];
+    public string[] Attributes = [];
+    public string[] MaterialStrings = [];
+    public string SourcePath = string.Empty;
 
     public MdlFile(string filePath)
     {
+        SourcePath = filePath ?? string.Empty;
         using var stream = new FileStream(filePath, FileMode.Open, FileAccess.Read);
         using var r = new LuminaBinaryReader(stream);
 
@@ -62,6 +85,7 @@ public class MdlFile
         IndexOffset = header.IndexOffset;
 
         var dataOffset = FileHeaderSize + header.RuntimeSize + header.StackSize;
+        DataSectionOffset = dataOffset;
         for (var i = 0; i < LodCount; ++i)
         {
             VertexOffset[i] -= dataOffset;
@@ -72,7 +96,9 @@ public class MdlFile
         for (var i = 0; i < header.VertexDeclarationCount; ++i)
             VertexDeclarations[i] = VertexDeclarationStruct.Read(r);
 
-        _ = LoadStrings(r);
+        var strings = LoadStrings(r);
+        var stringOffsets = strings.Item1;
+        Strings = strings.Item2;
 
         var modelHeader = LoadModelHeader(r);
         ElementIds = new ElementIdStruct[modelHeader.ElementIdCount];
@@ -80,9 +106,16 @@ public class MdlFile
             ElementIds[i] = ElementIdStruct.Read(r);
 
         Lods = new LodStruct[3];
+        LodOffsets = new long[3];
+        LodTableOffset = r.BaseStream.Position;
+        long lodStructSize = 0;
         for (var i = 0; i < 3; i++)
         {
+            var before = r.BaseStream.Position;
+            LodOffsets[i] = before;
             var lod = r.ReadStructure<LodStruct>();
+            if (lodStructSize == 0)
+                lodStructSize = r.BaseStream.Position - before;
             if (i < LodCount)
             {
                 lod.VertexDataOffset -= dataOffset;
@@ -92,13 +125,51 @@ public class MdlFile
             Lods[i] = lod;
         }
 
+        LodStructSize = (int)lodStructSize;
+
         ExtraLods = (modelHeader.Flags2 & ModelFlags2.ExtraLodEnabled) != 0
             ? r.ReadStructuresAsArray<ExtraLodStruct>(3)
             : [];
 
         Meshes = new MeshStruct[modelHeader.MeshCount];
+        MeshOffsets = new long[modelHeader.MeshCount];
+        MeshTableOffset = r.BaseStream.Position;
+        long meshStructSize = 0;
         for (var i = 0; i < modelHeader.MeshCount; i++)
+        {
+            var before = r.BaseStream.Position;
+            MeshOffsets[i] = before;
             Meshes[i] = MeshStruct.Read(r);
+            if (meshStructSize == 0)
+                meshStructSize = r.BaseStream.Position - before;
+        }
+
+        MeshStructSize = (int)meshStructSize;
+
+        Attributes = new string[modelHeader.AttributeCount];
+        for (var i = 0; i < modelHeader.AttributeCount; ++i)
+        {
+            var offset = r.ReadUInt32();
+            var stringIndex = stringOffsets.AsSpan().IndexOf(offset);
+            Attributes[i] = stringIndex >= 0 ? Strings[stringIndex] : string.Empty;
+        }
+
+        _ = r.ReadStructuresAsArray<TerrainShadowMeshStruct>(modelHeader.TerrainShadowMeshCount);
+
+        SubMeshes = new SubmeshStruct[modelHeader.SubmeshCount];
+        SubMeshOffsets = new long[modelHeader.SubmeshCount];
+        SubMeshTableOffset = r.BaseStream.Position;
+        long subMeshStructSize = 0;
+        for (var i = 0; i < modelHeader.SubmeshCount; i++)
+        {
+            var before = r.BaseStream.Position;
+            SubMeshOffsets[i] = before;
+            SubMeshes[i] = r.ReadStructure<SubmeshStruct>();
+            if (subMeshStructSize == 0)
+                subMeshStructSize = r.BaseStream.Position - before;
+        }
+
+        SubMeshStructSize = (int)subMeshStructSize;
     }
 
     private ModelFileHeader LoadModelFileHeader(LuminaBinaryReader r)
@@ -114,6 +185,13 @@ public class MdlFile
     {
         var modelHeader = r.ReadStructure<ModelHeader>();
         Radius = modelHeader.Radius;
+        BoneCount = modelHeader.BoneCount;
+        MaterialCount = modelHeader.MaterialCount;
+        AttributeCount = modelHeader.AttributeCount;
+        ShapeCount = modelHeader.ShapeCount;
+        ShapeMeshCount = modelHeader.ShapeMeshCount;
+        ShapeValueCount = modelHeader.ShapeValueCount;
+        TotalSubmeshCount = modelHeader.SubmeshCount;
         Flags1 = modelHeader.Flags1;
         Flags2 = modelHeader.Flags2;
         ModelClipOutDistance = modelHeader.ModelClipOutDistance;
@@ -126,6 +204,7 @@ public class MdlFile
         BgChangeMaterialIndex = modelHeader.BGChangeMaterialIndex;
         BgCrestChangeMaterialIndex = modelHeader.BGCrestChangeMaterialIndex;
 
+        MaterialStrings = ExtractMaterialStrings(Strings, BoneCount, MaterialCount);
         return modelHeader;
     }
 
@@ -180,6 +259,25 @@ public class MdlFile
         public ushort Unknown8;
         public ushort Unknown9;
         private fixed byte _padding[6];
+    }
+
+    private static string[] ExtractMaterialStrings(string[] strings, ushort boneCount, ushort materialCount)
+    {
+        if (strings.Length == 0 || materialCount == 0)
+            return [];
+
+        int start = Math.Min(strings.Length, boneCount);
+        if (start + materialCount <= strings.Length)
+        {
+            var directSlice = strings.Skip(start).Take(materialCount).ToArray();
+            if (directSlice.Length == materialCount && directSlice.All(static s => s.EndsWith(".mtrl", StringComparison.OrdinalIgnoreCase)))
+                return directSlice;
+        }
+
+        return strings.Where(static s => s.EndsWith(".mtrl", StringComparison.OrdinalIgnoreCase))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Take(materialCount)
+            .ToArray();
     }
 
     public struct ShapeStruct
