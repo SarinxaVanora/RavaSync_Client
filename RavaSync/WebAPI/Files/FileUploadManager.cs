@@ -6,6 +6,7 @@ using RavaSync.API.Dto.Files;
 using RavaSync.API.Routes;
 using RavaSync.FileCache;
 using RavaSync.MareConfiguration;
+using CharacterDataPushSanitizer = RavaSync.PlayerData.Data.CharacterDataPushSanitizer;
 using RavaSync.Services.Mediator;
 using RavaSync.Services.ServerConfiguration;
 using RavaSync.UI;
@@ -37,9 +38,12 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
     private static readonly TimeSpan VerifiedHashTtl = TimeSpan.FromHours(12);
     private const int MaxCdnExistenceChecks = 8;
     private const int HealthyCdnProbeAttempts = 3;
-    private const int MaxConfiguredParallelUploads = 12;
-    private const long TinyUploadThresholdBytes = 64L * 1024;
-    private const long SmallUploadThresholdBytes = 256L * 1024;
+    private const int MaxConfiguredParallelUploads = 16;
+    private const int MaxSmallFileAutoParallelUploads = 32;
+    private const int MaxTinyFileAutoParallelUploads = 48;
+    private const long TinyUploadThresholdBytes = 128L * 1024;
+    private const long SmallUploadThresholdBytes = 512L * 1024;
+    private const long RequestBoundUploadThresholdBytes = 512L * 1024;
     private const long SmallUploadInMemoryThresholdBytes = 1024L * 1024;
     private const long TinyUploadProgressThresholdBytes = 128L * 1024;
     private static readonly int UploadPayloadPreparationParallelism = GetUploadPayloadPreparationParallelism();
@@ -48,10 +52,11 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
     private static int GetUploadPayloadPreparationParallelism()
     {
         var cpu = Environment.ProcessorCount;
-        if (cpu <= 8) return 1;
-        if (cpu <= 16) return 2;
-        if (cpu <= 24) return 3;
-        return 4;
+        if (cpu <= 4) return 1;
+        if (cpu <= 8) return 2;
+        if (cpu <= 16) return 3;
+        if (cpu <= 24) return 4;
+        return 5;
     }
 
 
@@ -357,7 +362,10 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
 
         try
         {
-            var rawProgress = progress == null ? null : new Progress<long>(b => progress.Report(new UploadProgress(b, fileSize)));
+            // Do not report payload-preparation reads as upload progress. For many tiny files,
+            // the expensive bit is the ticket/PUT/complete round-trip, and reporting compression
+            // as 100% makes the UI look done while the request is still in flight.
+            IProgress<long>? rawProgress = null;
 
             if (fileSize <= SmallUploadInMemoryThresholdBytes)
             {
@@ -539,6 +547,16 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
 
         try
         {
+            var sanitizerResult = CharacterDataPushSanitizer.SanitizeForPush(data);
+            if (sanitizerResult.Changed)
+            {
+                Logger.LogDebug("Removed server-invalid outbound data before upload/share: {replacements} replacement(s), {gamePaths} game path(s), {buckets} object bucket(s), {honorific} honorific payload(s)",
+                    sanitizerResult.RemovedReplacements,
+                    sanitizerResult.RemovedGamePaths,
+                    sanitizerResult.RemovedBuckets,
+                    sanitizerResult.RemovedHonorificData);
+            }
+
             Logger.LogDebug("Preparing Character data {hash} for upload/share against service {url}",
                 data.DataHash.Value, _serverManager.CurrentApiUrl);
 
@@ -715,7 +733,6 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
             bufferSize: 1024 * 1024, options: FileOptions.Asynchronous | FileOptions.SequentialScan);
 
         await using var output = new MemoryStream(capacity: (int)Math.Min(input.Length + (64 * 1024), SmallUploadInMemoryThresholdBytes * 2));
-        await using var lz4 = new LZ4Stream(output, LZ4StreamMode.Compress, LZ4StreamFlags.None, BlockSize);
 
         var buffer = System.Buffers.ArrayPool<byte>.Shared.Rent(BlockSize);
         long raw = 0;
@@ -724,23 +741,26 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
 
         try
         {
-            int read;
-            while ((read = await input.ReadAsync(buffer.AsMemory(0, buffer.Length), ct).ConfigureAwait(false)) > 0)
+            await using (var lz4 = new LZ4Stream(output, LZ4StreamMode.Compress, LZ4StreamFlags.None, BlockSize))
             {
-                await lz4.WriteAsync(buffer.AsMemory(0, read), ct).ConfigureAwait(false);
-                raw += read;
-                sinceYield += read;
-                rawReadProgress?.Report(raw);
-
-                if (sinceYield >= YieldEveryBytes)
+                int read;
+                while ((read = await input.ReadAsync(buffer.AsMemory(0, buffer.Length), ct).ConfigureAwait(false)) > 0)
                 {
-                    sinceYield = 0;
-                    await Task.Yield();
-                    ct.ThrowIfCancellationRequested();
-                }
-            }
+                    await lz4.WriteAsync(buffer.AsMemory(0, read), ct).ConfigureAwait(false);
+                    raw += read;
+                    sinceYield += read;
+                    rawReadProgress?.Report(raw);
 
-            await lz4.FlushAsync(ct).ConfigureAwait(false);
+                    if (sinceYield >= YieldEveryBytes)
+                    {
+                        sinceYield = 0;
+                        await Task.Yield();
+                        ct.ThrowIfCancellationRequested();
+                    }
+                }
+
+                await lz4.FlushAsync(ct).ConfigureAwait(false);
+            }
         }
         finally
         {
@@ -839,8 +859,45 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
             FileHashes = hashes,
             UIDs = uids
         };
-        var response = await _orchestrator.SendRequestAsync(HttpMethod.Post, MareFiles.ServerFilesFilesSendFullPath(_orchestrator.UploadCdnUri!), filesSendDto, ct).ConfigureAwait(false);
-        return await response.Content.ReadFromJsonAsync<List<UploadFileDto>>(cancellationToken: ct).ConfigureAwait(false) ?? [];
+
+        using var response = await _orchestrator.SendRequestAsync(HttpMethod.Post, MareFiles.ServerFilesFilesSendFullPath(_orchestrator.UploadCdnUri!), filesSendDto, ct).ConfigureAwait(false);
+        var body = response.Content == null
+            ? string.Empty
+            : await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+
+        if (!response.IsSuccessStatusCode)
+        {
+            var trimmedError = TrimHttpBodyForLog(body);
+            throw new HttpRequestException(
+                $"FilesSend failed with HTTP {(int)response.StatusCode} {response.ReasonPhrase}. Response: {trimmedError}",
+                null,
+                response.StatusCode);
+        }
+
+        if (string.IsNullOrWhiteSpace(body))
+        {
+            Logger.LogDebug("FilesSend returned HTTP {status} with an empty body; treating as no uploads required", (int)response.StatusCode);
+            return [];
+        }
+
+        try
+        {
+            return JsonSerializer.Deserialize<List<UploadFileDto>>(body) ?? [];
+        }
+        catch (JsonException ex)
+        {
+            var trimmedBody = TrimHttpBodyForLog(body);
+            throw new InvalidOperationException($"FilesSend returned invalid JSON from HTTP {(int)response.StatusCode}. Response: {trimmedBody}", ex);
+        }
+    }
+
+    private static string TrimHttpBodyForLog(string? body)
+    {
+        if (string.IsNullOrWhiteSpace(body))
+            return "<empty>";
+
+        var normalized = body.Replace("\r", " ").Replace("\n", " ").Trim();
+        return normalized.Length <= 500 ? normalized : normalized[..500] + "...";
     }
 
     private HashSet<string> GetUnverifiedFiles(CharacterData data)
@@ -1123,22 +1180,42 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
 
             var mostlySmallFiles = false;
             var tinyHeavyFiles = false;
+            var requestBoundFiles = false;
             if (allowedHashes.Count >= 4 && sizeByHash.Count > 0)
             {
                 var small = 0;
                 var tiny = 0;
+                var requestBound = 0;
                 foreach (var s in sizeByHash.Values)
                 {
                     if (s <= SmallUploadThresholdBytes) small++;
                     if (s <= TinyUploadThresholdBytes) tiny++;
+                    if (s <= RequestBoundUploadThresholdBytes) requestBound++;
                 }
 
                 mostlySmallFiles = small >= (sizeByHash.Count * 3 / 4);
                 tinyHeavyFiles = allowedHashes.Count >= 8 && tiny >= (sizeByHash.Count * 3 / 4);
+                requestBoundFiles = allowedHashes.Count >= 8 && requestBound >= (sizeByHash.Count * 3 / 4);
+            }
+
+            if (isAuto && tinyHeavyFiles)
+            {
+                // Tiny-file storms are RTT/request-overhead bound, not bandwidth bound.
+                // They need enough in-flight ticket/PUT/complete work to hide latency.
+                maxParallel = Math.Clamp(Math.Max(cpuAuto * 5, 24), 12, MaxTinyFileAutoParallelUploads);
+            }
+            else if (isAuto && (mostlySmallFiles || requestBoundFiles))
+            {
+                // MTRL/ATEX/PAP support packs often contain hundreds of sub-512 KiB files.
+                // Per-file request overhead dominates, so start wider instead of slowly
+                // learning that the connection can handle more lanes.
+                maxParallel = Math.Clamp(Math.Max(cpuAuto * 3, 16), 8, MaxSmallFileAutoParallelUploads);
             }
 
             var desiredParallel = isAuto
-                ? (mostlySmallFiles ? Math.Min(maxParallel, maxParallel <= 3 ? maxParallel : 4) : 1)
+                ? (tinyHeavyFiles || requestBoundFiles
+                    ? maxParallel
+                    : (mostlySmallFiles ? Math.Min(maxParallel, Math.Max(12, cpuAuto * 2)) : Math.Min(maxParallel, Math.Max(2, cpuAuto / 2))))
                 : maxParallel;
             var orderedHashes = allowedHashes
                 .OrderByDescending(h => sizeByHash.TryGetValue(h, out var size) ? size : 0)
@@ -1159,13 +1236,13 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
             int pendingDesired = desiredParallel;
             int pendingHits = 0;
 
-            bool fastStartUsed = false;
+            bool fastStartUsed = tinyHeavyFiles || requestBoundFiles;
 
             double SampleBpsIfReady()
             {
                 var now = sw.Elapsed;
 
-                var minSampleInterval = tinyHeavyFiles
+                var minSampleInterval = (tinyHeavyFiles || requestBoundFiles)
                     ? (now < TimeSpan.FromSeconds(4) ? TimeSpan.FromMilliseconds(400) : TimeSpan.FromSeconds(1))
                     : (now < TimeSpan.FromSeconds(8) ? TimeSpan.FromSeconds(1) : TimeSpan.FromSeconds(2));
 
@@ -1185,17 +1262,21 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
 
             int ComputeDesiredFromBps(double bps)
             {
-                var slot = tinyHeavyFiles
-                    ? 128d * 1024d
-                    : (mostlySmallFiles ? 192d * 1024d : 256d * 1024d);
+                if (isAuto && (tinyHeavyFiles || requestBoundFiles))
+                    return maxParallel;
+
+                var slot = mostlySmallFiles
+                    ? 192d * 1024d
+                    : 256d * 1024d;
 
                 if (bps <= 0) return 1;
 
-                var bySpeed = tinyHeavyFiles
-                    ? (int)Math.Ceiling(bps / slot)
-                    : (int)Math.Round(bps / slot, MidpointRounding.AwayFromZero);
+                var bySpeed = (int)Math.Round(bps / slot, MidpointRounding.AwayFromZero);
 
                 bySpeed = Math.Clamp(bySpeed, 1, maxParallel);
+
+                if (isAuto && mostlySmallFiles)
+                    return Math.Clamp(Math.Max(bySpeed, Math.Min(maxParallel, 4)), 1, maxParallel);
 
                 return bySpeed;
             }
@@ -1222,21 +1303,10 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
                 {
                     var next = ComputeDesiredFromBps(bps);
 
-                        if (tinyHeavyFiles && bps > 0)
-                        {
-                            if (bps < 192 * 1024)
-                            {
-                                desiredParallel = 1;
-                                pendingDesired = 1;
-                                pendingHits = 0;
-                            }
-                            else if (bps < 512 * 1024 && desiredParallel > 2)
-                            {
-                                desiredParallel = 2;
-                                pendingDesired = 2;
-                                pendingHits = 0;
-                            }
-                        }
+                        // Tiny-file storms report low early EWMA because each file only contributes bytes
+                        // after ticket + PUT + complete round-trips finish. Do not downshift them based
+                        // purely on the first few low bandwidth samples, or auto mode collapses back into
+                        // serialized request overhead.
 
                         // ---- Fast-start boost (one-time jump) ----
                         if (!fastStartUsed && desiredParallel <= (tinyHeavyFiles ? 4 : 2))
@@ -1337,7 +1407,7 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
                     }
 
                     var origSize = sizeByHash.TryGetValue(hash, out var s) ? s : new FileInfo(filePath).Length;
-                    var useLiveProgress = origSize > TinyUploadProgressThresholdBytes;
+                    var useLiveProgress = true;
 
                     IProgress<UploadProgress>? throttledProg = null;
                     if (useLiveProgress)
@@ -1384,7 +1454,9 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
                         throttledProg = new ThrottledProgress<UploadProgress>(prog, TimeSpan.FromMilliseconds(150));
                     }
 
-                    var buf = ChooseUploadStreamBufferSize(ewmaBps);
+                    var buf = origSize <= SmallUploadThresholdBytes
+                        ? 64 * 1024
+                        : ChooseUploadStreamBufferSize(ewmaBps);
 
                     await UploadFileStreamedFromDisk(hash, filePath, _mareConfigService.Current.UseAlternativeFileUpload, throttledProg, tokenInner, buf, forceUploadTickets).ConfigureAwait(false);
 
@@ -1648,7 +1720,7 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
     {
         var handler = new SocketsHttpHandler
         {
-            MaxConnectionsPerServer = 64,
+            MaxConnectionsPerServer = 128,
             PooledConnectionLifetime = TimeSpan.FromMinutes(10),
             PooledConnectionIdleTimeout = TimeSpan.FromMinutes(2),
             KeepAlivePingDelay = TimeSpan.FromSeconds(60),

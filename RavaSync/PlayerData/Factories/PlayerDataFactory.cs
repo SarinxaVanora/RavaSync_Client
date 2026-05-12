@@ -24,7 +24,6 @@ public class PlayerDataFactory : IMediatorSubscriber
     private readonly IpcManager _ipcManager;
     private readonly ILogger<PlayerDataFactory> _logger;
     private readonly PerformanceCollectorService _performanceCollector;
-    private readonly XivDataAnalyzer _modelAnalyzer;
     private readonly PapSanitisationService _papSanitisationService;
     private readonly LocalPapSafetyModService _localPapSafetyModService;
     private readonly MareMediator _mareMediator;
@@ -33,23 +32,10 @@ public class PlayerDataFactory : IMediatorSubscriber
     private sealed record PapSessionDecision(string OverrideKey, string OriginalHash, string SkeletonFingerprint, PapRewriteStatus Status, string EffectiveHash, string EffectivePath, DateTimeOffset UpdatedUtc, string Reason);
 
     private readonly ConcurrentDictionary<string, PapSessionDecision> _playerPapDecisionsByKey = new(StringComparer.Ordinal);
-    private readonly ConcurrentDictionary<string, string[]> _initialCrawlSupportFilesByRoot = new(StringComparer.OrdinalIgnoreCase);
-    private readonly ConcurrentDictionary<string, IReadOnlyDictionary<string, string[]>> _initialCrawlSupportReverseResolveCache = new(StringComparer.Ordinal);
-    private const int ReverseResolveBatchSize = 64;
-    private const int SupportSweepDirectoryPauseStride = 24;
-    private const int SupportSweepFilePauseStride = 128;
-    private static readonly TimeSpan SupportSweepBreatherDelay = TimeSpan.FromMilliseconds(2);
+    private const int ReverseResolveBatchSize = 192;
+    private const int CharacterBuildYieldEvery = 128;
+    private static readonly TimeSpan SupportSweepBreatherDelay = TimeSpan.FromMilliseconds(1);
 
-    private const int EmbeddedDependencyResolveDepth = 3;
-    private const long MaxEmbeddedDependencyScanBytes = 8L * 1024L * 1024L;
-    
-    private readonly ConcurrentDictionary<string, EmbeddedDependencyScanCacheEntry> _embeddedDependencyScanCache = new(StringComparer.OrdinalIgnoreCase);
-    private sealed record EmbeddedDependencyScanCacheEntry(long Length, DateTime LastWriteUtc, HashSet<string> GamePaths);
-
-
-    private static readonly Regex EmbeddedDependencyPathRegex = new(
-        @"(?i)\b(?:chara|vfx|bgcommon|sound|ui|shader|common)/(?:[a-z0-9_\-./]+)\.(?:mdl|mtrl|tex|atex|avfx|pap|tmb2?|eid|skp|shpk|scd)\b",
-        RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
     public PlayerDataFactory(ILogger<PlayerDataFactory> logger, DalamudUtilService dalamudUtil, IpcManager ipcManager,
         TransientResourceManager transientResourceManager, FileCacheManager fileReplacementFactory,
@@ -62,12 +48,12 @@ public class PlayerDataFactory : IMediatorSubscriber
         _transientResourceManager = transientResourceManager;
         _fileCacheManager = fileReplacementFactory;
         _performanceCollector = performanceCollector;
-        _modelAnalyzer = modelAnalyzer;
         _papSanitisationService = papSanitizationService;
         _localPapSafetyModService = localPapSafetyModService;
         _mareMediator = mareMediator;
 
         _mareMediator.Subscribe<PenumbraFileCacheChangedMessage>(this, _ => InvalidatePapSessionCaches());
+        _mareMediator.Subscribe<PenumbraModSettingChangedMessage>(this, _ => InvalidatePapSessionCaches());
         _mareMediator.Subscribe<DisconnectedMessage>(this, _ => InvalidatePapSessionCaches());
         _mareMediator.Subscribe<DalamudLogoutMessage>(this, _ => InvalidatePapSessionCaches());
 
@@ -78,13 +64,16 @@ public class PlayerDataFactory : IMediatorSubscriber
 
     private void InvalidatePapSessionCaches()
     {
-        ClearInitialCrawlSupportSweepCache();
-        _initialCrawlSupportReverseResolveCache.Clear();
-        _embeddedDependencyScanCache.Clear();
         _playerPapDecisionsByKey.Clear();
     }
 
-    public async Task<CharacterDataFragment?> BuildCharacterData(GameObjectHandler playerRelatedObject, CancellationToken token)
+
+    public Task<CharacterDataFragment?> BuildCharacterData(GameObjectHandler playerRelatedObject, CancellationToken token)
+    {
+        return BuildCharacterData(playerRelatedObject, token, null);
+    }
+
+    public async Task<CharacterDataFragment?> BuildCharacterData(GameObjectHandler playerRelatedObject, CancellationToken token, string? reason)
     {
         if (!_ipcManager.Initialized)
         {
@@ -105,10 +94,10 @@ public class PlayerDataFactory : IMediatorSubscriber
             {
                 return await _performanceCollector.LogPerformance(this, $"CreateCharacterData>{playerRelatedObject.ObjectKind}", async () =>
                 {
-                    return await CreateCharacterData(playerRelatedObject, token).ConfigureAwait(false);
+                    return await CreateCharacterData(playerRelatedObject, token, reason).ConfigureAwait(false);
                 }).ConfigureAwait(true);
             }
-            return await CreateCharacterData(playerRelatedObject, token).ConfigureAwait(true);
+            return await CreateCharacterData(playerRelatedObject, token, reason).ConfigureAwait(true);
         }
         catch (OperationCanceledException)
         {
@@ -123,15 +112,18 @@ public class PlayerDataFactory : IMediatorSubscriber
         return null;
     }
 
-    private async Task<CharacterDataFragment> CreateCharacterData(GameObjectHandler playerRelatedObject, CancellationToken ct)
+    private async Task<CharacterDataFragment> CreateCharacterData(GameObjectHandler playerRelatedObject, CancellationToken ct, string? reason = null)
     {
         var objectKind = playerRelatedObject.ObjectKind;
         CharacterDataFragment fragment = objectKind == ObjectKind.Player ? new CharacterDataFragmentPlayer() : new();
+        _logger.LogDebug("Building character data for {obj}, reason={reason}",
+            playerRelatedObject,
+            string.IsNullOrWhiteSpace(reason) ? "<none>" : reason);
 
-        _logger.LogDebug("Building character data for {obj}", playerRelatedObject);
-
-        await _dalamudUtil.WaitWhileCharacterIsDrawing(_logger, playerRelatedObject, Guid.NewGuid(), 30000, ct: ct).ConfigureAwait(false);
-        int totalWaitTime = 10000;
+        var lightweightBuild = IsLightweightBuildReasonSet(reason);
+        var drawingWaitMs = lightweightBuild ? 1500 : 5000;
+        await _dalamudUtil.WaitWhileCharacterIsDrawing(_logger, playerRelatedObject, Guid.NewGuid(), drawingWaitMs, ct: ct).ConfigureAwait(false);
+        int totalWaitTime = lightweightBuild ? 1500 : 5000;
 
         var gameObj = await _dalamudUtil.CreateGameObjectAsync(playerRelatedObject.Address).ConfigureAwait(false);
 
@@ -192,25 +184,6 @@ public class PlayerDataFactory : IMediatorSubscriber
 
         ct.ThrowIfCancellationRequested();
 
-        if (objectKind == ObjectKind.Player)
-        {
-            await AddSelectedAnimationSupportReplacementsAsync(fragment, ct).ConfigureAwait(false);
-        }
-
-        ct.ThrowIfCancellationRequested();
-
-        if (objectKind != ObjectKind.Pet)
-        {
-            await AddEmbeddedPenumbraSubResourceReplacementsAsync(fragment, ct).ConfigureAwait(false);
-            await AddInitialCrawlSupportSweepReplacementsAsync(
-                fragment,
-                fragment.FileReplacements.ToArray(),
-                objectKind,
-                persistAsTransientHints: false,
-                source: "static",
-                ct: ct).ConfigureAwait(false);
-        }
-
         ct.ThrowIfCancellationRequested();
 
         if (_logger.IsEnabled(LogLevel.Debug))
@@ -227,6 +200,7 @@ public class PlayerDataFactory : IMediatorSubscriber
 
 
         await _transientResourceManager.WaitForRecording(ct).ConfigureAwait(false);
+        ct.ThrowIfCancellationRequested();
 
         // if it's pet then it's summoner, if it's summoner we actually want to keep all filereplacements alive at all times
         // or we get into redraw city for every change and nothing works properly
@@ -246,11 +220,6 @@ public class PlayerDataFactory : IMediatorSubscriber
 
         ct.ThrowIfCancellationRequested();
 
-        if (objectKind == ObjectKind.Player)
-        {
-            await _transientResourceManager.EnsureManifestPrimeAsync("PlayerDataFactory.CreateCharacterData", ct).ConfigureAwait(false);
-        }
-
         _logger.LogDebug("Handling transient update for {obj}", playerRelatedObject);
 
         // remove all potentially gathered paths from the transient resource manager that are resolved through static resolving
@@ -258,16 +227,8 @@ public class PlayerDataFactory : IMediatorSubscriber
 
         // get all remaining paths and resolve them
         var transientPaths = ManageSemiTransientData(objectKind);
-        var resolvedTransientPaths = await GetFileReplacementsFromPaths(transientPaths, new HashSet<string>(StringComparer.Ordinal), ct).ConfigureAwait(false);
+        var resolvedTransientPaths = await ResolveTransientReplacementsForBuildAsync(objectKind, transientPaths, reason, ct).ConfigureAwait(false);
         var transientReplacements = resolvedTransientPaths.Select(c => new FileReplacement([.. c.Value], c.Key)).ToList();
-        await AddInitialCrawlSupportSweepReplacementsAsync(
-            fragment,
-            transientReplacements.ToArray(),
-            objectKind,
-            persistAsTransientHints: true,
-            source: "transient",
-            ct: ct,
-            appendTarget: transientReplacements).ConfigureAwait(false);
         if (_logger.IsEnabled(LogLevel.Debug))
         {
             _logger.LogDebug("== Transient Replacements ==");
@@ -324,10 +285,14 @@ public class PlayerDataFactory : IMediatorSubscriber
         var toCompute = fragment.FileReplacements.Where(f => !f.IsFileSwap).ToArray();
         _logger.LogDebug("Getting Hashes for {amount} Files", toCompute.Length);
         var computedPaths = _fileCacheManager.GetFileCachesByPaths(toCompute.Select(c => c.ResolvedPath).ToArray());
-        foreach (var file in toCompute)
+        for (var i = 0; i < toCompute.Length; i++)
         {
             ct.ThrowIfCancellationRequested();
+            var file = toCompute[i];
             file.Hash = computedPaths[file.ResolvedPath]?.Hash ?? string.Empty;
+
+            if ((i + 1) % CharacterBuildYieldEvery == 0)
+                await Task.Yield();
         }
         var removed = fragment.FileReplacements.RemoveWhere(f => !f.IsFileSwap && string.IsNullOrEmpty(f.Hash));
         if (removed > 0)
@@ -342,83 +307,79 @@ public class PlayerDataFactory : IMediatorSubscriber
         return fragment;
     }
 
-    private async Task AddSelectedAnimationSupportReplacementsAsync(CharacterDataFragment fragment, CancellationToken ct)
+    private static bool IsLightweightBuildReasonSet(string? reason)
     {
-        if (!fragment.FileReplacements.Any(r => r.GamePaths.Any(XivSkeletonIdentity.IsHumanPlayerAnimationPapGamePath)))
-            return;
+        if (string.IsNullOrWhiteSpace(reason))
+            return false;
 
-        var collectionState = await _localPapSafetyModService.TryGetLocalPlayerCollectionSettingsAsync(ct).ConfigureAwait(false);
-        if (collectionState == null)
-            return;
-
-        var selectedSupportFiles = await _localPapSafetyModService.ResolveSelectedAnimationSupportFilesAsync(collectionState, ct).ConfigureAwait(false);
-        if (selectedSupportFiles.Count == 0)
-            return;
-
-        foreach (var support in selectedSupportFiles.OrderBy(s => s.GamePaths.FirstOrDefault() ?? s.ResolvedPath, StringComparer.OrdinalIgnoreCase))
-        {
-            ct.ThrowIfCancellationRequested();
-            UpsertSelectedAnimationSupportReplacement(fragment, support);
-        }
+        var reasons = reason.Split('|', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        return reasons.Length > 0 && reasons.All(IsLightweightBuildReason);
     }
 
-    private void UpsertSelectedAnimationSupportReplacement(CharacterDataFragment fragment, LocalPapSafetyModService.ManifestSupportSource support)
+    private static bool IsLightweightBuildReason(string reason)
     {
-        if (string.IsNullOrWhiteSpace(support.ResolvedPath) || !File.Exists(support.ResolvedPath))
-            return;
-
-        var supportGamePaths = support.GamePaths
-            .Where(g => !string.IsNullOrWhiteSpace(g))
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .ToArray();
-
-        if (supportGamePaths.Length == 0)
-            return;
-
-        var supportGamePathSet = supportGamePaths.ToHashSet(StringComparer.OrdinalIgnoreCase);
-        var conflictingExistingReplacements = fragment.FileReplacements
-            .Where(existing => existing.GamePaths.Any(supportGamePathSet.Contains))
-            .ToArray();
-
-        foreach (var existing in conflictingExistingReplacements)
-        {
-            fragment.FileReplacements.Remove(existing);
-
-            var remainingGamePaths = existing.GamePaths
-                .Where(g => !supportGamePathSet.Contains(g))
-                .Distinct(StringComparer.OrdinalIgnoreCase)
-                .ToArray();
-
-            if (remainingGamePaths.Length > 0)
-            {
-                fragment.FileReplacements.Add(new FileReplacement(remainingGamePaths, existing.ResolvedPath)
-                {
-                    Hash = existing.Hash,
-                });
-            }
-        }
-
-        if (fragment.FileReplacements.Add(new FileReplacement(supportGamePaths, support.ResolvedPath)))
-        {
-            _logger.LogDebug("Upserted selected animation support replacement {path} for [{gamePaths}]",
-                support.ResolvedPath,
-                string.Join(", ", supportGamePaths));
-        }
+        return string.Equals(reason, "GameObject:TransientResourceChanged", StringComparison.Ordinal)
+            || string.Equals(reason, "ImmediateFollowUp:GameObject:TransientResourceChanged", StringComparison.Ordinal)
+            || string.Equals(reason, "Glamourer:PlayerFallback", StringComparison.Ordinal)
+            || string.Equals(reason, "GameObject:PenumbraRedraw", StringComparison.Ordinal)
+            || string.Equals(reason, "GameObject:PenumbraEndRedraw", StringComparison.Ordinal)
+            || string.Equals(reason, "PenumbraFileCacheChanged", StringComparison.Ordinal)
+            || reason.StartsWith("ImmediateFollowUp:Connected:", StringComparison.Ordinal)
+            || reason.StartsWith("Connected:", StringComparison.Ordinal)
+            || reason.StartsWith("PenumbraModSettingChanged", StringComparison.Ordinal)
+            || reason.StartsWith("GameObject:SemanticDiff", StringComparison.Ordinal)
+            || reason.StartsWith("CustomizePlus:", StringComparison.Ordinal)
+            || reason.StartsWith("ClassJobChanged:", StringComparison.Ordinal);
     }
 
-    public async Task RefreshLocalPlayerConvertedAnimationPackAsync(GameObjectHandler playerRelatedObject, CancellationToken ct)
+
+
+    private static bool ShouldForceFullLiveTransientResolveForBuild(string? reason)
+    {
+        if (string.IsNullOrWhiteSpace(reason))
+            return false;
+
+        var reasons = reason.Split('|', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        return reasons.Any(ShouldForceFullLiveTransientResolveForReason);
+    }
+
+    private static bool ShouldForceFullLiveTransientResolveForReason(string reason)
+    {
+        if (string.IsNullOrWhiteSpace(reason))
+            return false;
+
+        // Raw Penumbra selection changes can swap the physical file behind an existing transient game path
+        // before the targeted manifest refresh has finished. Keep only that immediate safety build live.
+        // The follow-up PenumbraModSettingChanged:TransientManifest build can trust transient.json.
+        if (reason.StartsWith("PenumbraModSettingChanged", StringComparison.Ordinal)
+            && !reason.Contains(":TransientManifest", StringComparison.Ordinal))
+        {
+            return true;
+        }
+
+        // Directory changes can invalidate the physical resolved-file map. Startup/targeted manifest prime will
+        // reseed transient.json afterwards, but the immediate build should be conservative.
+        if (reason.StartsWith("PenumbraDirectoryChanged", StringComparison.Ordinal))
+            return true;
+
+        return false;
+    }
+
+
+
+    public async Task<bool> RefreshLocalPlayerConvertedAnimationPackAsync(GameObjectHandler playerRelatedObject, CancellationToken ct)
     {
         if (playerRelatedObject == null
             || playerRelatedObject.ObjectKind != ObjectKind.Player
             || playerRelatedObject.Address == IntPtr.Zero
             || !_ipcManager.Initialized)
         {
-            return;
+            return false;
         }
 
         var collectionState = await _localPapSafetyModService.TryGetLocalPlayerCollectionSettingsAsync(ct).ConfigureAwait(false);
         if (collectionState == null)
-            return;
+            return false;
 
         var selectedSourcesByGamePath = await _localPapSafetyModService.ResolveSelectedHumanPapSourcesAsync(collectionState, ct).ConfigureAwait(false);
         if (selectedSourcesByGamePath.Count == 0)
@@ -432,7 +393,7 @@ public class PlayerDataFactory : IMediatorSubscriber
             if (runtimeChanged)
                 await RequestLocalPlayerRedrawForRuntimePapChangeAsync(playerRelatedObject, ct).ConfigureAwait(false);
 
-            return;
+            return runtimeChanged;
         }
 
         var targetSkeletons = await _dalamudUtil.RunOnFrameworkThread(() => _papSanitisationService.GetTargetSkeletonSnapshots(playerRelatedObject)).ConfigureAwait(false);
@@ -498,6 +459,8 @@ public class PlayerDataFactory : IMediatorSubscriber
         var sanitizedRuntimeChanged = await _localPapSafetyModService.SyncRuntimeModAsync(collectionState, selectedSourcesByGamePath, sanitizedOverrides, ct).ConfigureAwait(false);
         if (sanitizedRuntimeChanged)
             await RequestLocalPlayerRedrawForRuntimePapChangeAsync(playerRelatedObject, ct).ConfigureAwait(false);
+
+        return sanitizedRuntimeChanged;
     }
 
     private async Task RequestLocalPlayerRedrawForRuntimePapChangeAsync(GameObjectHandler playerRelatedObject, CancellationToken ct)
@@ -618,221 +581,6 @@ public class PlayerDataFactory : IMediatorSubscriber
         };
     }
 
-    private async Task AddEmbeddedPenumbraSubResourceReplacementsAsync(CharacterDataFragment fragment, CancellationToken ct)
-    {
-        if (fragment.FileReplacements.Count == 0)
-            return;
-
-        var knownGamePaths = new HashSet<string>(
-            fragment.FileReplacements.SelectMany(r => r.GamePaths),
-            StringComparer.OrdinalIgnoreCase);
-
-        var frontier = fragment.FileReplacements
-            .Where(IsEmbeddedDependencyContainerReplacement)
-            .ToArray();
-
-        for (int depth = 0; depth < EmbeddedDependencyResolveDepth && frontier.Length > 0; depth++)
-        {
-            ct.ThrowIfCancellationRequested();
-
-            var dependencyGamePaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
-            foreach (var replacement in frontier)
-            {
-                ct.ThrowIfCancellationRequested();
-
-                foreach (var dependencyGamePath in await ExtractEmbeddedDependencyGamePathsAsync(replacement.ResolvedPath, ct).ConfigureAwait(false))
-                {
-                    if (knownGamePaths.Contains(dependencyGamePath))
-                        continue;
-
-                    dependencyGamePaths.Add(dependencyGamePath);
-                }
-            }
-
-            if (dependencyGamePaths.Count == 0)
-                break;
-
-            var resolvedDependencies = await GetFileReplacementsFromPaths(
-                dependencyGamePaths,
-                new HashSet<string>(StringComparer.Ordinal),
-                ct).ConfigureAwait(false);
-
-            var nextFrontier = new List<FileReplacement>();
-
-            foreach (var kvp in resolvedDependencies)
-            {
-                ct.ThrowIfCancellationRequested();
-
-                var resolvedPath = kvp.Key;
-                if (string.IsNullOrWhiteSpace(resolvedPath) || !File.Exists(resolvedPath))
-                    continue;
-
-                var gamePaths = kvp.Value
-                    .Select(NormalizeEmbeddedDependencyGamePath)
-                    .Where(IsEmbeddedDependencyGamePath)
-                    .Where(g => !knownGamePaths.Contains(g))
-                    .Distinct(StringComparer.OrdinalIgnoreCase)
-                    .ToArray();
-
-                if (gamePaths.Length == 0)
-                    continue;
-
-                var replacement = new FileReplacement(gamePaths, resolvedPath);
-                if (!replacement.HasFileReplacement || replacement.IsFileSwap)
-                    continue;
-
-                foreach (var gamePath in replacement.GamePaths)
-                    knownGamePaths.Add(gamePath);
-
-                if (!fragment.FileReplacements.Add(replacement))
-                    continue;
-
-                _logger.LogDebug(
-                    "Added embedded Penumbra sub-resource dependency {resolvedPath} for {gamePaths}",
-                    replacement.ResolvedPath,
-                    string.Join(", ", replacement.GamePaths));
-
-                if (IsEmbeddedDependencyContainerReplacement(replacement))
-                    nextFrontier.Add(replacement);
-            }
-
-            var unresolved = dependencyGamePaths
-                .Where(g => !knownGamePaths.Contains(g))
-                .ToArray();
-
-            foreach (var gamePath in unresolved)
-            {
-                _logger.LogTrace(
-                    "Embedded Penumbra sub-resource {gamePath} was referenced by a resolved file but did not forward-resolve through Penumbra",
-                    gamePath);
-            }
-
-            frontier = nextFrontier.ToArray();
-        }
-    }
-
-    private async Task<HashSet<string>> ExtractEmbeddedDependencyGamePathsAsync(string resolvedPath, CancellationToken ct)
-    {
-        var output = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
-        if (string.IsNullOrWhiteSpace(resolvedPath) || !IsEmbeddedDependencyContainerPath(resolvedPath) || !File.Exists(resolvedPath))
-            return output;
-
-        try
-        {
-            var info = new FileInfo(resolvedPath);
-            if (info.Length <= 0 || info.Length > MaxEmbeddedDependencyScanBytes)
-                return output;
-
-            var cacheKey = resolvedPath.Replace('\\', '/').ToLowerInvariant();
-            var lastWriteUtc = info.LastWriteTimeUtc;
-
-            if (_embeddedDependencyScanCache.TryGetValue(cacheKey, out var cached)
-                && cached.Length == info.Length
-                && cached.LastWriteUtc == lastWriteUtc)
-            {
-                return new HashSet<string>(cached.GamePaths, StringComparer.OrdinalIgnoreCase);
-            }
-
-            var bytes = await File.ReadAllBytesAsync(resolvedPath, ct).ConfigureAwait(false);
-            var text = Encoding.UTF8.GetString(bytes);
-
-            foreach (Match match in EmbeddedDependencyPathRegex.Matches(text))
-            {
-                ct.ThrowIfCancellationRequested();
-
-                var gamePath = NormalizeEmbeddedDependencyGamePath(match.Value);
-                if (IsEmbeddedDependencyGamePath(gamePath))
-                    output.Add(gamePath);
-            }
-
-            _embeddedDependencyScanCache[cacheKey] = new EmbeddedDependencyScanCacheEntry(
-                info.Length,
-                lastWriteUtc,
-                new HashSet<string>(output, StringComparer.OrdinalIgnoreCase));
-        }
-        catch (OperationCanceledException)
-        {
-            throw;
-        }
-        catch (Exception ex)
-        {
-            // Best-effort dependency discovery only. Do not break character data creation.
-        }
-
-        return output;
-    }
-
-    private static bool IsEmbeddedDependencyContainerReplacement(FileReplacement replacement)
-    {
-        if (replacement == null || replacement.IsFileSwap || string.IsNullOrWhiteSpace(replacement.ResolvedPath))
-            return false;
-
-        return IsEmbeddedDependencyContainerPath(replacement.ResolvedPath);
-    }
-
-    private static bool IsEmbeddedDependencyContainerPath(string path)
-    {
-        if (string.IsNullOrWhiteSpace(path))
-            return false;
-
-        return 
-            path.EndsWith(".mdl", StringComparison.OrdinalIgnoreCase)
-            || path.EndsWith(".mtrl", StringComparison.OrdinalIgnoreCase)
-            || path.EndsWith(".avfx", StringComparison.OrdinalIgnoreCase)
-            || path.EndsWith(".pap", StringComparison.OrdinalIgnoreCase)
-            || path.EndsWith(".tmb", StringComparison.OrdinalIgnoreCase)
-            || path.EndsWith(".tmb2", StringComparison.OrdinalIgnoreCase)
-            || path.EndsWith(".eid", StringComparison.OrdinalIgnoreCase)
-            || path.EndsWith(".skp", StringComparison.OrdinalIgnoreCase);
-    }
-
-    private static string NormalizeEmbeddedDependencyGamePath(string path)
-    {
-        var normalized = (path ?? string.Empty)
-            .Replace('\\', '/')
-            .Trim()
-            .Trim('\0')
-            .ToLowerInvariant();
-
-        while (normalized.StartsWith("./", StringComparison.Ordinal))
-            normalized = normalized[2..];
-
-        return normalized;
-    }
-
-    private static bool IsEmbeddedDependencyGamePath(string gamePath)
-    {
-        if (string.IsNullOrWhiteSpace(gamePath))
-            return false;
-
-        var path = NormalizeEmbeddedDependencyGamePath(gamePath);
-
-        var hasAllowedRoot = path.StartsWith("chara/", StringComparison.OrdinalIgnoreCase)
-            || path.StartsWith("vfx/", StringComparison.OrdinalIgnoreCase)
-            || path.StartsWith("bgcommon/", StringComparison.OrdinalIgnoreCase)
-            || path.StartsWith("sound/", StringComparison.OrdinalIgnoreCase)
-            || path.StartsWith("ui/", StringComparison.OrdinalIgnoreCase)
-            || path.StartsWith("shader/", StringComparison.OrdinalIgnoreCase)
-            || path.StartsWith("common/", StringComparison.OrdinalIgnoreCase);
-
-        if (!hasAllowedRoot)
-            return false;
-
-        return path.EndsWith(".mdl", StringComparison.OrdinalIgnoreCase)
-            || path.EndsWith(".mtrl", StringComparison.OrdinalIgnoreCase)
-            || path.EndsWith(".tex", StringComparison.OrdinalIgnoreCase)
-            || path.EndsWith(".atex", StringComparison.OrdinalIgnoreCase)
-            || path.EndsWith(".avfx", StringComparison.OrdinalIgnoreCase)
-            || path.EndsWith(".pap", StringComparison.OrdinalIgnoreCase)
-            || path.EndsWith(".tmb", StringComparison.OrdinalIgnoreCase)
-            || path.EndsWith(".tmb2", StringComparison.OrdinalIgnoreCase)
-            || path.EndsWith(".eid", StringComparison.OrdinalIgnoreCase)
-            || path.EndsWith(".skp", StringComparison.OrdinalIgnoreCase)
-            || path.EndsWith(".shpk", StringComparison.OrdinalIgnoreCase)
-            || path.EndsWith(".scd", StringComparison.OrdinalIgnoreCase);
-    }
 
     private async Task<IReadOnlyDictionary<string, string[]>> GetFileReplacementsFromPaths(HashSet<string> forwardResolve, HashSet<string> reverseResolve, CancellationToken ct = default)
     {
@@ -841,16 +589,27 @@ public class PlayerDataFactory : IMediatorSubscriber
 
         Dictionary<string, List<string>> resolvedPaths = new(StringComparer.OrdinalIgnoreCase);
 
+        static string NormalizeResolvedFilePathForBuild(string value)
+            => string.IsNullOrWhiteSpace(value)
+                ? string.Empty
+                : value.Replace('\\', '/').Trim();
+
+        static string NormalizeGamePathForBuild(string value)
+            => string.IsNullOrWhiteSpace(value)
+                ? string.Empty
+                : value.Replace('\\', '/').Trim().ToLowerInvariant();
+
         static void MergeForwardResolved(Dictionary<string, List<string>> target, string[] requestedGamePaths, string[] resolvedFilePaths)
         {
             for (int i = 0; i < requestedGamePaths.Length; i++)
             {
-                var filePath = resolvedFilePaths[i];
+                var filePath = NormalizeResolvedFilePathForBuild(resolvedFilePaths[i]);
                 if (string.IsNullOrEmpty(filePath))
                     continue;
 
-                filePath = filePath.ToLowerInvariant();
-                var gamePath = requestedGamePaths[i].ToLowerInvariant();
+                var gamePath = NormalizeGamePathForBuild(requestedGamePaths[i]);
+                if (string.IsNullOrEmpty(gamePath))
+                    continue;
 
                 if (!target.TryGetValue(filePath, out var list))
                     target[filePath] = list = new List<string>(1);
@@ -863,19 +622,18 @@ public class PlayerDataFactory : IMediatorSubscriber
         {
             for (int i = 0; i < requestedFilePaths.Length; i++)
             {
-                var filePath = requestedFilePaths[i];
+                var filePath = NormalizeResolvedFilePathForBuild(requestedFilePaths[i]);
                 if (string.IsNullOrEmpty(filePath))
                     continue;
-
-                filePath = filePath.ToLowerInvariant();
 
                 if (!target.TryGetValue(filePath, out var list))
                     target[filePath] = list = new List<string>(resolvedGamePaths[i].Length);
 
                 foreach (var gamePath in resolvedGamePaths[i])
                 {
-                    if (!string.IsNullOrEmpty(gamePath))
-                        list.Add(gamePath.ToLowerInvariant());
+                    var normalizedGamePath = NormalizeGamePathForBuild(gamePath);
+                    if (!string.IsNullOrEmpty(normalizedGamePath))
+                        list.Add(normalizedGamePath);
                 }
             }
         }
@@ -890,7 +648,10 @@ public class PlayerDataFactory : IMediatorSubscriber
         {
             for (int i = 0; i < reversePaths.Length; i += ReverseResolveBatchSize)
             {
-                var batch = reversePaths.Skip(i).Take(ReverseResolveBatchSize).ToArray();
+                var batchSize = Math.Min(ReverseResolveBatchSize, reversePaths.Length - i);
+                var batch = new string[batchSize];
+                Array.Copy(reversePaths, i, batch, 0, batchSize);
+
                 var (_, reverse) = await _ipcManager.Penumbra.ResolvePathsAsync([], batch).ConfigureAwait(false);
                 MergeReverseResolved(resolvedPaths, batch, reverse);
 
@@ -908,553 +669,191 @@ public class PlayerDataFactory : IMediatorSubscriber
         return output.AsReadOnly();
     }
 
-    private async Task<IReadOnlyDictionary<string, string[]>> GetOrResolveInitialCrawlSupportSweepPathsAsync(HashSet<string> reverseSweepPaths, string source, ObjectKind objectKind, CancellationToken ct)
+    private async Task<IReadOnlyDictionary<string, string[]>> ResolveTransientReplacementsForBuildAsync(ObjectKind objectKind, HashSet<string> transientPaths, string? reason, CancellationToken ct)
     {
-        var cacheKey = CreateInitialCrawlSupportReverseResolveCacheKey(reverseSweepPaths);
+        if (transientPaths.Count == 0)
+            return new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase).AsReadOnly();
 
-        if (_initialCrawlSupportReverseResolveCache.TryGetValue(cacheKey, out var cached))
+        if (ShouldForceFullLiveTransientResolveForBuild(reason))
         {
-            if (_logger.IsEnabled(LogLevel.Trace))
-                _logger.LogTrace("Reusing cached reverse-resolved {count} {source} support files for {obj}", reverseSweepPaths.Count, source, objectKind);
-
-            return cached;
+            var liveResolved = await GetFileReplacementsFromPaths(transientPaths, new HashSet<string>(StringComparer.Ordinal), ct).ConfigureAwait(false);
+            return MergeKnownTransientResolvedPathFallbacks(objectKind, transientPaths, liveResolved);
         }
 
-        _logger.LogDebug("Reverse-resolving {count} {source} support files for {obj}", reverseSweepPaths.Count, source, objectKind);
+        var knownResolved = _transientResourceManager.GetKnownResolvedFilePaths(objectKind, transientPaths);
+        if (knownResolved.Count == 0)
+        {
+            var liveResolved = await GetFileReplacementsFromPaths(transientPaths, new HashSet<string>(StringComparer.Ordinal), ct).ConfigureAwait(false);
+            return MergeKnownTransientResolvedPathFallbacks(objectKind, transientPaths, liveResolved);
+        }
 
-        var resolved = await GetFileReplacementsFromPaths(
-            new HashSet<string>(StringComparer.Ordinal),
-            reverseSweepPaths,
-            ct).ConfigureAwait(false);
+        var pathsNeedingLiveResolve = transientPaths
+            .Where(path => !knownResolved.ContainsKey(path))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
-        if (_initialCrawlSupportReverseResolveCache.Count > 32)
-            _initialCrawlSupportReverseResolveCache.Clear();
+        var output = BuildResolvedFilePathMapFromKnownTransientPaths(knownResolved);
 
-        _initialCrawlSupportReverseResolveCache[cacheKey] = resolved;
-        return resolved;
+        if (pathsNeedingLiveResolve.Count > 0)
+        {
+            var liveMissingResolved = await GetFileReplacementsFromPaths(pathsNeedingLiveResolve, new HashSet<string>(StringComparer.Ordinal), ct).ConfigureAwait(false);
+            MergeResolvedFilePathMap(output, liveMissingResolved);
+        }
+
+        if (_logger.IsEnabled(LogLevel.Debug))
+        {
+            _logger.LogDebug(
+                "Used transient.json resolve map for {known}/{total} {objectKind} path(s); live-resolved {live} missing path(s) for reason {reason}",
+                knownResolved.Count,
+                transientPaths.Count,
+                objectKind,
+                pathsNeedingLiveResolve.Count,
+                reason ?? "<none>");
+        }
+
+        return output.ToDictionary(kvp => kvp.Key, kvp => kvp.Value.Distinct(StringComparer.OrdinalIgnoreCase).ToArray(), StringComparer.OrdinalIgnoreCase).AsReadOnly();
     }
 
-    private static string CreateInitialCrawlSupportReverseResolveCacheKey(HashSet<string> reverseSweepPaths)
+    private static Dictionary<string, List<string>> BuildResolvedFilePathMapFromKnownTransientPaths(IReadOnlyDictionary<string, string> knownResolved)
     {
-        if (reverseSweepPaths.Count == 0)
-            return "0";
+        var output = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
 
-        return reverseSweepPaths.Count.ToString(System.Globalization.CultureInfo.InvariantCulture)
-            + "|"
-            + string.Join("|", reverseSweepPaths.OrderBy(p => p, StringComparer.OrdinalIgnoreCase));
-    }
-
-    private async Task AddInitialCrawlSupportSweepReplacementsAsync(CharacterDataFragment fragment, IEnumerable<FileReplacement> seedReplacements, ObjectKind objectKind, bool persistAsTransientHints, string source, CancellationToken ct, List<FileReplacement>? appendTarget = null)
-    {
-        var seeds = seedReplacements
-            .Where(IsInitialCrawlSupportSweepCandidate)
-            .ToArray();
-
-        if (seeds.Length == 0)
-            return;
-
-        var reverseSweepPaths = await CollectInitialCrawlSupportSweepPathsAsync(seeds, ct).ConfigureAwait(false);
-        if (reverseSweepPaths.Count == 0)
-            return;
-
-        var sweptSupportPaths = await GetOrResolveInitialCrawlSupportSweepPathsAsync(reverseSweepPaths, source, objectKind, ct).ConfigureAwait(false);
-
-        var sweptSupportMap = new Dictionary<string, string[]>(sweptSupportPaths, StringComparer.OrdinalIgnoreCase);
-        int synthesizedSupportPaths = 0;
-
-        foreach (var filePath in reverseSweepPaths)
+        foreach (var kvp in knownResolved)
         {
-            if (string.IsNullOrWhiteSpace(filePath))
+            var gamePath = NormalizeTransientGamePathForBuild(kvp.Key);
+            var resolvedFilePath = NormalizeTransientResolvedPathForBuild(kvp.Value);
+            if (string.IsNullOrWhiteSpace(gamePath) || string.IsNullOrWhiteSpace(resolvedFilePath))
                 continue;
 
-            if (sweptSupportMap.TryGetValue(filePath, out var resolvedGamePaths)
-                && resolvedGamePaths.Any(g => !string.IsNullOrWhiteSpace(g) && IsInitialCrawlSupportGamePath(g)))
-            {
-                continue;
-            }
+            if (!output.TryGetValue(resolvedFilePath, out var gamePaths))
+                output[resolvedFilePath] = gamePaths = [];
 
-            if (!TryDeriveMirroredGamePathFromResolvedFile(filePath, out var mirroredGamePath))
-                continue;
-
-            if (!IsInitialCrawlSupportGamePath(mirroredGamePath))
-                continue;
-
-            sweptSupportMap[filePath] = [mirroredGamePath];
-            synthesizedSupportPaths++;
-        }
-
-        if (synthesizedSupportPaths > 0)
-        {
-            _logger.LogDebug("Synthesized {count} mirrored {source} support game paths for {obj}", synthesizedSupportPaths, source, objectKind);
-        }
-
-        bool addedTransientHints = false;
-        int addedReplacements = 0;
-
-        foreach (var kvp in sweptSupportMap)
-        {
-            var filteredGamePaths = kvp.Value
-                .Where(g => !string.IsNullOrWhiteSpace(g) && IsInitialCrawlSupportGamePath(g))
-                .Distinct(StringComparer.OrdinalIgnoreCase)
-                .ToArray();
-
-            if (filteredGamePaths.Length == 0)
-                continue;
-
-            if (persistAsTransientHints)
-            {
-                foreach (var gamePath in filteredGamePaths)
-                {
-                    if (_transientResourceManager.AddTransientResource(objectKind, gamePath))
-                        addedTransientHints = true;
-                }
-            }
-
-            var replacement = new FileReplacement(filteredGamePaths, kvp.Key);
-            if (appendTarget != null)
-                appendTarget.Add(replacement);
-            else
-                fragment.FileReplacements.Add(replacement);
-
-            addedReplacements++;
-        }
-
-        if (addedTransientHints)
-        {
-            _logger.LogDebug("Persisting {source} support transient hints for {obj}", source, objectKind);
-            _transientResourceManager.PersistTransientResources(objectKind);
-        }
-
-        if (addedReplacements > 0)
-        {
-            _logger.LogDebug("Added {count} {source} support replacements for {obj}", addedReplacements, source, objectKind);
-        }
-    }
-
-    private async Task<HashSet<string>> CollectInitialCrawlSupportSweepPathsAsync(IEnumerable<FileReplacement> replacements, CancellationToken ct)
-    {
-        var output = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        var visitedRoots = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
-        foreach (var replacement in replacements)
-        {
-            ct.ThrowIfCancellationRequested();
-
-            if (!IsInitialCrawlSupportSweepCandidate(replacement))
-                continue;
-
-            var resolvedPath = replacement.ResolvedPath;
-            if (string.IsNullOrWhiteSpace(resolvedPath) || !File.Exists(resolvedPath))
-                continue;
-
-            foreach (var root in GetInitialCrawlSupportSweepRoots(replacement))
-            {
-                ct.ThrowIfCancellationRequested();
-
-                if (string.IsNullOrWhiteSpace(root) || !Directory.Exists(root))
-                    continue;
-
-                var normalizedRoot = root.Replace('\\', '/').ToLowerInvariant();
-                if (!visitedRoots.Add(normalizedRoot))
-                    continue;
-
-                foreach (var file in await GetOrEnumerateInitialCrawlSupportFilesForRootAsync(root, normalizedRoot, ct).ConfigureAwait(false))
-                {
-                    output.Add(file);
-                }
-            }
+            gamePaths.Add(gamePath);
         }
 
         return output;
     }
 
-    private async Task<string[]> GetOrEnumerateInitialCrawlSupportFilesForRootAsync(string root, string normalizedRoot, CancellationToken ct)
+    private static void MergeResolvedFilePathMap(Dictionary<string, List<string>> output, IReadOnlyDictionary<string, string[]> resolved)
     {
-        if (_initialCrawlSupportFilesByRoot.TryGetValue(normalizedRoot, out var cachedFiles))
-            return cachedFiles;
-
-        var enumeratedFiles = await EnumerateInitialCrawlSupportFilesAsync(root, ct).ConfigureAwait(false);
-        _initialCrawlSupportFilesByRoot[normalizedRoot] = enumeratedFiles;
-        return enumeratedFiles;
-    }
-
-    private void ClearInitialCrawlSupportSweepCache()
-    {
-        _initialCrawlSupportFilesByRoot.Clear();
-    }
-
-    private static async Task<string[]> EnumerateInitialCrawlSupportFilesAsync(string root, CancellationToken ct)
-    {
-        Stack<string> pendingDirectories = new();
-        pendingDirectories.Push(root);
-        List<string> files = [];
-        int visitedDirectoryCount = 0;
-        int collectedFileCount = 0;
-
-        while (pendingDirectories.Count > 0)
+        foreach (var kvp in resolved)
         {
-            ct.ThrowIfCancellationRequested();
+            var resolvedFilePath = NormalizeTransientResolvedPathForBuild(kvp.Key);
+            if (string.IsNullOrWhiteSpace(resolvedFilePath))
+                continue;
 
-            var currentDirectory = pendingDirectories.Pop();
-            visitedDirectoryCount++;
+            if (!output.TryGetValue(resolvedFilePath, out var gamePaths))
+                output[resolvedFilePath] = gamePaths = [];
 
-            IEnumerable<string> subDirectories;
-            try
+            foreach (var gamePath in kvp.Value)
             {
-                subDirectories = Directory.EnumerateDirectories(currentDirectory);
+                var normalizedGamePath = NormalizeTransientGamePathForBuild(gamePath);
+                if (!string.IsNullOrWhiteSpace(normalizedGamePath))
+                    gamePaths.Add(normalizedGamePath);
             }
-            catch (Exception)
+        }
+    }
+
+    private static string NormalizeTransientGamePathForBuild(string? value)
+        => string.IsNullOrWhiteSpace(value)
+            ? string.Empty
+            : value.Replace('\\', '/').Trim().ToLowerInvariant();
+
+    private static string NormalizeTransientResolvedPathForBuild(string? value)
+        => string.IsNullOrWhiteSpace(value)
+            ? string.Empty
+            : value.Replace('\\', '/').Trim();
+
+    private IReadOnlyDictionary<string, string[]> MergeKnownTransientResolvedPathFallbacks(ObjectKind objectKind, HashSet<string> requestedGamePaths, IReadOnlyDictionary<string, string[]> resolvedTransientPaths)
+    {
+        var knownResolvedPaths = _transientResourceManager.GetKnownResolvedFilePaths(objectKind, requestedGamePaths);
+        if (knownResolvedPaths.Count == 0)
+            return resolvedTransientPaths;
+
+        var output = resolvedTransientPaths.ToDictionary(
+            kvp => kvp.Key,
+            kvp => kvp.Value.ToList(),
+            StringComparer.OrdinalIgnoreCase);
+
+        static string? FindExistingOutputKey(Dictionary<string, List<string>> output, string resolvedFilePath)
+            => output.Keys.FirstOrDefault(key => string.Equals(key, resolvedFilePath, StringComparison.OrdinalIgnoreCase));
+
+        var fallbackCount = 0;
+        var correctedPathCount = 0;
+        var manifestOverrideCount = 0;
+        foreach (var kvp in knownResolvedPaths)
+        {
+            var gamePath = kvp.Key;
+            var resolvedFilePath = kvp.Value;
+
+            if (string.IsNullOrWhiteSpace(gamePath)
+                || string.IsNullOrWhiteSpace(resolvedFilePath)
+                || !File.Exists(resolvedFilePath))
             {
                 continue;
             }
 
-            foreach (var directory in subDirectories)
+            var outputKey = FindExistingOutputKey(output, resolvedFilePath);
+            if (!string.IsNullOrWhiteSpace(outputKey)
+                && !string.Equals(outputKey, resolvedFilePath, StringComparison.Ordinal))
             {
-                pendingDirectories.Push(directory);
-            }
-
-            foreach (var file in EnumerateInitialCrawlSupportFilesInDirectory(currentDirectory))
-            {
-                ct.ThrowIfCancellationRequested();
-                files.Add(file);
-                collectedFileCount++;
-
-                if ((collectedFileCount % SupportSweepFilePauseStride) == 0)
+                var existingGamePaths = output[outputKey];
+                output.Remove(outputKey);
+                if (output.TryGetValue(resolvedFilePath, out var alreadyCorrectedGamePaths))
                 {
-                    await Task.Delay(SupportSweepBreatherDelay, ct).ConfigureAwait(false);
+                    foreach (var existingGamePath in existingGamePaths)
+                    {
+                        if (!alreadyCorrectedGamePaths.Contains(existingGamePath, StringComparer.OrdinalIgnoreCase))
+                            alreadyCorrectedGamePaths.Add(existingGamePath);
+                    }
                 }
-            }
-
-            if ((visitedDirectoryCount % SupportSweepDirectoryPauseStride) == 0)
-            {
-                await Task.Delay(SupportSweepBreatherDelay, ct).ConfigureAwait(false);
-            }
-        }
-
-        return files.ToArray();
-    }
-
-    private static IEnumerable<string> EnumerateInitialCrawlSupportFilesInDirectory(string directory)
-    {
-        foreach (var pattern in InitialCrawlSupportFilePatterns)
-        {
-            IEnumerable<string> files;
-            try
-            {
-                files = Directory.EnumerateFiles(directory, pattern, SearchOption.TopDirectoryOnly);
-            }
-            catch (Exception)
-            {
-                continue;
-            }
-
-            foreach (var file in files)
-            {
-                yield return file.Replace('\\', '/').ToLowerInvariant();
-            }
-        }
-    }
-
-    private static bool IsInitialCrawlSupportSweepCandidate(FileReplacement replacement)
-    {
-        if (replacement == null || replacement.IsFileSwap || string.IsNullOrWhiteSpace(replacement.ResolvedPath))
-            return false;
-
-        foreach (var gamePath in replacement.GamePaths)
-        {
-            if (string.IsNullOrWhiteSpace(gamePath))
-                continue;
-
-            if (IsInitialCrawlSupportSweepGamePath(gamePath))
-                return true;
-        }
-
-        return false;
-    }
-
-    private static bool IsInitialCrawlSupportSweepGamePath(string gamePath)
-    {
-        if (string.IsNullOrWhiteSpace(gamePath))
-            return false;
-
-        return gamePath.StartsWith("vfx/", StringComparison.OrdinalIgnoreCase)
-            || gamePath.StartsWith("bgcommon/vfx/", StringComparison.OrdinalIgnoreCase)
-            || gamePath.StartsWith("sound/", StringComparison.OrdinalIgnoreCase)
-            || gamePath.StartsWith("chara/action/", StringComparison.OrdinalIgnoreCase)
-            || gamePath.StartsWith("chara/equipment/", StringComparison.OrdinalIgnoreCase)
-            || gamePath.StartsWith("chara/accessory/", StringComparison.OrdinalIgnoreCase)
-            || gamePath.StartsWith("chara/weapon/", StringComparison.OrdinalIgnoreCase)
-            || gamePath.StartsWith("chara/human/", StringComparison.OrdinalIgnoreCase)
-            || gamePath.StartsWith("chara/minion/", StringComparison.OrdinalIgnoreCase)
-            || gamePath.StartsWith("chara/monster/", StringComparison.OrdinalIgnoreCase)
-            || gamePath.StartsWith("chara/demihuman/", StringComparison.OrdinalIgnoreCase);
-    }
-
-    private static bool TryDeriveMirroredGamePathFromResolvedFile(string filePath, out string gamePath)
-    {
-        gamePath = string.Empty;
-        if (string.IsNullOrWhiteSpace(filePath))
-            return false;
-
-        var normalized = filePath.Replace('\\', '/');
-
-        static int LastMarkerIndex(string value, string marker)
-            => value.LastIndexOf(marker, StringComparison.OrdinalIgnoreCase);
-
-        var idx = LastMarkerIndex(normalized, "/bgcommon/vfx/");
-        if (idx < 0)
-            idx = LastMarkerIndex(normalized, "/chara/");
-        if (idx < 0)
-            idx = LastMarkerIndex(normalized, "/vfx/");
-        if (idx < 0)
-            idx = LastMarkerIndex(normalized, "/sound/");
-        if (idx < 0)
-            idx = LastMarkerIndex(normalized, "/ui/");
-        if (idx < 0)
-            idx = LastMarkerIndex(normalized, "/shader/");
-
-        if (idx < 0)
-            return false;
-
-        gamePath = normalized[(idx + 1)..].ToLowerInvariant();
-        return !string.IsNullOrWhiteSpace(gamePath);
-    }
-
-    private static bool IsInitialCrawlSupportGamePath(string gamePath)
-    {
-        if (string.IsNullOrWhiteSpace(gamePath))
-            return false;
-
-        return gamePath.EndsWith(".mdl", StringComparison.OrdinalIgnoreCase)
-            || gamePath.EndsWith(".mtrl", StringComparison.OrdinalIgnoreCase)
-            || gamePath.EndsWith(".tex", StringComparison.OrdinalIgnoreCase)
-            || gamePath.EndsWith(".atex", StringComparison.OrdinalIgnoreCase)
-            || gamePath.EndsWith(".avfx", StringComparison.OrdinalIgnoreCase)
-            || gamePath.EndsWith(".pap", StringComparison.OrdinalIgnoreCase)
-            || gamePath.EndsWith(".tmb", StringComparison.OrdinalIgnoreCase)
-            || gamePath.EndsWith(".tmb2", StringComparison.OrdinalIgnoreCase)
-            || gamePath.EndsWith(".eid", StringComparison.OrdinalIgnoreCase)
-            || gamePath.EndsWith(".sklb", StringComparison.OrdinalIgnoreCase)
-            || gamePath.EndsWith(".phy", StringComparison.OrdinalIgnoreCase)
-            || gamePath.EndsWith(".phyb", StringComparison.OrdinalIgnoreCase)
-            || gamePath.EndsWith(".pbd", StringComparison.OrdinalIgnoreCase)
-            || gamePath.EndsWith(".skp", StringComparison.OrdinalIgnoreCase)
-            || gamePath.EndsWith(".shpk", StringComparison.OrdinalIgnoreCase)
-            || gamePath.EndsWith(".scd", StringComparison.OrdinalIgnoreCase);
-    }
-
-    private static readonly string[] InitialCrawlSupportFilePatterns =
-    [
-        "*.mdl",
-        "*.mtrl",
-        "*.tex",
-        "*.atex",
-        "*.avfx",
-        "*.pap",
-        "*.tmb",
-        "*.tmb2",
-        "*.eid",
-        "*.sklb",
-        "*.phy",
-        "*.phyb",
-        "*.pbd",
-        "*.skp",
-        "*.shpk",
-        "*.scd",
-    ];
-
-    private static IEnumerable<string> GetInitialCrawlSupportSweepRoots(FileReplacement replacement)
-    {
-        var resolvedPath = replacement.ResolvedPath;
-        if (string.IsNullOrWhiteSpace(resolvedPath) || !File.Exists(resolvedPath))
-            yield break;
-
-        var normalizedResolvedPath = resolvedPath.Replace('\\', '/').ToLowerInvariant();
-        var immediateDirectory = Path.GetDirectoryName(resolvedPath);
-        if (!string.IsNullOrWhiteSpace(immediateDirectory))
-            yield return immediateDirectory;
-
-        foreach (var gamePath in replacement.GamePaths)
-        {
-            if (string.IsNullOrWhiteSpace(gamePath))
-                continue;
-
-            var normalizedGamePath = gamePath.Replace('\\', '/').ToLowerInvariant();
-            string? root = TryGetInitialCrawlEntityRoot(normalizedResolvedPath, normalizedGamePath);
-            if (!string.IsNullOrWhiteSpace(root))
-                yield return root;
-
-            foreach (var soundRoot in GetInitialCrawlSoundSupportRoots(normalizedResolvedPath, normalizedGamePath))
-                yield return soundRoot;
-        }
-    }
-
-    private static IEnumerable<string> GetInitialCrawlSoundSupportRoots(string normalizedResolvedPath, string normalizedGamePath)
-    {
-        if (string.IsNullOrWhiteSpace(normalizedResolvedPath) || string.IsNullOrWhiteSpace(normalizedGamePath))
-            yield break;
-
-        if (!ShouldScanInitialCrawlSoundSupportFolder(normalizedGamePath))
-            yield break;
-
-        var modRoot = TryGetInitialCrawlResolvedModRoot(normalizedResolvedPath);
-        if (string.IsNullOrWhiteSpace(modRoot))
-            yield break;
-
-        var soundRoot = Path.Combine(modRoot, "sound");
-        if (Directory.Exists(soundRoot))
-            yield return soundRoot;
-    }
-
-    private static bool ShouldScanInitialCrawlSoundSupportFolder(string normalizedGamePath)
-    {
-        if (string.IsNullOrWhiteSpace(normalizedGamePath))
-            return false;
-
-        return normalizedGamePath.StartsWith("sound/", StringComparison.OrdinalIgnoreCase)
-            || normalizedGamePath.StartsWith("vfx/", StringComparison.OrdinalIgnoreCase)
-            || normalizedGamePath.StartsWith("bgcommon/vfx/", StringComparison.OrdinalIgnoreCase)
-            || normalizedGamePath.StartsWith("chara/action/", StringComparison.OrdinalIgnoreCase)
-            || normalizedGamePath.StartsWith("chara/equipment/", StringComparison.OrdinalIgnoreCase)
-            || normalizedGamePath.StartsWith("chara/accessory/", StringComparison.OrdinalIgnoreCase)
-            || normalizedGamePath.StartsWith("chara/weapon/", StringComparison.OrdinalIgnoreCase)
-            || normalizedGamePath.StartsWith("chara/human/", StringComparison.OrdinalIgnoreCase)
-            || normalizedGamePath.StartsWith("chara/minion/", StringComparison.OrdinalIgnoreCase)
-            || normalizedGamePath.StartsWith("chara/monster/", StringComparison.OrdinalIgnoreCase)
-            || normalizedGamePath.StartsWith("chara/demihuman/", StringComparison.OrdinalIgnoreCase);
-    }
-
-    private static string? TryGetInitialCrawlResolvedModRoot(string normalizedResolvedPath)
-    {
-        if (string.IsNullOrWhiteSpace(normalizedResolvedPath))
-            return null;
-
-        string[] markers =
-        [
-            "/chara/",
-            "/vfx/",
-            "/bgcommon/",
-            "/sound/",
-            "/ui/",
-            "/shader/",
-            "/common/",
-        ];
-
-        var bestIdx = -1;
-        foreach (var marker in markers)
-        {
-            var idx = normalizedResolvedPath.IndexOf(marker, StringComparison.OrdinalIgnoreCase);
-            if (idx < 0)
-                continue;
-
-            if (bestIdx < 0 || idx < bestIdx)
-                bestIdx = idx;
-        }
-
-        if (bestIdx <= 0)
-            return null;
-
-        var root = normalizedResolvedPath[..bestIdx].Replace('/', Path.DirectorySeparatorChar);
-        return Directory.Exists(root) ? root : null;
-    }
-
-    private static string? TryGetInitialCrawlEntityRoot(string normalizedResolvedPath, string normalizedGamePath)
-    {
-        static IEnumerable<string> EnumerateEntityRootCandidates(string gamePath, string prefix, int fallbackSegmentCount)
-        {
-            if (!gamePath.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
-                yield break;
-
-            var parts = gamePath.Split('/', StringSplitOptions.RemoveEmptyEntries);
-            if (parts.Length < fallbackSegmentCount)
-                yield break;
-
-            for (int i = 0; i <= parts.Length - 3; i++)
-            {
-                if (!parts[i].Equals("obj", StringComparison.OrdinalIgnoreCase))
-                    continue;
-
-                var scopeType = parts[i + 1];
-                if (!scopeType.Equals("body", StringComparison.OrdinalIgnoreCase)
-                    && !scopeType.Equals("face", StringComparison.OrdinalIgnoreCase)
-                    && !scopeType.Equals("tail", StringComparison.OrdinalIgnoreCase)
-                    && !scopeType.Equals("met", StringComparison.OrdinalIgnoreCase))
+                else
                 {
-                    continue;
+                    output[resolvedFilePath] = existingGamePaths;
                 }
 
-                yield return string.Join('/', parts.Take(i + 3));
-                break;
+                outputKey = resolvedFilePath;
+                correctedPathCount++;
             }
 
-            yield return string.Join('/', parts.Take(fallbackSegmentCount));
-        }
-
-        static string? MatchEntityRoot(string resolvedPath, string gamePath, string prefix, int fallbackSegmentCount)
-        {
-            foreach (var entityRoot in EnumerateEntityRootCandidates(gamePath, prefix, fallbackSegmentCount)
-                .Distinct(StringComparer.OrdinalIgnoreCase))
+            if (string.IsNullOrWhiteSpace(outputKey))
             {
-                var marker = "/" + entityRoot + "/";
-                var idx = resolvedPath.IndexOf(marker, StringComparison.OrdinalIgnoreCase);
-                if (idx < 0)
-                    continue;
-
-                return resolvedPath[..(idx + marker.Length - 1)].Replace('/', Path.DirectorySeparatorChar);
+                outputKey = resolvedFilePath;
+                output[outputKey] = [];
             }
 
-            return null;
+            foreach (var otherKey in output.Keys.Where(key => !string.Equals(key, outputKey, StringComparison.OrdinalIgnoreCase)).ToList())
+            {
+                var otherGamePaths = output[otherKey];
+                var removed = otherGamePaths.RemoveAll(path => string.Equals(path, gamePath, StringComparison.OrdinalIgnoreCase));
+                if (removed > 0)
+                    manifestOverrideCount += removed;
+
+                if (otherGamePaths.Count == 0)
+                    output.Remove(otherKey);
+            }
+
+            var gamePaths = output[outputKey];
+            if (!gamePaths.Contains(gamePath, StringComparer.OrdinalIgnoreCase))
+            {
+                gamePaths.Add(gamePath);
+                fallbackCount++;
+            }
         }
 
-        if (normalizedGamePath.StartsWith("vfx/", StringComparison.OrdinalIgnoreCase)
-            || normalizedGamePath.StartsWith("bgcommon/vfx/", StringComparison.OrdinalIgnoreCase)
-            || normalizedGamePath.StartsWith("sound/", StringComparison.OrdinalIgnoreCase)
-            || normalizedGamePath.StartsWith("chara/action/", StringComparison.OrdinalIgnoreCase))
+        if (fallbackCount > 0 || correctedPathCount > 0 || manifestOverrideCount > 0)
         {
-            return Path.GetDirectoryName(normalizedResolvedPath.Replace('/', Path.DirectorySeparatorChar));
+            _logger.LogDebug(
+                "Applied {count} known transient manifest file path fallback(s), corrected {corrected} resolved path casing issue(s), and overrode {overridden} forward-resolved transient path(s)",
+                fallbackCount, correctedPathCount, manifestOverrideCount);
         }
 
-        return MatchEntityRoot(normalizedResolvedPath, normalizedGamePath, "chara/equipment/", 3)
-            ?? MatchEntityRoot(normalizedResolvedPath, normalizedGamePath, "chara/accessory/", 3)
-            ?? MatchEntityRoot(normalizedResolvedPath, normalizedGamePath, "chara/weapon/", 3)
-            ?? MatchEntityRoot(normalizedResolvedPath, normalizedGamePath, "chara/human/", 3)
-            ?? MatchEntityRoot(normalizedResolvedPath, normalizedGamePath, "chara/minion/", 3)
-            ?? MatchEntityRoot(normalizedResolvedPath, normalizedGamePath, "chara/monster/", 3)
-            ?? MatchEntityRoot(normalizedResolvedPath, normalizedGamePath, "chara/demihuman/", 3);
-    }
-
-    private static bool IsInitialCrawlSupportFile(string path)
-    {
-        if (string.IsNullOrWhiteSpace(path))
-            return false;
-
-        return path.EndsWith(".mdl", StringComparison.OrdinalIgnoreCase)
-            || path.EndsWith(".mtrl", StringComparison.OrdinalIgnoreCase)
-            || path.EndsWith(".tex", StringComparison.OrdinalIgnoreCase)
-            || path.EndsWith(".atex", StringComparison.OrdinalIgnoreCase)
-            || path.EndsWith(".avfx", StringComparison.OrdinalIgnoreCase)
-            || path.EndsWith(".pap", StringComparison.OrdinalIgnoreCase)
-            || path.EndsWith(".tmb", StringComparison.OrdinalIgnoreCase)
-            || path.EndsWith(".tmb2", StringComparison.OrdinalIgnoreCase)
-            || path.EndsWith(".eid", StringComparison.OrdinalIgnoreCase)
-            || path.EndsWith(".sklb", StringComparison.OrdinalIgnoreCase)
-            || path.EndsWith(".phy", StringComparison.OrdinalIgnoreCase)
-            || path.EndsWith(".phyb", StringComparison.OrdinalIgnoreCase)
-            || path.EndsWith(".pbd", StringComparison.OrdinalIgnoreCase)
-            || path.EndsWith(".skp", StringComparison.OrdinalIgnoreCase)
-            || path.EndsWith(".shpk", StringComparison.OrdinalIgnoreCase)
-            || path.EndsWith(".scd", StringComparison.OrdinalIgnoreCase);
+        return output.ToDictionary(kvp => kvp.Key, kvp => kvp.Value.Distinct(StringComparer.OrdinalIgnoreCase).ToArray(), StringComparer.OrdinalIgnoreCase).AsReadOnly();
     }
 
     private HashSet<string> ManageSemiTransientData(ObjectKind objectKind)
     {
-        if (_transientResourceManager.HasPendingTransients(objectKind))
-        {
-            _transientResourceManager.PersistTransientResources(objectKind);
-        }
-
         HashSet<string> pathsToResolve = new(StringComparer.Ordinal);
-        foreach (var path in _transientResourceManager.GetSemiTransientResources(objectKind))
+        foreach (var path in _transientResourceManager.PrepareTransientResourcesForBuild(objectKind))
         {
             if (!string.IsNullOrEmpty(path))
                 pathsToResolve.Add(path);

@@ -1,4 +1,4 @@
-﻿using RavaSync.FileCache;
+using RavaSync.FileCache;
 using RavaSync.Interop.Ipc;
 using RavaSync.PlayerData.Handlers;
 using RavaSync.PlayerData.Pairs;
@@ -25,14 +25,13 @@ public class PairHandlerFactory
     private readonly ServerConfigurationManager _serverConfigManager;
     private readonly PluginWarningNotificationService _pluginWarningNotificationManager;
     private readonly ModPathResolver _modPathResolver;
-    private readonly ObjectIndexCleanupService _objectIndexCleanupService;
     private readonly PapSanitisationService _papSanitisationService;
 
     public PairHandlerFactory(ILoggerFactory loggerFactory, GameObjectHandlerFactory gameObjectHandlerFactory, IpcManager ipcManager,
         FileDownloadManagerFactory fileDownloadManagerFactory, DalamudUtilService dalamudUtilService,
         PluginWarningNotificationService pluginWarningNotificationManager, IHostApplicationLifetime hostApplicationLifetime,
         FileCacheManager fileCacheManager, MareMediator mareMediator, PlayerPerformanceService playerPerformanceService,
-        ServerConfigurationManager serverConfigManager, ModPathResolver modPathResolver, ObjectIndexCleanupService objectIndexCleanupService, PapSanitisationService papSanitizationService)
+        ServerConfigurationManager serverConfigManager, ModPathResolver modPathResolver, PapSanitisationService papSanitizationService)
     {
         _loggerFactory = loggerFactory;
         _gameObjectHandlerFactory = gameObjectHandlerFactory;
@@ -46,7 +45,6 @@ public class PairHandlerFactory
         _playerPerformanceService = playerPerformanceService;
         _serverConfigManager = serverConfigManager;
         _modPathResolver = modPathResolver;
-        _objectIndexCleanupService = objectIndexCleanupService;
         _papSanitisationService = papSanitizationService;
     }
 
@@ -54,6 +52,6 @@ public class PairHandlerFactory
     {
         return new PairHandler(_loggerFactory.CreateLogger<PairHandler>(), pair, _gameObjectHandlerFactory,
             _ipcManager, _fileDownloadManagerFactory, _pluginWarningNotificationManager, _dalamudUtilService, _hostApplicationLifetime,
-            _fileCacheManager, _mareMediator, _playerPerformanceService, _serverConfigManager, _modPathResolver, _objectIndexCleanupService, _papSanitisationService);
+            _fileCacheManager, _mareMediator, _playerPerformanceService, _serverConfigManager, _modPathResolver, _papSanitisationService);
     }
 }

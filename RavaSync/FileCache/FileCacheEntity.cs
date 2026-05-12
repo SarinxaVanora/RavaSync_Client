@@ -24,6 +24,8 @@ public class FileCacheEntity
 
     public void SetResolvedFilePath(string filePath)
     {
-        ResolvedFilepath = filePath.ToLowerInvariant().Replace("\\\\", "\\", StringComparison.Ordinal);
+        // Keep the real filesystem casing. Lowercasing physical paths is harmless on Windows,
+        // but breaks Wine/Linux case-sensitive mod directories and leaves transient files unhashed.
+        ResolvedFilepath = filePath.Replace("\\\\", "\\", StringComparison.Ordinal);
     }
 }

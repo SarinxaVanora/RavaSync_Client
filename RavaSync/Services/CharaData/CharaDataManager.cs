@@ -1168,13 +1168,27 @@ public sealed partial class CharaDataManager : DisposableMediatorSubscriberBase
                 .CreateTemporaryCollectionAsync(Logger, metaInfo.Uploader.UID + metaInfo.Id)
                 .ConfigureAwait(false);
 
-            var idx = await _dalamudUtilService
-                .RunOnFrameworkThread(() => tempHandler.GetGameObject()?.ObjectIndex)
-                .ConfigureAwait(false) ?? 0;
-
-            await _ipcManager.Penumbra
-                .AssignTemporaryCollectionAsync(Logger, penumbraCollection, idx)
+            var (idx, expectedAddress) = await _dalamudUtilService
+                .RunOnFrameworkThread(() =>
+                {
+                    var obj = tempHandler.GetGameObject();
+                    return (obj?.ObjectIndex ?? -1, obj?.Address ?? nint.Zero);
+                })
                 .ConfigureAwait(false);
+
+            if (idx < 0 || expectedAddress == nint.Zero)
+                throw new InvalidOperationException($"Unable to resolve target actor for chara data application {metaInfo.Id}");
+
+            var assigned = isSelf
+                ? await _ipcManager.Penumbra
+                    .AssignTemporaryCollectionAsync(Logger, penumbraCollection, idx)
+                    .ConfigureAwait(false)
+                : await _ipcManager.Penumbra
+                    .AssignTemporaryCollectionToVerifiedCharacterAsync(Logger, penumbraCollection, idx, string.Empty, expectedAddress, tempHandler.Name)
+                    .ConfigureAwait(false);
+
+            if (!assigned)
+                throw new InvalidOperationException($"Penumbra refused to assign temporary collection for chara data application {metaInfo.Id}");
 
             await _ipcManager.Penumbra
                 .SetTemporaryModsAsync(Logger, applicationId, penumbraCollection, modPaths)

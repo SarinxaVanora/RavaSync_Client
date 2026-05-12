@@ -1,4 +1,4 @@
-﻿using Dalamud.Game.ClientState.Objects.Types;
+using Dalamud.Game.ClientState.Objects.Types;
 using RavaSync.API.Data;
 using RavaSync.API.Data.Enum;
 using RavaSync.PlayerData.Handlers;
@@ -78,98 +78,88 @@ public static class VariousExtensions
             bool hasNewAndOldFileReplacements = newFileReplacements != null && existingFileReplacements != null;
             bool hasNewAndOldGlamourerData = newGlamourerData != null && existingGlamourerData != null;
 
-            if (hasNewButNotOldFileReplacements || hasOldButNotNewFileReplacements || hasNewButNotOldGlamourerData || hasOldButNotNewGlamourerData)
+            if (hasNewButNotOldFileReplacements || hasOldButNotNewFileReplacements)
             {
-                logger.LogDebug("[BASE-{appBase}] Updating {object}/{kind} (Some new data arrived: NewButNotOldFiles:{hasNewButNotOldFileReplacements}," +
-                    " OldButNotNewFiles:{hasOldButNotNewFileReplacements}, NewButNotOldGlam:{hasNewButNotOldGlamourerData}, OldButNotNewGlam:{hasOldButNotNewGlamourerData}) => {change}, {change2}",
-                    applicationBase,
-                    cachedPlayer, objectKind, hasNewButNotOldFileReplacements, hasOldButNotNewFileReplacements, hasNewButNotOldGlamourerData, hasOldButNotNewGlamourerData, PlayerChanges.ModFiles, PlayerChanges.Glamourer);
+                logger.LogDebug("[BASE-{appBase}] Updating {object}/{kind} (File replacement data arrived/removed: NewButNotOldFiles:{hasNewButNotOldFileReplacements}, OldButNotNewFiles:{hasOldButNotNewFileReplacements}) => {change}",
+                    applicationBase, cachedPlayer, objectKind, hasNewButNotOldFileReplacements, hasOldButNotNewFileReplacements, PlayerChanges.ModFiles);
+
                 charaDataToUpdate[objectKind].Add(PlayerChanges.ModFiles);
-                charaDataToUpdate[objectKind].Add(PlayerChanges.Glamourer);
-                if (objectKind != ObjectKind.Player)
+                if (ShouldForceOwnedObjectRedrawForFileChange(objectKind, existingFileReplacements, newFileReplacements))
                     charaDataToUpdate[objectKind].Add(PlayerChanges.ForcedRedraw);
             }
-            else
+            else if (hasNewAndOldFileReplacements)
             {
-                if (hasNewAndOldFileReplacements)
+                bool listsAreEqual = oldData.FileReplacements[objectKind].SequenceEqual(newData.FileReplacements[objectKind], PlayerData.Data.FileReplacementDataComparer.Instance);
+                if (!listsAreEqual || forceApplyMods)
                 {
-                    bool listsAreEqual = oldData.FileReplacements[objectKind].SequenceEqual(newData.FileReplacements[objectKind], PlayerData.Data.FileReplacementDataComparer.Instance);
-                    if (!listsAreEqual || forceApplyMods)
+                    logger.LogDebug("[BASE-{appBase}] Updating {object}/{kind} (FileReplacements not equal) => {change}", applicationBase, cachedPlayer, objectKind, PlayerChanges.ModFiles);
+                    charaDataToUpdate[objectKind].Add(PlayerChanges.ModFiles);
+                    if (objectKind != ObjectKind.Player)
                     {
-                        logger.LogDebug("[BASE-{appBase}] Updating {object}/{kind} (FileReplacements not equal) => {change}", applicationBase, cachedPlayer, objectKind, PlayerChanges.ModFiles);
-                        charaDataToUpdate[objectKind].Add(PlayerChanges.ModFiles);
-                        if (objectKind != ObjectKind.Player)
-                        {
+                        if (ShouldForceOwnedObjectRedrawForFileChange(objectKind, existingFileReplacements, newFileReplacements))
                             charaDataToUpdate[objectKind].Add(PlayerChanges.ForcedRedraw);
-                        }
-                        else
+                    }
+                    else
+                    {
+                        var existingFace = existingFileReplacements.Where(g => g.GamePaths.Any(p => p.Contains("/face/", StringComparison.OrdinalIgnoreCase)))
+                            .OrderBy(g => string.IsNullOrEmpty(g.Hash) ? g.FileSwapPath : g.Hash, StringComparer.OrdinalIgnoreCase).ToList();
+                        var existingHair = existingFileReplacements.Where(g => g.GamePaths.Any(p => p.Contains("/hair/", StringComparison.OrdinalIgnoreCase)))
+                            .OrderBy(g => string.IsNullOrEmpty(g.Hash) ? g.FileSwapPath : g.Hash, StringComparer.OrdinalIgnoreCase).ToList();
+                        var existingTail = existingFileReplacements.Where(g => g.GamePaths.Any(p => p.Contains("/tail/", StringComparison.OrdinalIgnoreCase)))
+                            .OrderBy(g => string.IsNullOrEmpty(g.Hash) ? g.FileSwapPath : g.Hash, StringComparer.OrdinalIgnoreCase).ToList();
+                        var newFace = newFileReplacements.Where(g => g.GamePaths.Any(p => p.Contains("/face/", StringComparison.OrdinalIgnoreCase)))
+                            .OrderBy(g => string.IsNullOrEmpty(g.Hash) ? g.FileSwapPath : g.Hash, StringComparer.OrdinalIgnoreCase).ToList();
+                        var newHair = newFileReplacements.Where(g => g.GamePaths.Any(p => p.Contains("/hair/", StringComparison.OrdinalIgnoreCase)))
+                            .OrderBy(g => string.IsNullOrEmpty(g.Hash) ? g.FileSwapPath : g.Hash, StringComparer.OrdinalIgnoreCase).ToList();
+                        var newTail = newFileReplacements.Where(g => g.GamePaths.Any(p => p.Contains("/tail/", StringComparison.OrdinalIgnoreCase)))
+                            .OrderBy(g => string.IsNullOrEmpty(g.Hash) ? g.FileSwapPath : g.Hash, StringComparer.OrdinalIgnoreCase).ToList();
+                        var existingTransients = existingFileReplacements.Where(g => g.GamePaths.Any(PairApplyUtilities.IsTransientRedrawCriticalGamePath))
+                            .OrderBy(g => string.IsNullOrEmpty(g.Hash) ? g.FileSwapPath : g.Hash, StringComparer.OrdinalIgnoreCase).ToList();
+                        var newTransients = newFileReplacements.Where(g => g.GamePaths.Any(PairApplyUtilities.IsTransientRedrawCriticalGamePath))
+                            .OrderBy(g => string.IsNullOrEmpty(g.Hash) ? g.FileSwapPath : g.Hash, StringComparer.OrdinalIgnoreCase).ToList();
+
+                        logger.LogTrace("[BASE-{appbase}] ExistingFace: {of}, NewFace: {fc}; ExistingHair: {eh}, NewHair: {nh}; ExistingTail: {et}, NewTail: {nt}; ExistingTransient: {etr}, NewTransient: {ntr}", applicationBase,
+                            existingFace.Count, newFace.Count, existingHair.Count, newHair.Count, existingTail.Count, newTail.Count, existingTransients.Count, newTransients.Count);
+                        var differentFace = !existingFace.SequenceEqual(newFace, PlayerData.Data.FileReplacementDataComparer.Instance);
+                        var differentHair = !existingHair.SequenceEqual(newHair, PlayerData.Data.FileReplacementDataComparer.Instance);
+                        var differentTail = !existingTail.SequenceEqual(newTail, PlayerData.Data.FileReplacementDataComparer.Instance);
+                        var differentTransients = !existingTransients.SequenceEqual(newTransients, PlayerData.Data.FileReplacementDataComparer.Instance);
+
+                        if (differentTransients)
                         {
-                            var existingFace = existingFileReplacements.Where(g => g.GamePaths.Any(p => p.Contains("/face/", StringComparison.OrdinalIgnoreCase)))
-                                .OrderBy(g => string.IsNullOrEmpty(g.Hash) ? g.FileSwapPath : g.Hash, StringComparer.OrdinalIgnoreCase).ToList();
-                            var existingHair = existingFileReplacements.Where(g => g.GamePaths.Any(p => p.Contains("/hair/", StringComparison.OrdinalIgnoreCase)))
-                                .OrderBy(g => string.IsNullOrEmpty(g.Hash) ? g.FileSwapPath : g.Hash, StringComparer.OrdinalIgnoreCase).ToList();
-                            var existingTail = existingFileReplacements.Where(g => g.GamePaths.Any(p => p.Contains("/tail/", StringComparison.OrdinalIgnoreCase)))
-                                .OrderBy(g => string.IsNullOrEmpty(g.Hash) ? g.FileSwapPath : g.Hash, StringComparer.OrdinalIgnoreCase).ToList();
-                            var newFace = newFileReplacements.Where(g => g.GamePaths.Any(p => p.Contains("/face/", StringComparison.OrdinalIgnoreCase)))
-                                .OrderBy(g => string.IsNullOrEmpty(g.Hash) ? g.FileSwapPath : g.Hash, StringComparer.OrdinalIgnoreCase).ToList();
-                            var newHair = newFileReplacements.Where(g => g.GamePaths.Any(p => p.Contains("/hair/", StringComparison.OrdinalIgnoreCase)))
-                                .OrderBy(g => string.IsNullOrEmpty(g.Hash) ? g.FileSwapPath : g.Hash, StringComparer.OrdinalIgnoreCase).ToList();
-                            var newTail = newFileReplacements.Where(g => g.GamePaths.Any(p => p.Contains("/tail/", StringComparison.OrdinalIgnoreCase)))
-                                .OrderBy(g => string.IsNullOrEmpty(g.Hash) ? g.FileSwapPath : g.Hash, StringComparer.OrdinalIgnoreCase).ToList();
-                            var existingTransients = existingFileReplacements.Where(g => g.GamePaths.Any(PairApplyUtilities.IsTransientRedrawCriticalGamePath))
-                                .OrderBy(g => string.IsNullOrEmpty(g.Hash) ? g.FileSwapPath : g.Hash, StringComparer.OrdinalIgnoreCase).ToList();
-                            var newTransients = newFileReplacements.Where(g => g.GamePaths.Any(PairApplyUtilities.IsTransientRedrawCriticalGamePath))
-                                .OrderBy(g => string.IsNullOrEmpty(g.Hash) ? g.FileSwapPath : g.Hash, StringComparer.OrdinalIgnoreCase).ToList();
+                            logger.LogDebug("[BASE-{appbase}] Different transient/animation/VFX paths: {transients}; redraw decision will be handled by the download-aware temp-content gate", applicationBase,
+                                differentTransients);
+                            charaDataToUpdate[objectKind].Add(PlayerChanges.ModFiles);
+                        }
 
-                            logger.LogTrace("[BASE-{appbase}] ExistingFace: {of}, NewFace: {fc}; ExistingHair: {eh}, NewHair: {nh}; ExistingTail: {et}, NewTail: {nt}; ExistingTransient: {etr}, NewTransient: {ntr}", applicationBase,
-                                existingFace.Count, newFace.Count, existingHair.Count, newHair.Count, existingTail.Count, newTail.Count, existingTransients.Count, newTransients.Count);
-                            var differentFace = !existingFace.SequenceEqual(newFace, PlayerData.Data.FileReplacementDataComparer.Instance);
-                            var differentHair = !existingHair.SequenceEqual(newHair, PlayerData.Data.FileReplacementDataComparer.Instance);
-                            var differentTail = !existingTail.SequenceEqual(newTail, PlayerData.Data.FileReplacementDataComparer.Instance);
-                            var differentTransients = !existingTransients.SequenceEqual(newTransients, PlayerData.Data.FileReplacementDataComparer.Instance);
-
-                            if (differentTransients)
-                            {
-                                logger.LogDebug("[BASE-{appbase}] Different transient/animation/VFX paths: {transients}; redraw decision will be handled by the download-aware temp-content gate", applicationBase,
-                                    differentTransients);
-                                charaDataToUpdate[objectKind].Add(PlayerChanges.ModFiles);
-                            }
-
-                            if (differentFace || differentHair || differentTail)
-                            {
-                                //logger.LogDebug("[BASE-{appbase}] Different Subparts: Face: {face}, Hair: {hair}, Tail: {tail} => no forced redraw; Glamourer/temp-files refresh handles these like gear", applicationBase,
-                                //    differentFace, differentHair, differentTail);
-
-                                // Apply Glamourer
-                                charaDataToUpdate[objectKind].Add(PlayerChanges.Glamourer);
-
-                                //re-evaluate mod files so race swaps pull in the right textures.
-                                charaDataToUpdate[objectKind].Add(PlayerChanges.ModFiles);
-                            }
-
+                        if (differentFace || differentHair || differentTail)
+                        {
+                            // Apply Glamourer and re-evaluate mod files so race swaps pull in the right textures.
+                            charaDataToUpdate[objectKind].Add(PlayerChanges.Glamourer);
+                            charaDataToUpdate[objectKind].Add(PlayerChanges.ModFiles);
                         }
                     }
                 }
+            }
 
-                if (hasNewAndOldGlamourerData)
+            if (hasNewButNotOldGlamourerData || hasOldButNotNewGlamourerData)
+            {
+                logger.LogDebug("[BASE-{appBase}] Updating {object}/{kind} (Glamourer data arrived/removed: NewButNotOldGlam:{hasNewButNotOldGlamourerData}, OldButNotNewGlam:{hasOldButNotNewGlamourerData}) => {change}",
+                    applicationBase, cachedPlayer, objectKind, hasNewButNotOldGlamourerData, hasOldButNotNewGlamourerData, PlayerChanges.Glamourer);
+
+                charaDataToUpdate[objectKind].Add(PlayerChanges.Glamourer);
+                if (ShouldForceOwnedObjectRedrawForMetadataChange(objectKind, existingFileReplacements, newFileReplacements, oldData, newData))
+                    charaDataToUpdate[objectKind].Add(PlayerChanges.ForcedRedraw);
+            }
+            else if (hasNewAndOldGlamourerData)
+            {
+                bool glamourerDataDifferent = !string.Equals(oldData.GlamourerData[objectKind], newData.GlamourerData[objectKind], StringComparison.Ordinal);
+                if (glamourerDataDifferent || forceApplyCustomization)
                 {
-                    bool glamourerDataDifferent = !string.Equals(oldData.GlamourerData[objectKind], newData.GlamourerData[objectKind], StringComparison.Ordinal);
-                    if (glamourerDataDifferent || forceApplyCustomization)
-                    {
-                        logger.LogDebug(
-                                   "[BASE-{appBase}] Updating {object}/{kind} (Glamourer different) => {change1}, {change2}",
-                                   applicationBase,
-                                   cachedPlayer,
-                                   objectKind,
-                                   PlayerChanges.Glamourer,
-                                   PlayerChanges.ModFiles);
+                    logger.LogDebug("[BASE-{appBase}] Updating {object}/{kind} (Glamourer different) => {change}",
+                        applicationBase, cachedPlayer, objectKind, PlayerChanges.Glamourer);
 
-                        // Apply Glamourer
-                        charaDataToUpdate[objectKind].Add(PlayerChanges.Glamourer);
-
-                        //re-evaluate mod files so race swaps pull in the right textures.
-                        charaDataToUpdate[objectKind].Add(PlayerChanges.ModFiles);
-                    }
+                    charaDataToUpdate[objectKind].Add(PlayerChanges.Glamourer);
                 }
             }
 
@@ -242,6 +232,40 @@ public static class VariousExtensions
 
         return charaDataToUpdate;
     }
+
+
+    private static bool ShouldForceOwnedObjectRedrawForFileChange(ObjectKind objectKind, List<FileReplacementData>? existingFileReplacements, List<FileReplacementData>? newFileReplacements)
+    {
+        if (objectKind == ObjectKind.Player)
+            return false;
+
+        return HasMeaningfulFileReplacements(existingFileReplacements)
+            || HasMeaningfulFileReplacements(newFileReplacements);
+    }
+
+    private static bool ShouldForceOwnedObjectRedrawForMetadataChange(ObjectKind objectKind, List<FileReplacementData>? existingFileReplacements, List<FileReplacementData>? newFileReplacements, CharacterData oldData, CharacterData newData)
+    {
+        if (objectKind == ObjectKind.Player)
+            return false;
+
+        if (objectKind != ObjectKind.MinionOrMount)
+            return true;
+
+        return HasMeaningfulFileReplacements(existingFileReplacements)
+            || HasMeaningfulFileReplacements(newFileReplacements)
+            || HasMeaningfulCustomizePayload(oldData, objectKind)
+            || HasMeaningfulCustomizePayload(newData, objectKind);
+    }
+
+    private static bool HasMeaningfulFileReplacements(List<FileReplacementData>? replacements)
+        => replacements != null && replacements.Any(static replacement =>
+            !string.IsNullOrWhiteSpace(replacement.Hash)
+            || !string.IsNullOrWhiteSpace(replacement.FileSwapPath)
+            || replacement.GamePaths.Any());
+
+    private static bool HasMeaningfulCustomizePayload(CharacterData data, ObjectKind objectKind)
+        => data.CustomizePlusData.TryGetValue(objectKind, out var payload)
+            && !string.IsNullOrWhiteSpace(payload);
 
     public static T DeepClone<T>(this T obj)
     {

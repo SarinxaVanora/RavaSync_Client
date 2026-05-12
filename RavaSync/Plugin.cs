@@ -1,4 +1,4 @@
-﻿using Dalamud.Game;
+using Dalamud.Game;
 using Dalamud.Interface.ImGuiFileDialog;
 using Dalamud.Interface.Windowing;
 using Dalamud.Plugin;
@@ -53,7 +53,7 @@ public sealed class Plugin : IAsyncDalamudPlugin
         IFramework framework, IObjectTable objectTable, IClientState clientState, ICondition condition, IChatGui chatGui,
         IGameGui gameGui, IDtrBar dtrBar, IPluginLog pluginLog, ITargetManager targetManager, INotificationManager notificationManager,
         ITextureProvider textureProvider, IContextMenu contextMenu, IGameInteropProvider gameInteropProvider, IGameConfig gameConfig,
-        ISigScanner sigScanner, IPartyList partyList, INamePlateGui nameplate)
+        IDutyState dutyState, ISigScanner sigScanner, IPartyList partyList, INamePlateGui nameplate)
     {
 
         _configDirectory = pluginInterface.ConfigDirectory.FullName;
@@ -88,9 +88,11 @@ public sealed class Plugin : IAsyncDalamudPlugin
             collection.AddSingleton<ISigScanner>(sigScanner);
             collection.AddSingleton<IObjectTable>(objectTable);
             collection.AddSingleton<IPartyList>(partyList);
+            collection.AddSingleton<IDutyState>(dutyState);
             collection.AddSingleton<IGameGui>(gameGui);
             collection.AddSingleton<ICommandManager>(commandManager);
             collection.AddSingleton<IChatGui>(chatGui);
+            collection.AddSingleton<IDataManager>(gameData);
             collection.AddSingleton(clientState);
             collection.AddSingleton<MareMediator>();
             collection.AddSingleton<IRavaMesh, RavaMesh>();
@@ -137,7 +139,6 @@ public sealed class Plugin : IAsyncDalamudPlugin
             collection.AddSingleton<TransientResourceManager>();
             collection.AddSingleton<ToyBox>();
             collection.AddSingleton<ModPathResolver>();
-            collection.AddSingleton<ObjectIndexCleanupService>();
 
 
             collection.AddSingleton<CharaDataManager>();
@@ -158,8 +159,8 @@ public sealed class Plugin : IAsyncDalamudPlugin
                 s.GetRequiredService<ILogger<EventAggregator>>(), s.GetRequiredService<MareMediator>()));
             collection.AddSingleton((s) => new DalamudUtilService(s.GetRequiredService<ILogger<DalamudUtilService>>(),
                 clientState, objectTable, framework, gameGui, condition, gameData, targetManager, gameConfig,
-                s.GetRequiredService<BlockedCharacterHandler>(), s.GetRequiredService<MareMediator>(), s.GetRequiredService<PerformanceCollectorService>(),
-                s.GetRequiredService<MareConfigService>(),partyList));
+                dutyState, s.GetRequiredService<BlockedCharacterHandler>(), s.GetRequiredService<MareMediator>(), s.GetRequiredService<PerformanceCollectorService>(),
+                s.GetRequiredService<MareConfigService>(), partyList));
             collection.AddSingleton((s) => new DtrEntry(s.GetRequiredService<ILogger<DtrEntry>>(), dtrBar, s.GetRequiredService<MareConfigService>(),
                 s.GetRequiredService<MareMediator>(), s.GetRequiredService<PairManager>(), s.GetRequiredService<ApiController>(), s.GetRequiredService<UiSharedService>()));
             collection.AddSingleton(s => new PairManager(s.GetRequiredService<ILogger<PairManager>>(), s.GetRequiredService<PairFactory>(),

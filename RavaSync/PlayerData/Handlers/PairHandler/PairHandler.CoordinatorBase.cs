@@ -5,6 +5,7 @@ using System.IO;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
+using Glamourer.Api.Enums;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using RavaSync.API.Data;
@@ -57,7 +58,6 @@ public sealed partial class PairHandler
         protected ServerConfigurationManager _serverConfigManager => Owner._serverConfigManager;
         protected PluginWarningNotificationService _pluginWarningNotificationManager => Owner._pluginWarningNotificationManager;
         protected ModPathResolver _modPathResolver => Owner._modPathResolver;
-        protected ObjectIndexCleanupService _objectIndexCleanupService => Owner._objectIndexCleanupService;
         protected PapSanitisationService _papSanitisationService => Owner._papSanitisationService;
 
         protected CancellationTokenSource? _applicationCancellationTokenSource { get => Owner._applicationCancellationTokenSource; set => Owner._applicationCancellationTokenSource = value; }
@@ -134,6 +134,8 @@ public sealed partial class PairHandler
         protected static int VisibleReplayDispatchCooldownMs => PairHandler.VisibleReplayDispatchCooldownMs;
         protected static SemaphoreSlim NormalApplySemaphore => PairHandler.NormalApplySemaphore;
         protected static SemaphoreSlim StormApplySemaphore => PairHandler.StormApplySemaphore;
+        protected static SemaphoreSlim NormalDownloadSemaphore => PairHandler.NormalDownloadSemaphore;
+        protected static SemaphoreSlim StormDownloadSemaphore => PairHandler.StormDownloadSemaphore;
         protected static SemaphoreSlim GlobalRedrawSemaphore => PairHandler.GlobalRedrawSemaphore;
         protected static ConcurrentDictionary<int, byte> RedrawObjectIndicesInFlight => PairHandler.RedrawObjectIndicesInFlight;
         protected static SemaphoreSlim GlobalPostApplyRepairSemaphore => PairHandler.GlobalPostApplyRepairSemaphore;
@@ -141,7 +143,6 @@ public sealed partial class PairHandler
         protected nint ResolveStablePlayerAddress(nint fallbackAddress = 0) => Owner.ResolveStablePlayerAddress(fallbackAddress);
         protected nint ResolveStrictVisiblePlayerAddress(nint fallbackAddress = 0) => Owner.ResolveStrictVisiblePlayerAddress(fallbackAddress);
         protected bool IsExpectedPlayerAddress(nint address) => Owner.IsExpectedPlayerAddress(address);
-        protected void CleanupOldAssignedIndexIfNeeded(int? objectIndex, Guid applicationId) => Owner.CleanupOldAssignedIndexIfNeeded(objectIndex, applicationId);
         protected void ClearAppliedLightweightState() => Owner.ClearAppliedLightweightState();
         protected bool ShouldApplyLightweightMetadata(Dictionary<ObjectKind, string> cache, ObjectKind kind, string data) => Owner.ShouldApplyLightweightMetadata(cache, kind, data);
         protected void ResetCollectionBindingState() => Owner.ResetCollectionBindingState();
@@ -167,7 +168,7 @@ public sealed partial class PairHandler
         protected bool HasPendingOwnedObjectCustomizationPayload(CharacterData charaData, ObjectKind objectKind) => Owner.HasPendingOwnedObjectCustomizationPayload(charaData, objectKind);
         protected nint ResolveOwnedObjectAddressForRetry(nint playerAddress, ObjectKind objectKind) => Owner.ResolveOwnedObjectAddressForRetry(playerAddress, objectKind);
         protected void ProcessPendingOwnedObjectCustomizationRetry(long nowTick) => Owner.ProcessPendingOwnedObjectCustomizationRetry(nowTick);
-        protected Task<bool> ApplyCustomizationDataAsync(Guid applicationId, KeyValuePair<ObjectKind, HashSet<PlayerChanges>> changes, CharacterData charaData, bool allowPlayerRedraw, bool forceLightweightMetadataReapply, bool awaitPlayerGlamourerApply, CancellationToken token) => Owner.ApplyCustomizationDataAsync(applicationId, changes, charaData, allowPlayerRedraw, forceLightweightMetadataReapply, awaitPlayerGlamourerApply, token);
+        protected Task<bool> ApplyCustomizationDataAsync(Guid applicationId, KeyValuePair<ObjectKind, HashSet<PlayerChanges>> changes, CharacterData charaData, bool allowPlayerRedraw, bool forceLightweightMetadataReapply, bool awaitPlayerGlamourerApply, ApplyFlag glamourerApplyFlags, CancellationToken token) => Owner.ApplyCustomizationDataAsync(applicationId, changes, charaData, allowPlayerRedraw, forceLightweightMetadataReapply, awaitPlayerGlamourerApply, glamourerApplyFlags, token);
         protected Task<bool> OnePassRedrawAsync(Guid applicationId, CancellationToken token, bool criticalRedraw = false) => Owner.OnePassRedrawAsync(applicationId, token, criticalRedraw);
         protected Task<(bool Bound, bool Reassigned)> EnsurePenumbraCollectionBindingAsync(Guid applicationId) => Owner.EnsurePenumbraCollectionBindingAsync(applicationId);
         protected Task EnsurePenumbraCollectionAsync() => Owner.EnsurePenumbraCollectionAsync();

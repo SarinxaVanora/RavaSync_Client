@@ -2,7 +2,7 @@
 <Project Sdk="Dalamud.NET.Sdk/15.0.0">
   <PropertyGroup>
 	  <AssemblyName>RavaSync</AssemblyName>
-    <Version>1.15.0.23</Version>
+    <Version>1.15.0.35</Version>
   </PropertyGroup>
 
   <PropertyGroup>
@@ -197,6 +197,9 @@
     </Content>
     <EmbeddedResource Include="Localization\ru.json" />
     <EmbeddedResource Include="Localization\it.json" />
+    <EmbeddedResource Include="Localization\sv.json" />
+    <EmbeddedResource Include="Localization\pl.json" />
+    <EmbeddedResource Include="Localization\nl.json" />
     <EmbeddedResource Include="Localization\en.json" />
     <EmbeddedResource Include="Localization\ar.json" />
     <EmbeddedResource Include="Localization\es.json" />

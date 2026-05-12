@@ -22,7 +22,7 @@ public sealed class CacheMonitor : DisposableMediatorSubscriberBase
     private readonly CancellationTokenSource _periodicCalculationTokenSource = new();
     private readonly object _csvFlushGate = new();
     private CancellationTokenSource? _csvFlushCts;
-    public static readonly IImmutableList<string> AllowedFileExtensions = [".mdl", ".tex", ".mtrl", ".tmb", ".pap", ".avfx", ".atex", ".sklb", ".eid", ".phy", ".phyb", ".pbd", ".scd", ".skp", ".shpk"];
+    public static readonly IImmutableList<string> AllowedFileExtensions = [".mdl", ".tex", ".mtrl", ".tmb", ".tmb2", ".pap", ".avfx", ".atex", ".sklb", ".eid", ".phy", ".phyb", ".pbd", ".scd", ".skp", ".shpk"];
     private const string AutomaticTrimScanLock = "CacheMonitor.AutomaticTrim";
     private const int AutomaticTrimDeleteRetryCount = 5;
     private static readonly TimeSpan AutomaticTrimDeleteRetryDelay = TimeSpan.FromMilliseconds(150);

@@ -1,4 +1,4 @@
-﻿using Dalamud.Utility;
+using Dalamud.Utility;
 using K4os.Compression.LZ4.Legacy;
 using Microsoft.Extensions.Logging;
 using RavaSync.API.Data;
@@ -31,31 +31,57 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
     private readonly FileCompactor _fileCompactor;
     private readonly FileCacheManager _fileDbManager;
     private readonly FileTransferOrchestrator _orchestrator;
+    private static readonly HttpClient SharedCdnFastClient = CreateCdnFastClient();
     private readonly HttpClient _cdnFastClient;
     private readonly List<ThrottledStream> _activeDownloadStreams;
+    private static readonly bool IsWineRuntime = SafeIsWine();
+    private static bool IsWineOrLinuxRuntime => IsWineRuntime || RuntimeInformation.IsOSPlatform(OSPlatform.Linux);
+
+    private static bool SafeIsWine()
+    {
+        try { return Util.IsWine(); }
+        catch { return false; }
+    }
     private static readonly ArrayPool<byte> _downloadBufferPool = ArrayPool<byte>.Shared;
-    private const int DownloadBufferSize = 1024 * 1024;
-    const int Lz4BlockSize = 4 * 1024 * 1024;
-    private const int CdnBufferSize = 4 * 1024 * 1024;
+    private const int CdnBufferSize = 512 * 1024;
+    private const int DownloadBufferSize = CdnBufferSize;
+    const int Lz4BlockSize = 256 * 1024;
+    private const int CdnSmoothDecodeBufferSize = 256 * 1024;
+    private const long CdnSmoothYieldEveryBytes = 512L * 1024;
+    private const long CdnSmoothMicroPauseEveryBytes = 8L * 1024 * 1024;
+    private const long CdnSmoothInterFilePauseThresholdBytes = 8L * 1024 * 1024;
+    private const int NativeThreadModeBackgroundBegin = 0x00010000;
     private readonly MareConfigService _mareConfigService;
     private const int MaxCdnAttemptsPerFile = 3;
     private static readonly TimeSpan CdnAttemptTimeout = TimeSpan.FromSeconds(60);
     private const long TinyFilePayloadBytes = 2L * 1024 * 1024;
-    private const int TinyFileParallelFloor = 16;
-    private const int TinyFileParallelMax = 48;
-    private const long CdnInMemorySpoolMaxPayloadBytes = 4L * 1024 * 1024;
-    private const long CdnInMemorySpoolMaxGroupBytes = 1024L * 1024 * 1024;
+    private const int TinyFileParallelFloor = 6;
+    private const int TinyFileParallelMax = 12;
+    private const long CdnInMemorySpoolMaxPayloadBytes = 2L * 1024 * 1024;
+    private const long CdnInMemorySpoolMaxGroupBytes = 48L * 1024 * 1024;
+    private const long CdnPressureInMemorySpoolMaxPayloadBytes = 1L * 1024 * 1024;
+    private const long CdnPressureInMemorySpoolMaxGroupBytes = 24L * 1024 * 1024;
+    private const long CdnDirectStreamMaxPayloadBytes = 0L;
 
 
-    private const int AutoCdnMinParallel = 4;
-    private const int AutoCdnMaxParallel = 32;
+    private const int AutoCdnMinParallel = 3;
+    private const int AutoCdnMaxParallel = 12;
 
     private const long AutoCdnSlowBpsThreshold = 768 * 1024;
 
-    private int _autoCdnParallel = 12;
+    private int _autoCdnParallel = 8;
 
-    private static readonly SemaphoreSlim CdnDecodeConcurrencySemaphore = new(Math.Max(2, Math.Min(GetCdnDecodeParallelism(), 8)));
-    private static readonly SemaphoreSlim CdnValidationConcurrencySemaphore = new(Math.Max(2, Math.Min(GetCdnValidationParallelism(), 12)));
+    // Keep CPU-heavy LZ4/SHA1 work in one low-impact lane. The CDN/network side can still keep fetching,
+    // but decode/finalize must not stampede the game process.
+    private static readonly SemaphoreSlim CdnDecodeConcurrencySemaphore = new(1, 1);
+    private static readonly SemaphoreSlim CdnValidationConcurrencySemaphore = new(1, 1);
+    private static readonly SemaphoreSlim CdnSpoolFileWriteSemaphore = new(2, 2);
+
+    [DllImport("kernel32.dll")]
+    private static extern IntPtr GetCurrentThread();
+
+    [DllImport("kernel32.dll")]
+    private static extern bool SetThreadPriority(IntPtr hThread, int nPriority);
 
     private readonly ConcurrentDictionary<string, byte> _createdDirs = new(StringComparer.OrdinalIgnoreCase);
 
@@ -64,8 +90,15 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
     private Task _cachePersistLoop = Task.CompletedTask;
     private int _cachePersistLoopStarted;
     private int _cachePersistFlushRunning;
-    private const int CachePersistBatchSize = 64;
+    private const int CachePersistBatchSize = 32;
+    private const int CdnFinalCacheRegistrationBatchSize = 32;
     private static readonly TimeSpan CachePersistFlushInterval = TimeSpan.FromMilliseconds(250);
+
+    private static long GetEffectiveInMemorySpoolPayloadBudgetBytes()
+        => SyncStorm.IsDownloadPressureHigh ? CdnPressureInMemorySpoolMaxPayloadBytes : CdnInMemorySpoolMaxPayloadBytes;
+
+    private static long GetEffectiveInMemorySpoolGroupBudgetBytes()
+        => SyncStorm.IsDownloadPressureHigh ? CdnPressureInMemorySpoolMaxGroupBytes : CdnInMemorySpoolMaxGroupBytes;
 
 
     private sealed class CdnInMemorySpoolBudget
@@ -75,13 +108,15 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
         public bool TryReserve(long bytes)
         {
             if (bytes <= 0) return true;
-            if (bytes > CdnInMemorySpoolMaxGroupBytes) return false;
+
+            var groupBudget = FileDownloadManager.GetEffectiveInMemorySpoolGroupBudgetBytes();
+            if (bytes > groupBudget) return false;
 
             while (true)
             {
                 var used = Volatile.Read(ref _usedBytes);
                 var next = used + bytes;
-                if (next > CdnInMemorySpoolMaxGroupBytes)
+                if (next > groupBudget)
                     return false;
 
                 if (Interlocked.CompareExchange(ref _usedBytes, next, used) == used)
@@ -106,8 +141,95 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
         public long LastPublishTicks;
     }
 
+    private sealed class VisibleProgressState
+    {
+        public long TotalBytes;
+        public int TotalFiles;
+        public long TransferredBytes;
+        public int TransferredFiles;
+    }
+
     private readonly ConcurrentDictionary<string, GroupProgressState> _groupProgress
         = new(StringComparer.Ordinal);
+
+    private readonly ConcurrentDictionary<string, VisibleProgressState> _visibleProgressByGroup
+        = new(StringComparer.Ordinal);
+
+    private Dictionary<string, FileDownloadStatus> SnapshotDownloadStatusForUi(Dictionary<string, FileDownloadStatus>? source)
+    {
+        if (source == null || source.Count == 0)
+            return new Dictionary<string, FileDownloadStatus>(StringComparer.Ordinal);
+
+        var snapshot = new Dictionary<string, FileDownloadStatus>(source.Count, StringComparer.Ordinal);
+
+        foreach (var kv in source)
+        {
+            var current = kv.Value;
+            if (current == null)
+                continue;
+
+            DownloadStatus phase;
+            long totalBytes;
+            int totalFiles;
+            long transferredBytes;
+            int transferredFiles;
+
+            lock (current)
+            {
+                phase = current.DownloadStatus;
+                totalBytes = Math.Max(0, current.TotalBytes);
+                totalFiles = Math.Max(0, current.TotalFiles);
+                transferredBytes = Math.Max(0, current.TransferredBytes);
+                transferredFiles = Math.Max(0, current.TransferredFiles);
+            }
+
+            var visible = _visibleProgressByGroup.GetOrAdd(kv.Key, _ => new VisibleProgressState());
+
+            lock (visible)
+            {
+                if (totalBytes > visible.TotalBytes)
+                    visible.TotalBytes = totalBytes;
+
+                if (totalFiles > visible.TotalFiles)
+                    visible.TotalFiles = totalFiles;
+
+                var stableTotalBytes = Math.Max(visible.TotalBytes, totalBytes);
+                var stableTotalFiles = Math.Max(visible.TotalFiles, totalFiles);
+
+                if (transferredBytes > visible.TransferredBytes)
+                    visible.TransferredBytes = transferredBytes;
+
+                if (transferredFiles > visible.TransferredFiles)
+                    visible.TransferredFiles = transferredFiles;
+
+                var stableTransferredBytes = Math.Clamp(visible.TransferredBytes, 0, stableTotalBytes > 0 ? stableTotalBytes : long.MaxValue);
+                var stableTransferredFiles = stableTotalFiles > 0
+                    ? Math.Clamp(visible.TransferredFiles, 0, stableTotalFiles)
+                    : visible.TransferredFiles;
+
+                snapshot[kv.Key] = new FileDownloadStatus
+                {
+                    DownloadStatus = phase,
+                    TotalBytes = stableTotalBytes,
+                    TotalFiles = stableTotalFiles,
+                    TransferredBytes = stableTransferredBytes,
+                    TransferredFiles = stableTransferredFiles
+                };
+            }
+        }
+
+        return snapshot;
+    }
+
+    private void PublishDownloadStatus(GameObjectHandler downloadId)
+    {
+        Mediator.Publish(new DownloadStartedMessage(downloadId, SnapshotDownloadStatusForUi(_downloadStatus)));
+    }
+
+    private void PublishDownloadStatus(GameObjectHandler downloadId, Dictionary<string, FileDownloadStatus> status, bool countsTowardGlobal)
+    {
+        Mediator.Publish(new DownloadStartedMessage(downloadId, SnapshotDownloadStatusForUi(status), countsTowardGlobal));
+    }
 
     private void AddGroupProgress(GameObjectHandler downloadId, string groupKey, long bytes, long files)
     {
@@ -126,7 +248,7 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
             Interlocked.CompareExchange(ref state.LastPublishTicks, now, last) == last)
         {
             TryFlushGroupProgress(groupKey, state, force: true);
-            Mediator.Publish(new DownloadStartedMessage(downloadId, _downloadStatus));
+            PublishDownloadStatus(downloadId);
         }
     }
 
@@ -198,27 +320,19 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
     }
 
 
-    private static int GetCdnDecodeParallelism()
-    {
-        var cpu = Environment.ProcessorCount;
-        if (cpu <= 8) return 3;
-        if (cpu <= 16) return 4;
-        if (cpu <= 24) return 6;
-        return 8;
-    }
+    private static int GetCdnDecodeParallelism() => 1;
 
-    private static int GetCdnValidationParallelism()
-    {
-        var cpu = Environment.ProcessorCount;
-        if (cpu <= 8) return 4;
-        if (cpu <= 16) return 6;
-        if (cpu <= 24) return 8;
-        return 12;
-    }
+    private static int GetEffectiveAutoCdnMaxParallel()
+        => IsWineOrLinuxRuntime ? 8 : AutoCdnMaxParallel;
+
+    private static int GetEffectiveTinyFileParallelMax()
+        => IsWineOrLinuxRuntime ? 8 : TinyFileParallelMax;
 
     private int GetCdnParallelTarget(int configuredParallel, int filesInGroup)
     {
-        var maxParallel = AutoCdnMaxParallel;
+        // CDN transfer speed should stay high even during room pressure. Smoothness is handled by
+        // keeping decode/hash/finalise polite and letting the UI sit in Decompressing if local work lags.
+        var maxParallel = GetEffectiveAutoCdnMaxParallel();
 
         if (configuredParallel > 0)
             return Math.Clamp(configuredParallel, 1, Math.Min(maxParallel, Math.Max(1, filesInGroup)));
@@ -261,7 +375,7 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
         {
             if (usedParallel >= cur)
             {
-                var step = cur < 16 ? 4 : 2;
+                var step = 1;
                 next = Math.Min(AutoCdnMaxParallel, cur + step);
             }
 
@@ -357,7 +471,7 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
         _fileCompactor = fileCompactor;
         _activeDownloadStreams = [];
         _mareConfigService = mareConfigService;
-        _cdnFastClient = CreateCdnFastClient();
+        _cdnFastClient = SharedCdnFastClient;
 
         Mediator.Subscribe<DownloadLimitChangedMessage>(this, (msg) =>
         {
@@ -494,6 +608,53 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
         _centralFileRepairDataHash = dataHash ?? string.Empty;
     }
 
+    private bool TryPublishCentralFileRepairRequest(string hash, string reason)
+    {
+        if (string.IsNullOrWhiteSpace(hash))
+            return false;
+
+        var repairAttempts = _centralFileRepairAttemptsByHash.AddOrUpdate(
+            hash,
+            1,
+            (_, current) => current + 1);
+
+        if (repairAttempts > MaxCentralFileRepairAttemptsPerFile)
+        {
+            Logger.LogWarning(
+                "Central B2 repair retry limit reached for {hash}; not requesting another repair. Reason={reason}",
+                hash,
+                reason);
+
+            return false;
+        }
+
+        PublishCentralFileRepairRequest(hash, reason);
+
+        Logger.LogWarning(
+            "Requested central B2 repair for {hash}. Repair attempt {attempt}/{max}. Reason={reason}",
+            hash,
+            repairAttempts,
+            MaxCentralFileRepairAttemptsPerFile,
+            reason);
+
+        return true;
+    }
+
+    private static bool IsLikelyCdnPayloadDecodeFailure(Exception ex)
+    {
+        var root = ex.GetBaseException();
+        var message = root.Message ?? string.Empty;
+
+        if (root is InvalidDataException || root is EndOfStreamException)
+            return true;
+
+        return message.Contains("did not match expected size", StringComparison.OrdinalIgnoreCase)
+            || message.Contains("exceeded expected size", StringComparison.OrdinalIgnoreCase)
+            || message.Contains("CDN header", StringComparison.OrdinalIgnoreCase)
+            || message.Contains("LZ4", StringComparison.OrdinalIgnoreCase)
+            || message.Contains("Unexpected end", StringComparison.OrdinalIgnoreCase);
+    }
+
     private void PublishCentralFileRepairRequest(string hash, string reason)
     {
         if (string.IsNullOrWhiteSpace(hash)
@@ -549,6 +710,7 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
 
         _createdDirs.Clear();
         _groupProgress.Clear();
+        _visibleProgressByGroup.Clear();
         _centralFileRepairAttemptsByHash.Clear();
     }
 
@@ -571,9 +733,23 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
     }
 
 
+    private static async Task YieldForDownloadResponsivenessAsync(bool microPause, CancellationToken ct)
+    {
+        if (microPause && IsWineOrLinuxRuntime)
+            await Task.Delay(1, ct).ConfigureAwait(false);
+        else
+            await Task.Yield();
+
+        ct.ThrowIfCancellationRequested();
+    }
+
+
     private static async Task CopyExactlyWithProgressAsync(Stream src, Stream dst, long bytes, Action<int> onRead, CancellationToken ct)
     {
-        var buffer = ArrayPool<byte>.Shared.Rent(256 * 1024);
+        var buffer = ArrayPool<byte>.Shared.Rent(CdnBufferSize);
+        long sinceYield = 0;
+        long sinceMicroPause = 0;
+
         try
         {
             long remaining = bytes;
@@ -587,6 +763,18 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
                 remaining -= read;
 
                 onRead(read);
+                sinceYield += read;
+                sinceMicroPause += read;
+
+                if (sinceYield >= CdnSmoothYieldEveryBytes)
+                {
+                    var microPause = sinceMicroPause >= CdnSmoothMicroPauseEveryBytes;
+                    sinceYield = 0;
+                    if (microPause)
+                        sinceMicroPause = 0;
+
+                    await YieldForDownloadResponsivenessAsync(microPause, ct).ConfigureAwait(false);
+                }
             }
         }
         finally
@@ -597,7 +785,10 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
 
     private static async Task CopyToWithProgressAsync(Stream src, Stream dst, Action<int> onRead, CancellationToken ct)
     {
-        var buffer = ArrayPool<byte>.Shared.Rent(256 * 1024);
+        var buffer = ArrayPool<byte>.Shared.Rent(CdnBufferSize);
+        long sinceYield = 0;
+        long sinceMicroPause = 0;
+
         try
         {
             while (true)
@@ -607,27 +798,18 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
 
                 await dst.WriteAsync(buffer.AsMemory(0, read), ct).ConfigureAwait(false);
                 onRead(read);
-            }
-        }
-        finally
-        {
-            ArrayPool<byte>.Shared.Return(buffer);
-        }
-    }
+                sinceYield += read;
+                sinceMicroPause += read;
 
-    private static async Task CopyExactlyAsync(Stream src, Stream dst, long bytes, CancellationToken ct)
-    {
-        var buffer = ArrayPool<byte>.Shared.Rent(256 * 1024);
-        try
-        {
-            long remaining = bytes;
-            while (remaining > 0)
-            {
-                int want = (int)Math.Min(buffer.Length, remaining);
-                int read = await src.ReadAsync(buffer.AsMemory(0, want), ct).ConfigureAwait(false);
-                if (read <= 0) throw new EndOfStreamException($"Expected {bytes} bytes, got {bytes - remaining}");
-                await dst.WriteAsync(buffer.AsMemory(0, read), ct).ConfigureAwait(false);
-                remaining -= read;
+                if (sinceYield >= CdnSmoothYieldEveryBytes)
+                {
+                    var microPause = sinceMicroPause >= CdnSmoothMicroPauseEveryBytes;
+                    sinceYield = 0;
+                    if (microPause)
+                        sinceMicroPause = 0;
+
+                    await YieldForDownloadResponsivenessAsync(microPause, ct).ConfigureAwait(false);
+                }
             }
         }
         finally
@@ -658,7 +840,7 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
             try { _cachePersistLoop.GetAwaiter().GetResult(); } catch { /* ignore */ }
             try { FlushPendingCacheEntries(allowDuringShutdown: true).GetAwaiter().GetResult(); } catch { /* ignore */ }
             try { _cachePersistCts.Dispose(); } catch { /* ignore */ }
-            try { _cdnFastClient.Dispose(); } catch { /* ignore */ }
+            // SharedCdnFastClient is process/plugin-lifetime shared; do not dispose it from per-pair managers.
         }
 
         base.Dispose(disposing);
@@ -927,14 +1109,45 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
 
         CurrentDownloads = claimedTransfers;
 
-        // If every missing hash is already being downloaded by another pair, wait here so
-        // the caller can immediately recalculate and apply from cache rather than starting
-        // a duplicate CDN storm or burning retry attempts.
+        // If every missing hash is already being downloaded by another pair, keep the pair UI
+        // honest without double-counting this work in the global download overlay. The owning
+        // pair's real DownloadStartedMessage still drives the global bytes; this synthetic one
+        // is only for this pair/compact row while it waits for shared cache completion.
         if (CurrentDownloads.Count == 0 && sharedWaits.Count > 0)
-            await WaitForGlobalInflightDownloadsAsync(sharedWaits, ct).ConfigureAwait(false);
+        {
+            PublishSharedHashWaitStatus(gameObjectHandler, transferable);
+            try
+            {
+                await WaitForGlobalInflightDownloadsAsync(sharedWaits, ct).ConfigureAwait(false);
+            }
+            finally
+            {
+                Mediator.Publish(new DownloadFinishedMessage(gameObjectHandler));
+            }
+        }
 
         return CurrentDownloads;
 
+    }
+
+    private void PublishSharedHashWaitStatus(GameObjectHandler gameObjectHandler, IReadOnlyCollection<DownloadFileTransfer> transfers)
+    {
+        if (transfers.Count == 0)
+            return;
+
+        var status = new Dictionary<string, FileDownloadStatus>(StringComparer.Ordinal)
+        {
+            ["shared-cache"] = new FileDownloadStatus
+            {
+                DownloadStatus = DownloadStatus.WaitingForQueue,
+                TotalBytes = transfers.Sum(t => Math.Max(0, t.Total)),
+                TotalFiles = transfers.Count,
+                TransferredBytes = 0,
+                TransferredFiles = 0
+            }
+        };
+
+        PublishDownloadStatus(gameObjectHandler, status, countsTowardGlobal: false);
     }
 
     private void MarkAllGroupsComplete()
@@ -963,7 +1176,7 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
         }
 
         MarkAllGroupsComplete();
-        Mediator.Publish(new DownloadStartedMessage(downloadId, _downloadStatus));
+        PublishDownloadStatus(downloadId);
     }
 
     private async Task DownloadFilesInternal(GameObjectHandler gameObjectHandler, List<FileReplacementData> fileReplacement, CancellationToken ct)
@@ -984,7 +1197,7 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
             };
         }
 
-        Mediator.Publish(new DownloadStartedMessage(gameObjectHandler, _downloadStatus));
+        PublishDownloadStatus(gameObjectHandler);
 
 
         var anyGroupFailure = 0;
@@ -1143,7 +1356,7 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
                 {
                     try
                     {
-                        await Task.Delay(8, _cachePersistCts.Token).ConfigureAwait(false);
+                        await Task.Delay(16, _cachePersistCts.Token).ConfigureAwait(false);
                     }
                     catch (OperationCanceledException)
                     {
@@ -1293,36 +1506,6 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
         }
     }
 
-    private static bool DetectHeaderIsMunged(FileStream fs)
-    {
-        long pos = fs.Position;
-        int b = fs.ReadByte();
-        if (b == -1) throw new EndOfStreamException();
-        fs.Position = pos;
-
-        // If XOR(42) yields '#', it's munged; if it's already '#', it's plain.
-        if ((char)(b ^ 42) == '#') return true;
-        if ((char)b == '#') return false;
-
-        // Neither looks like a header start
-        throw new InvalidDataException("Data is invalid, first char is neither '#' nor munged '#'");
-    }
-
-    private int GetParallelApplyDegree(int filesInBlock)
-    {
-        int logical = Environment.ProcessorCount;
-
-        // Cap by CPU, but also by how many files we actually have
-        int maxByCpu =
-            logical <= 4 ? 2 :
-            logical <= 8 ? 3 :
-            logical <= 16 ? 4 :
-                            6;
-
-        return Math.Clamp(filesInBlock, 1, maxByCpu);
-    }
-
-
     private static bool TryParseHeader(ReadOnlySpan<byte> headerBytes, bool munged, out string fileHash, out long fileLengthBytes)
     {
         fileHash = string.Empty;
@@ -1445,7 +1628,9 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
         };
 
         long total = 0;
-        var buffer = _downloadBufferPool.Rent(256 * 1024);
+        long sinceYield = 0;
+        long sinceMicroPause = 0;
+        var buffer = _downloadBufferPool.Rent(CdnSmoothDecodeBufferSize);
 
         try
         {
@@ -1460,15 +1645,84 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
                 sha1.AppendData(buffer, 0, read);
                 await outFs.WriteAsync(buffer.AsMemory(0, read), ct).ConfigureAwait(false);
                 total += read;
+                sinceYield += read;
+                sinceMicroPause += read;
 
                 if (expectedRawSize > 0 && total > expectedRawSize)
                     throw new InvalidDataException($"Raw bytes exceeded expected size (expected {expectedRawSize}, got {total})");
+
+                if (sinceYield >= CdnSmoothYieldEveryBytes)
+                {
+                    var microPause = sinceMicroPause >= CdnSmoothMicroPauseEveryBytes;
+                    sinceYield = 0;
+                    if (microPause)
+                        sinceMicroPause = 0;
+
+                    await YieldForDownloadResponsivenessAsync(microPause, ct).ConfigureAwait(false);
+                }
             }
 
             if (expectedRawSize > 0 && total != expectedRawSize)
                 throw new InvalidDataException($"Raw bytes did not match expected size (expected {expectedRawSize}, got {total})");
 
             return (Convert.ToHexString(sha1.GetHashAndReset()), total);
+        }
+        finally
+        {
+            _downloadBufferPool.Return(buffer);
+        }
+    }
+
+    private static async Task<long> DecompressLz4ToFileAsync(Stream input, string destPath, long expectedRawSize, CancellationToken ct)
+    {
+        var outOpts = new FileStreamOptions
+        {
+            Access = FileAccess.Write,
+            Mode = FileMode.Create,
+            Share = FileShare.None,
+            Options = FileOptions.Asynchronous | FileOptions.SequentialScan,
+            BufferSize = DownloadBufferSize
+        };
+
+        long total = 0;
+        var buffer = _downloadBufferPool.Rent(CdnSmoothDecodeBufferSize);
+        try
+        {
+            await using var outFs = new FileStream(destPath, outOpts);
+            using var fullReadInput = new FullReadStream(input);
+            await using var lz4 = new LZ4Stream(fullReadInput, LZ4StreamMode.Decompress, LZ4StreamFlags.None, Lz4BlockSize);
+
+            long sinceYield = 0;
+            long sinceMicroPause = 0;
+
+            while (true)
+            {
+                var read = await lz4.ReadAsync(buffer.AsMemory(0, buffer.Length), ct).ConfigureAwait(false);
+                if (read <= 0) break;
+
+                await outFs.WriteAsync(buffer.AsMemory(0, read), ct).ConfigureAwait(false);
+                total += read;
+                sinceYield += read;
+                sinceMicroPause += read;
+
+                if (expectedRawSize > 0 && total > expectedRawSize)
+                    throw new InvalidDataException($"Decompressed bytes exceeded expected size (expected {expectedRawSize}, got {total})");
+
+                if (sinceYield >= CdnSmoothYieldEveryBytes)
+                {
+                    var microPause = sinceMicroPause >= CdnSmoothMicroPauseEveryBytes;
+                    sinceYield = 0;
+                    if (microPause)
+                        sinceMicroPause = 0;
+
+                    await YieldForDownloadResponsivenessAsync(microPause, ct).ConfigureAwait(false);
+                }
+            }
+
+            if (expectedRawSize > 0 && total != expectedRawSize)
+                throw new InvalidDataException($"Decompressed bytes did not match expected size (expected {expectedRawSize}, got {total})");
+
+            return total;
         }
         finally
         {
@@ -1490,16 +1744,15 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
         };
 
         long total = 0;
-        var minDecodeBuffer = Math.Max(Lz4BlockSize, 256 * 1024);
-        var buffer = _downloadBufferPool.Rent(minDecodeBuffer);
+        var buffer = _downloadBufferPool.Rent(CdnSmoothDecodeBufferSize);
         try
         {
             await using var outFs = new FileStream(destPath, outOpts);
             using var fullReadInput = new FullReadStream(input);
             await using var lz4 = new LZ4Stream(fullReadInput, LZ4StreamMode.Decompress, LZ4StreamFlags.None, Lz4BlockSize);
 
-            const long YieldEveryBytes = 2L * 1024 * 1024; // 2MB time-slice
             long sinceYield = 0;
+            long sinceMicroPause = 0;
 
             while (true)
             {
@@ -1510,17 +1763,21 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
                 await outFs.WriteAsync(buffer.AsMemory(0, read), ct).ConfigureAwait(false);
                 total += read;
                 sinceYield += read;
+                sinceMicroPause += read;
 
                 // Safety: if server told us the raw size, never allow overflow expansions.
                 if (expectedRawSize > 0 && total > expectedRawSize)
                     throw new InvalidDataException($"Decompressed bytes exceeded expected size (expected {expectedRawSize}, got {total})");
 
                 // Cooperative scheduling: avoid long uninterrupted CPU bursts inside the game process.
-                if (sinceYield >= YieldEveryBytes)
+                if (sinceYield >= CdnSmoothYieldEveryBytes)
                 {
+                    var microPause = sinceMicroPause >= CdnSmoothMicroPauseEveryBytes;
                     sinceYield = 0;
-                    await Task.Yield();
-                    ct.ThrowIfCancellationRequested();
+                    if (microPause)
+                        sinceMicroPause = 0;
+
+                    await YieldForDownloadResponsivenessAsync(microPause, ct).ConfigureAwait(false);
                 }
             }
 
@@ -1549,7 +1806,7 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
 
             try
             {
-                await using var src1 = new FileStream(spoolPath, FileMode.Open, FileAccess.Read, FileShare.Read, 256 * 1024, FileOptions.SequentialScan | FileOptions.Asynchronous);
+                await using var src1 = new FileStream(spoolPath, FileMode.Open, FileAccess.Read, FileShare.Read, CdnBufferSize, FileOptions.SequentialScan | FileOptions.Asynchronous);
                 var res1 = await DecompressLz4ToFileAndHashAsync(src1, tempPath, expectedRawSize, ct).ConfigureAwait(false);
                 if (TryMatches(res1))
                     return (res1.HashUpper, res1.BytesWritten, false);
@@ -1561,7 +1818,7 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
 
             try
             {
-                await using var src2 = new FileStream(spoolPath, FileMode.Open, FileAccess.Read, FileShare.Read, 256 * 1024, FileOptions.SequentialScan | FileOptions.Asynchronous);
+                await using var src2 = new FileStream(spoolPath, FileMode.Open, FileAccess.Read, FileShare.Read, CdnBufferSize, FileOptions.SequentialScan | FileOptions.Asynchronous);
                 using var xor2 = new LimitedXorStream(src2, src2.Length, 42);
                 var res2 = await DecompressLz4ToFileAndHashAsync(xor2, tempPath, expectedRawSize, ct).ConfigureAwait(false);
                 if (TryMatches(res2))
@@ -1574,7 +1831,7 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
 
             try
             {
-                await using var src3 = new FileStream(spoolPath, FileMode.Open, FileAccess.Read, FileShare.Read, 256 * 1024, FileOptions.SequentialScan | FileOptions.Asynchronous);
+                await using var src3 = new FileStream(spoolPath, FileMode.Open, FileAccess.Read, FileShare.Read, CdnBufferSize, FileOptions.SequentialScan | FileOptions.Asynchronous);
                 var res3 = await CopyRawToFileAndHashAsync(src3, tempPath, expectedRawSize, ct).ConfigureAwait(false);
                 if (TryMatches(res3))
                     return (res3.HashUpper, res3.BytesWritten, false);
@@ -1584,7 +1841,7 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
                 try { if (File.Exists(tempPath)) File.Delete(tempPath); } catch { }
             }
 
-            await using var src4 = new FileStream(spoolPath, FileMode.Open, FileAccess.Read, FileShare.Read, 256 * 1024, FileOptions.SequentialScan | FileOptions.Asynchronous);
+            await using var src4 = new FileStream(spoolPath, FileMode.Open, FileAccess.Read, FileShare.Read, CdnBufferSize, FileOptions.SequentialScan | FileOptions.Asynchronous);
             using var xor4 = new LimitedXorStream(src4, src4.Length, 42);
             var res4 = await CopyRawToFileAndHashAsync(xor4, tempPath, expectedRawSize, ct).ConfigureAwait(false);
             return (res4.HashUpper, res4.BytesWritten, true);
@@ -1667,17 +1924,32 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
         var length = (int)maxBytes;
         var payloadBuffer = ArrayPool<byte>.Shared.Rent(length);
         var offset = 0;
+        long sinceYield = 0;
+        long sinceMicroPause = 0;
 
         try
         {
             while (offset < length)
             {
-                var read = await input.ReadAsync(payloadBuffer.AsMemory(offset, length - offset), ct).ConfigureAwait(false);
+                var want = Math.Min(CdnBufferSize, length - offset);
+                var read = await input.ReadAsync(payloadBuffer.AsMemory(offset, want), ct).ConfigureAwait(false);
                 if (read <= 0)
                     throw new EndOfStreamException($"CDN payload ended early, expected {length} bytes but only received {offset}");
 
                 offset += read;
                 progress(read);
+                sinceYield += read;
+                sinceMicroPause += read;
+
+                if (sinceYield >= CdnSmoothYieldEveryBytes)
+                {
+                    var microPause = sinceMicroPause >= CdnSmoothMicroPauseEveryBytes;
+                    sinceYield = 0;
+                    if (microPause)
+                        sinceMicroPause = 0;
+
+                    await YieldForDownloadResponsivenessAsync(microPause, ct).ConfigureAwait(false);
+                }
             }
 
             return (payloadBuffer, length);
@@ -1719,9 +1991,14 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
             // 0 => Auto (adaptive)
             var cdnParallel = GetCdnParallelTarget(configured, transfers.Count);
             if (configured <= 0 && tinyFileHeavy)
-                cdnParallel = Math.Clamp(Math.Max(cdnParallel, Math.Min(TinyFileParallelMax, transfers.Count)), 1, Math.Min(TinyFileParallelMax, transfers.Count));
+            {
+                var tinyMax = Math.Min(GetEffectiveTinyFileParallelMax(), transfers.Count);
+                cdnParallel = Math.Clamp(Math.Max(cdnParallel, tinyMax), 1, tinyMax);
+            }
             else
+            {
                 cdnParallel = Math.Min(cdnParallel, transfers.Count);
+            }
 
             var anyFailure = new int[1];
             var anyTimeoutOrBackoff = new int[1];
@@ -1731,6 +2008,10 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
             var spooledFiles = new ConcurrentBag<CdnSpooledFile>();
             var results = new ConcurrentBag<CdnDownloadedFile>();
             var inMemorySpoolBudget = new CdnInMemorySpoolBudget();
+            var decodeParallel = Math.Clamp(GetCdnDecodeParallelism(), 1, Math.Max(1, Math.Min(transfers.Count, GetCdnDecodeParallelism())));
+            // Do not let decompression throttle transfer speed. Payloads are bounded by the in-memory spool
+            // budget and otherwise live as spool files, so the fetch side can finish fast while the low-priority
+            // decode lane drains afterwards and the UI honestly reports Decompressing.
             using var decodeQueue = new BlockingCollection<CdnSpooledFile>();
             var groupKey = fileGroup.Key;
 
@@ -1741,40 +2022,19 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
                     statusStart.DownloadStatus = DownloadStatus.Downloading;
                 }
 
-                Mediator.Publish(new DownloadStartedMessage(gameObjectHandler, _downloadStatus));
+                PublishDownloadStatus(gameObjectHandler);
             }
 
-            var decodeParallel = Math.Clamp(GetCdnDecodeParallelism(), 1, Math.Max(1, Math.Min(transfers.Count, GetCdnDecodeParallelism())));
             var decodeWorkers = new List<Task>(decodeParallel);
 
             for (var i = 0; i < decodeParallel; i++)
             {
-                decodeWorkers.Add(Task.Run(async () =>
-                {
-                    try
-                    {
-                        foreach (var spooled in decodeQueue.GetConsumingEnumerable(ct))
-                        {
-                            if (Volatile.Read(ref anyFailure[0]) != 0)
-                            {
-                                try { if (File.Exists(spooled.TempPath)) File.Delete(spooled.TempPath); } catch { }
-                                CleanupSpooledPayload(spooled);
-                                continue;
-                            }
-
-                            await DecodeOneCdnSpoolAsync(
-                                spooled,
-                                results,
-                                anyFailure,
-                                anySlow,
-                                ct).ConfigureAwait(false);
-                        }
-                    }
-                    catch (OperationCanceledException) when (!ct.IsCancellationRequested)
-                    {
-                        Interlocked.Exchange(ref anyFailure[0], 1);
-                    }
-                }, ct));
+                decodeWorkers.Add(StartLowPriorityCdnDecodeWorker(
+                    decodeQueue,
+                    results,
+                    anyFailure,
+                    anySlow,
+                    ct));
             }
 
             var index = -1;
@@ -1850,7 +2110,7 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
                     statusDecode.DownloadStatus = DownloadStatus.Decompressing;
                 }
 
-                Mediator.Publish(new DownloadStartedMessage(gameObjectHandler, _downloadStatus));
+                PublishDownloadStatus(gameObjectHandler);
             }
 
             try
@@ -1875,10 +2135,15 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
                 return false;
             }
 
-            _fileDbManager.RegisterDownloadedCacheFiles(results.Select(r => (r.Hash, r.FinalPath)));
-
-            foreach (var result in results)
-                CompleteGlobalInflightDownload(result.Hash, success: true);
+            try
+            {
+                RegisterAndReleaseCompletedCdnFiles(results);
+            }
+            catch
+            {
+                UpdateAutoCdnParallel(cdnParallel, success: false, hadTimeoutOrBackoff: hadTimeout, hadSlow: true);
+                return false;
+            }
 
             if (_downloadStatus.TryGetValue(groupKey, out var status))
             {
@@ -1887,7 +2152,7 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
                     status.DownloadStatus = DownloadStatus.Downloading;
                 }
             }
-            Mediator.Publish(new DownloadStartedMessage(gameObjectHandler, _downloadStatus));
+            PublishDownloadStatus(gameObjectHandler);
 
             Logger.LogDebug("CDN staged-path: completed all files for group {group} via CDN", groupKey);
             success = true;
@@ -1902,9 +2167,6 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
         }
 
     }
-
-
-
 
     private async Task DownloadOneFromCdnToSpoolAsync(GameObjectHandler gameObjectHandler, string groupKey, Dictionary<string, string> fileExtByHash, ConcurrentBag<CdnSpooledFile> spooledFiles, BlockingCollection<CdnSpooledFile> decodeQueue, int[] downloadedStageCount, ConcurrentBag<CdnDownloadedFile> results, CdnInMemorySpoolBudget inMemorySpoolBudget, DownloadFileTransfer transfer, int[] anyFailure, int[] anyTimeoutOrBackoff, int[] anySlow, CancellationToken ct)
     {
@@ -2095,9 +2357,78 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
                     var tempPath = CreateTempDownloadPath(finalPath);
                     var compressedBytes = 0L;
 
+                    var directDecodeSlotTaken = false;
+                    if (looksHeadered && payloadLen > 0 && payloadLen <= CdnDirectStreamMaxPayloadBytes)
+                        directDecodeSlotTaken = await CdnDecodeConcurrencySemaphore.WaitAsync(0, attemptToken).ConfigureAwait(false);
+
+                    if (directDecodeSlotTaken)
+                    {
+                        var directSw = Stopwatch.StartNew();
+
+                        try
+                        {
+                            await using var payloadStream = new LimitedXorStream(respStream, payloadLen, munged ? (byte)42 : (byte)0);
+                            using var progressStream = new ProgressReadStream(payloadStream, read =>
+                            {
+                                AddAttemptProgress(read);
+                            });
+
+                            var decoded = await DecompressLz4ToFileAndHashAsync(
+                                progressStream,
+                                tempPath,
+                                transfer.TotalRaw,
+                                attemptToken).ConfigureAwait(false);
+
+                            var bytesWritten = decoded.BytesWritten;
+
+                            if (!string.Equals(decoded.HashUpper, headerHash, StringComparison.OrdinalIgnoreCase))
+                                throw new InvalidDataException($"CDN direct-stream: raw hash mismatch for {transfer.Hash}, got {decoded.HashUpper}, expected {headerHash}");
+
+                            directSw.Stop();
+
+                            if (bytesWritten <= 0)
+                                throw new InvalidDataException($"CDN direct-stream: decoded payload was empty for {transfer.Hash}");
+
+                            if (bytesWritten >= (2 * 1024 * 1024) && directSw.Elapsed.TotalSeconds >= 1.0)
+                            {
+                                var bps = (long)(bytesWritten / directSw.Elapsed.TotalSeconds);
+                                if (bps < AutoCdnSlowBpsThreshold)
+                                    Interlocked.Exchange(ref anySlow[0], 1);
+                            }
+
+                            try
+                            {
+                                File.Move(tempPath, finalPath, overwrite: true);
+                            }
+                            catch (Exception ex)
+                            {
+                                throw new IOException($"CDN direct-stream: failed to finalize {transfer.Hash} to {finalPath}", ex);
+                            }
+
+                            results.Add(new CdnDownloadedFile(headerHash, finalPath));
+                            RegisterAndReleaseCompletedCdnFile(headerHash, finalPath);
+                            Interlocked.Increment(ref downloadedStageCount[0]);
+
+                            _cdn404State.TryRemove(headerHash, out _);
+                            _cdn404State.TryRemove(transfer.Hash, out _);
+
+                            CommitAttemptFile();
+                            return;
+                        }
+                        catch
+                        {
+                            CleanupFailedCdnDownload(tempPath);
+                            throw;
+                        }
+                        finally
+                        {
+                            CdnDecodeConcurrencySemaphore.Release();
+                        }
+                    }
+
                     var canKeepPayloadInMemory = looksHeadered
                         && payloadLen > 0
-                        && payloadLen <= CdnInMemorySpoolMaxPayloadBytes
+                        && payloadLen <= GetEffectiveInMemorySpoolPayloadBudgetBytes()
                         && inMemorySpoolBudget.TryReserve(payloadLen);
 
                     if (canKeepPayloadInMemory)
@@ -2115,32 +2446,40 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
                     {
                         spoolPath = tempPath + ".spool." + Guid.NewGuid().ToString("N");
 
-                        await using (var spoolOut = new FileStream(
-                            spoolPath,
-                            new FileStreamOptions
-                            {
-                                Access = FileAccess.Write,
-                                Mode = FileMode.Create,
-                                Share = FileShare.None,
-                                Options = FileOptions.Asynchronous | FileOptions.SequentialScan,
-                                BufferSize = 256 * 1024
-                            }))
+                        await CdnSpoolFileWriteSemaphore.WaitAsync(attemptToken).ConfigureAwait(false);
+                        try
                         {
-                            if (looksHeadered)
-                            {
-                                await using var payloadStream = new LimitedXorStream(respStream, payloadLen, munged ? (byte)42 : (byte)0);
-                                await CopyExactlyWithProgressAsync(payloadStream, spoolOut, payloadLen, read =>
+                            await using (var spoolOut = new FileStream(
+                                spoolPath,
+                                new FileStreamOptions
                                 {
-                                    AddAttemptProgress(read);
-                                }, attemptToken).ConfigureAwait(false);
-                            }
-                            else
+                                    Access = FileAccess.Write,
+                                    Mode = FileMode.Create,
+                                    Share = FileShare.None,
+                                    Options = FileOptions.Asynchronous | FileOptions.SequentialScan,
+                                    BufferSize = CdnBufferSize
+                                }))
                             {
-                                await CopyToWithProgressAsync(respStream, spoolOut, read =>
+                                if (looksHeadered)
                                 {
-                                    AddAttemptProgress(read);
-                                }, attemptToken).ConfigureAwait(false);
+                                    await using var payloadStream = new LimitedXorStream(respStream, payloadLen, munged ? (byte)42 : (byte)0);
+                                    await CopyExactlyWithProgressAsync(payloadStream, spoolOut, payloadLen, read =>
+                                    {
+                                        AddAttemptProgress(read);
+                                    }, attemptToken).ConfigureAwait(false);
+                                }
+                                else
+                                {
+                                    await CopyToWithProgressAsync(respStream, spoolOut, read =>
+                                    {
+                                        AddAttemptProgress(read);
+                                    }, attemptToken).ConfigureAwait(false);
+                                }
                             }
+                        }
+                        finally
+                        {
+                            CdnSpoolFileWriteSemaphore.Release();
                         }
 
                         var fi = new FileInfo(spoolPath);
@@ -2225,7 +2564,7 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
 
                         if (File.Exists(finalPath2) && ValidateDownloadedFileLowPri(finalPath2, transfer.Hash, expectedRawSize: 0, ct))
                         {
-                            PersistFileToStorageLowPri(transfer.Hash, finalPath2, ct);
+                            RegisterAndReleaseCompletedCdnFile(transfer.Hash, finalPath2);
                             results.Add(new CdnDownloadedFile(transfer.Hash, finalPath2));
                             Interlocked.Increment(ref downloadedStageCount[0]);
 
@@ -2275,6 +2614,15 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
 
                     if (attempts >= MaxCdnAttemptsPerFile)
                     {
+                        if (IsLikelyCdnPayloadDecodeFailure(ex))
+                        {
+                            var root = ex.GetBaseException();
+
+                            TryPublishCentralFileRepairRequest(
+                                transfer.Hash,
+                                $"CDN payload failed during download/decode; {root.GetType().Name}: {root.Message}");
+                        }
+
                         Interlocked.Exchange(ref anyFailure[0], 1);
                         return;
                     }
@@ -2295,41 +2643,268 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
         }
     }
 
-    private async Task DecodeOneCdnSpoolAsync(CdnSpooledFile spooled, ConcurrentBag<CdnDownloadedFile> results, int[] anyFailure, int[] anySlow, CancellationToken ct)
+    private Task StartLowPriorityCdnDecodeWorker(BlockingCollection<CdnSpooledFile> decodeQueue, ConcurrentBag<CdnDownloadedFile> results, int[] anyFailure, int[] anySlow, CancellationToken ct)
+    {
+        var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        var thread = new Thread(() =>
+        {
+            try
+            {
+                EnterCdnBackgroundThreadMode("RavaSync CDN Decode");
+
+                foreach (var spooled in decodeQueue.GetConsumingEnumerable(ct))
+                {
+                    if (Volatile.Read(ref anyFailure[0]) != 0)
+                    {
+                        try { if (File.Exists(spooled.TempPath)) File.Delete(spooled.TempPath); } catch { }
+                        CleanupSpooledPayload(spooled);
+                        continue;
+                    }
+
+                    DecodeOneCdnSpoolLowImpact(spooled, results, anyFailure, anySlow, ct);
+                }
+
+                completion.TrySetResult();
+            }
+            catch (OperationCanceledException ex)
+            {
+                if (ct.IsCancellationRequested)
+                    completion.TrySetCanceled(ct);
+                else
+                {
+                    Interlocked.Exchange(ref anyFailure[0], 1);
+                    completion.TrySetException(ex);
+                }
+            }
+            catch (Exception ex)
+            {
+                Interlocked.Exchange(ref anyFailure[0], 1);
+                completion.TrySetException(ex);
+            }
+        })
+        {
+            IsBackground = true,
+            Priority = ThreadPriority.BelowNormal
+        };
+
+        thread.Start();
+        return completion.Task;
+    }
+
+    private static void EnterCdnBackgroundThreadMode(string threadName)
+    {
+        try { Thread.CurrentThread.Name = threadName; } catch { /* ignore */ }
+        try { Thread.CurrentThread.Priority = ThreadPriority.BelowNormal; } catch { /* ignore */ }
+
+        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+            return;
+
+        try { _ = SetThreadPriority(GetCurrentThread(), NativeThreadModeBackgroundBegin); }
+        catch { /* ignore: best-effort OS scheduler hint only */ }
+    }
+
+    private static void LowImpactCpuPause(long bytesSinceLastHardPause, CancellationToken ct)
+    {
+        ct.ThrowIfCancellationRequested();
+
+        // Under Wine/Proton, Thread.Yield can be too polite to the scheduler and still allow long CPU/IO pulses.
+        // Keep Windows fast, but give Wine/Linux a real 1ms breather only at the coarse micro-pause cadence.
+        if (IsWineOrLinuxRuntime && bytesSinceLastHardPause >= CdnSmoothMicroPauseEveryBytes)
+            Thread.Sleep(1);
+        else
+            Thread.Yield();
+    }
+
+    private static (string HashUpper, long BytesWritten) CopyRawToFileAndHashLowImpact(Stream input, string destPath, long expectedRawSize, CancellationToken ct)
+    {
+        using var sha1 = IncrementalHash.CreateHash(HashAlgorithmName.SHA1);
+
+        long total = 0;
+        long sincePause = 0;
+        long sinceHardPause = 0;
+        var buffer = _downloadBufferPool.Rent(CdnSmoothDecodeBufferSize);
+
+        try
+        {
+            using var outFs = new FileStream(destPath, FileMode.Create, FileAccess.Write, FileShare.None, DownloadBufferSize, FileOptions.SequentialScan);
+
+            while (true)
+            {
+                ct.ThrowIfCancellationRequested();
+
+                var read = input.Read(buffer, 0, buffer.Length);
+                if (read <= 0)
+                    break;
+
+                sha1.AppendData(buffer, 0, read);
+                outFs.Write(buffer, 0, read);
+                total += read;
+                sincePause += read;
+                sinceHardPause += read;
+
+                if (expectedRawSize > 0 && total > expectedRawSize)
+                    throw new InvalidDataException($"Raw bytes exceeded expected size (expected {expectedRawSize}, got {total})");
+
+                if (sincePause >= CdnSmoothYieldEveryBytes)
+                {
+                    LowImpactCpuPause(sinceHardPause, ct);
+                    sincePause = 0;
+
+                    if (sinceHardPause >= CdnSmoothMicroPauseEveryBytes)
+                        sinceHardPause = 0;
+                }
+            }
+
+            if (expectedRawSize > 0 && total != expectedRawSize)
+                throw new InvalidDataException($"Raw bytes did not match expected size (expected {expectedRawSize}, got {total})");
+
+            return (Convert.ToHexString(sha1.GetHashAndReset()), total);
+        }
+        finally
+        {
+            _downloadBufferPool.Return(buffer);
+        }
+    }
+
+    private static (string HashUpper, long BytesWritten) DecompressLz4ToFileAndHashLowImpact(Stream input, string destPath, long expectedRawSize, CancellationToken ct)
+    {
+        using var sha1 = IncrementalHash.CreateHash(HashAlgorithmName.SHA1);
+
+        long total = 0;
+        long sincePause = 0;
+        long sinceHardPause = 0;
+        var buffer = _downloadBufferPool.Rent(CdnSmoothDecodeBufferSize);
+
+        try
+        {
+            using var outFs = new FileStream(destPath, FileMode.Create, FileAccess.Write, FileShare.None, DownloadBufferSize, FileOptions.SequentialScan);
+            using var fullReadInput = new FullReadStream(input);
+            using var lz4 = new LZ4Stream(fullReadInput, LZ4StreamMode.Decompress, LZ4StreamFlags.None, Lz4BlockSize);
+
+            while (true)
+            {
+                ct.ThrowIfCancellationRequested();
+
+                var read = lz4.Read(buffer, 0, buffer.Length);
+                if (read <= 0)
+                    break;
+
+                sha1.AppendData(buffer, 0, read);
+                outFs.Write(buffer, 0, read);
+                total += read;
+                sincePause += read;
+                sinceHardPause += read;
+
+                if (expectedRawSize > 0 && total > expectedRawSize)
+                    throw new InvalidDataException($"Decompressed bytes exceeded expected size (expected {expectedRawSize}, got {total})");
+
+                if (sincePause >= CdnSmoothYieldEveryBytes)
+                {
+                    LowImpactCpuPause(sinceHardPause, ct);
+                    sincePause = 0;
+
+                    if (sinceHardPause >= CdnSmoothMicroPauseEveryBytes)
+                        sinceHardPause = 0;
+                }
+            }
+
+            if (expectedRawSize > 0 && total != expectedRawSize)
+                throw new InvalidDataException($"Decompressed bytes did not match expected size (expected {expectedRawSize}, got {total})");
+
+            return (Convert.ToHexString(sha1.GetHashAndReset()), total);
+        }
+        finally
+        {
+            _downloadBufferPool.Return(buffer);
+        }
+    }
+
+    private (string ComputedHash, long BytesWritten, bool UsedXorCompat) DecodeHeaderlessSpoolWithCompatLowImpact(string spoolPath, string tempPath, long expectedRawSize, string expectedHash, CancellationToken ct)
+    {
+        CdnDecodeConcurrencySemaphore.Wait(ct);
+        try
+        {
+            bool TryMatches((string HashUpper, long BytesWritten) res)
+                => res.BytesWritten > 0 && string.Equals(res.HashUpper, expectedHash, StringComparison.OrdinalIgnoreCase);
+
+            try
+            {
+                using var src1 = new FileStream(spoolPath, FileMode.Open, FileAccess.Read, FileShare.Read, CdnBufferSize, FileOptions.SequentialScan);
+                var res1 = DecompressLz4ToFileAndHashLowImpact(src1, tempPath, expectedRawSize, ct);
+                if (TryMatches(res1))
+                    return (res1.HashUpper, res1.BytesWritten, false);
+            }
+            catch
+            {
+                try { if (File.Exists(tempPath)) File.Delete(tempPath); } catch { }
+            }
+
+            try
+            {
+                using var src2 = new FileStream(spoolPath, FileMode.Open, FileAccess.Read, FileShare.Read, CdnBufferSize, FileOptions.SequentialScan);
+                using var xor2 = new LimitedXorStream(src2, src2.Length, 42);
+                var res2 = DecompressLz4ToFileAndHashLowImpact(xor2, tempPath, expectedRawSize, ct);
+                if (TryMatches(res2))
+                    return (res2.HashUpper, res2.BytesWritten, true);
+            }
+            catch
+            {
+                try { if (File.Exists(tempPath)) File.Delete(tempPath); } catch { }
+            }
+
+            try
+            {
+                using var src3 = new FileStream(spoolPath, FileMode.Open, FileAccess.Read, FileShare.Read, CdnBufferSize, FileOptions.SequentialScan);
+                var res3 = CopyRawToFileAndHashLowImpact(src3, tempPath, expectedRawSize, ct);
+                if (TryMatches(res3))
+                    return (res3.HashUpper, res3.BytesWritten, false);
+            }
+            catch
+            {
+                try { if (File.Exists(tempPath)) File.Delete(tempPath); } catch { }
+            }
+
+            using var src4 = new FileStream(spoolPath, FileMode.Open, FileAccess.Read, FileShare.Read, CdnBufferSize, FileOptions.SequentialScan);
+            using var xor4 = new LimitedXorStream(src4, src4.Length, 42);
+            var res4 = CopyRawToFileAndHashLowImpact(xor4, tempPath, expectedRawSize, ct);
+            return (res4.HashUpper, res4.BytesWritten, true);
+        }
+        finally
+        {
+            try { if (File.Exists(spoolPath)) File.Delete(spoolPath); } catch { }
+            CdnDecodeConcurrencySemaphore.Release();
+        }
+    }
+
+    private void DecodeOneCdnSpoolLowImpact(CdnSpooledFile spooled, ConcurrentBag<CdnDownloadedFile> results, int[] anyFailure, int[] anySlow, CancellationToken ct)
     {
         var sw = Stopwatch.StartNew();
 
         try
         {
-            string computed;
+            string computed = spooled.Hash;
             long bytesWritten;
             bool usedHeaderlessXorCompat = false;
 
             if (spooled.IsHeadered)
             {
-                await CdnDecodeConcurrencySemaphore.WaitAsync(ct).ConfigureAwait(false);
+                CdnDecodeConcurrencySemaphore.Wait(ct);
                 try
                 {
                     if (spooled.InMemoryPayload != null)
                     {
                         using var decodeSrc = new MemoryStream(spooled.InMemoryPayload, 0, spooled.InMemoryPayloadLength, writable: false, publiclyVisible: true);
-
-                        (computed, bytesWritten) = await DecompressLz4ToFileAndHashAsync(
-                            decodeSrc,
-                            spooled.TempPath,
-                            spooled.ExpectedRawSize,
-                            ct).ConfigureAwait(false);
+                        var decoded = DecompressLz4ToFileAndHashLowImpact(decodeSrc, spooled.TempPath, spooled.ExpectedRawSize, ct);
+                        computed = decoded.HashUpper;
+                        bytesWritten = decoded.BytesWritten;
                     }
                     else
                     {
-                        await using var decodeSrc = new FileStream(spooled.SpoolPath!, FileMode.Open, FileAccess.Read, FileShare.Read,
-                            256 * 1024, FileOptions.SequentialScan | FileOptions.Asynchronous);
-
-                        (computed, bytesWritten) = await DecompressLz4ToFileAndHashAsync(
-                            decodeSrc,
-                            spooled.TempPath,
-                            spooled.ExpectedRawSize,
-                            ct).ConfigureAwait(false);
+                        using var decodeSrc = new FileStream(spooled.SpoolPath!, FileMode.Open, FileAccess.Read, FileShare.Read, CdnBufferSize, FileOptions.SequentialScan);
+                        var decoded = DecompressLz4ToFileAndHashLowImpact(decodeSrc, spooled.TempPath, spooled.ExpectedRawSize, ct);
+                        computed = decoded.HashUpper;
+                        bytesWritten = decoded.BytesWritten;
                     }
                 }
                 finally
@@ -2340,12 +2915,12 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
             }
             else
             {
-                (computed, bytesWritten, usedHeaderlessXorCompat) = await DecodeHeaderlessSpoolWithCompatAsync(
+                (computed, bytesWritten, usedHeaderlessXorCompat) = DecodeHeaderlessSpoolWithCompatLowImpact(
                     spooled.SpoolPath!,
                     spooled.TempPath,
                     spooled.ExpectedRawSize,
                     spooled.Hash,
-                    ct).ConfigureAwait(false);
+                    ct);
             }
 
             sw.Stop();
@@ -2353,54 +2928,23 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
             if (usedHeaderlessXorCompat)
                 Logger.LogDebug("CDN staged-path: headerless XOR compat path used for {hash}", spooled.Hash);
 
-            if (bytesWritten >= (2 * 1024 * 1024) && sw.Elapsed.TotalSeconds >= 1.0)
-            {
-                var bps = (long)(bytesWritten / sw.Elapsed.TotalSeconds);
-                if (bps < AutoCdnSlowBpsThreshold)
-                    Interlocked.Exchange(ref anySlow[0], 1);
-            }
-
+            // Decode speed is intentionally allowed to be slower than transfer speed so the game stays smooth.
+            // Do not feed local decompression throughput back into CDN auto-parallel tuning.
             if (bytesWritten <= 0 || !string.Equals(computed, spooled.Hash, StringComparison.OrdinalIgnoreCase))
             {
                 Logger.LogWarning(
-                    "CDN staged-path: bad decoded content for {hash} (computed={computed}, bytes={bytes}); cleaning temp",
-                    spooled.Hash, computed, bytesWritten);
+                    "CDN staged-path: bad decoded content for {hash} (computed={computed}, bytes={bytes}, expectedRaw={expectedRaw}, compressed={compressed}, headered={headered}); cleaning temp",
+                    spooled.Hash,
+                    computed,
+                    bytesWritten,
+                    spooled.ExpectedRawSize,
+                    spooled.CompressedBytes,
+                    spooled.IsHeadered);
 
-                CleanupFailedCdnDownload(spooled.TempPath);
-                Interlocked.Exchange(ref anyFailure[0], 1);
-                return;
-            }
+                TryPublishCentralFileRepairRequest(
+                    spooled.Hash,
+                    $"bad decoded CDN payload; computed={computed}; bytes={bytesWritten}; expectedRaw={spooled.ExpectedRawSize}; compressed={spooled.CompressedBytes}; headered={spooled.IsHeadered}");
 
-            var requiresExtraValidation = string.Equals(Path.GetExtension(spooled.TempPath), ".mdl", StringComparison.OrdinalIgnoreCase);
-
-            bool extraOk;
-            try
-            {
-                if (!requiresExtraValidation)
-                {
-                    extraOk = true;
-                }
-                else
-                {
-                    await CdnValidationConcurrencySemaphore.WaitAsync(ct).ConfigureAwait(false);
-                    try
-                    {
-                        extraOk = ExtraContentValidation(spooled.TempPath, spooled.Hash);
-                    }
-                    finally
-                    {
-                        CdnValidationConcurrencySemaphore.Release();
-                    }
-                }
-            }
-            catch (OperationCanceledException) when (!ct.IsCancellationRequested)
-            {
-                extraOk = false;
-            }
-
-            if (!extraOk)
-            {
-                Logger.LogWarning("CDN staged-path: extra validation failed for {hash}, cleaning temp", spooled.Hash);
                 CleanupFailedCdnDownload(spooled.TempPath);
                 Interlocked.Exchange(ref anyFailure[0], 1);
                 return;
@@ -2419,6 +2963,7 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
             }
 
             results.Add(new CdnDownloadedFile(spooled.Hash, spooled.FinalPath));
+            LowImpactCpuPause(bytesWritten, ct);
         }
         catch (OperationCanceledException)
         {
@@ -2429,6 +2974,16 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
         catch (Exception ex)
         {
             Logger.LogWarning(ex, "CDN staged-path: unexpected decode/finalize error for {hash}", spooled.Hash);
+
+            if (IsLikelyCdnPayloadDecodeFailure(ex))
+            {
+                var root = ex.GetBaseException();
+
+                TryPublishCentralFileRepairRequest(
+                    spooled.Hash,
+                    $"CDN payload decode failed; {root.GetType().Name}: {root.Message}; expectedRaw={spooled.ExpectedRawSize}; compressed={spooled.CompressedBytes}; headered={spooled.IsHeadered}");
+            }
+
             CleanupFailedCdnDownload(spooled.TempPath);
             Interlocked.Exchange(ref anyFailure[0], 1);
         }
@@ -2450,6 +3005,47 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
         }
     }
 
+    private void RegisterAndReleaseCompletedCdnFile(string hash, string finalPath)
+    {
+        RegisterAndReleaseCompletedCdnFiles([new CdnDownloadedFile(hash, finalPath)]);
+    }
+
+    private void RegisterAndReleaseCompletedCdnFiles(IEnumerable<CdnDownloadedFile> files)
+    {
+        var completed = files
+            .Where(f => !string.IsNullOrWhiteSpace(f.Hash) && !string.IsNullOrWhiteSpace(f.FinalPath))
+            .GroupBy(f => f.Hash, StringComparer.OrdinalIgnoreCase)
+            .Select(g => g.First())
+            .ToList();
+
+        if (completed.Count == 0)
+            return;
+
+        try
+        {
+            for (var offset = 0; offset < completed.Count; offset += CdnFinalCacheRegistrationBatchSize)
+            {
+                var batch = completed
+                    .Skip(offset)
+                    .Take(CdnFinalCacheRegistrationBatchSize)
+                    .ToList();
+
+                _fileDbManager.RegisterDownloadedCacheFiles(batch.Select(f => (f.Hash, f.FinalPath)));
+
+                foreach (var file in batch)
+                    CompleteGlobalInflightDownload(file.Hash, success: true);
+
+                if (offset + CdnFinalCacheRegistrationBatchSize < completed.Count)
+                    Thread.Yield();
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.LogWarning(ex, "CDN staged-path: failed to register completed CDN cache batch ({count} files)", completed.Count);
+            throw;
+        }
+    }
+
     private void CleanupSpooledFiles(IEnumerable<CdnSpooledFile> spooledFiles)
     {
         foreach (var spooled in spooledFiles)
@@ -2458,9 +3054,6 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
             CleanupSpooledPayload(spooled);
         }
     }
-
-
-
 
     private bool ExtraContentValidation(string filePath, string hash)
     {
@@ -2497,11 +3090,58 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
         }
     }
 
+    private static string ComputeFileHashLowImpact(string filePath, CancellationToken ct)
+    {
+        using var sha1 = IncrementalHash.CreateHash(HashAlgorithmName.SHA1);
+        using var fs = new FileStream(
+            filePath,
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.Read,
+            CdnBufferSize,
+            FileOptions.SequentialScan);
+
+        var buffer = _downloadBufferPool.Rent(CdnSmoothDecodeBufferSize);
+        long sincePause = 0;
+        long sinceHardPause = 0;
+
+        try
+        {
+            while (true)
+            {
+                ct.ThrowIfCancellationRequested();
+
+                var read = fs.Read(buffer, 0, buffer.Length);
+                if (read <= 0)
+                    break;
+
+                sha1.AppendData(buffer, 0, read);
+                sincePause += read;
+                sinceHardPause += read;
+
+                if (sincePause >= CdnSmoothYieldEveryBytes)
+                {
+                    LowImpactCpuPause(sinceHardPause, ct);
+                    sincePause = 0;
+
+                    if (sinceHardPause >= CdnSmoothMicroPauseEveryBytes)
+                        sinceHardPause = 0;
+                }
+            }
+
+            return Convert.ToHexString(sha1.GetHashAndReset());
+        }
+        finally
+        {
+            _downloadBufferPool.Return(buffer);
+        }
+    }
+
     private bool ValidateDownloadedFileLowPri(string fullPath, string fileHash, long expectedRawSize, CancellationToken ct)
     {
         try
         {
-            const long InlineTinyValidationBytes = 256 * 1024;
+            const long InlineTinyValidationBytes = 64 * 1024;
 
             long sizeHint = expectedRawSize;
             if (sizeHint <= 0)
@@ -2520,13 +3160,13 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
 
             if (sizeHint > 0 && sizeHint <= InlineTinyValidationBytes)
             {
-                return ValidateDownloadedFile(fullPath, fileHash, expectedRawSize);
+                return ValidateDownloadedFile(fullPath, fileHash, expectedRawSize, ct);
             }
 
             CdnValidationConcurrencySemaphore.Wait(ct);
             try
             {
-                return ValidateDownloadedFile(fullPath, fileHash, expectedRawSize);
+                return ValidateDownloadedFile(fullPath, fileHash, expectedRawSize, ct);
             }
             finally
             {
@@ -2543,7 +3183,7 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
             return false;
         }
     }
-    private bool ValidateDownloadedFile(string fullPath, string fileHash, long expectedRawSize)
+    private bool ValidateDownloadedFile(string fullPath, string fileHash, long expectedRawSize, CancellationToken ct)
     {
         // Conservative: IO errors should not silently "pass" validation, because that allows partial/corrupt files
         // to persist and potentially crash-loop on apply.
@@ -2581,13 +3221,13 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
             {
                 try
                 {
-                    computed = Crypto.GetFileHash(fi.FullName);
+                    computed = ComputeFileHashLowImpact(fi.FullName, ct);
                     break;
                 }
                 catch (IOException ioEx) when (attempt < MaxIoRetries)
                 {
                     Logger.LogDebug(ioEx, "IO error while hashing {path} (attempt {attempt}/{max})", fullPath, attempt + 1, MaxIoRetries + 1);
-                    Thread.Sleep(50 * (attempt + 1));
+                    Thread.Yield();
                     continue;
                 }
             }
@@ -2620,20 +3260,23 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
 
     private int GetDownloadGroupParallelism(int groupCount)
     {
-        var max = Math.Min(Environment.ProcessorCount, 6);
+        var max = Math.Min(Environment.ProcessorCount, 3);
         var configured = _mareConfigService.Current.ParallelDownloads;
 
         if (configured > 0)
-            return Math.Clamp(Math.Min(configured, groupCount), 2, max);
+            return Math.Clamp(Math.Min(configured, groupCount), 1, max);
+
+        if (IsWineOrLinuxRuntime)
+            return 1;
 
         var cpu = Environment.ProcessorCount;
         var auto =
             cpu <= 4 ? 2 :
-            cpu <= 8 ? 3 :
-            cpu <= 16 ? 4 :
-                        6;
+            cpu <= 8 ? 2 :
+            cpu <= 16 ? 3 :
+                        3;
 
-        return Math.Clamp(Math.Min(auto, groupCount), 2, max);
+        return Math.Clamp(Math.Min(auto, groupCount), 1, max);
     }
 
 

@@ -60,15 +60,10 @@ public sealed class LocalPapSafetyModService
     private readonly SemaphoreSlim _syncGate = new(1, 1);
     private readonly object _appliedStateLock = new();
     private readonly object _localCollectionSettingsCacheLock = new();
-    private readonly object _selectedAnimationSupportCacheLock = new();
     private string? _lastAppliedRuntimeFingerprint;
-    private string? _selectedAnimationSupportCacheKey;
-    private IReadOnlyCollection<ManifestSupportSource>? _selectedAnimationSupportCache;
-    private DateTime _selectedAnimationSupportCacheUntilUtc = DateTime.MinValue;
     private IpcCallerPenumbra.PenumbraCollectionModSettings? _cachedLocalPlayerCollectionSettings;
     private DateTime _cachedLocalPlayerCollectionSettingsUntilUtc = DateTime.MinValue;
     private static readonly TimeSpan LocalPlayerCollectionSettingsCacheDuration = TimeSpan.FromMilliseconds(750);
-    private static readonly TimeSpan SelectedAnimationSupportCacheDuration = TimeSpan.FromSeconds(10);
     private const int ManifestScanYieldStride = 4;
     private const int ModScanYieldStride = 8;
 
@@ -102,24 +97,27 @@ public sealed class LocalPapSafetyModService
             || string.Equals(fileName, RuntimeModDisplayName, StringComparison.OrdinalIgnoreCase);
     }
 
+    public static bool IsRavaSyncInternalTemporaryModIdentifier(string? modIdentifier)
+    {
+        if (string.IsNullOrWhiteSpace(modIdentifier))
+            return false;
+
+        var normalized = modIdentifier.Replace('/', '\\').Trim().Trim('\\');
+        var fileName = Path.GetFileName(normalized);
+
+        return string.Equals(fileName, "MareChara_Files", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(fileName, "MareChara_Files_A", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(fileName, "MareChara_Files_B", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(fileName, "MareChara_Meta", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(fileName, "RavaSync_AsyncLoadSupport", StringComparison.OrdinalIgnoreCase);
+    }
+
     public void InvalidateLocalPlayerCollectionSettingsCache()
     {
         lock (_localCollectionSettingsCacheLock)
         {
             _cachedLocalPlayerCollectionSettings = null;
             _cachedLocalPlayerCollectionSettingsUntilUtc = DateTime.MinValue;
-        }
-
-        InvalidateSelectedAnimationSupportCache();
-    }
-
-    public void InvalidateSelectedAnimationSupportCache()
-    {
-        lock (_selectedAnimationSupportCacheLock)
-        {
-            _selectedAnimationSupportCacheKey = null;
-            _selectedAnimationSupportCache = null;
-            _selectedAnimationSupportCacheUntilUtc = DateTime.MinValue;
         }
     }
 
@@ -280,9 +278,6 @@ public sealed class LocalPapSafetyModService
             if (++scannedMods % ModScanYieldStride == 0)
                 await Task.Yield();
 
-            if (!mod.Value.Enabled)
-                continue;
-
             if (IsRuntimeModKey(modDirectory, mod.Key))
                 continue;
 
@@ -343,17 +338,6 @@ public sealed class LocalPapSafetyModService
         if (collectionState == null || string.IsNullOrWhiteSpace(modDirectory) || !Directory.Exists(modDirectory))
             return empty;
 
-        var cacheKey = BuildSelectedAnimationSupportCacheKey(modDirectory, collectionState);
-        lock (_selectedAnimationSupportCacheLock)
-        {
-            if (_selectedAnimationSupportCache != null
-                && DateTime.UtcNow <= _selectedAnimationSupportCacheUntilUtc
-                && string.Equals(_selectedAnimationSupportCacheKey, cacheKey, StringComparison.Ordinal))
-            {
-                return _selectedAnimationSupportCache;
-            }
-        }
-
         var winnersByGamePath = new Dictionary<string, ManifestSupportCandidate>(StringComparer.OrdinalIgnoreCase);
         var scannedMods = 0;
 
@@ -363,9 +347,6 @@ public sealed class LocalPapSafetyModService
 
             if (++scannedMods % ModScanYieldStride == 0)
                 await Task.Yield();
-
-            if (!mod.Value.Enabled)
-                continue;
 
             if (IsRuntimeModKey(modDirectory, mod.Key))
                 continue;
@@ -440,16 +421,7 @@ public sealed class LocalPapSafetyModService
             output.Add(new ManifestSupportSource(kvp.Value.ResolvedPath, hash, kvp.Value.Priority, kvp.Value.GamePaths));
         }
 
-        var result = output.ToArray();
-
-        lock (_selectedAnimationSupportCacheLock)
-        {
-            _selectedAnimationSupportCacheKey = cacheKey;
-            _selectedAnimationSupportCache = result;
-            _selectedAnimationSupportCacheUntilUtc = DateTime.UtcNow + SelectedAnimationSupportCacheDuration;
-        }
-
-        return result;
+        return output;
     }
 
     public async Task<bool> SyncRuntimeModAsync(IpcCallerPenumbra.PenumbraCollectionModSettings collectionState, IReadOnlyDictionary<string, ManifestPapSource> selectedSourcesByGamePath, IReadOnlyCollection<SanitizedPapOverride> desiredOverrides, CancellationToken token)
@@ -525,7 +497,7 @@ public sealed class LocalPapSafetyModService
             }
 
             var sourceRuntimeState = await ResolveSourceRuntimeGroupSelectionStateAsync(collectionState, token).ConfigureAwait(false);
-            AddExistingRuntimeGroupsBackedByEnabledSourceMods(sourceRuntimeState.SourceBackedGroupNames, desiredGroups.Keys, collectionState, token);
+            AddExistingRuntimeGroupsBackedBySourceMods(sourceRuntimeState.SourceBackedGroupNames, desiredGroups.Keys, collectionState, token);
 
             foreach (var sourceBackedGroupName in sourceRuntimeState.SourceBackedGroupNames)
             {
@@ -634,6 +606,12 @@ public sealed class LocalPapSafetyModService
                 }
             }
 
+            if (runtimeStateChanged)
+            {
+                runtimeCollectionState = await TryGetLocalPlayerCollectionSettingsAsync(token).ConfigureAwait(false) ?? runtimeCollectionState;
+                runtimeCollectionState.Mods.TryGetValue(runtimeModKey, out runtimeState);
+            }
+
             var currentSelections = runtimeState?.Settings ?? new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
             {
                 foreach (var group in desiredGroups.Values.OrderBy(g => g.Name, StringComparer.OrdinalIgnoreCase))
@@ -691,46 +669,6 @@ public sealed class LocalPapSafetyModService
         {
             _syncGate.Release();
         }
-    }
-
-    private static string BuildSelectedAnimationSupportCacheKey(string modDirectory, IpcCallerPenumbra.PenumbraCollectionModSettings collectionState)
-    {
-        var sb = new StringBuilder(1024);
-
-        sb.Append(NormalizeFullPath(modDirectory));
-        sb.Append('|');
-        sb.Append(collectionState.CollectionId);
-        sb.Append('|');
-
-        foreach (var mod in collectionState.Mods.OrderBy(m => m.Key, StringComparer.OrdinalIgnoreCase))
-        {
-            var state = mod.Value;
-            if (!state.Enabled)
-                continue;
-
-            sb.Append(mod.Key);
-            sb.Append(':');
-            sb.Append(state.Priority);
-            sb.Append(':');
-
-            foreach (var setting in state.Settings.OrderBy(s => s.Key, StringComparer.OrdinalIgnoreCase))
-            {
-                sb.Append(setting.Key);
-                sb.Append('=');
-
-                foreach (var option in setting.Value.OrderBy(v => v, StringComparer.OrdinalIgnoreCase))
-                {
-                    sb.Append(option);
-                    sb.Append(',');
-                }
-
-                sb.Append(';');
-            }
-
-            sb.Append('|');
-        }
-
-        return sb.ToString();
     }
 
     private async Task<(List<ManifestSupportCandidate> Candidates, bool HasSelectedHumanAnimationPap)> LoadSelectedManifestAnimationSupportCandidatesAsync(string modPath, Dictionary<string, List<string>> selectedSettings, int priority, CancellationToken token)
@@ -892,13 +830,35 @@ public sealed class LocalPapSafetyModService
         if (!(normalized.EndsWith(".mdl", StringComparison.OrdinalIgnoreCase)
             || normalized.EndsWith(".mtrl", StringComparison.OrdinalIgnoreCase)
             || normalized.EndsWith(".tex", StringComparison.OrdinalIgnoreCase)
-            || normalized.EndsWith(".atex", StringComparison.OrdinalIgnoreCase)))
+            || normalized.EndsWith(".atex", StringComparison.OrdinalIgnoreCase)
+            || normalized.EndsWith(".avfx", StringComparison.OrdinalIgnoreCase)
+            || normalized.EndsWith(".shpk", StringComparison.OrdinalIgnoreCase)))
         {
             return false;
         }
 
+        // These are support assets commonly referenced by animation/VFX payloads.
+        // They need to be present in the pushed temp mod before Penumbra's async loader
+        // asks for them, otherwise the first async load can fail even though the main PAP/TMB exists.
         return normalized.StartsWith("chara/weapon/", StringComparison.OrdinalIgnoreCase)
-            || normalized.StartsWith("chara/accessory/", StringComparison.OrdinalIgnoreCase);
+            || normalized.StartsWith("chara/accessory/", StringComparison.OrdinalIgnoreCase)
+            || normalized.StartsWith("chara/minion/", StringComparison.OrdinalIgnoreCase)
+            || normalized.StartsWith("chara/monster/", StringComparison.OrdinalIgnoreCase)
+            || normalized.StartsWith("chara/demihuman/", StringComparison.OrdinalIgnoreCase)
+            || normalized.StartsWith("vfx/", StringComparison.OrdinalIgnoreCase)
+            || IsHumanObjectAnimationSupportGamePath(normalized);
+    }
+
+    private static bool IsHumanObjectAnimationSupportGamePath(string normalizedGamePath)
+    {
+        if (!normalizedGamePath.StartsWith("chara/human/", StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        return normalizedGamePath.Contains("/obj/hair/", StringComparison.OrdinalIgnoreCase)
+            || normalizedGamePath.Contains("/obj/face/", StringComparison.OrdinalIgnoreCase)
+            || normalizedGamePath.Contains("/obj/tail/", StringComparison.OrdinalIgnoreCase)
+            || normalizedGamePath.Contains("/obj/zear/", StringComparison.OrdinalIgnoreCase)
+            || normalizedGamePath.Contains("/obj/ear/", StringComparison.OrdinalIgnoreCase);
     }
 
     private async Task<List<ManifestPapCandidate>> LoadSelectedManifestPapCandidatesAsync(string modDirectoryRoot, string relativeModDirectory, string modPath, Dictionary<string, List<string>> selectedSettings, int priority, CancellationToken token)
@@ -1033,37 +993,85 @@ public sealed class LocalPapSafetyModService
             ? groupNameElement.GetString() ?? string.Empty
             : string.Empty;
 
-        if (!string.IsNullOrWhiteSpace(groupName)
-            && selectedSettings.TryGetValue(groupName, out var selected)
-            && selected != null)
+        if (!string.IsNullOrWhiteSpace(groupName))
         {
-            foreach (var item in selected.Where(s => !string.IsNullOrWhiteSpace(s)))
-                output.Add(item);
+            List<string>? selected = null;
 
-            return output;
+            if (!selectedSettings.TryGetValue(groupName, out selected))
+            {
+                var normalizedGroupName = groupName.Replace('\\', '/').ToLowerInvariant();
+                foreach (var kvp in selectedSettings)
+                {
+                    if (string.Equals((kvp.Key ?? string.Empty).Replace('\\', '/').ToLowerInvariant(), normalizedGroupName, StringComparison.OrdinalIgnoreCase))
+                    {
+                        selected = kvp.Value;
+                        break;
+                    }
+                }
+            }
+
+            if (selected != null)
+            {
+                foreach (var item in selected.Where(s => !string.IsNullOrWhiteSpace(s)))
+                    output.Add(item);
+
+                if (output.Count > 0)
+                    return output;
+            }
         }
 
         if (!groupRoot.TryGetProperty("Options", out var options) || options.ValueKind != JsonValueKind.Array)
             return output;
 
-        if (groupRoot.TryGetProperty("DefaultSettings", out var defaultSettings)
-            && defaultSettings.ValueKind == JsonValueKind.Number
-            && defaultSettings.TryGetInt32(out var mask)
-            && mask > 0)
+        var optionNames = new List<string>();
+        foreach (var option in options.EnumerateArray())
         {
-            int index = 0;
-            foreach (var option in options.EnumerateArray())
-            {
-                if ((mask & (1 << index)) != 0 && option.TryGetProperty("Name", out var optionNameElement))
-                {
-                    var name = optionNameElement.GetString();
-                    if (!string.IsNullOrWhiteSpace(name))
-                        output.Add(name);
-                }
+            if (!option.TryGetProperty("Name", out var optionNameElement))
+                continue;
 
-                index++;
-            }
+            var name = optionNameElement.GetString();
+            if (!string.IsNullOrWhiteSpace(name))
+                optionNames.Add(name);
         }
+
+        if (optionNames.Count == 0)
+            return output;
+
+        if (!groupRoot.TryGetProperty("DefaultSettings", out var defaultSettings)
+            || defaultSettings.ValueKind != JsonValueKind.Number
+            || !defaultSettings.TryGetInt32(out var defaultValue))
+        {
+            return output;
+        }
+
+        var groupType = groupRoot.TryGetProperty("Type", out var typeElement)
+            ? typeElement.GetString() ?? string.Empty
+            : string.Empty;
+
+        if (string.Equals(groupType, "Single", StringComparison.OrdinalIgnoreCase))
+        {
+            if (defaultValue >= 0 && defaultValue < optionNames.Count)
+                output.Add(optionNames[defaultValue]);
+
+            return output;
+        }
+
+        if (string.Equals(groupType, "Multi", StringComparison.OrdinalIgnoreCase))
+        {
+            if (defaultValue <= 0)
+                return output;
+
+            for (var i = 0; i < optionNames.Count; i++)
+            {
+                if ((defaultValue & (1 << i)) != 0)
+                    output.Add(optionNames[i]);
+            }
+
+            return output;
+        }
+
+        if (defaultValue >= 0 && defaultValue < optionNames.Count)
+            output.Add(optionNames[defaultValue]);
 
         return output;
     }
@@ -1392,7 +1400,7 @@ public sealed class LocalPapSafetyModService
         }
     }
 
-    private void AddExistingRuntimeGroupsBackedByEnabledSourceMods(HashSet<string> output, IEnumerable<string> runtimeGroupNames, IpcCallerPenumbra.PenumbraCollectionModSettings collectionState, CancellationToken token)
+    private void AddExistingRuntimeGroupsBackedBySourceMods(HashSet<string> output, IEnumerable<string> runtimeGroupNames, IpcCallerPenumbra.PenumbraCollectionModSettings collectionState, CancellationToken token)
     {
         var modDirectory = _ipcManager.Penumbra.ModDirectory;
         if (collectionState == null || string.IsNullOrWhiteSpace(modDirectory) || !Directory.Exists(modDirectory))
@@ -1409,8 +1417,6 @@ public sealed class LocalPapSafetyModService
         {
             token.ThrowIfCancellationRequested();
 
-            if (!mod.Value.Enabled)
-                continue;
 
             if (IsRuntimeModKey(modDirectory, mod.Key))
                 continue;

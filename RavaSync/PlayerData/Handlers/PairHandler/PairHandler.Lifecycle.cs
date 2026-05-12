@@ -118,7 +118,7 @@ public sealed partial class PairHandler
             _deferredTempFilesModCleanupCts = null;
             _downloadCancellationTokenSource?.CancelDispose();
             _downloadCancellationTokenSource = null;
-            DisposeDownloadManager();
+            DisposeDownloadManager(runAsync: false);
 
             try
             {

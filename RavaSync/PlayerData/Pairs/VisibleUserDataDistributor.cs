@@ -7,6 +7,7 @@ using RavaSync.WebAPI.Files;
 using RavaSync.Interop.Ipc;
 using Microsoft.Extensions.Logging;
 using RavaSync.PlayerData.Services;
+using CharacterDataPushSanitizer = RavaSync.PlayerData.Data.CharacterDataPushSanitizer;
 
 namespace RavaSync.PlayerData.Pairs;
 
@@ -31,6 +32,7 @@ public class VisibleUserDataDistributor : DisposableMediatorSubscriberBase
     private readonly List<UserData> _noLongerVisibleUsersBuffer = [];
     private readonly List<nint> _visiblePlayerAddressesBuffer = [];
     private readonly SemaphoreSlim _pushDataSemaphore = new(1, 1);
+    private int _pushTaskQueuedOrRunning;
     private readonly object _pushQueueLock = new();
     private readonly CancellationTokenSource _runtimeCts = new();
     private long _queuedPushRevisionCounter;
@@ -65,7 +67,8 @@ public class VisibleUserDataDistributor : DisposableMediatorSubscriberBase
     private readonly Dictionary<string, string> _lastOutboundAppearanceSignatureByUid = new(StringComparer.Ordinal);
     private readonly Dictionary<string, long> _lastOutboundSendTickByUid = new(StringComparer.Ordinal);
     private readonly Dictionary<string, long> _lastOutboundSidecarOnlyTickByUid = new(StringComparer.Ordinal);
-    private const int DisplayedMetricsPreSendWaitMs = 1500;
+    private const int DisplayedMetricsPreSendWaitMs = 250;
+    private const int OutboundPushCoalesceDelayMs = 75;
     private const int DuplicateOutboundSuppressWindowMs = 10_000;
     private const int SidecarOnlyOutboundMinIntervalMs = 60_000;
     private static readonly TimeSpan SidecarRefreshMinInterval = TimeSpan.FromSeconds(60);
@@ -132,11 +135,11 @@ public class VisibleUserDataDistributor : DisposableMediatorSubscriberBase
             {
                 Logger.LogTrace("Data hash {hash}/{payload} equal to stored data", newData.DataHash.Value, newPayloadFingerprint);
 
-                if (msg.ForceOutbound)
+                if (msg.ForceOutbound && Logger.IsEnabled(LogLevel.Trace))
                 {
-                    _lastCreatedData = newData;
-                    _lastCreatedDataPayloadFingerprint = newPayloadFingerprint;
-                    PushToAllVisibleUsers(forceOutbound: true);
+                    Logger.LogTrace(
+                        "Suppressing force-outbound push for unchanged local payload; reason={reason}",
+                        msg.Reason);
                 }
             }
         });
@@ -173,7 +176,21 @@ public class VisibleUserDataDistributor : DisposableMediatorSubscriberBase
 
         Mediator.Subscribe<ConnectedMessage>(this, (_) =>
         {
-            QueueVisibleUsersForPush(forceBarrier: true);
+            lock (_pushQueueLock)
+            {
+                _lastOutboundFullSignatureByUid.Clear();
+                _lastOutboundAppearanceSignatureByUid.Clear();
+                _lastOutboundSendTickByUid.Clear();
+                _lastOutboundSidecarOnlyTickByUid.Clear();
+            }
+
+            var queuedCount = QueueVisibleUsersForPush(forceBarrier: true);
+
+            if (_lastCreatedData != null && queuedCount > 0)
+            {
+                Logger.LogDebug("Forcing outbound character data refresh after connection established for {count} visible players", queuedCount);
+                PushCharacterData(forced: true, forceOutbound: true);
+            }
         });
 
         Mediator.Subscribe<ZoneSwitchStartMessage>(this, (_) => ResetZoneVisibilityTracking());
@@ -201,12 +218,7 @@ public class VisibleUserDataDistributor : DisposableMediatorSubscriberBase
             _fileUploadTask = null;
             _lastUploadBarrierKey = string.Empty;
             _authorizedRecipientUids.Clear();
-            _lastCreatedData = null;
-            _lastCreatedDataPayloadFingerprint = string.Empty;
-            _lastHeelsData = string.Empty;
-            _lastHonorificData = string.Empty;
-            _lastMoodlesData = string.Empty;
-            _lastPetNamesData = string.Empty;
+            // Keep the last built local payload across a transport disconnect so reconnect can repush it to visible recipients.
             _pendingHeelsData = null;
             _hasPendingHeelsUpdate = false;
             _pendingHonorificData = null;
@@ -479,6 +491,25 @@ public class VisibleUserDataDistributor : DisposableMediatorSubscriberBase
         }
     }
 
+    private void ForgetOutboundStateForUsers(IEnumerable<UserData> users)
+    {
+        lock (_pushQueueLock)
+        {
+            foreach (var user in users)
+            {
+                var uid = user.UID;
+                if (string.IsNullOrWhiteSpace(uid))
+                    continue;
+
+                _lastOutboundFullSignatureByUid.Remove(uid);
+                _lastOutboundAppearanceSignatureByUid.Remove(uid);
+                _lastOutboundSendTickByUid.Remove(uid);
+                _lastOutboundSidecarOnlyTickByUid.Remove(uid);
+                _authorizedRecipientUids.Remove(uid);
+            }
+        }
+    }
+
     private int QueueVisibleUsersForPush(bool forceBarrier = false)
     {
         var visibleUsers = new List<UserData>();
@@ -583,7 +614,10 @@ public class VisibleUserDataDistributor : DisposableMediatorSubscriberBase
         }
 
         if (noLongerVisibleUsers.Count > 0)
+        {
             _pairManager.ClearDisplayedPerformanceMetrics(noLongerVisibleUsers);
+            ForgetOutboundStateForUsers(noLongerVisibleUsers);
+        }
 
         _ipcManager.OtherSync.UpdateTrackedVisibleAddresses(visiblePlayerAddresses);
 
@@ -601,12 +635,29 @@ public class VisibleUserDataDistributor : DisposableMediatorSubscriberBase
 
         QueueUsersForPush(newVisibleUsers);
 
-        PushCharacterData();
+        // A visibility gain is a recipient-state change, not a local payload change.
+        // Send the current payload even if it matches what this UID saw shortly before.
+        PushCharacterData(forceOutbound: true);
 
+    }
+
+    private void LogPushSanitizerResult(CharacterDataPushSanitizer.Result result, string stage)
+    {
+        if (!result.Changed || !Logger.IsEnabled(LogLevel.Debug))
+            return;
+
+        Logger.LogDebug("Removed server-invalid outbound data at {stage}: {replacements} replacement(s), {gamePaths} game path(s), {buckets} object bucket(s), {honorific} honorific payload(s)",
+            stage,
+            result.RemovedReplacements,
+            result.RemovedGamePaths,
+            result.RemovedBuckets,
+            result.RemovedHonorificData);
     }
 
     private void PushCharacterData(bool forced = false, bool forceOutbound = false, bool includeSyncManifest = true)
     {
+        var requestedImmediateSend = forced || forceOutbound;
+
         if (forced || forceOutbound)
         {
             lock (_pushQueueLock)
@@ -619,11 +670,19 @@ public class VisibleUserDataDistributor : DisposableMediatorSubscriberBase
             }
         }
 
+        if (Interlocked.CompareExchange(ref _pushTaskQueuedOrRunning, 1, 0) != 0)
+            return;
+
         _ = Task.Run(async () =>
         {
-            await _pushDataSemaphore.WaitAsync(_runtimeCts.Token).ConfigureAwait(false);
             try
             {
+                await _pushDataSemaphore.WaitAsync(_runtimeCts.Token).ConfigureAwait(false);
+                try
+                {
+                    if (!requestedImmediateSend)
+                        await Task.Delay(OutboundPushCoalesceDelayMs, _runtimeCts.Token).ConfigureAwait(false);
+
                 List<UserData> targetUsers;
                 List<UserData> originalTargetUsers;
                 CharacterData dataToSend;
@@ -642,6 +701,7 @@ public class VisibleUserDataDistributor : DisposableMediatorSubscriberBase
                         return;
 
                     dataToSend = _lastCreatedData.DeepClone();
+                    LogPushSanitizerResult(CharacterDataPushSanitizer.SanitizeForPush(dataToSend), "snapshot");
                     forceBarrier = _forceBarrierPending;
                     forceOutboundSend = _forceOutboundPending;
                     _forceBarrierPending = false;
@@ -711,6 +771,19 @@ public class VisibleUserDataDistributor : DisposableMediatorSubscriberBase
                     return;
                 }
 
+                if (forceOutboundSend)
+                {
+                    if (Logger.IsEnabled(LogLevel.Debug))
+                    {
+                        Logger.LogDebug(
+                            "Sending immediate appearance update to {users} before upload/share barrier completes",
+                            string.Join(", ", targetUsers.Select(k => k.AliasOrUID)));
+                    }
+
+                    if (await _apiController.PushCharacterData(dataToSend.DeepClone(), targetUsers).ConfigureAwait(false))
+                        RecordOutboundSend(dataToSend, targetUsers);
+                }
+
                 _uploadingCharacterData = dataToSend;
 
                 Logger.LogDebug(
@@ -735,6 +808,7 @@ public class VisibleUserDataDistributor : DisposableMediatorSubscriberBase
                 }
 
                 dataToSend = uploadResult.Data;
+                LogPushSanitizerResult(CharacterDataPushSanitizer.SanitizeForPush(dataToSend), "post-upload");
 
                 if (Logger.IsEnabled(LogLevel.Debug))
                     Logger.LogDebug("Sending your appearance to {users}", string.Join(", ", targetUsers.Select(k => k.AliasOrUID)));
@@ -760,9 +834,21 @@ public class VisibleUserDataDistributor : DisposableMediatorSubscriberBase
                 _uploadingCharacterData = null;
                 _fileUploadTask = null;
             }
+                finally
+                {
+                    _pushDataSemaphore.Release();
+                }
+            }
             finally
             {
-                _pushDataSemaphore.Release();
+                Volatile.Write(ref _pushTaskQueuedOrRunning, 0);
+
+                bool hasQueuedUsers;
+                lock (_pushQueueLock)
+                    hasQueuedUsers = _lastCreatedData != null && _usersToPushDataTo.Count > 0;
+
+                if (hasQueuedUsers && !_runtimeCts.IsCancellationRequested)
+                    PushCharacterData();
             }
         });
     }

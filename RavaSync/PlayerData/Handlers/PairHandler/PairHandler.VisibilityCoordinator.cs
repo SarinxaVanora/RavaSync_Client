@@ -371,8 +371,6 @@ public sealed partial class PairHandler
                             Logger.LogDebug("[{applicationId}] Visibility lost for {pair}; hard wiping live receiver state", _applicationId, Pair.UserData.AliasOrUID);
                             ResetToUninitializedState();
 
-                            //CleanupOldAssignedIndexIfNeeded(oldIdx, _applicationId);
-
                             return;
                         }
 
@@ -394,28 +392,20 @@ public sealed partial class PairHandler
                 if (!IsVisibleReplayReady(replayAddress, Environment.TickCount64))
                     return;
 
-                var cachedData = Pair.PrepareCharacterDataForLocalApply(dataForInitialApply.DeepClone());
-                if (cachedData == null) return;
-
                 var nowTick2 = Environment.TickCount64;
                 if (_lastInitialApplyDispatchTick >= 0 && nowTick2 - _lastInitialApplyDispatchTick < VisibleReplayDispatchCooldownMs)
                     return;
 
-                var cachedHash = cachedData.DataHash.Value;
-                var cachedPipelineKey = PairApplyUtilities.ComputeCharacterDataPayloadFingerprint(cachedData);
+                var sourceData = dataForInitialApply;
+                var sourceHash = sourceData.DataHash.Value;
 
-                if (!string.IsNullOrEmpty(cachedHash))
+                if (!string.IsNullOrEmpty(sourceHash)
+                    && string.Equals(sourceHash, _lastAttemptedDataHash, StringComparison.Ordinal)
+                    && (nowTick2 - _lastApplyCompletedTick) < 2500
+                    && !_forceApplyMods
+                    && !_redrawOnNextApplication)
                 {
-                    if (IsPairSyncBusyForPayload(cachedPipelineKey))
-                        return;
-
-                    if (string.Equals(cachedHash, _lastAttemptedDataHash, StringComparison.Ordinal)
-                        && (nowTick2 - _lastApplyCompletedTick) < 2500
-                        && !_forceApplyMods
-                        && !_redrawOnNextApplication)
-                    {
-                        return;
-                    }
+                    return;
                 }
 
                 var appData = Guid.NewGuid();
@@ -426,10 +416,25 @@ public sealed partial class PairHandler
                 {
                     try
                     {
+                        var cachedData = Pair.PrepareCharacterDataForLocalApply(sourceData.DeepClone());
+                        if (cachedData == null)
+                        {
+                            MarkInitialApplyRequired();
+                            return;
+                        }
+
+                        var cachedPipelineKey = PairApplyUtilities.ComputeCharacterDataPayloadFingerprint(cachedData);
+                        if (IsPairSyncBusyForPayload(cachedPipelineKey))
+                        {
+                            MarkInitialApplyRequired();
+                            return;
+                        }
+
                         Owner.ApplyCharacterData(appData, cachedData, forceApplyCustomization: true, PairSyncReason.BecameVisible);
                     }
                     catch (Exception ex)
                     {
+                        MarkInitialApplyRequired();
                         Logger.LogWarning(ex, "[BASE-{appBase}] Deferred initial apply dispatch failed for {player}", appData, PlayerName);
                     }
                 });
@@ -577,7 +582,7 @@ public sealed partial class PairHandler
                         }
                     }
 
-                    CleanupOldAssignedIndexIfNeeded(oldIdx, applicationId);
+                    Logger.LogDebug("[{applicationId}] Visibility teardown removed temp collection for {pair}; old object index cleanup intentionally skipped", applicationId, Pair.UserData.AliasOrUID);
                 }
                 catch (OperationCanceledException)
                 {

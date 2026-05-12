@@ -5,6 +5,8 @@ using System.IO;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
+using Dalamud.Utility;
+using Glamourer.Api.Enums;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using RavaSync.API.Data;
@@ -43,7 +45,6 @@ public sealed partial class PairHandler : DisposableMediatorSubscriberBase
     private readonly ServerConfigurationManager _serverConfigManager;
     private readonly PluginWarningNotificationService _pluginWarningNotificationManager;
     private readonly ModPathResolver _modPathResolver;
-    private readonly ObjectIndexCleanupService _objectIndexCleanupService;
     private readonly PapSanitisationService _papSanitisationService;
     private readonly VisibilityCoordinator _visibilityCoordinator;
     private readonly OtherSyncCoordinator _otherSyncCoordinator;
@@ -79,27 +80,65 @@ public sealed partial class PairHandler : DisposableMediatorSubscriberBase
     private DateTime _lastAssignedCollectionAssignUtc = DateTime.MinValue;
     private DateTime _nextTempCollectionRetryNotBeforeUtc = DateTime.MinValue;
     private long _lastApplyCompletedTick;
+    private static readonly bool IsWineRuntime = SafeIsWine();
+
+    private static bool SafeIsWine()
+    {
+        try { return Util.IsWine(); }
+        catch { return false; }
+    }
+
     private static int ComputeNormalApplyConcurrency()
     {
         var logical = Environment.ProcessorCount;
 
-        // Room entry already funnels the truly framework-sensitive Penumbra IPC through
-        // IpcCallerPenumbra's single paced gate. Keep pair commits parallel enough that
-        // cached/no-download room applies do not feel like a long one-by-one queue.
+        if (IsWineRuntime)
+            return logical <= 8 ? 1 : 2;
+
         if (logical <= 8) return 2;
         if (logical <= 16) return 4;
         return 6;
     }
 
+    private static int ComputeNormalDownloadConcurrency()
+    {
+        var logical = Environment.ProcessorCount;
+        if (IsWineRuntime) return logical <= 8 ? 1 : 2;
+        if (logical <= 8) return 2;
+        if (logical <= 16) return 3;
+        return 4;
+    }
+
+    private static int ComputeStormApplyConcurrency()
+    {
+        var logical = Environment.ProcessorCount;
+        if (IsWineRuntime) return 1;
+        if (logical <= 8) return 1;
+        if (logical <= 16) return 2;
+        return 3;
+    }
+
+    private static int ComputeStormDownloadConcurrency()
+    {
+        var logical = Environment.ProcessorCount;
+        if (IsWineRuntime) return 1;
+        return logical <= 8 ? 1 : 2;
+    }
+
     private static readonly int NormalApplyConcurrency = ComputeNormalApplyConcurrency();
-    private static readonly int StormApplyConcurrency = Math.Max(1, NormalApplyConcurrency / 2);
+    private static readonly int StormApplyConcurrency = ComputeStormApplyConcurrency();
+    private static readonly int NormalDownloadConcurrency = ComputeNormalDownloadConcurrency();
+    private static readonly int StormDownloadConcurrency = ComputeStormDownloadConcurrency();
 
     private static readonly SemaphoreSlim NormalApplySemaphore = new(NormalApplyConcurrency, NormalApplyConcurrency);
     private static readonly SemaphoreSlim StormApplySemaphore = new(StormApplyConcurrency, StormApplyConcurrency);
+    private static readonly SemaphoreSlim NormalDownloadSemaphore = new(NormalDownloadConcurrency, NormalDownloadConcurrency);
+    private static readonly SemaphoreSlim StormDownloadSemaphore = new(StormDownloadConcurrency, StormDownloadConcurrency);
 
     // Smooth redraw spikes globally (room-entry bursts) without hard-stalling the entire room.
     // Per-actor redraw coalescing still prevents duplicate redraws for the same object.
-    private static readonly SemaphoreSlim GlobalRedrawSemaphore = new(2, 2);
+    private static readonly int GlobalRedrawConcurrency = IsWineRuntime ? 1 : 2;
+    private static readonly SemaphoreSlim GlobalRedrawSemaphore = new(GlobalRedrawConcurrency, GlobalRedrawConcurrency);
     private static readonly ConcurrentDictionary<int, byte> RedrawObjectIndicesInFlight = new();
 
     private static readonly SemaphoreSlim GlobalPostApplyRepairSemaphore = new(2, 2);
@@ -173,7 +212,7 @@ public sealed partial class PairHandler : DisposableMediatorSubscriberBase
 
 
     public PairHandler(ILogger<PairHandler> logger, Pair pair,GameObjectHandlerFactory gameObjectHandlerFactory,IpcManager ipcManager, FileDownloadManagerFactory fileDownloadManagerFactory,PluginWarningNotificationService pluginWarningNotificationManager,DalamudUtilService dalamudUtil, 
-        IHostApplicationLifetime lifetime,FileCacheManager fileDbManager, MareMediator mediator,PlayerPerformanceService playerPerformanceService,ServerConfigurationManager serverConfigManager,ModPathResolver modPathResolver,ObjectIndexCleanupService objectIndexCleanupService,PapSanitisationService papSanitizationService) 
+        IHostApplicationLifetime lifetime,FileCacheManager fileDbManager, MareMediator mediator,PlayerPerformanceService playerPerformanceService,ServerConfigurationManager serverConfigManager,ModPathResolver modPathResolver,PapSanitisationService papSanitizationService) 
         : base(logger, mediator)
     {
         Pair = pair;
@@ -188,7 +227,6 @@ public sealed partial class PairHandler : DisposableMediatorSubscriberBase
         _playerPerformanceService = playerPerformanceService;
         _serverConfigManager = serverConfigManager;
         _modPathResolver = modPathResolver;
-        _objectIndexCleanupService = objectIndexCleanupService;
         _papSanitisationService = papSanitizationService;
         _visibilityCoordinator = new VisibilityCoordinator(this);
         _otherSyncCoordinator = new OtherSyncCoordinator(this);
@@ -287,33 +325,37 @@ public sealed partial class PairHandler : DisposableMediatorSubscriberBase
         return _dalamudUtil.AddressMatchesPlayerIdent(Pair.Ident, address);
     }
 
+
     private FileDownloadManager GetOrCreateDownloadManager()
     {
         return _downloadManager ??= _fileDownloadManagerFactory.Create();
     }
 
-    private void DisposeDownloadManager()
+    private void DisposeDownloadManager(bool runAsync = true)
     {
         var manager = Interlocked.Exchange(ref _downloadManager, null);
         if (manager == null)
             return;
 
-        try
+        void DisposeCore()
         {
-            manager.Dispose();
+            try
+            {
+                manager.Dispose();
+            }
+            catch (Exception ex)
+            {
+                Logger.LogTrace(ex, "Error disposing download manager for {pair}", Pair.UserData.AliasOrUID);
+            }
         }
-        catch (Exception ex)
-        {
-            Logger.LogTrace(ex, "Error disposing download manager for {pair}", Pair.UserData.AliasOrUID);
-        }
-    }
 
-    private void CleanupOldAssignedIndexIfNeeded(int? objectIndex, Guid applicationId)
-    {
-        if (!Pair.AutoPausedByOtherSync && objectIndex.HasValue && objectIndex.Value >= 0)
+        if (runAsync && !_lifetime.ApplicationStopping.IsCancellationRequested)
         {
-            _ = _objectIndexCleanupService.CleanupIfNotOwnedByIdentAsync(objectIndex.Value, Pair.Ident, applicationId);
+            _ = Task.Run(DisposeCore);
+            return;
         }
+
+        DisposeCore();
     }
 
     public nint PlayerCharacter => ResolveStablePlayerAddress();
@@ -613,8 +655,8 @@ public sealed partial class PairHandler : DisposableMediatorSubscriberBase
     private void ProcessPendingOwnedObjectCustomizationRetry(long nowTick)
         => _customizationCoordinator.ProcessPendingOwnedObjectCustomizationRetry(nowTick);
 
-    private Task<bool> ApplyCustomizationDataAsync(Guid applicationId, KeyValuePair<ObjectKind, HashSet<PlayerChanges>> changes, CharacterData charaData, bool allowPlayerRedraw, bool forceLightweightMetadataReapply, bool awaitPlayerGlamourerApply, CancellationToken token)
-        => _customizationCoordinator.ApplyCustomizationDataAsync(applicationId, changes, charaData, allowPlayerRedraw, forceLightweightMetadataReapply, awaitPlayerGlamourerApply, token);
+    private Task<bool> ApplyCustomizationDataAsync(Guid applicationId, KeyValuePair<ObjectKind, HashSet<PlayerChanges>> changes, CharacterData charaData, bool allowPlayerRedraw, bool forceLightweightMetadataReapply, bool awaitPlayerGlamourerApply, ApplyFlag glamourerApplyFlags, CancellationToken token)
+        => _customizationCoordinator.ApplyCustomizationDataAsync(applicationId, changes, charaData, allowPlayerRedraw, forceLightweightMetadataReapply, awaitPlayerGlamourerApply, glamourerApplyFlags, token);
 
     private Task RevertCustomizationDataAsync(ObjectKind objectKind, string name, Guid applicationId, CancellationToken cancelToken, nint addressOverride = 0, IReadOnlyDictionary<ObjectKind, Guid?>? customizeIdSnapshot = null)
         => _customizationCoordinator.RevertCustomizationDataAsync(objectKind, name, applicationId, cancelToken, addressOverride, customizeIdSnapshot);

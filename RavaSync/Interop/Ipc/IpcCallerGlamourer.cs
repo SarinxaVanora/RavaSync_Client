@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Diagnostics;
 using System.Linq;
 using System.Threading;
@@ -36,6 +36,10 @@ public sealed class IpcCallerGlamourer : DisposableMediatorSubscriberBase, IIpcC
 
     private bool _shownGlamourerUnavailable = false;
     private readonly uint LockCode = 0x6D617265;
+
+    private static readonly SemaphoreSlim GlamourerFrameworkIpcGate = new(1, 1);
+    private static long _nextGlamourerFrameworkIpcTick;
+    private const int GlamourerFrameworkIpcSpacingMs = 16;
 
     public IpcCallerGlamourer(ILogger<IpcCallerGlamourer> logger, IDalamudPluginInterface pi, DalamudUtilService dalamudUtil, MareMediator mareMediator,
         RedrawManager redrawManager) : base(logger, mareMediator)
@@ -109,7 +113,40 @@ public sealed class IpcCallerGlamourer : DisposableMediatorSubscriberBase, IIpcC
         }
     }
 
-    public async Task ApplyAllAsync(ILogger logger, GameObjectHandler handler, string? customization, Guid applicationId, CancellationToken token, bool fireAndForget = false)
+    private async Task<T> RunPacedGlamourerFrameworkIpcAsync<T>(ILogger logger, string operationName, Func<T> action, CancellationToken token, int warnAfterMs = 60)
+    {
+        await GlamourerFrameworkIpcGate.WaitAsync(token).ConfigureAwait(false);
+        try
+        {
+            var delayMs = Volatile.Read(ref _nextGlamourerFrameworkIpcTick) - Environment.TickCount64;
+            if (delayMs > 0 && delayMs < 1000)
+                await Task.Delay((int)delayMs, token).ConfigureAwait(false);
+
+            return await _dalamudUtil.RunOnFrameworkThread(() =>
+            {
+                var frameworkStopwatch = Stopwatch.StartNew();
+                try
+                {
+                    return action();
+                }
+                finally
+                {
+                    frameworkStopwatch.Stop();
+                    if (frameworkStopwatch.ElapsedMilliseconds >= warnAfterMs)
+                        logger.LogWarning("[Glamourer IPC HitchGuard] {operation} took {elapsed}ms on framework", operationName, frameworkStopwatch.ElapsedMilliseconds);
+                    else
+                        logger.LogTrace("[Glamourer IPC HitchGuard] {operation} took {elapsed}ms on framework", operationName, frameworkStopwatch.ElapsedMilliseconds);
+                }
+            }).ConfigureAwait(false);
+        }
+        finally
+        {
+            Interlocked.Exchange(ref _nextGlamourerFrameworkIpcTick, Environment.TickCount64 + GlamourerFrameworkIpcSpacingMs);
+            GlamourerFrameworkIpcGate.Release();
+        }
+    }
+
+    public async Task ApplyAllAsync(ILogger logger, GameObjectHandler handler, string? customization, Guid applicationId, CancellationToken token, bool fireAndForget = false, ApplyFlag? flags = null)
     {
         if (!APIAvailable || string.IsNullOrEmpty(customization) || _dalamudUtil.IsZoning) return;
 
@@ -117,18 +154,18 @@ public sealed class IpcCallerGlamourer : DisposableMediatorSubscriberBase, IIpcC
         {
             await SafeIpc.TryRun(Logger, "Glamourer.ApplyAll", TimeSpan.FromSeconds(2), async ct =>
             {
-                await _dalamudUtil.RunOnFrameworkThread(() =>
+                var applyFlags = flags ?? ApplyFlagEx.StateDefault;
+                await RunPacedGlamourerFrameworkIpcAsync(logger, $"Glamourer.ApplyState({applyFlags})", () =>
                 {
-                    var frameworkStopwatch = Stopwatch.StartNew();
                     try
                     {
-                        logger.LogDebug("[{appid}] Calling on IPC: GlamourerApplyAll", applicationId);
+                        logger.LogDebug("[{appid}] Calling on IPC: GlamourerApplyAll flags={flags}", applicationId, applyFlags);
 
                         var gameObj = handler.GetGameObject();
                         if (gameObj is not ICharacter chara)
                             return 0;
 
-                        _glamourerApplyAll!.Invoke(customization, chara.ObjectIndex, LockCode);
+                        _glamourerApplyAll!.Invoke(customization, chara.ObjectIndex, LockCode, applyFlags);
                         return 0;
                     }
                     catch (Exception ex)
@@ -136,15 +173,7 @@ public sealed class IpcCallerGlamourer : DisposableMediatorSubscriberBase, IIpcC
                         logger.LogWarning(ex, "[{appid}] Failed to apply Glamourer data", applicationId);
                         return 0;
                     }
-                    finally
-                    {
-                        frameworkStopwatch.Stop();
-                        if (frameworkStopwatch.ElapsedMilliseconds >= 60)
-                        {
-                            logger.LogWarning("[{appid}] GlamourerApplyAll for {name} took {elapsed}ms on framework", applicationId, handler.Name, frameworkStopwatch.ElapsedMilliseconds);
-                        }
-                    }
-                }).ConfigureAwait(false);
+                }, ct).ConfigureAwait(false);
 
                 await _dalamudUtil.RunOnFrameworkThread(() => 0).ConfigureAwait(false);
 
@@ -171,7 +200,7 @@ public sealed class IpcCallerGlamourer : DisposableMediatorSubscriberBase, IIpcC
 
         token.ThrowIfCancellationRequested();
 
-        await _dalamudUtil.RunOnFrameworkThread(() =>
+        await RunPacedGlamourerFrameworkIpcAsync(logger, "Glamourer.ReapplyState(Once)", () =>
         {
             if (handler.GetGameObject() is not ICharacter chara)
                 return 0;
@@ -187,7 +216,7 @@ public sealed class IpcCallerGlamourer : DisposableMediatorSubscriberBase, IIpcC
             }
 
             return 0;
-        }).ConfigureAwait(false);
+        }, token).ConfigureAwait(false);
     }
 
 

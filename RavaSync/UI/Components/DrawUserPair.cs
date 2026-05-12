@@ -11,6 +11,7 @@ using RavaSync.PlayerData.Pairs;
 using RavaSync.Services;
 using RavaSync.Services.Mediator;
 using RavaSync.Services.ServerConfiguration;
+using RavaSync.UI;
 using RavaSync.UI.Handlers;
 using RavaSync.WebAPI;
 
@@ -363,17 +364,14 @@ public class DrawUserPair
                 {
                     if (dl != null && dl.HasAny)
                     {
-                        if (dl.AnyDownloading)
+                        var phase = DownloadProgressHints.GetPrimaryPhase(pair.CurrentDownloadStatus?.Values);
+                        var phaseLabel = DownloadProgressHints.GetPhaseLabel(phase);
+
+                        if (!string.IsNullOrWhiteSpace(phaseLabel))
                         {
-                            icon = FontAwesomeIcon.Download;
-                            color = ImGuiColors.ParsedBlue;
-                            stateText = "Visible - Downloading";
-                        }
-                        else if (dl.AnyLoading)
-                        {
-                            icon = FontAwesomeIcon.Sync;
-                            color = ImGuiColors.DalamudViolet;
-                            stateText = "Visible - Loading files";
+                            icon = phase == DownloadProgressPhase.Downloading ? FontAwesomeIcon.Download : FontAwesomeIcon.Sync;
+                            color = phase == DownloadProgressPhase.Downloading ? ImGuiColors.ParsedBlue : ImGuiColors.DalamudViolet;
+                            stateText = $"Visible - {phaseLabel}";
                         }
                     }
                 }

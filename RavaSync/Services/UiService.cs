@@ -90,7 +90,7 @@ public sealed class UiService : DisposableMediatorSubscriberBase
     public void ToggleMainUi()
     {
         if (_mareConfigService.Current.HasValidSetup())
-            Mediator.Publish(new UiToggleMessage(typeof(CompactUi)));
+            Mediator.Publish(new RestoreCompactUiStateMessage());
         else
             Mediator.Publish(new UiToggleMessage(typeof(IntroUi)));
     }

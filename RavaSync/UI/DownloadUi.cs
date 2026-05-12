@@ -99,7 +99,7 @@ public class DownloadUi : WindowMediatorSubscriberBase
 
         Mediator.Subscribe<DownloadStartedMessage>(this, (msg) =>
         {
-            if (msg.DownloadId == null) return;
+            if (msg.DownloadId == null || !msg.CountsTowardGlobal) return;
 
             var now = DateTime.UtcNow;
 
@@ -269,7 +269,10 @@ public class DownloadUi : WindowMediatorSubscriberBase
                     UiSharedService.DrawOutlinedFont($"▼", ImGuiColors.DalamudWhite, new Vector4(0, 0, 0, 255), 1);
                     ImGui.SameLine();
                     var xDistance = ImGui.GetCursorPosX();
-                    UiSharedService.DrawOutlinedFont($"{item.Key.Name} [Q:{dlQueue}/P:{dlProg}/D:{dlDecomp}]", ImGuiColors.DalamudWhite, new Vector4(0, 0, 0, 255), 1);
+                    var phase = DownloadProgressHints.GetPrimaryPhase(0, dlQueue, dlProg, dlDecomp);
+                    var phaseLabel = DownloadProgressHints.GetPhaseLabel(phase);
+                    var headerText = string.IsNullOrWhiteSpace(phaseLabel) ? item.Key.Name : $"{item.Key.Name} - {phaseLabel}";
+                    UiSharedService.DrawOutlinedFont(headerText, ImGuiColors.DalamudWhite, new Vector4(0, 0, 0, 255), 1);
                     ImGui.NewLine();
                     ImGui.SameLine(xDistance);
                     UiSharedService.DrawOutlinedFont($"{transferredFiles}/{totalFiles} ({UiSharedService.ByteToString(transferredBytes, addSuffix: false)}/{UiSharedService.ByteToString(totalBytes)})", ImGuiColors.DalamudWhite, new Vector4(0, 0, 0, 255), 1);
@@ -377,52 +380,18 @@ public class DownloadUi : WindowMediatorSubscriberBase
                     double dlProgressPercent;
                     string downloadText;
 
-                    if (hasProg)
-                    {
-                        dlProgressPercent = totalBytes <= 0 ? 0.0 : transferredBytes / (double)totalBytes;
-                        dlProgressPercent = Math.Clamp(dlProgressPercent, 0.0, 1.0);
+                    var downloadPhase = DownloadProgressHints.GetPrimaryPhase(sInit, sQueue, sProg, sDecomp);
 
-                        downloadText = $"{UiSharedService.ByteToString(transferredBytes, addSuffix: false)}/{UiSharedService.ByteToString(totalBytes)}";
-                    }
-                    else if (hasDecomp)
-                    {
-                        dlProgressPercent = totalBytes <= 0 ? 0.0 : transferredBytes / (double)totalBytes;
-                        dlProgressPercent = Math.Clamp(dlProgressPercent, 0.0, 1.0);
-
-                        downloadText = totalBytes > 0
-                            ? $"Decompressing ({sDecomp})  {UiSharedService.ByteToString(transferredBytes, addSuffix: false)}/{UiSharedService.ByteToString(totalBytes)}"
-                            : $"Decompressing ({sDecomp})";
-                    }
-                    else if (hasQueue || hasInit)
+                    if (isWaiting || isInitializing)
                     {
                         dlProgressPercent = 0.0;
-
-                        var parts = new List<string>(4);
-                        if (sQueue > 0) parts.Add($"Q:{sQueue}");
-                        if (sProg > 0) parts.Add($"P:{sProg}");
-                        if (sDecomp > 0) parts.Add($"D:{sDecomp}");
-                        if (sInit > 0) parts.Add($"I:{sInit}");
-
-                        var breakdown = parts.Count > 0 ? string.Join(" ", parts) : string.Empty;
-
-                        if (hasQueue) downloadText = $"Queued  [{breakdown}]";
-                        else downloadText = $"Initializing  [{breakdown}]";
+                        downloadText = DownloadProgressHints.GetPhaseLabel(downloadPhase);
                     }
                     else
                     {
                         dlProgressPercent = totalBytes <= 0 ? 0.0 : transferredBytes / (double)totalBytes;
                         dlProgressPercent = Math.Clamp(dlProgressPercent, 0.0, 1.0);
-
-                        var atEnd = dlProgressPercent >= 0.9995;
-
-                        if (atEnd && !transfer.Value.Finished)
-                        {
-                            downloadText = $"Finalizing…  {UiSharedService.ByteToString(transferredBytes, addSuffix: false)}/{UiSharedService.ByteToString(totalBytes)}";
-                        }
-                        else
-                        {
-                            downloadText = $"{UiSharedService.ByteToString(transferredBytes, addSuffix: false)}/{UiSharedService.ByteToString(totalBytes)}";
-                        }
+                        downloadText = DownloadProgressHints.FormatProgressText(downloadPhase, transferredBytes, totalBytes);
                     }
 
                     var dt = io.DeltaTime;
@@ -1114,9 +1083,14 @@ public class DownloadUi : WindowMediatorSubscriberBase
         var dlPct = (dlTotalBytes <= 0) ? 0f : (float)(dlTransferredBytes / (double)dlTotalBytes);
         dlPct = Math.Clamp(dlPct, 0f, 1f);
 
+        var dlPhase = DownloadProgressHints.GetPrimaryPhase(dlInit, dlQueue, dlProg, dlDecomp);
+        var dlPhaseLabel = DownloadProgressHints.GetPhaseLabel(dlPhase);
+        if (string.IsNullOrWhiteSpace(dlPhaseLabel))
+            dlPhaseLabel = "Downloading";
+
         var dlText = dlAllPreparing
-            ? "Preparing Files..."
-            : $"{dlTransferredFiles}/{dlTotalFiles}  ({UiSharedService.ByteToString(dlTransferredBytes, addSuffix: false)}/{UiSharedService.ByteToString(dlTotalBytes)})";
+            ? dlPhaseLabel
+            : $"{dlPhaseLabel}  {dlTransferredFiles}/{dlTotalFiles}  ({UiSharedService.ByteToString(dlTransferredBytes, addSuffix: false)}/{UiSharedService.ByteToString(dlTotalBytes)})";
 
         // ===== Build upload aggregate =====
         var uploads = haveUploads ? _fileTransferManager.GetCurrentUploadsSnapshot() : null;
@@ -1169,22 +1143,12 @@ public class DownloadUi : WindowMediatorSubscriberBase
 
             ImGui.Dummy(new Vector2(barW, barH));
 
-            string? hint = null;
+            string? hint = DownloadProgressHints.BuildPhaseList(dlInit, dlQueue, dlProg, dlDecomp);
 
-            void AppendHint(string part)
-            {
-                hint = hint == null ? part : hint + "  •  " + part;
-            }
+            if (string.IsNullOrWhiteSpace(hint) && dlAllPreparing)
+                hint = dlPhaseLabel;
 
-            if (dlInit > 0) AppendHint($"Initializing: {dlInit}");
-            if (dlQueue > 0) AppendHint($"Queued: {dlQueue}");
-            if (dlProg > 0) AppendHint($"Downloading: {dlProg}");
-            if (dlDecomp > 0) AppendHint($"Decompressing: {dlDecomp}");
-
-            if (hint == null && dlAllPreparing)
-                hint = "Preparing...";
-
-            if (hint != null)
+            if (!string.IsNullOrWhiteSpace(hint))
             {
                 var hintSize = ImGui.CalcTextSize(hint);
 
@@ -1335,7 +1299,10 @@ public class DownloadUi : WindowMediatorSubscriberBase
                 var pct = (totalBytes <= 0) ? 0f : (float)(transferredBytes / (double)totalBytes);
                 pct = Math.Clamp(pct, 0f, 1f);
 
-                ImGui.TextUnformatted(string.Format(_uiShared.L("UI.DownloadUi.374a36b2", "{0}  [I:{1}/Q:{2}/P:{3}/D:{4}]"), kv.Key.Name, sInit, sQueue, sProg, sDecomp));
+                var listPhase = DownloadProgressHints.GetPrimaryPhase(sInit, sQueue, sProg, sDecomp);
+                var listPhaseLabel = DownloadProgressHints.GetPhaseLabel(listPhase);
+                var headerText = string.IsNullOrWhiteSpace(listPhaseLabel) ? kv.Key.Name : $"{kv.Key.Name} - {listPhaseLabel}";
+                ImGui.TextUnformatted(headerText);
                 ImGui.SameLine();
                 ImGui.TextDisabled($"{UiSharedService.ByteToString(transferredBytes, addSuffix: false)}/{UiSharedService.ByteToString(totalBytes)}");
 

@@ -5,6 +5,7 @@ using System.IO;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
+using Glamourer.Api.Enums;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using RavaSync.API.Data;
@@ -105,7 +106,7 @@ public sealed partial class PairHandler
                 _nextOwnedObjectCustomizationRetryTick = nowTick + 750;
             }
 
-            public async Task<bool> ApplyCustomizationDataAsync(Guid applicationId, KeyValuePair<ObjectKind, HashSet<PlayerChanges>> changes, CharacterData charaData, bool allowPlayerRedraw, bool forceLightweightMetadataReapply, bool awaitPlayerGlamourerApply, CancellationToken token)
+            public async Task<bool> ApplyCustomizationDataAsync(Guid applicationId, KeyValuePair<ObjectKind, HashSet<PlayerChanges>> changes, CharacterData charaData, bool allowPlayerRedraw, bool forceLightweightMetadataReapply, bool awaitPlayerGlamourerApply, ApplyFlag glamourerApplyFlags, CancellationToken token)
             {
                 if (PlayerCharacter == nint.Zero) return false;
                 var ptr = PlayerCharacter;
@@ -135,7 +136,8 @@ public sealed partial class PairHandler
                     Logger.LogDebug("[{applicationId}] Applying Customization Data for {handler}", applicationId, handler);
                     if (changes.Key != ObjectKind.Player)
                     {
-                        await _dalamudUtil.WaitWhileCharacterIsDrawing(Logger, handler, applicationId, 30000, token).ConfigureAwait(false);
+                        var ownedObjectDrawWaitMs = SyncStorm.IsActive ? 500 : 1500;
+                        await _dalamudUtil.WaitWhileCharacterIsDrawing(Logger, handler, applicationId, ownedObjectDrawWaitMs, token).ConfigureAwait(false);
                         token.ThrowIfCancellationRequested();
                     }
 
@@ -197,7 +199,7 @@ public sealed partial class PairHandler
                                 if (charaData.GlamourerData.TryGetValue(changes.Key, out var glamourerData))
                                 {
                                     var waitForThisGlamourerApply = awaitPlayerGlamourerApply && changes.Key == ObjectKind.Player;
-                                    await _ipcManager.Glamourer.ApplyAllAsync(Logger, handler, glamourerData, applicationId, token, fireAndForget: !waitForThisGlamourerApply).ConfigureAwait(false);
+                                    await _ipcManager.Glamourer.ApplyAllAsync(Logger, handler, glamourerData, applicationId, token, fireAndForget: !waitForThisGlamourerApply, flags: glamourerApplyFlags).ConfigureAwait(false);
                                 }
                                 break;
 

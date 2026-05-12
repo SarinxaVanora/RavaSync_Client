@@ -90,7 +90,7 @@ public class MareConfig : IMareConfiguration
     public bool CacheFolderSubdirMigrationDone { get; set; } = false;
     public HashSet<string> LocalCustomizePlusDisabledUids { get; set; } = new(StringComparer.Ordinal);
     public HashSet<string> LocalHeightMetadataDisabledUids { get; set; } = new(StringComparer.Ordinal);
-    public bool HasUpgradedTransientsSystemV3 { get; set; } = false;
+    public bool HasUpgradedTransientsSystemV02 { get; set; } = false;
     public bool EditGlobalTransferOverlay { get; set; } = false;
     public float GlobalTransferOverlayX { get; set; } = -1f;
     public float GlobalTransferOverlayY { get; set; } = -1f;

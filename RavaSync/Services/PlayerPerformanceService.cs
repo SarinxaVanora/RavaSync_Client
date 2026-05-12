@@ -35,7 +35,9 @@ public class PlayerPerformanceService : MediatorSubscriberBase
     private readonly ConcurrentDictionary<string, (long Bytes, long Stamp)> _modelVramByHash = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, UserData> _autoThresholdPausedUsers = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, UserData> _autoCombatPausedUsers = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, UserData> _autoInstancePausedUsers = new(StringComparer.Ordinal);
     private int _combatPauseActive;
+    private int _instancePauseActive;
 
     // pooled VRAM (bytes) per non-direct (Syncshell) UID
     private readonly ConcurrentDictionary<string, long> _syncshellVramByUid = new(StringComparer.Ordinal);
@@ -95,6 +97,8 @@ public class PlayerPerformanceService : MediatorSubscriberBase
         Mediator.Subscribe<DelayedFrameworkUpdateMessage>(this, _ => TryKickAutoCapStateSave());
         _mediator.Subscribe<CombatOrPerformanceStartMessage>(this, _ => HandleCombatAutoPauseStart());
         _mediator.Subscribe<CombatOrPerformanceEndMessage>(this, _ => HandleCombatAutoPauseEnd());
+        _mediator.Subscribe<InstancedContentStartMessage>(this, _ => HandleInstanceAutoPauseStart());
+        _mediator.Subscribe<InstancedContentEndMessage>(this, _ => HandleInstanceAutoPauseEnd());
         _mediator.Subscribe<ConnectedMessage>(this, _ => HandleConnected());
         _mediator.Subscribe<DisconnectedMessage>(this, _ => ClearPendingThresholdResumeOnConnect());
         _mediator.Subscribe<DelayedFrameworkUpdateMessage>(this, _ => ProcessPendingThresholdResumeOnConnect(Environment.TickCount64));
@@ -206,11 +210,22 @@ public class PlayerPerformanceService : MediatorSubscriberBase
         if (user == null || string.IsNullOrWhiteSpace(user.UID))
             return;
 
+        var changed = false;
+
         if (_autoThresholdPausedUsers.TryRemove(user.UID, out _))
         {
             MarkStateDirty();
-            _mediator.Publish(new RefreshUiMessage());
+            changed = true;
         }
+
+        if (_autoCombatPausedUsers.TryRemove(user.UID, out _))
+            changed = true;
+
+        if (_autoInstancePausedUsers.TryRemove(user.UID, out _))
+            changed = true;
+
+        if (changed)
+            _mediator.Publish(new RefreshUiMessage());
     }
 
     private void PruneRememberedThresholdPausedUsers()
@@ -889,7 +904,7 @@ public class PlayerPerformanceService : MediatorSubscriberBase
         if (string.IsNullOrWhiteSpace(gamePath))
             return false;
 
-        var path = NormalizePerformanceGamePath(gamePath);
+        var path = gamePath.Replace('\\', '/');
 
         var extension = Path.GetExtension(path);
         if (string.IsNullOrWhiteSpace(extension))
@@ -904,17 +919,21 @@ public class PlayerPerformanceService : MediatorSubscriberBase
             return false;
         }
 
+        if (path.StartsWith("vfx/", StringComparison.OrdinalIgnoreCase)
+            || path.StartsWith("bgcommon/vfx/", StringComparison.OrdinalIgnoreCase)
+            || path.StartsWith("sound/", StringComparison.OrdinalIgnoreCase)
+            || path.StartsWith("ui/", StringComparison.OrdinalIgnoreCase)
+            || path.StartsWith("chara/action/", StringComparison.OrdinalIgnoreCase)
+            || path.StartsWith("chara/monster/", StringComparison.OrdinalIgnoreCase)
+            || path.StartsWith("chara/demihuman/", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
         return path.StartsWith("chara/human/", StringComparison.OrdinalIgnoreCase)
             || path.StartsWith("chara/equipment/", StringComparison.OrdinalIgnoreCase)
-            || path.StartsWith("chara/accessory/", StringComparison.OrdinalIgnoreCase);
-    }
-
-    private static string NormalizePerformanceGamePath(string? gamePath)
-    {
-        if (string.IsNullOrWhiteSpace(gamePath))
-            return string.Empty;
-
-        return gamePath.ToLowerInvariant().Replace("\\", "/", StringComparison.OrdinalIgnoreCase);
+            || path.StartsWith("chara/accessory/", StringComparison.OrdinalIgnoreCase)
+            || path.StartsWith("chara/common/", StringComparison.OrdinalIgnoreCase);
     }
 
     private bool IsSemiTransientOnly(ObjectKind objectKind, IEnumerable<string>? gamePaths, Dictionary<ObjectKind, HashSet<string>> semiTransientByKind)
@@ -932,9 +951,7 @@ public class PlayerPerformanceService : MediatorSubscriberBase
         foreach (var gamePath in gamePaths)
         {
             any = true;
-
-            var normalizedGamePath = NormalizePerformanceGamePath(gamePath);
-            if (string.IsNullOrWhiteSpace(normalizedGamePath) || !semiTransientPaths.Contains(normalizedGamePath))
+            if (!semiTransientPaths.Contains(gamePath))
                 return false;
         }
 
@@ -1341,6 +1358,7 @@ public class PlayerPerformanceService : MediatorSubscriberBase
             {
                 if (_autoThresholdPausedUsers.ContainsKey(uid)) continue;
                 if (_autoCapPausedUsers.ContainsKey(uid)) continue;
+                if (_autoInstancePausedUsers.ContainsKey(uid)) continue;
 
                 if (liveByUid.TryGetValue(uid, out var livePair))
                 {
@@ -1358,6 +1376,98 @@ public class PlayerPerformanceService : MediatorSubscriberBase
 
         if (_logger.IsEnabled(LogLevel.Debug))
             _logger.LogDebug("Combat auto-pause: resumed users and cleared list");
+    }
+
+    private void HandleInstanceAutoPauseStart()
+    {
+        var cfg = _playerPerformanceConfigService.Current;
+        if (!cfg.AutoPauseWhileInInstancedContent) return;
+
+        if (Interlocked.Exchange(ref _instancePauseActive, 1) == 1)
+            return;
+
+        _autoInstancePausedUsers.Clear();
+
+        foreach (var pair in EnumerateAllPairs())
+        {
+            try
+            {
+                if (!pair.IsVisible) continue;
+
+                // don't interfere with other-sync ownership
+                if (pair.AutoPausedByOtherSync && !pair.EffectiveOverrideOtherSync) continue;
+
+                // already paused? record combat-paused users so duty can keep them paused after combat ends, but do not touch manual/cap/scope pauses.
+                if (pair.UserPair?.OwnPermissions.IsPaused() ?? false)
+                {
+                    if (_autoCombatPausedUsers.ContainsKey(pair.UserData.UID))
+                        _autoInstancePausedUsers[pair.UserData.UID] = pair.UserData;
+
+                    continue;
+                }
+
+                // if they are paused by cap right now, don't touch
+                if (pair.AutoPausedByCap) continue;
+
+                // ignore list should still apply
+                if (IsIgnored(cfg, pair.UserData)) continue;
+
+                _autoInstancePausedUsers[pair.UserData.UID] = pair.UserData;
+                pair.EnterPausedVanillaState();
+                _mediator.Publish(new PauseMessage(pair.UserData));
+            }
+            catch
+            {
+                // best effort
+            }
+        }
+
+        if (_logger.IsEnabled(LogLevel.Debug))
+            _logger.LogDebug("Instance auto-pause: paused {count} visible users", _autoInstancePausedUsers.Count);
+    }
+
+    private void HandleInstanceAutoPauseEnd()
+    {
+        if (Interlocked.Exchange(ref _instancePauseActive, 0) == 0)
+            return;
+
+        if (_autoInstancePausedUsers.IsEmpty)
+            return;
+
+        var liveByUid = new Dictionary<string, Pair>(StringComparer.Ordinal);
+        foreach (var p in EnumerateAllPairs())
+        {
+            if (p?.UserData?.UID is string uid && !string.IsNullOrEmpty(uid))
+                liveByUid[uid] = p;
+        }
+
+        foreach (var kv in _autoInstancePausedUsers)
+        {
+            var uid = kv.Key;
+            var user = kv.Value;
+
+            try
+            {
+                if (_autoThresholdPausedUsers.ContainsKey(uid)) continue;
+                if (_autoCapPausedUsers.ContainsKey(uid)) continue;
+                if (_autoCombatPausedUsers.ContainsKey(uid)) continue;
+
+                if (liveByUid.TryGetValue(uid, out var livePair))
+                {
+                    if (livePair.AutoPausedByCap) continue;
+                    if (livePair.AutoPausedByOtherSync && !livePair.EffectiveOverrideOtherSync) continue;
+                    if (!(livePair.UserPair?.OwnPermissions.IsPaused() ?? false)) continue;
+                }
+
+                _mediator.Publish(new ResumeMessage(user));
+            }
+            catch { }
+        }
+
+        _autoInstancePausedUsers.Clear();
+
+        if (_logger.IsEnabled(LogLevel.Debug))
+            _logger.LogDebug("Instance auto-pause: resumed users and cleared list");
     }
 
     //Kaia, you fucking idiot. Why awas this making huge calls every tick? WHY. I fixed it, love, your own drunk ass.

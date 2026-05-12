@@ -8,7 +8,7 @@ public partial class FileReplacement
 {
     public FileReplacement(string[] gamePaths, string filePath)
     {
-        GamePaths = gamePaths.Select(g => g.Replace('\\', '/').ToLowerInvariant()).ToHashSet(StringComparer.Ordinal);
+        GamePaths = CharacterDataPushSanitizer.GetServerAcceptedGamePaths(gamePaths).ToHashSet(StringComparer.OrdinalIgnoreCase);
         ResolvedPath = filePath.Replace('\\', '/');
     }
 

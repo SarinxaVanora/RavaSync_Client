@@ -41,12 +41,27 @@ public sealed partial class PairHandler
                         if (obj == null || obj.Address == nint.Zero)
                             return (-1, nint.Zero, false);
 
+                        var localPlayerAddress = _dalamudUtil.GetPlayerPtr();
+                        if (localPlayerAddress != nint.Zero && obj.Address == localPlayerAddress)
+                        {
+                            Logger.LogWarning("[{applicationId}] Refusing to bind remote pair {player}/{uid} to the local player object index {idx}",
+                                applicationId, PlayerName, Pair.UserData.UID, obj.ObjectIndex);
+                            return (-1, nint.Zero, false);
+                        }
+
                         if (!IsExpectedPlayerAddress(obj.Address))
                             return (-1, nint.Zero, false);
 
                         var stablePlayerAddr = ResolveStablePlayerAddress(obj.Address);
                         if (stablePlayerAddr == nint.Zero || !IsExpectedPlayerAddress(stablePlayerAddr))
                             return (-1, nint.Zero, false);
+
+                        if (localPlayerAddress != nint.Zero && stablePlayerAddr == localPlayerAddress)
+                        {
+                            Logger.LogWarning("[{applicationId}] Refusing to bind remote pair {player}/{uid} because the stable owner resolved to the local player",
+                                applicationId, PlayerName, Pair.UserData.UID);
+                            return (-1, nint.Zero, false);
+                        }
 
                         return (obj.ObjectIndex, stablePlayerAddr, true);
                     })
@@ -87,7 +102,13 @@ public sealed partial class PairHandler
 
                 await EnsurePenumbraCollectionAsync().ConfigureAwait(false);
 
-                var ok = await _ipcManager.Penumbra.AssignTemporaryCollectionAsync(Logger, _penumbraCollection, objIndex).ConfigureAwait(false);
+                var ok = await _ipcManager.Penumbra.AssignTemporaryCollectionToVerifiedCharacterAsync(
+                    Logger,
+                    _penumbraCollection,
+                    objIndex,
+                    Pair.Ident,
+                    ownershipAddr,
+                    PlayerName ?? Pair.UserData.AliasOrUID).ConfigureAwait(false);
 
                 if (!ok)
                 {
@@ -105,9 +126,8 @@ public sealed partial class PairHandler
 
                 if (indexChanged && oldIdx.HasValue && oldIdx.Value >= 0)
                 {
-                    Logger.LogDebug("[{applicationId}] ObjectIndex changed {oldIdx} -> {newIdx}; clearing stale state from the old slot if it is no longer owned by {ident}",
-                        applicationId, oldIdx.Value, objIndex, Pair.Ident);
-                    CleanupOldAssignedIndexIfNeeded(oldIdx, applicationId);
+                    Logger.LogDebug("[{applicationId}] ObjectIndex changed {oldIdx} -> {newIdx}; old object index cleanup intentionally skipped. Object indices are volatile and must never be cleared blindly.",
+                        applicationId, oldIdx.Value, objIndex);
                 }
 
                 return (true, needsAssign);

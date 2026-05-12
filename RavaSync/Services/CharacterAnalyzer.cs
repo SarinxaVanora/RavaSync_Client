@@ -108,9 +108,6 @@ public sealed class CharacterAnalyzer : MediatorSubscriberBase, IDisposable
                 if (entry == null)
                     continue;
 
-                if (!ShouldCountForDisplayedPerformance(kv.Key, entry))
-                    continue;
-
                 if (!string.IsNullOrEmpty(entry.Hash) && seenHashes.Add(entry.Hash))
                     vramBytes += Math.Max(0, entry.VramBytes);
 
@@ -309,11 +306,8 @@ public sealed class CharacterAnalyzer : MediatorSubscriberBase, IDisposable
                         Logger.LogWarning(ex, "Could not identify extension for {path}", probePath);
                     }
 
-                    var countsForDisplayedPerformance = ShouldCountForDisplayedPerformance(obj.Key, fileEntry.GamePaths, ext);
-
-                    var isModelEntry = countsForDisplayedPerformance
-                        && (string.Equals(ext, "mdl", StringComparison.OrdinalIgnoreCase)
-                            || (fileEntry.GamePaths?.Any(p => p.EndsWith(".mdl", StringComparison.OrdinalIgnoreCase)) ?? false));
+                    var isModelEntry = string.Equals(ext, "mdl", StringComparison.OrdinalIgnoreCase)
+                        || (fileEntry.GamePaths?.Any(p => p.EndsWith(".mdl", StringComparison.OrdinalIgnoreCase)) ?? false);
 
                     var tris = isModelEntry
                         ? await _xivDataAnalyzer.GetTrianglesByHash(fileEntry.Hash).ConfigureAwait(false)
@@ -322,7 +316,7 @@ public sealed class CharacterAnalyzer : MediatorSubscriberBase, IDisposable
                     long vramBytes = 0;
                     try
                     {
-                        if (countsForDisplayedPerformance && string.Equals(ext, "tex", StringComparison.OrdinalIgnoreCase))
+                        if (string.Equals(ext, "tex", StringComparison.OrdinalIgnoreCase))
                         {
                             foreach (var p in existingPaths)
                             {
@@ -330,7 +324,7 @@ public sealed class CharacterAnalyzer : MediatorSubscriberBase, IDisposable
                                     vramBytes = Math.Max(vramBytes, b);
                             }
                         }
-                        else if (countsForDisplayedPerformance && string.Equals(ext, "mdl", StringComparison.OrdinalIgnoreCase))
+                        else if (string.Equals(ext, "mdl", StringComparison.OrdinalIgnoreCase))
                         {
                             foreach (var p in existingPaths)
                             {
@@ -367,13 +361,10 @@ public sealed class CharacterAnalyzer : MediatorSubscriberBase, IDisposable
             }
 
             var aggregateByHash = new Dictionary<string, (long Triangles, long VramBytes)>(StringComparer.OrdinalIgnoreCase);
-            foreach (var kindData in LastAnalysis)
+            foreach (var kindData in LastAnalysis.Values)
             {
-                foreach (var entry in kindData.Value.Values)
+                foreach (var entry in kindData.Values)
                 {
-                    if (!ShouldCountForDisplayedPerformance(kindData.Key, entry))
-                        continue;
-
                     if (!aggregateByHash.TryGetValue(entry.Hash, out var existing))
                     {
                         aggregateByHash[entry.Hash] = (entry.Triangles, entry.VramBytes);
@@ -476,50 +467,6 @@ public sealed class CharacterAnalyzer : MediatorSubscriberBase, IDisposable
             UiSharedService.ByteToString(LastAnalysis.Values.Sum(c => c.Values.Sum(v => v.OriginalSize))),
             UiSharedService.ByteToString(LastAnalysis.Values.Sum(c => c.Values.Sum(v => v.CompressedSize))));
         Logger.LogInformation("IMPORTANT NOTES:\n\r- For RavaSync up- and downloads only the compressed size is relevant.\n\r- An unusually high total files count beyond 200 and up will also increase your download time to others significantly.");
-    }
-
-
-    private static bool ShouldCountForDisplayedPerformance(ObjectKind objectKind, FileDataEntry? entry)
-    {
-        if (entry == null)
-            return false;
-
-        return ShouldCountForDisplayedPerformance(objectKind, entry.GamePaths, entry.FileType);
-    }
-
-    private static bool ShouldCountForDisplayedPerformance(ObjectKind objectKind, IEnumerable<string>? gamePaths, string? fileType)
-    {
-        if (objectKind != ObjectKind.Player)
-            return false;
-
-        if (gamePaths == null)
-            return false;
-
-        var normalizedFileType = (fileType ?? string.Empty).TrimStart('.');
-
-        if (normalizedFileType.Equals("mdl", StringComparison.OrdinalIgnoreCase))
-            return gamePaths.Any(p => IsDisplayedPerformanceGamePath(p, ".mdl"));
-
-        if (normalizedFileType.Equals("tex", StringComparison.OrdinalIgnoreCase))
-            return gamePaths.Any(p => IsDisplayedPerformanceGamePath(p, ".tex"));
-
-        return false;
-    }
-
-    private static bool IsDisplayedPerformanceGamePath(string? gamePath, string requiredExtension)
-    {
-        if (string.IsNullOrWhiteSpace(gamePath))
-            return false;
-
-        var path = gamePath.ToLowerInvariant().Replace("\\", "/", StringComparison.OrdinalIgnoreCase);
-        var extension = Path.GetExtension(path);
-
-        if (!extension.Equals(requiredExtension, StringComparison.OrdinalIgnoreCase))
-            return false;
-
-        return path.StartsWith("chara/human/", StringComparison.OrdinalIgnoreCase)
-            || path.StartsWith("chara/equipment/", StringComparison.OrdinalIgnoreCase)
-            || path.StartsWith("chara/accessory/", StringComparison.OrdinalIgnoreCase);
     }
 
     private sealed record AggregateMetricsEntry(long VramBytes, long Triangles);

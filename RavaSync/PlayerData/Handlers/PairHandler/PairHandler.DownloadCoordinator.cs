@@ -28,6 +28,11 @@ public sealed partial class PairHandler
 {
     private sealed class DownloadCoordinator : CoordinatorBase
     {
+        private const int PairUploadWaitPollMs = 100;
+        private const int PairUploadWaitLogMs = 1000;
+        private const int PairUploadWaitUiRefreshMs = 250;
+        private const string PairUploadWaitStatusKey = "__pair_upload_wait";
+
         public DownloadCoordinator(PairHandler owner) : base(owner)
         {
         }
@@ -109,98 +114,144 @@ public sealed partial class PairHandler
 
                     toDownloadReplacements = PairApplyUtilities.DeduplicateReplacementsByHash(toDownloadReplacements);
 
-                    Mediator.Publish(new EventMessage(new Event(
-                        PlayerName,
-                        Pair.UserData,
-                        nameof(PairHandler),
-                        EventSeverity.Informational,
-                        $"Starting download for {toDownloadReplacements.Count} files (attempt {attempts}/10)")));
+                    var uploadWaitBlock = await WaitForPairUploadsToFinishBeforeDownloadAsync(applicationBase, toDownloadReplacements, downloadToken).ConfigureAwait(false);
+                    if (uploadWaitBlock != null)
+                        return (uploadWaitBlock, moddedPaths, assetPlan, downloadedAny);
 
-                    var downloadManager = EnsureDownloadManager();
-                    downloadManager.ConfigureFileRepairContext(Pair.UserData.UID, Pair.Ident, charaData.DataHash.Value);
-
-                    var toDownloadFiles = await downloadManager
-                        .InitiateDownloadList(_charaHandler!, toDownloadReplacements, downloadToken)
-                        .ConfigureAwait(false);
-
-                    if (toDownloadFiles != null && toDownloadFiles.Count > 0)
-                        downloadedAny = true;
-
-                    if (toDownloadFiles == null || toDownloadFiles.Count == 0)
-                    {
-                        var recalculatedMissing = RecalculateMissing();
-
-                        if (recalculatedMissing.Count == 0)
-                            break;
-
-                        _downloadManager?.ClearDownload();
-                        _pairDownloadTask = null;
-
-                        var delayMs = Math.Min(4000, 500 * attempts);
-                        await Task.Delay(delayMs, downloadToken).ConfigureAwait(false);
-
-                        previousMissingCount = recalculatedMissing.Count;
-                        toDownloadReplacements = recalculatedMissing;
-                        continue;
-                    }
-
-                    if (!_playerPerformanceService
-                            .ComputeAndAutoPauseOnVRAMUsageThresholds(Owner, charaData, toDownloadFiles, stableDataHash: charaData.DataHash.Value))
-                    {
-                        _downloadManager?.ClearDownload();
-                        ClearPairSyncDownloadStatus();
-                        return (PairSyncCommitResult.ThresholdBlocked("VRAM/data thresholds blocked download/apply"), moddedPaths, assetPlan, downloadedAny);
-                    }
-
-                    var downloadBlock = GetPairSyncExecutionBlockReason($"download files attempt {attempts}");
-                    if (downloadBlock != null)
-                    {
-                        _downloadManager?.ClearDownload();
-                        ClearPairSyncDownloadStatus();
-                        return (downloadBlock, moddedPaths, BuildPairSyncAssetPlanFromResolvedPaths(moddedPaths, toDownloadReplacements, charaData), downloadedAny);
-                    }
-
-                    _pairDownloadTask = downloadManager.DownloadFiles(_charaHandler!, toDownloadReplacements, downloadToken);
+                    SyncStorm.RegisterDownloadQueued();
+                    var downloadLaneQueued = true;
+                    var downloadLane = SyncStorm.IsActive ? StormDownloadSemaphore : NormalDownloadSemaphore;
+                    var downloadLaneAcquired = false;
 
                     try
                     {
-                        await _pairDownloadTask.ConfigureAwait(false);
-                        ClearPairSyncDownloadStatus();
-                    }
-                    catch (OperationCanceledException)
-                    {
-                        ClearPairSyncDownloadStatus();
-                        return (PairSyncCommitResult.Cancelled("download task was cancelled"), moddedPaths, assetPlan, downloadedAny);
-                    }
-                    catch (Exception ex)
-                    {
-                        Logger.LogWarning(ex, "[BASE-{appBase}] Download task failed on attempt {attempt}/10 for {player}",
-                            applicationBase, attempts, PlayerName);
+                        await downloadLane.WaitAsync(downloadToken).ConfigureAwait(false);
+                        downloadLaneAcquired = true;
+                        downloadLaneQueued = false;
+                        SyncStorm.RegisterDownloadStarted();
 
-                        ClearPairSyncDownloadStatus();
+                        var queueBlock = GetPairSyncExecutionBlockReason($"download lane acquired attempt {attempts}");
+                        if (queueBlock != null)
+                            return (queueBlock, moddedPaths, assetPlan, downloadedAny);
 
-                        _downloadManager?.ClearDownload();
-                        _pairDownloadTask = null;
+                        Mediator.Publish(new EventMessage(new Event(
+                            PlayerName,
+                            Pair.UserData,
+                            nameof(PairHandler),
+                            EventSeverity.Informational,
+                            $"Starting download for {toDownloadReplacements.Count} files (attempt {attempts}/10)")));
 
-                        var delayMs = Math.Min(15000, 2000 * attempts);
-                        await Task.Delay(delayMs, downloadToken).ConfigureAwait(false);
+                        var downloadManager = EnsureDownloadManager();
+                        downloadManager.ConfigureFileRepairContext(Pair.UserData.UID, Pair.Ident, charaData.DataHash.Value);
+
+                        var toDownloadFiles = await downloadManager
+                            .InitiateDownloadList(_charaHandler!, toDownloadReplacements, downloadToken)
+                            .ConfigureAwait(false);
+
+                        if (toDownloadFiles != null && toDownloadFiles.Count > 0)
+                            downloadedAny = true;
+
+                        if (toDownloadFiles == null || toDownloadFiles.Count == 0)
+                        {
+                            var recalculatedMissing = RecalculateMissing();
+
+                            if (recalculatedMissing.Count == 0)
+                                break;
+
+                            _downloadManager?.ClearDownload();
+                            _pairDownloadTask = null;
+
+                            if (downloadLaneAcquired)
+                            {
+                                downloadLane.Release();
+                                downloadLaneAcquired = false;
+                                SyncStorm.RegisterDownloadFinished();
+                            }
+
+                            var delayMs = Math.Min(4000, 500 * attempts);
+                            await Task.Delay(delayMs, downloadToken).ConfigureAwait(false);
+
+                            previousMissingCount = recalculatedMissing.Count;
+                            toDownloadReplacements = recalculatedMissing;
+                            continue;
+                        }
+
+                        if (!_playerPerformanceService
+                                .ComputeAndAutoPauseOnVRAMUsageThresholds(Owner, charaData, toDownloadFiles, stableDataHash: charaData.DataHash.Value))
+                        {
+                            _downloadManager?.ClearDownload();
+                            ClearPairSyncDownloadStatus();
+                            return (PairSyncCommitResult.ThresholdBlocked("VRAM/data thresholds blocked download/apply"), moddedPaths, assetPlan, downloadedAny);
+                        }
+
+                        var downloadBlock = GetPairSyncExecutionBlockReason($"download files attempt {attempts}");
+                        if (downloadBlock != null)
+                        {
+                            _downloadManager?.ClearDownload();
+                            ClearPairSyncDownloadStatus();
+                            return (downloadBlock, moddedPaths, BuildPairSyncAssetPlanFromResolvedPaths(moddedPaths, toDownloadReplacements, charaData), downloadedAny);
+                        }
+
+                        _pairDownloadTask = downloadManager.DownloadFiles(_charaHandler!, toDownloadReplacements, downloadToken);
+
+                        try
+                        {
+                            await _pairDownloadTask.ConfigureAwait(false);
+                            ClearPairSyncDownloadStatus();
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            ClearPairSyncDownloadStatus();
+                            return (PairSyncCommitResult.Cancelled("download task was cancelled"), moddedPaths, assetPlan, downloadedAny);
+                        }
+                        catch (Exception ex)
+                        {
+                            Logger.LogWarning(ex, "[BASE-{appBase}] Download task failed on attempt {attempt}/10 for {player}",
+                                applicationBase, attempts, PlayerName);
+
+                            ClearPairSyncDownloadStatus();
+
+                            _downloadManager?.ClearDownload();
+                            _pairDownloadTask = null;
+
+                            if (downloadLaneAcquired)
+                            {
+                                downloadLane.Release();
+                                downloadLaneAcquired = false;
+                                SyncStorm.RegisterDownloadFinished();
+                            }
+
+                            var delayMs = Math.Min(15000, 2000 * attempts);
+                            await Task.Delay(delayMs, downloadToken).ConfigureAwait(false);
+
+                            toDownloadReplacements = RecalculateMissing();
+                            previousMissingCount = toDownloadReplacements.Count;
+                            continue;
+                        }
+
+                        downloadToken.ThrowIfCancellationRequested();
 
                         toDownloadReplacements = RecalculateMissing();
+
+                        if (toDownloadReplacements.Count > 0 && toDownloadReplacements.Count == previousMissingCount && Logger.IsEnabled(LogLevel.Debug))
+                        {
+                            Logger.LogDebug("[BASE-{appBase}] Missing count unchanged after download attempt {attempt}/10 for {player}: still {count}",
+                                applicationBase, attempts, PlayerName, toDownloadReplacements.Count);
+                        }
+
                         previousMissingCount = toDownloadReplacements.Count;
-                        continue;
                     }
-
-                    downloadToken.ThrowIfCancellationRequested();
-
-                    toDownloadReplacements = RecalculateMissing();
-
-                    if (toDownloadReplacements.Count > 0 && toDownloadReplacements.Count == previousMissingCount && Logger.IsEnabled(LogLevel.Debug))
+                    finally
                     {
-                        Logger.LogDebug("[BASE-{appBase}] Missing count unchanged after download attempt {attempt}/10 for {player}: still {count}",
-                            applicationBase, attempts, PlayerName, toDownloadReplacements.Count);
-                    }
+                        if (downloadLaneQueued)
+                            SyncStorm.RegisterDownloadQueueCancelled();
 
-                    previousMissingCount = toDownloadReplacements.Count;
+                        if (downloadLaneAcquired)
+                        {
+                            downloadLane.Release();
+                            SyncStorm.RegisterDownloadFinished();
+                        }
+                    }
                 }
 
                 if (downloadToken.IsCancellationRequested)
@@ -242,14 +293,109 @@ public sealed partial class PairHandler
                         retryImmediately), moddedPaths, BuildPairSyncAssetPlanFromResolvedPaths(moddedPaths, toDownloadReplacements, charaData), downloadedAny);
                 }
 
-                if (!await _playerPerformanceService.CheckBothThresholds(Owner, charaData).ConfigureAwait(false))
-                    return (PairSyncCommitResult.ThresholdBlocked("performance thresholds blocked application after downloads"), moddedPaths, BuildPairSyncAssetPlanFromResolvedPaths(moddedPaths, toDownloadReplacements, charaData), downloadedAny);
+            if (!await _playerPerformanceService.CheckBothThresholds(Owner, charaData).ConfigureAwait(false))
+                return (PairSyncCommitResult.ThresholdBlocked("performance thresholds blocked application after downloads"), moddedPaths, BuildPairSyncAssetPlanFromResolvedPaths(moddedPaths, toDownloadReplacements, charaData), downloadedAny);
 
-                return (null, moddedPaths, BuildPairSyncAssetPlanFromResolvedPaths(moddedPaths, [], charaData), downloadedAny);
+            return (null, moddedPaths, BuildPairSyncAssetPlanFromResolvedPaths(moddedPaths, [], charaData), downloadedAny);
+        }
+
+        private async Task<PairSyncCommitResult?> WaitForPairUploadsToFinishBeforeDownloadAsync(Guid applicationBase, IReadOnlyCollection<FileReplacementData> toDownloadReplacements, CancellationToken downloadToken)
+        {
+            if (!Pair.IsUploadingRecently)
+                return null;
+
+            var startedTick = Environment.TickCount64;
+            var lastLogTick = 0L;
+            var lastUiTick = 0L;
+            var fileCount = Math.Max(1, toDownloadReplacements?.Count ?? 0);
+
+            PublishPairUploadWaitStatus(fileCount);
+
+            Logger.LogDebug(
+                "[BASE-{appBase}] Waiting for {player}'s upload to finish before downloading {count} file(s)",
+                applicationBase,
+                PlayerName,
+                fileCount);
+
+            while (Pair.IsUploadingRecently)
+            {
+                downloadToken.ThrowIfCancellationRequested();
+
+                var block = GetPairSyncExecutionBlockReason("waiting for pair upload to finish before download");
+                if (block != null)
+                {
+                    ClearPairSyncDownloadStatus();
+                    return block;
+                }
+
+                var nowTick = Environment.TickCount64;
+
+                if (unchecked(nowTick - lastLogTick) >= PairUploadWaitLogMs)
+                {
+                    lastLogTick = nowTick;
+                    Logger.LogTrace(
+                        "[BASE-{appBase}] Still waiting for {player}'s upload before downloading; waited {elapsed}ms",
+                        applicationBase,
+                        PlayerName,
+                        unchecked(nowTick - startedTick));
+                }
+
+                if (unchecked(nowTick - lastUiTick) >= PairUploadWaitUiRefreshMs)
+                {
+                    lastUiTick = nowTick;
+                    PublishPairUploadWaitStatus(fileCount);
+                }
+
+                await Task.Delay(PairUploadWaitPollMs, downloadToken).ConfigureAwait(false);
             }
 
-            private async Task<PairSyncCommitResult?> WaitForApplicationCommitSlotAsync(Guid applicationBase, CancellationToken downloadToken)
+            var postWaitBlock = GetPairSyncExecutionBlockReason("pair upload finished before download");
+            if (postWaitBlock != null)
             {
+                ClearPairSyncDownloadStatus();
+                return postWaitBlock;
+            }
+
+            Logger.LogDebug(
+                "[BASE-{appBase}] Pair upload finished for {player}; starting download after {elapsed}ms wait",
+                applicationBase,
+                PlayerName,
+                unchecked(Environment.TickCount64 - startedTick));
+
+            return null;
+        }
+
+        private void PublishPairUploadWaitStatus(int fileCount)
+        {
+            var totalFiles = Math.Max(1, fileCount);
+
+            Pair.SetVisibleTransferStatus(Pair.VisibleTransferIndicator.Downloading);
+            Pair.SetCurrentDownloadSummary(new Pair.DownloadProgressSummary(
+                HasAny: true,
+                AnyDownloading: true,
+                AnyLoading: false,
+                TotalBytes: 0,
+                TransferredBytes: 0,
+                TotalFiles: totalFiles,
+                TransferredFiles: 0));
+
+            Pair.SetCurrentDownloadStatus(new Dictionary<string, FileDownloadStatus>(StringComparer.Ordinal)
+            {
+                [PairUploadWaitStatusKey] = new()
+                {
+                    DownloadStatus = DownloadStatus.WaitingForQueue,
+                    TotalFiles = totalFiles,
+                    TransferredFiles = 0,
+                    TotalBytes = 0,
+                    TransferredBytes = 0,
+                }
+            });
+
+            ScheduleRefreshUi();
+        }
+
+        private async Task<PairSyncCommitResult?> WaitForApplicationCommitSlotAsync(Guid applicationBase, CancellationToken downloadToken)
+        {
                 CancellationToken? appToken;
                 try
                 {
@@ -316,7 +462,7 @@ public sealed partial class PairHandler
                 if (downloadedAny)
                 {
                     var jitterSeed = Math.Abs(PlayerNameHash?.GetHashCode(StringComparison.Ordinal) ?? applicationBase.GetHashCode());
-                    var smoothDelayMs = SyncStorm.IsActive ? 45 + (jitterSeed % 35) : 15 + (jitterSeed % 20);
+                    var smoothDelayMs = SyncStorm.IsActive ? 20 + (jitterSeed % 25) : 8 + (jitterSeed % 15);
                     await Task.Delay(smoothDelayMs, downloadToken).ConfigureAwait(false);
                 }
 

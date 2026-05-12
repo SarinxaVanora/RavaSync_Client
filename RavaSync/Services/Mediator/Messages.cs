@@ -1,4 +1,4 @@
-﻿using Dalamud.Game.ClientState.Objects.SubKinds;
+using Dalamud.Game.ClientState.Objects.SubKinds;
 using Dalamud.Game.ClientState.Objects.Types;
 using RavaSync.API.Data;
 using RavaSync.API.Data.Enum;
@@ -52,6 +52,7 @@ public record PenumbraRedrawMessage(IntPtr Address, int ObjTblIdx, bool WasReque
 public record GlamourerChangedMessage(IntPtr Address) : MessageBase;
 public record HeelsOffsetMessage(string Offset) : MessageBase;
 public record PenumbraResourceLoadMessage(IntPtr GameObject, string GamePath, string FilePath) : SameThreadMessage;
+public record ObservedSupportResourceMessage(ObjectKind ObjectKind, string GamePath, string FilePath, bool IsTransientManaged) : MessageBase;
 public record CustomizePlusMessage(nint? Address) : MessageBase;
 public record HonorificMessage(string NewHonorificTitle) : MessageBase;
 public record MoodlesMessage(IntPtr Address,string MoodlesData) : MessageBase;
@@ -80,7 +81,7 @@ public record HubReconnectingMessage(Exception? Exception) : SameThreadMessage;
 public record HubReconnectedMessage(string? Arg) : SameThreadMessage;
 public record HubClosedMessage(Exception? Exception) : SameThreadMessage;
 public record DownloadReadyMessage(Guid RequestId) : MessageBase;
-public record DownloadStartedMessage(GameObjectHandler DownloadId, Dictionary<string, FileDownloadStatus> DownloadStatus) : MessageBase;
+public record DownloadStartedMessage(GameObjectHandler DownloadId, Dictionary<string, FileDownloadStatus> DownloadStatus, bool CountsTowardGlobal = true) : MessageBase;
 public record DownloadFinishedMessage(GameObjectHandler DownloadId) : MessageBase;
 public record UiToggleMessage(Type UiType) : MessageBase;
 public record RestoreCompactUiStateMessage : MessageBase;
@@ -108,6 +109,8 @@ public record CensusUpdateMessage(byte Gender, byte RaceId, byte TribeId) : Mess
 public record TargetPairMessage(Pair Pair) : MessageBase;
 public record CombatOrPerformanceStartMessage : MessageBase;
 public record CombatOrPerformanceEndMessage : MessageBase;
+public record InstancedContentStartMessage : MessageBase;
+public record InstancedContentEndMessage : MessageBase;
 public record EventMessage(Event Event) : MessageBase;
 public record PenumbraDirectoryChangedMessage(string? ModDirectory) : MessageBase;
 public record PenumbraFileCacheChangedMessage(IReadOnlyCollection<string> Paths) : MessageBase;

@@ -6,6 +6,7 @@ using System.Text.Json;
 using System.Text.Json.Nodes;
 using RavaSync.API.Data;
 using RavaSync.API.Data.Enum;
+using CharacterDataPushSanitizer = RavaSync.PlayerData.Data.CharacterDataPushSanitizer;
 using RavaSync.PlayerData.Services;
 
 namespace RavaSync.Utils;
@@ -91,13 +92,12 @@ public sealed class CharacterRavaSidecarUtility
             foreach (var file in objectFiles.Value ?? [])
             {
                 var hash = file.Hash ?? string.Empty;
-                var fileSwap = file.FileSwapPath ?? string.Empty;
-                foreach (var gamePathRaw in file.GamePaths ?? [])
-                {
-                    var gamePath = NormalizeGamePath(gamePathRaw);
-                    if (string.IsNullOrWhiteSpace(gamePath))
-                        continue;
+                var fileSwap = CharacterDataPushSanitizer.NormalizeGamePathForPush(file.FileSwapPath);
+                if (!CharacterDataPushSanitizer.IsServerAcceptedHash(hash) || !CharacterDataPushSanitizer.IsServerAcceptedFileSwapPath(fileSwap))
+                    continue;
 
+                foreach (var gamePath in CharacterDataPushSanitizer.GetServerAcceptedGamePaths(file.GamePaths))
+                {
                     var kind = ClassifyKind(gamePath, hash, fileSwap);
                     var criticality = ClassifyCriticality(gamePath, kind);
                     assets.Add(new SyncManifestAsset((int)objectFiles.Key, gamePath, hash, fileSwap, kind, criticality));
@@ -133,14 +133,18 @@ public sealed class CharacterRavaSidecarUtility
                 continue;
 
             var objectKind = (ObjectKind)asset.ok;
-            var gamePath = NormalizeGamePath(asset.gp);
-            if (string.IsNullOrWhiteSpace(gamePath))
+            var gamePath = CharacterDataPushSanitizer.NormalizeGamePathForPush(asset.gp);
+            if (!CharacterDataPushSanitizer.IsServerAcceptedGamePath(gamePath))
                 continue;
 
             var hash = asset.h ?? string.Empty;
-            var fileSwap = asset.fs ?? string.Empty;
-            if (string.IsNullOrWhiteSpace(hash) && string.IsNullOrWhiteSpace(fileSwap))
+            var fileSwap = CharacterDataPushSanitizer.NormalizeGamePathForPush(asset.fs);
+            if ((string.IsNullOrWhiteSpace(hash) && string.IsNullOrWhiteSpace(fileSwap))
+                || !CharacterDataPushSanitizer.IsServerAcceptedHash(hash)
+                || !CharacterDataPushSanitizer.IsServerAcceptedFileSwapPath(fileSwap))
+            {
                 continue;
+            }
 
             if (!charaData.FileReplacements.TryGetValue(objectKind, out var replacements) || replacements == null)
             {

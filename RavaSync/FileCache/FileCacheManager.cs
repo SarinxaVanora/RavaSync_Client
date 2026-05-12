@@ -201,15 +201,18 @@ public sealed partial class FileCacheManager : IHostedService
         if (string.IsNullOrEmpty(modDirectory))
             return null;
 
-        var fullName = fi.FullName.ToLowerInvariant();
-        var modDirLower = modDirectory.ToLowerInvariant();
-
-        if (!fullName.Contains(modDirLower, StringComparison.Ordinal))
+        var fullName = fi.FullName;
+        var normalizedModDirectory = Path.GetFullPath(modDirectory).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        var modDirIndex = fullName.IndexOf(normalizedModDirectory, StringComparison.OrdinalIgnoreCase);
+        if (modDirIndex < 0)
             return null;
 
-        string prefixedPath = fullName
-            .Replace(modDirLower, PenumbraPrefix + "\\", StringComparison.Ordinal)
-            .Replace("\\\\", "\\", StringComparison.Ordinal);
+        var suffixStart = modDirIndex + normalizedModDirectory.Length;
+        var suffix = suffixStart < fullName.Length ? fullName[suffixStart..].TrimStart(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) : string.Empty;
+        var prefixedPath = string.IsNullOrEmpty(suffix)
+            ? PenumbraPrefix
+            : PenumbraPrefix + "\\" + suffix;
+        prefixedPath = prefixedPath.Replace("\\\\", "\\", StringComparison.Ordinal);
 
         return CreateFileCacheEntity(fi, prefixedPath);
     }

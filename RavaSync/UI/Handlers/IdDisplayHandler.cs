@@ -123,37 +123,40 @@ public class IdDisplayHandler
             ImGui.SetCursorPosX(textPosX);
             ImGui.SetCursorPosY(startY + line + spacing * 0.25f);
 
-            // If this pair is actively downloading/loading, show progress where VRAM normally sits.
-            // Once downloads finish (PairHandler clears it), this naturally falls back to VRAM.
+            // Compact pair list deliberately uses tiny transfer hints only: UP/DL.
+            // The full overlay/world bars keep the human-readable phase labels.
             var dl = pair.CurrentDownloadSummary;
-            if (dl != null && dl.HasAny)
+            if (pair.IsUploading || (dl != null && dl.HasAny))
             {
-                bool anyDownloading = dl.AnyDownloading;
-                bool anyLoading = dl.AnyLoading;
-                long totalBytes = dl.TotalBytes;
-                long transferredBytes = dl.TransferredBytes;
-                int totalFiles = dl.TotalFiles;
-                int transferredFiles = dl.TransferredFiles;
+                var phase = DownloadProgressHints.GetPrimaryPhase(pair.CurrentDownloadStatus?.Values);
+                var label = DownloadProgressHints.GetCompactPairTransferLabel(pair.IsUploading, phase);
+                if (string.IsNullOrWhiteSpace(label) && dl != null && dl.HasAny)
+                    label = "DL";
 
-                string label = anyLoading && !anyDownloading ? "Loading" : "DL";
+                bool uploadStyle = pair.IsUploading;
+                long totalBytes = dl?.TotalBytes ?? 0;
+                long transferredBytes = dl?.TransferredBytes ?? 0;
+                int totalFiles = dl?.TotalFiles ?? 0;
+                int transferredFiles = dl?.TransferredFiles ?? 0;
+
                 string text;
 
-                if (totalBytes > 0)
+                if (!uploadStyle && totalBytes > 0)
                 {
                     var pct = (double)transferredBytes * 100d / (double)totalBytes;
                     text = $"{label}: {UiSharedService.ByteToString(transferredBytes, addSuffix: true)}/{UiSharedService.ByteToString(totalBytes, addSuffix: true)} ({pct:0}%)";
                 }
-                else if (totalFiles > 0)
+                else if (!uploadStyle && totalFiles > 0)
                 {
                     var pct = (double)transferredFiles * 100d / (double)totalFiles;
                     text = $"{label}: {transferredFiles}/{totalFiles} files ({pct:0}%)";
                 }
                 else
                 {
-                    text = anyLoading ? "Loading files..." : "Downloading...";
+                    text = label;
                 }
 
-                ImGui.PushStyleColor(ImGuiCol.Text, anyLoading ? ImGuiColors.DalamudViolet : ImGuiColors.ParsedBlue);
+                ImGui.PushStyleColor(ImGuiCol.Text, uploadStyle ? ImGuiColors.DalamudYellow : ImGuiColors.ParsedBlue);
                 ImGui.TextUnformatted(text);
                 ImGui.PopStyleColor();
             }

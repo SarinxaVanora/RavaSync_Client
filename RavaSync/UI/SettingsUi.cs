@@ -88,6 +88,9 @@ public class SettingsUi : WindowMediatorSubscriberBase
         { "Français", "fr" },
         { "Español", "es" },
         { "Italiano", "it" },
+        { "Svenska", "sv" },
+        { "Polski", "pl" },
+        { "Nederlands", "nl" },
         { "العربية", "ar" },
         { "日本語", "ja" },
         { "中文", "zh" },
@@ -158,7 +161,7 @@ public class SettingsUi : WindowMediatorSubscriberBase
         Mediator.Subscribe<CharacterDataCreatedMessage>(this, (msg) => LastCreatedCharacterData = msg.CharacterData);
         Mediator.Subscribe<DownloadStartedMessage>(this, (msg) =>
         {
-            if (msg.DownloadId == null) return;
+            if (msg.DownloadId == null || !msg.CountsTowardGlobal) return;
             _currentDownloads[msg.DownloadId] = SnapshotStatus(msg.DownloadStatus);
         });
         Mediator.Subscribe<DownloadFinishedMessage>(this, (msg) =>
@@ -1179,6 +1182,14 @@ public class SettingsUi : WindowMediatorSubscriberBase
             _playerPerformanceConfigService.Save();
         }
         _uiShared.DrawHelpText(_uiShared.L("UI.SettingsUi.AutoPauseWhileInCombat.Help","When enabled, RavaSync will pause all currently visible players when you enter combat, then automatically unpause only those players when combat ends."));
+
+        bool autoPauseInstance = _playerPerformanceConfigService.Current.AutoPauseWhileInInstancedContent;
+        if (ImGui.Checkbox(_uiShared.L("UI.SettingsUi.AutoPauseWhileInInstancedContent", "Auto pause visible players while you are in instanced content"), ref autoPauseInstance))
+        {
+            _playerPerformanceConfigService.Current.AutoPauseWhileInInstancedContent = autoPauseInstance;
+            _playerPerformanceConfigService.Save();
+        }
+        _uiShared.DrawHelpText(_uiShared.L("UI.SettingsUi.AutoPauseWhileInInstancedContent.Help", "When enabled, RavaSync will pause all currently visible players when you enter a duty, trial, raid, alliance raid, or other content, then automatically unpause those players when you leave."));
 
         bool showPerformanceIndicator = _playerPerformanceConfigService.Current.ShowPerformanceIndicator;
         if (ImGui.Checkbox(_uiShared.L("UI.SettingsUi.32ca13f6", "Show performance indicator"), ref showPerformanceIndicator))

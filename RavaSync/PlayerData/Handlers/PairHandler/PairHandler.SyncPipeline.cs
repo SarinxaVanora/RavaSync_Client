@@ -171,15 +171,14 @@ public sealed partial class PairHandler
 
     private sealed record PairSyncAssetEntry(ObjectKind ObjectKind, string GamePath, string? Hash, string ResolvedPath, PairSyncAssetKind Kind, PairSyncAssetCriticality Criticality);
 
-    private sealed record PairSyncAssetPlan(Dictionary<(string GamePath, string? Hash), string> ModdedPaths, List<FileReplacementData> MissingFiles, List<PairSyncAssetEntry> Entries, HashSet<string> UniqueHashes, List<string> PrimeTransientPaths, List<string> TransientSupportPaths, bool ContainsAnimationCritical, bool ContainsVfxCritical, bool ContainsVfxPropSupport, string TempModsFingerprint, string TransientSupportFingerprint)
+    private sealed record PairSyncAssetPlan(Dictionary<(string GamePath, string? Hash), string> ModdedPaths, List<FileReplacementData> MissingFiles, List<PairSyncAssetEntry> Entries, HashSet<string> UniqueHashes, List<string> PrimeTransientPaths, Dictionary<ObjectKind, List<string>> PrimeTransientPathsByKind, List<string> TransientSupportPaths, bool ContainsAnimationCritical, bool ContainsVfxCritical, bool ContainsVfxPropSupport, string TempModsFingerprint, string TransientSupportFingerprint)
     {
-        public static PairSyncAssetPlan Empty { get; } = new([], [], [], new(StringComparer.OrdinalIgnoreCase), [], [], false, false, false, "EMPTY", "EMPTY");
+        public static PairSyncAssetPlan Empty { get; } = new([], [], [], new(StringComparer.OrdinalIgnoreCase), [], new(), [], false, false, false, "EMPTY", "EMPTY");
         public bool HasAssets => Entries.Count > 0;
         public bool HasMissingFiles => MissingFiles.Count > 0;
-        public bool RequiresTransientPrime => PrimeTransientPaths.Count > 0;
-        public bool RequiresFirstUseTransientWarmup => ContainsAnimationCritical || ContainsVfxCritical || PrimeTransientPaths.Count > 0 || TransientSupportPaths.Count > 0;
-        public bool RequiresFirstUseModelSupportWarmup => (ContainsAnimationCritical || ContainsVfxCritical) && TransientSupportPaths.Count > 0;
-        public bool RequiresTransientSupportRefresh(string? lastAppliedTransientSupportFingerprint) => (ContainsAnimationCritical || ContainsVfxCritical) && ContainsVfxPropSupport && !string.Equals(TransientSupportFingerprint, lastAppliedTransientSupportFingerprint, StringComparison.Ordinal);
+        public bool RequiresTransientPrime => PrimeTransientPathsByKind.Count > 0;
+        public bool RequiresFirstUseTransientWarmup => ContainsAnimationCritical || ContainsVfxCritical || ContainsVfxPropSupport || PrimeTransientPathsByKind.Count > 0 || TransientSupportPaths.Count > 0;
+        public bool RequiresTransientSupportRefresh(string? lastAppliedTransientSupportFingerprint) => ContainsVfxPropSupport && !string.Equals(TransientSupportFingerprint, lastAppliedTransientSupportFingerprint, StringComparison.Ordinal);
     }
 
     private sealed record PairSyncReadiness(bool Ready, bool RetryImmediately, string Reason, ActorBinding? Binding, ApplyFrameworkSnapshot? Snapshot)
@@ -861,6 +860,8 @@ public sealed partial class PairHandler
         if (!lifecycleRedrawRequested)
             SuppressNonLifecyclePlayerForcedRedraw(updatedData, request.ApplicationBase);
 
+        EnsureNonPlayerRedrawChangesForCriticalAssets(updatedData, assetPlan);
+
         if (!updatedData.Any())
             return PairSyncPlanBuildResult.NoOp("no player changes detected");
 
@@ -902,7 +903,6 @@ public sealed partial class PairHandler
 
     private static bool RequiresAppearanceFileReadyGate(Dictionary<ObjectKind, HashSet<PlayerChanges>> updatedData)
         => updatedData.Values.Any(v => v.Contains(PlayerChanges.ModFiles)
-            || v.Contains(PlayerChanges.Glamourer)
             || v.Contains(PlayerChanges.Customize)
             || v.Contains(PlayerChanges.ModManip));
 
@@ -921,6 +921,42 @@ public sealed partial class PairHandler
 
         if (playerChanges.Count == 0)
             updatedData.Remove(ObjectKind.Player);
+    }
+
+    private static void EnsureNonPlayerRedrawChangesForCriticalAssets(Dictionary<ObjectKind, HashSet<PlayerChanges>> updatedData, PairSyncAssetPlan assetPlan)
+    {
+        if (!assetPlan.HasAssets)
+            return;
+
+        foreach (var objectKind in assetPlan.Entries
+            .Where(static entry => IsNonPlayerRedrawCriticalAsset(entry))
+            .Select(static entry => entry.ObjectKind)
+            .Distinct())
+        {
+            if (!updatedData.TryGetValue(objectKind, out var changes))
+            {
+                changes = [];
+                updatedData[objectKind] = changes;
+            }
+
+            changes.Add(PlayerChanges.ModFiles);
+            changes.Add(PlayerChanges.ForcedRedraw);
+        }
+    }
+
+    private static bool IsNonPlayerRedrawCriticalAsset(PairSyncAssetEntry entry)
+    {
+        if (entry.ObjectKind == ObjectKind.Player)
+            return false;
+
+        if (entry.Criticality == PairSyncAssetCriticality.AppearanceCritical)
+            return true;
+
+        if (entry.Kind == PairSyncAssetKind.Sound)
+            return true;
+
+        return PairApplyUtilities.IsTransientRedrawCriticalGamePath(entry.GamePath)
+            || PairApplyUtilities.IsSkeletonOrPhysicsCriticalGamePath(entry.GamePath);
     }
 
     private static string DescribeUpdatedChanges(Dictionary<ObjectKind, HashSet<PlayerChanges>> updatedData)
@@ -970,20 +1006,26 @@ public sealed partial class PairHandler
         }
 
         var primeTransientPaths = new List<string>();
+        var primeTransientPathsByKind = new Dictionary<ObjectKind, HashSet<string>>();
         var transientSupportPaths = new List<string>();
 
         if (containsAnimationCritical || containsVfxCritical)
         {
             foreach (var entry in entries)
             {
+                var isPropSupport = PairApplyUtilities.IsVfxPropSupportGamePath(entry.GamePath);
                 if (entry.Criticality == PairSyncAssetCriticality.AnimationCritical
                     || entry.Criticality == PairSyncAssetCriticality.VfxCritical
+                    || isPropSupport
                     || (containsVfxCritical && PairApplyUtilities.IsVfxModelSupportGamePath(entry.GamePath)))
                 {
                     primeTransientPaths.Add(entry.GamePath);
+                    if (!primeTransientPathsByKind.TryGetValue(entry.ObjectKind, out var byKindSet))
+                        primeTransientPathsByKind[entry.ObjectKind] = byKindSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    byKindSet.Add(entry.GamePath);
                 }
 
-                if (PairApplyUtilities.IsVfxPropSupportGamePath(entry.GamePath))
+                if (isPropSupport)
                     transientSupportPaths.Add(entry.GamePath);
             }
         }
@@ -992,7 +1034,13 @@ public sealed partial class PairHandler
             foreach (var entry in entries)
             {
                 if (PairApplyUtilities.IsVfxPropSupportGamePath(entry.GamePath))
+                {
+                    primeTransientPaths.Add(entry.GamePath);
+                    if (!primeTransientPathsByKind.TryGetValue(entry.ObjectKind, out var byKindSet))
+                        primeTransientPathsByKind[entry.ObjectKind] = byKindSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    byKindSet.Add(entry.GamePath);
                     transientSupportPaths.Add(entry.GamePath);
+                }
             }
         }
 
@@ -1002,7 +1050,11 @@ public sealed partial class PairHandler
         var tempMods = PairApplyUtilities.BuildPenumbraTempMods(moddedPaths);
         var tempModsFingerprint = PairApplyUtilities.ComputeTempModsFingerprint(tempMods);
         var transientSupportFingerprint = PairApplyUtilities.ComputePathSetFingerprint(transientSupportPaths);
-        return new PairSyncAssetPlan(moddedPaths, missingFiles?.ToList() ?? [], entries, uniqueHashes, primeTransientPaths, transientSupportPaths, containsAnimationCritical, containsVfxCritical, containsVfxPropSupport, tempModsFingerprint, transientSupportFingerprint);
+        var finalizedPrimeTransientPathsByKind = primeTransientPathsByKind.ToDictionary(
+            kvp => kvp.Key,
+            kvp => kvp.Value.OrderBy(static p => p, StringComparer.OrdinalIgnoreCase).ToList());
+
+        return new PairSyncAssetPlan(moddedPaths, missingFiles?.ToList() ?? [], entries, uniqueHashes, primeTransientPaths, finalizedPrimeTransientPathsByKind, transientSupportPaths, containsAnimationCritical, containsVfxCritical, containsVfxPropSupport, tempModsFingerprint, transientSupportFingerprint);
     }
 
     private static Dictionary<string, ObjectKind> BuildPairSyncObjectKindLookup(CharacterData charaData)

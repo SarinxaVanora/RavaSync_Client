@@ -1,4 +1,5 @@
 using RavaSync.API.Data.Enum;
+using RavaSync.FileCache;
 using RavaSync.PlayerData.Data;
 using RavaSync.PlayerData.Factories;
 using RavaSync.PlayerData.Handlers;
@@ -17,6 +18,7 @@ public sealed class CacheCreationService : DisposableMediatorSubscriberBase
     private readonly DalamudUtilService _dalamudUtil;
     private readonly PlayerDataFactory _characterDataFactory;
     private readonly LocalPapSafetyModService _localPapSafetyModService;
+    private readonly TransientResourceManager _transientResourceManager;
     private readonly HashSet<ObjectKind> _currentlyCreating = [];
     private readonly HashSet<ObjectKind> _debouncedObjectCache = [];
     private readonly Dictionary<ObjectKind, HashSet<string>> _debouncedReasons = [];
@@ -46,20 +48,24 @@ public sealed class CacheCreationService : DisposableMediatorSubscriberBase
     private static readonly TimeSpan PenumbraTransientFollowWindow = TimeSpan.FromSeconds(5);
     private static readonly TimeSpan InitialPenumbraTransientSettleWindow = TimeSpan.FromSeconds(10);
     private static readonly TimeSpan StartupImmediatePublishSettleWindow = TimeSpan.FromSeconds(4);
-    private static readonly TimeSpan ConnectedImmediatePublishSettleWindow = TimeSpan.FromSeconds(3);
-    private static readonly TimeSpan FastPlayerAppearanceDelay = TimeSpan.FromMilliseconds(25);
-    private static readonly TimeSpan DefaultBuildDelay = TimeSpan.FromMilliseconds(75);
-    private static readonly TimeSpan ImmediatePlayerPublishCoalesceDelay = TimeSpan.FromMilliseconds(250);
-    private static readonly TimeSpan ImmediatePlayerPublishCooldown = TimeSpan.FromMilliseconds(350);
-    private static readonly TimeSpan ImmediatePlayerPublishSettleWindow = TimeSpan.FromMilliseconds(900);
+    private static readonly TimeSpan ConnectedImmediatePublishSettleWindow = TimeSpan.Zero;
+    private static readonly TimeSpan FastPlayerAppearanceDelay = TimeSpan.FromMilliseconds(750);
+    private static readonly TimeSpan DefaultBuildDelay = TimeSpan.FromMilliseconds(250);
+    private static readonly TimeSpan ImmediatePlayerPublishCoalesceDelay = TimeSpan.FromMilliseconds(1500);
+    private static readonly TimeSpan ImmediatePlayerPublishCooldown = TimeSpan.FromMilliseconds(1500);
+    private static readonly TimeSpan ImmediatePlayerPublishSettleWindow = TimeSpan.FromMilliseconds(2000);
+    private static readonly TimeSpan TransientResourceImmediateCoalesceDelay = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan TransientResourceImmediateCooldown = TimeSpan.FromSeconds(5);
     private static readonly TimeSpan PenumbraModSettingSettleDelay = TimeSpan.FromMilliseconds(1000);
 
     public CacheCreationService(ILogger<CacheCreationService> logger, MareMediator mediator, GameObjectHandlerFactory gameObjectHandlerFactory,
-        PlayerDataFactory characterDataFactory, DalamudUtilService dalamudUtil, LocalPapSafetyModService localPapSafetyModService) : base(logger, mediator)
+        PlayerDataFactory characterDataFactory, DalamudUtilService dalamudUtil, LocalPapSafetyModService localPapSafetyModService,
+        TransientResourceManager transientResourceManager) : base(logger, mediator)
     {
         _characterDataFactory = characterDataFactory;
         _dalamudUtil = dalamudUtil;
         _localPapSafetyModService = localPapSafetyModService;
+        _transientResourceManager = transientResourceManager;
 
         Mediator.Subscribe<ZoneSwitchStartMessage>(this, (msg) => _isZoning = true);
         Mediator.Subscribe<ZoneSwitchEndMessage>(this, (msg) => _isZoning = false);
@@ -71,6 +77,9 @@ public sealed class CacheCreationService : DisposableMediatorSubscriberBase
 
         Mediator.Subscribe<CreateCacheForObjectMessage>(this, (msg) =>
         {
+            if (!IsOwnedTrackedObjectHandler(msg.ObjectToCreateFor))
+                return;
+
             if (msg.ObjectToCreateFor.ObjectKind == ObjectKind.Player)
             {
                 if (IsPlayerAppearanceSignalReason(msg.Reason))
@@ -99,6 +108,7 @@ public sealed class CacheCreationService : DisposableMediatorSubscriberBase
         Mediator.Subscribe<ImmediatePlayerStatePublishMessage>(this, (msg) =>
         {
             if (msg.ObjectToCreateFor.ObjectKind != ObjectKind.Player) return;
+            if (!IsOwnedTrackedObjectHandler(msg.ObjectToCreateFor)) return;
             if (_isZoning || _haltCharaDataCreation) return;
 
             QueueImmediatePlayerPublish(msg.ObjectToCreateFor, msg.Reason);
@@ -119,7 +129,21 @@ public sealed class CacheCreationService : DisposableMediatorSubscriberBase
             var playerHandler = _playerRelatedObjects[ObjectKind.Player];
             if (playerHandler.Address != IntPtr.Zero)
             {
-                ScheduleImmediatePlayerFollowUpBuild("Connected:InitialPlayerState", ConnectedImmediatePublishSettleWindow);
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        await PublishPlayerStateImmediatelyAsync(playerHandler, "Connected:ImmediatePlayerState", _runtimeCts.Token, forceOutbound: true).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        // reconnect publish was superseded or the plugin is shutting down
+                    }
+                }, _runtimeCts.Token);
+
+                // Keep a tiny follow-up so late IPC/plugin settle can still correct the state,
+                // but do not make the first reconnect push depend on that settled pass.
+                ScheduleImmediatePlayerFollowUpBuild("Connected:SettledPlayerState", TimeSpan.FromSeconds(1));
             }
 
             AddCacheToCreate(ObjectKind.Pet, "Connected:InitialState");
@@ -137,6 +161,9 @@ public sealed class CacheCreationService : DisposableMediatorSubscriberBase
 
         Mediator.Subscribe<ClearCacheForObjectMessage>(this, (msg) =>
         {
+            if (!IsOwnedTrackedObjectHandler(msg.ObjectToCreateFor))
+                return;
+
             if (msg.ObjectToCreateFor.ObjectKind == ObjectKind.Pet)
             {
                 return;
@@ -220,6 +247,7 @@ public sealed class CacheCreationService : DisposableMediatorSubscriberBase
         Mediator.Subscribe<PenumbraModSettingChangedMessage>(this, (msg) =>
         {
             if (_isZoning || _haltCharaDataCreation) return;
+            if (LocalPapSafetyModService.IsRavaSyncInternalTemporaryModIdentifier(msg.ModName)) return;
             if (_localPapSafetyModService.IsManagedRuntimeModIdentifierForCurrentRoot(msg.ModName)) return;
 
             var playerHandler = _playerRelatedObjects[ObjectKind.Player];
@@ -240,20 +268,22 @@ public sealed class CacheCreationService : DisposableMediatorSubscriberBase
                     if (!await IsPenumbraModSettingChangeForLocalPlayerCollectionAsync(msg, penumbraToken).ConfigureAwait(false))
                         return;
 
-                    if (_localPapSafetyModService.ModMayContainHumanAnimationPapPayload(msg.ModName, penumbraToken))
-                    {
-                        await Task.Delay(PenumbraModSettingSettleDelay, penumbraToken).ConfigureAwait(false);
-
-                        if (_isZoning || _haltCharaDataCreation || playerHandler.Address == IntPtr.Zero)
-                            return;
-
-                        await _characterDataFactory.RefreshLocalPlayerConvertedAnimationPackAsync(playerHandler, penumbraToken).ConfigureAwait(false);
-                    }
+                    await Task.Delay(PenumbraModSettingSettleDelay, penumbraToken).ConfigureAwait(false);
 
                     if (_isZoning || _haltCharaDataCreation || playerHandler.Address == IntPtr.Zero)
                         return;
 
-                    QueueImmediatePlayerPublish(playerHandler, "PenumbraModSettingChanged");
+                    var runtimeChanged = false;
+                    if (_localPapSafetyModService.ModMayContainHumanAnimationPapPayload(msg.ModName, penumbraToken))
+                        runtimeChanged = await _characterDataFactory.RefreshLocalPlayerConvertedAnimationPackAsync(playerHandler, penumbraToken).ConfigureAwait(false);
+
+                    if (runtimeChanged)
+                    {
+                        Logger.LogDebug("Local Penumbra mod-setting change for {mod} refreshed the converted animation runtime pack; redraw-triggered publish will carry the settled state", msg.ModName);
+                        return;
+                    }
+
+                    QueueImmediatePlayerPublish(playerHandler, "PenumbraModSettingChanged:PlayerState");
                 }
                 catch (OperationCanceledException)
                 {
@@ -261,9 +291,7 @@ public sealed class CacheCreationService : DisposableMediatorSubscriberBase
                 }
                 catch (Exception ex)
                 {
-                    Logger.LogDebug(ex, "Failed to process local Penumbra mod-setting change; falling back to the normal immediate publish queue");
-                    if (!_isZoning && !_haltCharaDataCreation && playerHandler.Address != IntPtr.Zero)
-                        QueueImmediatePlayerPublish(playerHandler, "PenumbraModSettingChanged");
+                    Logger.LogDebug(ex, "Failed to process local Penumbra mod-setting converted-animation refresh for {mod}", msg.ModName);
                 }
             }, penumbraToken);
         });
@@ -272,8 +300,9 @@ public sealed class CacheCreationService : DisposableMediatorSubscriberBase
         {
             if (_isZoning || _haltCharaDataCreation) return;
             if (msg.Paths != null && msg.Paths.Count > 0 && msg.Paths.All(_localPapSafetyModService.IsManagedRuntimePapPath)) return;
+            if (!PenumbraFileCacheChangeTouchesCurrentLocalData(msg.Paths)) return;
 
-            _localPapSafetyModService.InvalidateSelectedAnimationSupportCache();
+            //_localPapSafetyModService.InvalidateSelectedAnimationSupportCache();
 
             var playerHandler = _playerRelatedObjects[ObjectKind.Player];
             if (playerHandler.Address == IntPtr.Zero) return;
@@ -301,6 +330,65 @@ public sealed class CacheCreationService : DisposableMediatorSubscriberBase
         _penumbraModSettingPublishCts.Dispose();
         _creationCts.Cancel();
         _creationCts.Dispose();
+    }
+
+    private bool IsOwnedTrackedObjectHandler(GameObjectHandler? handler)
+    {
+        if (handler == null)
+            return false;
+
+        return _playerRelatedObjects.TryGetValue(handler.ObjectKind, out var trackedHandler)
+            && ReferenceEquals(trackedHandler, handler);
+    }
+
+    private bool PenumbraFileCacheChangeTouchesCurrentLocalData(IReadOnlyCollection<string>? changedPaths)
+    {
+        if (changedPaths == null || changedPaths.Count == 0)
+            return true;
+
+        var changedFullPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var changedPath in changedPaths)
+        {
+            var normalized = NormalizeFullPathOrEmpty(changedPath);
+            if (!string.IsNullOrWhiteSpace(normalized))
+                changedFullPaths.Add(normalized);
+        }
+
+        if (changedFullPaths.Count == 0)
+            return true;
+
+        foreach (var replacementSet in _playerData.FileReplacements.Values)
+        {
+            if (replacementSet == null)
+                continue;
+
+            foreach (var replacement in replacementSet)
+            {
+                var resolvedPath = NormalizeFullPathOrEmpty(replacement.ResolvedPath);
+                if (!string.IsNullOrWhiteSpace(resolvedPath) && changedFullPaths.Contains(resolvedPath))
+                    return true;
+            }
+        }
+
+        if (Logger.IsEnabled(LogLevel.Trace))
+            Logger.LogTrace("Ignoring Penumbra file-cache change because none of the changed files are in current local outbound data: {count} changed path(s)", changedFullPaths.Count);
+
+        return false;
+    }
+
+    private static string NormalizeFullPathOrEmpty(string? path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+            return string.Empty;
+
+        try
+        {
+            return Path.GetFullPath(path).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        }
+        catch
+        {
+            return path.Replace('/', Path.DirectorySeparatorChar).Replace('\\', Path.DirectorySeparatorChar).Trim();
+        }
     }
 
     private void NotePlayerAppearanceSignal()
@@ -423,14 +511,27 @@ public sealed class CacheCreationService : DisposableMediatorSubscriberBase
 
     private static bool IsPlayerAppearanceSignalReason(string? reason)
     {
-        if (string.IsNullOrEmpty(reason)) return false;
+        return IsFastPlayerAppearanceReason(reason);
+    }
 
-        return reason.StartsWith("GameObject:SemanticDiff", StringComparison.Ordinal)
-            || string.Equals(reason, "GameObject:TransientResourceChanged", StringComparison.Ordinal)
-            || reason.StartsWith("PenumbraModSettingChanged", StringComparison.Ordinal)
-            || reason.StartsWith("CustomizePlus:", StringComparison.Ordinal)
-            || reason.StartsWith("Glamourer:", StringComparison.Ordinal)
-            || reason.StartsWith("ClassJobChanged:", StringComparison.Ordinal);
+    private static bool IsTransientResourceChangedReason(string? reason)
+    {
+        return string.Equals(reason, "GameObject:TransientResourceChanged", StringComparison.Ordinal)
+            || string.Equals(reason, "ImmediateFollowUp:GameObject:TransientResourceChanged", StringComparison.Ordinal);
+    }
+
+    private static TimeSpan GetImmediatePlayerPublishCoalesceDelay(string? reason)
+    {
+        return IsTransientResourceChangedReason(reason)
+            ? TransientResourceImmediateCoalesceDelay
+            : ImmediatePlayerPublishCoalesceDelay;
+    }
+
+    private static TimeSpan GetImmediatePlayerPublishCooldown(string? reason)
+    {
+        return IsTransientResourceChangedReason(reason)
+            ? TransientResourceImmediateCooldown
+            : ImmediatePlayerPublishCooldown;
     }
 
     private static bool IsFastPlayerAppearanceReason(string? reason)
@@ -451,15 +552,7 @@ public sealed class CacheCreationService : DisposableMediatorSubscriberBase
 
     private static bool ShouldUseImmediatePlayerPublishOnly(string? reason)
     {
-        if (string.IsNullOrEmpty(reason))
-            return false;
-
-        return string.Equals(reason, "GameObject:TransientResourceChanged", StringComparison.Ordinal)
-            || reason.StartsWith("PenumbraModSettingChanged", StringComparison.Ordinal)
-            || string.Equals(reason, "PenumbraFileCacheChanged", StringComparison.Ordinal)
-            || reason.StartsWith("CustomizePlus:", StringComparison.Ordinal)
-            || reason.StartsWith("Glamourer:", StringComparison.Ordinal)
-            || reason.StartsWith("ClassJobChanged:", StringComparison.Ordinal);
+        return IsFastPlayerAppearanceReason(reason);
     }
 
     private static bool IsPureFastPlayerAppearanceReasonSet(IReadOnlyCollection<string> reasons)
@@ -520,6 +613,9 @@ public sealed class CacheCreationService : DisposableMediatorSubscriberBase
 
     private static TimeSpan GetDebounceDelay(ObjectKind kind, string? reason)
     {
+        if (SyncStorm.IsActive)
+            return kind == ObjectKind.Player ? TimeSpan.FromMilliseconds(2500) : TimeSpan.FromMilliseconds(1000);
+
         if (kind == ObjectKind.Player && IsFastPlayerAppearanceReason(reason))
             return FastPlayerAppearanceDelay;
 
@@ -667,15 +763,19 @@ public sealed class CacheCreationService : DisposableMediatorSubscriberBase
                 var immediatePublishInFlight = _immediatePublishLock.CurrentCount == 0;
                 if (immediatePublishInFlight)
                 {
-                    _pendingImmediatePlayerFollowUp = true;
-                    _pendingImmediatePlayerFollowUpReason = reason;
+                    if (Logger.IsEnabled(LogLevel.Trace))
+                        Logger.LogTrace("Ignoring fast player publish follow-up for {reason} because an immediate player publish is already in flight", reason);
+
                     return;
                 }
 
+                var cooldown = GetImmediatePlayerPublishCooldown(reason);
+                var coalesceDelay = GetImmediatePlayerPublishCoalesceDelay(reason);
+
                 var timeSinceLastImmediatePublish = DateTime.UtcNow - _lastImmediatePlayerPublishUtc;
-                delay = timeSinceLastImmediatePublish <= ImmediatePlayerPublishCooldown
-                    ? ImmediatePlayerPublishCooldown - timeSinceLastImmediatePublish
-                    : ImmediatePlayerPublishCoalesceDelay;
+                delay = timeSinceLastImmediatePublish <= cooldown
+                    ? cooldown - timeSinceLastImmediatePublish
+                    : coalesceDelay;
             }
 
             ScheduleCoalescedImmediatePlayerPublish(objectToCreateFor, reason, delay);
@@ -735,13 +835,19 @@ public sealed class CacheCreationService : DisposableMediatorSubscriberBase
         NotePlayerAppearanceSignal();
 
         var queueFollowUpBuild = false;
+        var publishedPlayerState = false;
         string followUpReason = reason;
 
         await _immediatePublishLock.WaitAsync(token).ConfigureAwait(false);
         try
         {
-            var fragment = await BuildLocalPlayerFragmentAsync(objectToCreateFor, token).ConfigureAwait(false);
+            if (ShouldSkipObservedTransientPlayerBuild(reason))
+                return;
+
+            var fragment = await BuildLocalPlayerFragmentAsync(objectToCreateFor, reason, token).ConfigureAwait(false);
+            var hasChanges = HasFragmentStateChanged(ObjectKind.Player, fragment);
             _playerData.SetFragment(ObjectKind.Player, fragment);
+            SyncObservedSupportState(ObjectKind.Player, fragment);
 
             lock (_cacheCreateLockObj)
             {
@@ -753,7 +859,16 @@ public sealed class CacheCreationService : DisposableMediatorSubscriberBase
                     _activeReasons.Remove(ObjectKind.Player);
             }
 
-            Mediator.Publish(new CharacterDataCreatedMessage(_playerData.ToAPI(), forceOutbound, reason));
+            if (!hasChanges && !forceOutbound)
+                return;
+
+            var effectiveForceOutbound = forceOutbound;
+
+            if (!hasChanges && forceOutbound && Logger.IsEnabled(LogLevel.Debug))
+                Logger.LogDebug("Force-publishing unchanged local player state for reason {reason}", reason);
+
+            Mediator.Publish(new CharacterDataCreatedMessage(_playerData.ToAPI(), effectiveForceOutbound, reason));
+            publishedPlayerState = true;
         }
         catch (OperationCanceledException)
         {
@@ -766,10 +881,13 @@ public sealed class CacheCreationService : DisposableMediatorSubscriberBase
         {
             lock (_cacheCreateLockObj)
             {
-                _lastImmediatePlayerPublishUtc = DateTime.UtcNow;
-                var suppressUntil = _lastImmediatePlayerPublishUtc + ImmediatePlayerPublishSettleWindow;
-                if (suppressUntil > _suppressFastPlayerBuildsUntilUtc)
-                    _suppressFastPlayerBuildsUntilUtc = suppressUntil;
+                if (publishedPlayerState)
+                {
+                    _lastImmediatePlayerPublishUtc = DateTime.UtcNow;
+                    var suppressUntil = _lastImmediatePlayerPublishUtc + ImmediatePlayerPublishSettleWindow;
+                    if (suppressUntil > _suppressFastPlayerBuildsUntilUtc)
+                        _suppressFastPlayerBuildsUntilUtc = suppressUntil;
+                }
 
                 queueFollowUpBuild = _pendingImmediatePlayerFollowUp;
                 if (!string.IsNullOrWhiteSpace(_pendingImmediatePlayerFollowUpReason))
@@ -784,7 +902,16 @@ public sealed class CacheCreationService : DisposableMediatorSubscriberBase
 
         if (queueFollowUpBuild && !_isZoning && !_haltCharaDataCreation)
         {
-            ScheduleCoalescedImmediatePlayerPublish(objectToCreateFor, $"ImmediateFollowUp:{followUpReason}", ImmediatePlayerPublishCooldown);
+            if (IsFastPlayerAppearanceReason(followUpReason))
+            {
+                if (Logger.IsEnabled(LogLevel.Trace))
+                    Logger.LogTrace("Suppressing fast immediate player follow-up for {reason}; the coalesced publish already captured the settled state", followUpReason);
+
+                return;
+            }
+
+            var followUpReasonText = $"ImmediateFollowUp:{followUpReason}";
+            ScheduleCoalescedImmediatePlayerPublish(objectToCreateFor, followUpReasonText, GetImmediatePlayerPublishCooldown(followUpReasonText));
         }
     }
 
@@ -883,9 +1010,77 @@ public sealed class CacheCreationService : DisposableMediatorSubscriberBase
         });
     }
 
-    private async Task<CharacterDataFragmentPlayer?> BuildLocalPlayerFragmentAsync(GameObjectHandler playerHandler, CancellationToken token)
+    private async Task<CharacterDataFragmentPlayer?> BuildLocalPlayerFragmentAsync(GameObjectHandler playerHandler, string? reason, CancellationToken token)
     {
-        return await _characterDataFactory.BuildCharacterData(playerHandler, token).ConfigureAwait(false) as CharacterDataFragmentPlayer;
+        return await _characterDataFactory.BuildCharacterData(playerHandler, token, reason).ConfigureAwait(false) as CharacterDataFragmentPlayer;
+    }
+
+    private bool ShouldSkipObservedTransientPlayerBuild(string? reason)
+    {
+        if (string.IsNullOrWhiteSpace(reason))
+            return false;
+
+        return ShouldSkipObservedTransientPlayerBuild(new[] { reason });
+    }
+
+    private bool ShouldSkipObservedTransientPlayerBuild(IReadOnlyCollection<string> reasons)
+    {
+        return false;
+    }
+
+
+
+
+
+    private void SyncObservedSupportState(ObjectKind objectKind, CharacterDataFragment? fragment)
+    {
+        // Transient support state is intentionally derived from owned observed resources only.
+    }
+
+    private bool HasFragmentStateChanged(ObjectKind objectKind, CharacterDataFragment? fragment)
+    {
+        _playerData.FileReplacements.TryGetValue(objectKind, out var currentReplacements);
+        var nextReplacements = fragment?.FileReplacements ?? new HashSet<FileReplacement>(FileReplacementComparer.Instance);
+        if (!AreFileReplacementSetsEqual(currentReplacements, nextReplacements))
+            return true;
+
+        _playerData.CustomizePlusScale.TryGetValue(objectKind, out var currentCustomize);
+        var nextCustomize = fragment?.CustomizePlusScale ?? string.Empty;
+        if (!string.Equals(currentCustomize ?? string.Empty, nextCustomize, StringComparison.Ordinal))
+            return true;
+
+        _playerData.GlamourerString.TryGetValue(objectKind, out var currentGlamourer);
+        var nextGlamourer = fragment?.GlamourerString ?? string.Empty;
+        if (!string.Equals(currentGlamourer ?? string.Empty, nextGlamourer, StringComparison.Ordinal))
+            return true;
+
+        if (objectKind != ObjectKind.Player)
+            return false;
+
+        var playerFragment = fragment as CharacterDataFragmentPlayer;
+        if (!string.Equals(_playerData.ManipulationString, playerFragment?.ManipulationString ?? string.Empty, StringComparison.Ordinal))
+            return true;
+        if (!string.Equals(_playerData.HeelsData, playerFragment?.HeelsData ?? string.Empty, StringComparison.Ordinal))
+            return true;
+        if (!string.Equals(_playerData.HonorificData, playerFragment?.HonorificData ?? string.Empty, StringComparison.Ordinal))
+            return true;
+        if (!string.Equals(_playerData.MoodlesData, playerFragment?.MoodlesData ?? string.Empty, StringComparison.Ordinal))
+            return true;
+        if (!string.Equals(_playerData.PetNamesData, playerFragment?.PetNamesData ?? string.Empty, StringComparison.Ordinal))
+            return true;
+
+        return false;
+    }
+
+    private static bool AreFileReplacementSetsEqual(HashSet<FileReplacement>? currentReplacements, HashSet<FileReplacement> newReplacements)
+    {
+        if ((currentReplacements?.Count ?? 0) != newReplacements.Count)
+            return false;
+
+        if (currentReplacements == null)
+            return newReplacements.Count == 0;
+
+        return currentReplacements.SetEquals(newReplacements);
     }
 
     private void ProcessCacheCreation()
@@ -942,7 +1137,7 @@ public sealed class CacheCreationService : DisposableMediatorSubscriberBase
                     objectKindsSnapshot = [.. _currentlyCreating];
                 }
 
-                async Task<CharacterDataFragment?> BuildOneAsync(ObjectKind objectKind)
+                async Task<(bool ShouldApply, CharacterDataFragment? Fragment, HashSet<string> ReasonSet)> BuildOneAsync(ObjectKind objectKind)
                 {
                     HashSet<string> reasonSet;
                     lock (_cacheCreateLockObj)
@@ -953,16 +1148,17 @@ public sealed class CacheCreationService : DisposableMediatorSubscriberBase
                     }
 
                     if (ShouldSkipPenumbraTransientOnlyBuild(objectKind, reasonSet))
-                    {
-                        return null;
-                    }
+                        return (false, null, reasonSet);
+
+                    if (objectKind == ObjectKind.Player && ShouldSkipObservedTransientPlayerBuild(reasonSet))
+                        return (false, null, reasonSet);
 
                     if (objectKind == ObjectKind.Player
                         && IsPureFastPlayerAppearanceReasonSet(reasonSet)
                         && (HasRecentImmediatePlayerPublish(ImmediatePlayerPublishSettleWindow)
                             || reasonSet.Any(ShouldSuppressFastPlayerBuildNow)))
                     {
-                        return null;
+                        return (false, null, reasonSet);
                     }
 
                     var handler = _playerRelatedObjects[objectKind];
@@ -970,28 +1166,54 @@ public sealed class CacheCreationService : DisposableMediatorSubscriberBase
                         && (handler.Address == IntPtr.Zero
                             || handler.CurrentDrawCondition is GameObjectHandler.DrawCondition.ObjectZero or GameObjectHandler.DrawCondition.DrawObjectZero))
                     {
-                        return null;
+                        return (true, null, reasonSet);
                     }
 
                     if (objectKind == ObjectKind.Player)
-                        return await BuildLocalPlayerFragmentAsync(handler, linkedCts.Token).ConfigureAwait(false);
+                    {
+                        var combinedReason = reasonSet.Count == 0 ? null : string.Join("|", reasonSet);
+                        return (true, await BuildLocalPlayerFragmentAsync(handler, combinedReason, linkedCts.Token).ConfigureAwait(false), reasonSet);
+                    }
 
-                    return await _characterDataFactory.BuildCharacterData(handler, linkedCts.Token).ConfigureAwait(false);
+                    return (true, await _characterDataFactory.BuildCharacterData(handler, linkedCts.Token).ConfigureAwait(false), reasonSet);
                 }
 
                 var publishedEarlyPlayer = false;
+                var changedKinds = new HashSet<ObjectKind>();
+                var playerReasonSet = new HashSet<string>();
+
                 if (objectKindsSnapshot.Count == 1 && objectKindsSnapshot.Contains(ObjectKind.Player))
                 {
-                    var playerFragment = await BuildOneAsync(ObjectKind.Player).ConfigureAwait(false);
-                    createdData[ObjectKind.Player] = playerFragment;
-                    _playerData.SetFragment(ObjectKind.Player, playerFragment);
-                    builtAnyData = true;
-                    Mediator.Publish(new CharacterDataCreatedMessage(_playerData.ToAPI()));
-                    publishedEarlyPlayer = true;
+                    var (shouldApplyPlayer, playerFragment, playerReasons) = await BuildOneAsync(ObjectKind.Player).ConfigureAwait(false);
+                    playerReasonSet = playerReasons;
+
+                    if (shouldApplyPlayer)
+                    {
+                        createdData[ObjectKind.Player] = playerFragment;
+                        var hasPlayerChanges = HasFragmentStateChanged(ObjectKind.Player, playerFragment);
+                        _playerData.SetFragment(ObjectKind.Player, playerFragment);
+                        SyncObservedSupportState(ObjectKind.Player, playerFragment);
+
+                        if (hasPlayerChanges)
+                        {
+                            changedKinds.Add(ObjectKind.Player);
+                            builtAnyData = true;
+
+                            var combinedReason = playerReasonSet.Count == 0 ? string.Empty : string.Join("|", playerReasonSet);
+                            var forceOutbound = false;
+
+                            Mediator.Publish(new CharacterDataCreatedMessage(_playerData.ToAPI(), forceOutbound, combinedReason));
+                            publishedEarlyPlayer = true;
+                        }
+                    }
                 }
                 else if (objectKindsSnapshot.Contains(ObjectKind.Player))
                 {
-                    createdData[ObjectKind.Player] = await BuildOneAsync(ObjectKind.Player).ConfigureAwait(false);
+                    var (shouldApplyPlayer, playerFragment, playerReasons) = await BuildOneAsync(ObjectKind.Player).ConfigureAwait(false);
+                    playerReasonSet = playerReasons;
+
+                    if (shouldApplyPlayer)
+                        createdData[ObjectKind.Player] = playerFragment;
                 }
 
                 foreach (var objectKind in objectKindsSnapshot)
@@ -999,7 +1221,9 @@ public sealed class CacheCreationService : DisposableMediatorSubscriberBase
                     if (objectKind == ObjectKind.Player)
                         continue;
 
-                    createdData[objectKind] = await BuildOneAsync(objectKind).ConfigureAwait(false);
+                    var (shouldApplyObject, objectFragment, _) = await BuildOneAsync(objectKind).ConfigureAwait(false);
+                    if (shouldApplyObject)
+                        createdData[objectKind] = objectFragment;
                 }
 
                 foreach (var kvp in createdData)
@@ -1007,18 +1231,22 @@ public sealed class CacheCreationService : DisposableMediatorSubscriberBase
                     if (kvp.Key == ObjectKind.Player && publishedEarlyPlayer)
                         continue;
 
+                    var hasChanges = HasFragmentStateChanged(kvp.Key, kvp.Value);
                     _playerData.SetFragment(kvp.Key, kvp.Value);
+                    SyncObservedSupportState(kvp.Key, kvp.Value);
+
+                    if (hasChanges)
+                        changedKinds.Add(kvp.Key);
                 }
 
-                if (createdData.Count > 0 && !publishedEarlyPlayer)
+                if (changedKinds.Count > 0 && !publishedEarlyPlayer)
                 {
                     builtAnyData = true;
-                    Mediator.Publish(new CharacterDataCreatedMessage(_playerData.ToAPI()));
-                }
-                else if (createdData.Any(kvp => kvp.Key != ObjectKind.Player))
-                {
-                    builtAnyData = true;
-                    Mediator.Publish(new CharacterDataCreatedMessage(_playerData.ToAPI()));
+
+                    var combinedReason = playerReasonSet.Count == 0 ? string.Empty : string.Join("|", playerReasonSet);
+                    var forceOutbound = false;
+
+                    Mediator.Publish(new CharacterDataCreatedMessage(_playerData.ToAPI(), forceOutbound, combinedReason));
                 }
 
                 buildSucceeded = true;

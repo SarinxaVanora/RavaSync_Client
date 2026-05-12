@@ -44,7 +44,8 @@ public class Pair
     private CancellationTokenSource? _uploadingClearCts;
     private CancellationTokenSource? _pendingEmptyApplyCts;
     private const int PendingEmptyFileListApplyDebounceMs = 500;
-    private const int PendingUploadingEmptyFileListApplyDebounceMs = 1250;
+    private const int PendingUploadingEmptyFileListApplyDebounceMs = 900;
+    private const int RemoteUploadRecentlyWindowMs = 900;
     private string _lastAcceptedIncomingDataHash = string.Empty;
     private string _lastAcceptedIncomingPayloadFingerprint = string.Empty;
 
@@ -551,7 +552,7 @@ public class Pair
         {
             try
             {
-                await Task.Delay(2500, token).ConfigureAwait(false);
+                await Task.Delay(RemoteUploadRecentlyWindowMs, token).ConfigureAwait(false);
 
                 if (token.IsCancellationRequested)
                     return;
@@ -582,7 +583,7 @@ public class Pair
                 return false;
 
             var elapsed = unchecked(Environment.TickCount64 - lastTick);
-            return elapsed >= 0 && elapsed < 2500;
+            return elapsed >= 0 && elapsed < RemoteUploadRecentlyWindowMs;
         }
     }
 

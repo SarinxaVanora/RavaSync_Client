@@ -61,7 +61,7 @@ public class CharacterData
             fileReplacements[item.Key].AddRange(fileSwapsToAdd);
         }
 
-        return new API.Data.CharacterData()
+        var apiData = new API.Data.CharacterData()
         {
             FileReplacements = fileReplacements,
             GlamourerData = GlamourerString.ToDictionary(d => d.Key, d => d.Value),
@@ -72,5 +72,8 @@ public class CharacterData
             MoodlesData = MoodlesData,
             PetNamesData = PetNamesData
         };
+
+        CharacterDataPushSanitizer.SanitizeForPush(apiData);
+        return apiData;
     }
 }

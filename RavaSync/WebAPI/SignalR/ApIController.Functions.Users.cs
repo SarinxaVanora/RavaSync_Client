@@ -3,6 +3,7 @@ using RavaSync.API.Dto;
 using RavaSync.API.Dto.Group;
 using RavaSync.API.Dto.User;
 using RavaSync.Services.Mediator;
+using CharacterDataPushSanitizer = RavaSync.PlayerData.Data.CharacterDataPushSanitizer;
 using Microsoft.AspNetCore.SignalR.Client;
 using Microsoft.Extensions.Logging;
 using System.Text;
@@ -75,6 +76,8 @@ public partial class ApiController
 
     public async Task UserPushData(UserCharaDataMessageDto dto)
     {
+        if (!TryPrepareUserPushData(dto, "direct")) return;
+
         try
         {
             await _mareHub!.InvokeAsync(nameof(UserPushData), dto).ConfigureAwait(false);
@@ -87,6 +90,8 @@ public partial class ApiController
 
     private async Task<bool> TryUserPushData(UserCharaDataMessageDto dto)
     {
+        if (!TryPrepareUserPushData(dto, "final")) return false;
+
         try
         {
             await _mareHub!.InvokeAsync(nameof(UserPushData), dto).ConfigureAwait(false);
@@ -97,6 +102,28 @@ public partial class ApiController
             Logger.LogWarning(ex, "Failed to Push character data");
             return false;
         }
+    }
+
+    private bool TryPrepareUserPushData(UserCharaDataMessageDto? dto, string stage)
+    {
+        if (dto?.CharaData == null)
+        {
+            Logger.LogWarning("Skipped UserPushData ({stage}) because character data was null", stage);
+            return false;
+        }
+
+        var sanitizerResult = CharacterDataPushSanitizer.SanitizeForPush(dto.CharaData);
+        if (sanitizerResult.Changed)
+        {
+            Logger.LogDebug("Removed server-invalid outbound data before UserPushData ({stage}): {replacements} replacement(s), {gamePaths} game path(s), {buckets} object bucket(s), {honorific} honorific payload(s)",
+                stage,
+                sanitizerResult.RemovedReplacements,
+                sanitizerResult.RemovedGamePaths,
+                sanitizerResult.RemovedBuckets,
+                sanitizerResult.RemovedHonorificData);
+        }
+
+        return true;
     }
 
     public async Task SetBulkPermissions(BulkPermissionsDto dto)
@@ -141,6 +168,16 @@ public partial class ApiController
 
     private async Task<bool> PushCharacterDataInternal(CharacterData character, List<UserData> visibleCharacters)
     {
+        var sanitizerResult = CharacterDataPushSanitizer.SanitizeForPush(character);
+        if (sanitizerResult.Changed)
+        {
+            Logger.LogDebug("Removed server-invalid outbound data before UserPushData: {replacements} replacement(s), {gamePaths} game path(s), {buckets} object bucket(s), {honorific} honorific payload(s)",
+                sanitizerResult.RemovedReplacements,
+                sanitizerResult.RemovedGamePaths,
+                sanitizerResult.RemovedBuckets,
+                sanitizerResult.RemovedHonorificData);
+        }
+
         Logger.LogInformation("Pushing character data for {hash} to {charas}", character.DataHash.Value, string.Join(", ", visibleCharacters.Select(c => c.AliasOrUID)));
         StringBuilder sb = new();
         foreach (var kvp in character.FileReplacements.ToList())

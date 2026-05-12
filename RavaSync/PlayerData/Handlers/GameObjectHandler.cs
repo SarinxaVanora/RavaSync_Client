@@ -386,7 +386,9 @@ public sealed class GameObjectHandler : DisposableMediatorSubscriberBase, IHighP
             if (_isOwnedObject)
             {
                 var semanticDiff = equipDiff || customizeDiff || nameChange;
-                if (semanticDiff)
+                var nonPlayerStructuralDiff = ObjectKind != ObjectKind.Player && (addrDiff || drawObjDiff);
+
+                if (semanticDiff || nonPlayerStructuralDiff)
                 {
                     if (ObjectKind == ObjectKind.Player && (equipDiff || customizeDiff))
                     {
@@ -403,12 +405,16 @@ public sealed class GameObjectHandler : DisposableMediatorSubscriberBase, IHighP
                         }
                     }
 
-                    Logger.LogDebug("[{this}] Changed, Sending CreateCacheObjectMessage", this);
-                    Mediator.Publish(new CreateCacheForObjectMessage(this, $"GameObject:SemanticDiff(equip={equipDiff},customize={customizeDiff},name={nameChange})"));
+                    var reason = semanticDiff
+                        ? $"GameObject:SemanticDiff(equip={equipDiff},customize={customizeDiff},name={nameChange})"
+                        : $"GameObject:StructuralDiff(addr={addrDiff},draw={drawObjDiff})";
+
+                    Logger.LogDebug("[{this}] Changed, Sending CreateCacheObjectMessage ({reason})", this, reason);
+                    Mediator.Publish(new CreateCacheForObjectMessage(this, reason));
                 }
                 else if (addrDiff || drawObjDiff)
                 {
-                    Logger.LogTrace("[{this}] Suppressing CreateCacheObjectMessage for pointer-only churn (addrDiff={addrDiff}, drawObjDiff={drawObjDiff})", this, addrDiff, drawObjDiff);
+                    Logger.LogTrace("[{this}] Suppressing CreateCacheObjectMessage for player pointer-only churn (addrDiff={addrDiff}, drawObjDiff={drawObjDiff})", this, addrDiff, drawObjDiff);
                 }
             }
         }
@@ -554,11 +560,14 @@ public sealed class GameObjectHandler : DisposableMediatorSubscriberBase, IHighP
         var renderFlags = (((uint)flags) & 0x800u) != 0;
         if (renderFlags) return DrawCondition.RenderFlags;
 
-        if (ObjectKind == ObjectKind.Player)
+        if (((DrawObject*)DrawObjectAddress)->Object.GetObjectType() == ObjectType.CharacterBase)
         {
-            var modelInSlotLoaded = (((CharacterBase*)DrawObjectAddress)->HasModelInSlotLoaded != 0);
+            var characterBase = (CharacterBase*)DrawObjectAddress;
+
+            var modelInSlotLoaded = characterBase->HasModelInSlotLoaded != 0;
             if (modelInSlotLoaded) return DrawCondition.ModelInSlotLoaded;
-            var modelFilesInSlotLoaded = (((CharacterBase*)DrawObjectAddress)->HasModelFilesInSlotLoaded != 0);
+
+            var modelFilesInSlotLoaded = characterBase->HasModelFilesInSlotLoaded != 0;
             if (modelFilesInSlotLoaded) return DrawCondition.ModelFilesInSlotLoaded;
         }
 

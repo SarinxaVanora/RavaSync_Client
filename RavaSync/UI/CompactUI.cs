@@ -73,6 +73,7 @@ public class CompactUi : WindowMediatorSubscriberBase
     private bool _restoreUncollapse;
     private bool _suppressMinimizedRestoreIcon;
     private bool _wasCollapsed;
+    private bool _transientPrimeModalOpen;
     private volatile bool _drawFoldersRefreshPending;
     private volatile bool _drawFoldersRefreshDeferredUntilVisible;
     private long _nextDrawFoldersRefreshUtcTicks;
@@ -214,7 +215,7 @@ public class CompactUi : WindowMediatorSubscriberBase
         Mediator.Subscribe<CutsceneEndMessage>(this, (_) => UiSharedService_GposeEnd());
         Mediator.Subscribe<DownloadStartedMessage>(this, (msg) =>
         {
-            if (msg.DownloadId == null) return;
+            if (msg.DownloadId == null || !msg.CountsTowardGlobal) return;
             _currentDownloads[msg.DownloadId] = SummarizeDownloadStatus(msg.DownloadStatus);
         });
         Mediator.Subscribe<DownloadFinishedMessage>(this, (msg) =>
@@ -469,6 +470,8 @@ public class CompactUi : WindowMediatorSubscriberBase
             ImGui.EndPopup();
         }
 
+        DrawTransientManifestPrimeProgressPopup();
+
         if (_bc7Task != null && !_bc7Task.IsCompleted)
         {
             if (_bc7ShowModal && !_bc7ModalOpen)
@@ -495,16 +498,34 @@ public class CompactUi : WindowMediatorSubscriberBase
         }
         else if (_bc7Task != null && _bc7Task.IsCompleted && _bc7Total > 0)
         {
+            var completedTask = _bc7Task;
+            var touchedPaths = _bc7TouchedPaths;
+            var completedSuccessfully = completedTask.IsCompletedSuccessfully && !_bc7Cts.IsCancellationRequested;
+
             _bc7Task = null;
             _bc7Set.Clear();
+            _bc7TouchedPaths = Array.Empty<string>();
             _bc7CurFile = string.Empty;
             _bc7CurIndex = 0;
             _bc7Total = 0;
             _bc7ShowModal = false;
             _bc7ModalOpen = false;
 
-            _ = _characterAnalyzer.ComputeAnalysis(print: false, recalculate: true);
-            ScheduleReduceMySizeSnapshotRebuild(immediate: true);
+            if (completedTask.IsFaulted && completedTask.Exception != null)
+                _logger.LogWarning(completedTask.Exception.Flatten(), "Reduce My Size optimisation failed");
+
+            if (completedSuccessfully && touchedPaths.Length > 0)
+            {
+                // The reduce pass rewrites existing Penumbra mod files in-place.  Do not recalculate
+                // analysis against the old hashes here; first force the local outbound character data
+                // to rebuild so FileCacheManager validates the touched paths, records the new hashes,
+                // uploads them, and then lets CharacterAnalyzer rebuild from the fresh payload.
+                Mediator.Publish(new PenumbraFileCacheChangedMessage(touchedPaths));
+            }
+            else
+            {
+                ScheduleReduceMySizeSnapshotRebuild(immediate: true);
+            }
         }
 
         var pos = ImGui.GetWindowPos();
@@ -515,6 +536,51 @@ public class CompactUi : WindowMediatorSubscriberBase
             _lastPosition = pos;
             Mediator.Publish(new CompactUiChange(_lastSize, _lastPosition));
         }
+    }
+
+    private void DrawTransientManifestPrimeProgressPopup()
+    {
+        var progress = _transientResourceManager.ManifestPrimeProgress;
+        var popupTitle = _uiSharedService.L("UI.CompactUI.TransientPrimeProgress.Title", "Transient Scan in Progress");
+
+        var showStartupCrawlProgress = progress.IsRunning && !progress.IsTargeted;
+
+        if (showStartupCrawlProgress && !_transientPrimeModalOpen)
+        {
+            ImGui.OpenPopup(popupTitle);
+            _transientPrimeModalOpen = true;
+        }
+
+        if (!ImGui.BeginPopupModal(popupTitle))
+        {
+            if (!showStartupCrawlProgress)
+                _transientPrimeModalOpen = false;
+
+            return;
+        }
+
+        if (!showStartupCrawlProgress)
+        {
+            ImGui.CloseCurrentPopup();
+            _transientPrimeModalOpen = false;
+            ImGui.EndPopup();
+            return;
+        }
+
+        var label = _uiSharedService.L("UI.CompactUI.TransientPrimeProgress.Startup", "Scanning active Penumbra mods");
+
+        ImGui.TextUnformatted(label);
+        ImGui.TextUnformatted($"{progress.Phase}: {progress.ScannedMods}/{progress.TotalMods}");
+
+        if (!string.IsNullOrWhiteSpace(progress.CurrentMod))
+            UiSharedService.TextWrapped(string.Format(_uiSharedService.L("UI.CompactUI.TransientPrimeProgress.Current", "Current mod: {0}"), progress.CurrentMod));
+
+        ImGui.ProgressBar(progress.Progress, new Vector2(-1, 0), $"{MathF.Round(progress.Progress * 100f)}%");
+        UiSharedService.TextWrapped(string.Format(_uiSharedService.L("UI.CompactUI.TransientPrimeProgress.Counts", "Imported: {0}   Pruned: {1}"), progress.ImportedPaths, progress.PrunedPaths));
+        UiSharedService.TextWrapped(_uiSharedService.L("UI.CompactUI.TransientPrimeProgress.Note", "RavaSync is collecting selected transient resources."));
+
+        UiSharedService.SetScaledWindowSize(500);
+        ImGui.EndPopup();
     }
 
     private void DrawPairs()
@@ -1550,6 +1616,7 @@ public class CompactUi : WindowMediatorSubscriberBase
     private bool _bc7ShowModal = false;
     private bool _bc7ModalOpen = false;
     private readonly Dictionary<string, string[]> _bc7Set = new(StringComparer.Ordinal);
+    private string[] _bc7TouchedPaths = Array.Empty<string>();
 
     private sealed record TextureCleanupEstimateCandidate(string PrimaryPath, string HintPath, string Format, long SourceSize, string[] RelatedModels);
 
@@ -2580,6 +2647,7 @@ public class CompactUi : WindowMediatorSubscriberBase
         Interlocked.Exchange(ref _nextMeshEstimateRefreshUtcTicks, 0L);
 
         _bc7Total = _bc7Set.Count + meshWork.Count;
+        _bc7TouchedPaths = Array.Empty<string>();
         _bc7CurFile = string.Empty;
         _bc7CurIndex = 0;
 
@@ -2598,6 +2666,7 @@ public class CompactUi : WindowMediatorSubscriberBase
 
         var targetByPrimary = new Dictionary<string, string>(textureTargets ?? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase), StringComparer.OrdinalIgnoreCase);
         var relatedModelsByTexture = BuildTextureModelReferenceMapFromAnalysis(_bc7Set.Keys);
+        _bc7TouchedPaths = BuildReduceTouchedPathSnapshot(_bc7Set, meshWork);
         _bc7Task = Task.Run(async () =>
         {
             int completed = 0;
@@ -2637,6 +2706,34 @@ public class CompactUi : WindowMediatorSubscriberBase
         }, _bc7Cts.Token);
 
         _bc7ShowModal = true;
+    }
+
+    private static string[] BuildReduceTouchedPathSnapshot(params IReadOnlyDictionary<string, string[]>[] pathSets)
+    {
+        var touched = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var pathSet in pathSets ?? Array.Empty<IReadOnlyDictionary<string, string[]>>())
+        {
+            if (pathSet == null)
+                continue;
+
+            foreach (var kv in pathSet)
+            {
+                if (!string.IsNullOrWhiteSpace(kv.Key))
+                    touched.Add(kv.Key);
+
+                if (kv.Value == null)
+                    continue;
+
+                foreach (var alternate in kv.Value)
+                {
+                    if (!string.IsNullOrWhiteSpace(alternate))
+                        touched.Add(alternate);
+                }
+            }
+        }
+
+        return touched.ToArray();
     }
 
     private Dictionary<string, string[]> BuildTextureModelReferenceMapFromAnalysis(IEnumerable<string> texturePrimaries)

@@ -30,8 +30,11 @@ public partial class IntroUi : WindowMediatorSubscriberBase
     { "English", "en" },
     { "Deutsch", "de" },
     { "Français", "fr" },
-
     { "Español", "es" },
+    { "Italiano", "it" },
+    { "Svenska", "sv" },
+    { "Polski", "pl" },
+    { "Nederlands", "nl" },
     { "العربية", "ar" },
     { "日本語", "ja" },
     { "中文", "zh" },
