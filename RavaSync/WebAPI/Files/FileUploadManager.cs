@@ -1,5 +1,4 @@
-﻿using FFXIVClientStructs.FFXIV.Component.Text;
-using K4os.Compression.LZ4.Legacy;
+using FFXIVClientStructs.FFXIV.Component.Text;
 using Microsoft.Extensions.Logging;
 using RavaSync.API.Data;
 using RavaSync.API.Dto.Files;
@@ -33,6 +32,9 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
     private readonly FileTransferOrchestrator _orchestrator;
     private readonly ServerConfigurationManager _serverManager;
     private readonly System.Collections.Concurrent.ConcurrentDictionary<string, DateTime> _verifiedUploadedHashes = new(StringComparer.Ordinal);
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, long> _recentOutboundRecipientUids = new(StringComparer.Ordinal);
+    private readonly object _outboundRecipientUidsLock = new();
+    private HashSet<string> _outboundRecipientUids = new(StringComparer.Ordinal);
     private readonly SemaphoreSlim _centralRepairUploadSemaphore = new(1, 1);
     private CancellationTokenSource? _uploadCancellationTokenSource = new();
     private static readonly TimeSpan VerifiedHashTtl = TimeSpan.FromHours(12);
@@ -46,6 +48,7 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
     private const long RequestBoundUploadThresholdBytes = 512L * 1024;
     private const long SmallUploadInMemoryThresholdBytes = 1024L * 1024;
     private const long TinyUploadProgressThresholdBytes = 128L * 1024;
+    private const int LocalOutboundUploadStatusEchoSuppressMs = 2500;
     private static readonly int UploadPayloadPreparationParallelism = GetUploadPayloadPreparationParallelism();
     private static readonly SemaphoreSlim UploadPayloadPreparationSemaphore = new(UploadPayloadPreparationParallelism, UploadPayloadPreparationParallelism);
 
@@ -97,6 +100,55 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
         }
     }
 
+    public bool IsLocalOutboundUploadRecipient(string uid)
+    {
+        if (string.IsNullOrWhiteSpace(uid))
+            return false;
+
+        lock (_outboundRecipientUidsLock)
+        {
+            if (_outboundRecipientUids.Contains(uid))
+                return true;
+        }
+
+        if (_recentOutboundRecipientUids.TryGetValue(uid, out var suppressUntilTick))
+        {
+            var remaining = unchecked(suppressUntilTick - Environment.TickCount64);
+            if (remaining > 0)
+                return true;
+
+            _recentOutboundRecipientUids.TryRemove(uid, out _);
+        }
+
+        return false;
+    }
+
+    private void SetLocalOutboundUploadRecipients(IEnumerable<string> uids)
+    {
+        lock (_outboundRecipientUidsLock)
+        {
+            _outboundRecipientUids = uids
+                .Where(u => !string.IsNullOrWhiteSpace(u))
+                .Distinct(StringComparer.Ordinal)
+                .ToHashSet(StringComparer.Ordinal);
+        }
+    }
+
+    private void ClearLocalOutboundUploadRecipients()
+    {
+        lock (_outboundRecipientUidsLock)
+        {
+            if (_outboundRecipientUids.Count > 0)
+            {
+                var suppressUntilTick = unchecked(Environment.TickCount64 + LocalOutboundUploadStatusEchoSuppressMs);
+                foreach (var uid in _outboundRecipientUids)
+                    _recentOutboundRecipientUids[uid] = suppressUntilTick;
+            }
+
+            _outboundRecipientUids.Clear();
+        }
+    }
+
     private void CompleteAndClearCurrentUploads(bool publishRefresh = true)
     {
         lock (_currentUploadsLock)
@@ -127,6 +179,23 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
             {
                 // best effort
             }
+
+            // The global upload overlay is frame-driven, but a second refresh after the
+            // last throttled progress callback has had time to flush prevents the UI
+            // lingering at 100% after the actual upload list has been cleared.
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await Task.Delay(250).ConfigureAwait(false);
+                    if (!IsUploading)
+                        Mediator.Publish(new RefreshUiMessage());
+                }
+                catch
+                {
+                    // best effort
+                }
+            });
         }
     }
 
@@ -151,6 +220,7 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
         _uploadCancellationTokenSource?.Dispose();
         _uploadCancellationTokenSource = null;
         CompleteAndClearCurrentUploads();
+        ClearLocalOutboundUploadRecipients();
         return true;
     }
 
@@ -311,7 +381,9 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
         var fileSize = new FileInfo(filePath).Length;
 
         var ticketUri = GetUploadTicketUri(fileHash, forceUploadTicket);
-        var ticketReq = new UploadTicketRequestDto(fileSize, munged, 0);
+        // RawV2 uploads must be the exact bytes that produced the SHA1 hash.
+        // The old alternative/munged upload path only applied to legacy LZ4 transport.
+        var ticketReq = new UploadTicketRequestDto(fileSize, clientWouldMunge: false, clientParallelUploads: 0, payloadEncoding: FilePayloadEncoding.RawV2);
 
         using var ticketResp = await _orchestrator.SendRequestAsync(HttpMethod.Post, ticketUri, ticketReq, uploadToken).ConfigureAwait(false);
         if (ticketResp.StatusCode == HttpStatusCode.NotFound)
@@ -352,69 +424,53 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
                 throw new InvalidOperationException($"[{fileHash}] Forced upload ticket did not require upload while CDN/B2 object is missing.");
         }
 
-        Logger.LogDebug("[{hash}] Direct upload ticket acquired, preparing payload (LZ4)", fileHash);
+        Logger.LogDebug("[{hash}] Direct upload ticket acquired, preparing raw payload", fileHash);
 
-        TempLz4UploadFile? temp = null;
         byte[]? inMemoryPayload = null;
         long rawSize;
-        long compressedSize;
+        long payloadSize;
         string md5Base64;
 
         try
         {
-            // Do not report payload-preparation reads as upload progress. For many tiny files,
-            // the expensive bit is the ticket/PUT/complete round-trip, and reporting compression
-            // as 100% makes the UI look done while the request is still in flight.
-            IProgress<long>? rawProgress = null;
-
             if (fileSize <= SmallUploadInMemoryThresholdBytes)
             {
-                // Small files stay ungated so upload storms still feel snappy.
-                var prepared = await PrepareSmallUploadInMemoryAsync(filePath, uploadToken, rawProgress).ConfigureAwait(false);
+                // Small files stay in-memory, but the payload is now raw bytes, not LZ4.
+                var prepared = await PrepareSmallRawUploadInMemoryAsync(filePath, uploadToken).ConfigureAwait(false);
                 inMemoryPayload = prepared.PayloadBytes;
                 rawSize = prepared.RawSize;
-                compressedSize = prepared.CompressedSize;
+                payloadSize = prepared.PayloadSize;
                 md5Base64 = prepared.Md5Base64;
             }
             else
             {
-                // Large LZ4 preparation is CPU/disk-heavy. Pace prep separately from network upload
-                // so uploads remain fast without several compressors hammering the game process at once.
-                await UploadPayloadPreparationSemaphore.WaitAsync(uploadToken).ConfigureAwait(false);
-                try
-                {
-                    temp = await TempLz4UploadFile.CreateAsync(filePath, uploadToken, rawProgress).ConfigureAwait(false);
-                }
-                finally
-                {
-                    UploadPayloadPreparationSemaphore.Release();
-                }
-
-                if (temp == null)
-                    throw new InvalidOperationException($"[{fileHash}] Failed to prepare temporary upload payload.");
-
-                rawSize = temp.RawSize;
-                compressedSize = temp.CompressedSize;
-                md5Base64 = temp.Md5Base64;
+                // Large files are streamed straight from the final cache file.
+                // We only precompute Content-MD5 for B2 integrity; no temp LZ4 payload is created.
+                rawSize = fileSize;
+                payloadSize = fileSize;
+                md5Base64 = await ComputeFileMd5Base64Async(filePath, uploadToken).ConfigureAwait(false);
             }
 
             if (rawSize <= 0)
                 throw new InvalidDataException($"[{fileHash}] Refusing to upload zero-length raw payload.");
 
-            if (compressedSize <= 0)
-                throw new InvalidDataException($"[{fileHash}] Refusing to upload zero-length compressed payload.");
+            if (payloadSize <= 0)
+                throw new InvalidDataException($"[{fileHash}] Refusing to upload zero-length payload.");
 
-            if (inMemoryPayload != null && inMemoryPayload.LongLength != compressedSize)
-                throw new InvalidDataException($"[{fileHash}] In-memory payload size mismatch (expected {compressedSize}, got {inMemoryPayload.LongLength}).");
+            if (rawSize != payloadSize)
+                throw new InvalidDataException($"[{fileHash}] RawV2 payload size mismatch (raw={rawSize}, payload={payloadSize}).");
 
-            if (temp != null)
+            if (inMemoryPayload != null && inMemoryPayload.LongLength != payloadSize)
+                throw new InvalidDataException($"[{fileHash}] In-memory payload size mismatch (expected {payloadSize}, got {inMemoryPayload.LongLength}).");
+
+            if (inMemoryPayload == null)
             {
-                var fi = new FileInfo(temp.TempPath);
-                if (!fi.Exists || fi.Length != compressedSize)
-                    throw new InvalidDataException($"[{fileHash}] Temporary upload payload size mismatch (expected {compressedSize}, got {fi.Length}).");
+                var fi = new FileInfo(filePath);
+                if (!fi.Exists || fi.Length != payloadSize)
+                    throw new InvalidDataException($"[{fileHash}] Source upload payload size mismatch (expected {payloadSize}, got {fi.Length}).");
             }
 
-            progress?.Report(new UploadProgress(rawSize, rawSize));
+            progress?.Report(new UploadProgress(0, rawSize));
 
             const int maxAttempts = 4;
             Exception? last = null;
@@ -425,14 +481,14 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
 
                 try
                 {
-                    await using var fs0 = OpenPreparedUploadPayloadStream(inMemoryPayload, temp, streamBufferSize);
+                    await using var fs0 = OpenRawUploadPayloadStream(inMemoryPayload, filePath, streamBufferSize);
 
                     var netProgress = progress == null
                         ? null
                         : new Progress<long>(sent =>
                         {
                             var rawTotal = rawSize;
-                            var netTotal = compressedSize;
+                            var netTotal = payloadSize;
 
                             long mapped = sent;
                             if (netTotal > 0 && rawTotal > 0)
@@ -449,7 +505,7 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
 
                     var content = new StreamContent(fs, streamBufferSize);
                     content.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
-                    content.Headers.ContentLength = compressedSize;
+                    content.Headers.ContentLength = payloadSize;
                     try { content.Headers.ContentMD5 = Convert.FromBase64String(md5Base64); } catch { }
 
                     put.Content = content;
@@ -469,7 +525,7 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
                     var etag = putResp.Headers.ETag?.Tag;
 
                     var completeUri = MareFiles.ServerFilesUploadCompleteFullPath(_orchestrator.UploadCdnUri!, fileHash);
-                    var complete = new UploadCompleteDto(rawSize, compressedSize, md5Base64, etag, true);
+                    var complete = new UploadCompleteDto(rawSize, payloadSize, md5Base64, etag, true, FilePayloadEncoding.RawV2);
 
                     using var completeResp = await _orchestrator.SendRequestAsync(HttpMethod.Post, completeUri, complete, uploadToken).ConfigureAwait(false);
                     if (Logger.IsEnabled(LogLevel.Debug))
@@ -533,8 +589,7 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
         }
         finally
         {
-            if (temp != null)
-                await temp.DisposeAsync().ConfigureAwait(false);
+            // RawV2 uses either an in-memory byte array or the original cache file; no temp payload cleanup required.
         }
     }
 
@@ -593,6 +648,8 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
                 .Where(u => !string.IsNullOrWhiteSpace(u))
                 .Distinct(StringComparer.Ordinal)
                 .ToList();
+
+            SetLocalOutboundUploadRecipients(uids);
 
             Logger.LogDebug("Authorizing/share-check for {count} hashes to {uids} recipients", presentLocal.Count, uids.Count);
 
@@ -666,6 +723,7 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
             _uploadCancellationTokenSource = null;
 
             CompleteAndClearCurrentUploads();
+            ClearLocalOutboundUploadRecipients();
         }
     }
 
@@ -725,70 +783,64 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
         });
     }
 
-    private static async Task<(byte[] PayloadBytes, long RawSize, long CompressedSize, string Md5Base64)> PrepareSmallUploadInMemoryAsync(string filePath, CancellationToken ct, IProgress<long>? rawReadProgress)
+    private static async Task<(byte[] PayloadBytes, long RawSize, long PayloadSize, string Md5Base64)> PrepareSmallRawUploadInMemoryAsync(string filePath, CancellationToken ct)
     {
-        const int BlockSize = 256 * 1024;
-
         await using var input = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read,
             bufferSize: 1024 * 1024, options: FileOptions.Asynchronous | FileOptions.SequentialScan);
 
-        await using var output = new MemoryStream(capacity: (int)Math.Min(input.Length + (64 * 1024), SmallUploadInMemoryThresholdBytes * 2));
+        if (input.Length <= 0)
+            throw new InvalidDataException($"Refusing to prepare zero-length upload payload from {filePath}");
 
-        var buffer = System.Buffers.ArrayPool<byte>.Shared.Rent(BlockSize);
-        long raw = 0;
-        const long YieldEveryBytes = 2L * 1024 * 1024;
-        long sinceYield = 0;
+        if (input.Length > int.MaxValue)
+            throw new InvalidDataException($"In-memory raw upload payload is too large for {filePath}");
 
+        var payloadBytes = new byte[(int)input.Length];
+        var offset = 0;
+
+        while (offset < payloadBytes.Length)
+        {
+            var read = await input.ReadAsync(payloadBytes.AsMemory(offset, payloadBytes.Length - offset), ct).ConfigureAwait(false);
+            if (read <= 0)
+                throw new EndOfStreamException($"Unexpected end of file while preparing raw upload payload from {filePath}");
+
+            offset += read;
+        }
+
+        using var md5 = MD5.Create();
+        var md5Base64 = Convert.ToBase64String(md5.ComputeHash(payloadBytes));
+
+        return (payloadBytes, payloadBytes.LongLength, payloadBytes.LongLength, md5Base64);
+    }
+
+    private static async Task<string> ComputeFileMd5Base64Async(string filePath, CancellationToken ct)
+    {
+        await using var input = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read,
+            bufferSize: 1024 * 1024, options: FileOptions.Asynchronous | FileOptions.SequentialScan);
+
+        using var md5 = IncrementalHash.CreateHash(HashAlgorithmName.MD5);
+        var buffer = System.Buffers.ArrayPool<byte>.Shared.Rent(1024 * 1024);
         try
         {
-            await using (var lz4 = new LZ4Stream(output, LZ4StreamMode.Compress, LZ4StreamFlags.None, BlockSize))
+            int read;
+            while ((read = await input.ReadAsync(buffer.AsMemory(0, buffer.Length), ct).ConfigureAwait(false)) > 0)
             {
-                int read;
-                while ((read = await input.ReadAsync(buffer.AsMemory(0, buffer.Length), ct).ConfigureAwait(false)) > 0)
-                {
-                    await lz4.WriteAsync(buffer.AsMemory(0, read), ct).ConfigureAwait(false);
-                    raw += read;
-                    sinceYield += read;
-                    rawReadProgress?.Report(raw);
-
-                    if (sinceYield >= YieldEveryBytes)
-                    {
-                        sinceYield = 0;
-                        await Task.Yield();
-                        ct.ThrowIfCancellationRequested();
-                    }
-                }
-
-                await lz4.FlushAsync(ct).ConfigureAwait(false);
+                md5.AppendData(buffer, 0, read);
             }
+
+            return Convert.ToBase64String(md5.GetHashAndReset());
         }
         finally
         {
             System.Buffers.ArrayPool<byte>.Shared.Return(buffer);
         }
-
-        if (raw <= 0)
-            throw new InvalidDataException($"Refusing to prepare zero-length upload payload from {filePath}");
-
-        var payloadBytes = output.ToArray();
-        if (payloadBytes.LongLength <= 0)
-            throw new InvalidDataException($"Compressed in-memory payload was zero-length for {filePath}");
-
-        using var md5 = MD5.Create();
-        var md5Base64 = Convert.ToBase64String(md5.ComputeHash(payloadBytes));
-
-        return (payloadBytes, raw, payloadBytes.LongLength, md5Base64);
     }
 
-    private static Stream OpenPreparedUploadPayloadStream(byte[]? inMemoryPayload, TempLz4UploadFile? temp, int streamBufferSize)
+    private static Stream OpenRawUploadPayloadStream(byte[]? inMemoryPayload, string filePath, int streamBufferSize)
     {
         if (inMemoryPayload != null)
             return new MemoryStream(inMemoryPayload, writable: false);
 
-        if (temp == null)
-            throw new InvalidOperationException("No prepared upload payload is available.");
-
-        return new FileStream(temp.TempPath, FileMode.Open, FileAccess.Read, FileShare.Read,
+        return new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read,
             bufferSize: Math.Max(streamBufferSize, 64 * 1024), options: FileOptions.Asynchronous | FileOptions.SequentialScan);
     }
 
@@ -857,7 +909,9 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
         FilesSendDto filesSendDto = new()
         {
             FileHashes = hashes,
-            UIDs = uids
+            UIDs = uids,
+            DesiredPayloadEncoding = FilePayloadEncoding.RawV2,
+            ForcePayloadEncoding = true
         };
 
         using var response = await _orchestrator.SendRequestAsync(HttpMethod.Post, MareFiles.ServerFilesFilesSendFullPath(_orchestrator.UploadCdnUri!), filesSendDto, ct).ConfigureAwait(false);
@@ -940,6 +994,8 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
         _uploadCancellationTokenSource?.Dispose();
         _uploadCancellationTokenSource = null;
         CompleteAndClearCurrentUploads();
+        ClearLocalOutboundUploadRecipients();
+        _recentOutboundRecipientUids.Clear();
         _verifiedUploadedHashes.Clear();
     }
 
@@ -971,7 +1027,7 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
                 var fileSize = new FileInfo(cache.ResolvedFilepath).Length;
 
                 var ticketUri = MareFiles.ServerFilesUploadTicketFullPath(_orchestrator.UploadCdnUri!, hash);
-                var ticketReq = new UploadTicketRequestDto(fileSize, _mareConfigService.Current.UseAlternativeFileUpload, 0);
+                var ticketReq = new UploadTicketRequestDto(fileSize, clientWouldMunge: false, clientParallelUploads: 0, payloadEncoding: FilePayloadEncoding.RawV2);
 
                 using var ticketResp = await _orchestrator.SendRequestAsync(HttpMethod.Post, ticketUri, ticketReq, ct).ConfigureAwait(false);
 

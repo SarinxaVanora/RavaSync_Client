@@ -37,7 +37,7 @@ public sealed partial class PairHandler
         {
         }
 
-        public async Task<PairSyncCommitResult> DownloadAndApplyCharacterAsync(Guid applicationBase, CharacterData charaData, Dictionary<ObjectKind, HashSet<PlayerChanges>> updatedData, bool updateModdedPaths, bool updateManip, bool requiresFileReadyGate, PairSyncAssetPlan assetPlan, bool forceApplyModsForThisApply, bool lifecycleRedrawRequestedFromPlan, CancellationToken downloadToken)
+        public async Task<PairSyncCommitResult> DownloadAndApplyCharacterAsync(Guid applicationBase, CharacterData charaData, Dictionary<ObjectKind, HashSet<PlayerChanges>> updatedData, bool updateModdedPaths, bool updateManip, bool requiresFileReadyGate, PairSyncAssetPlan assetPlan, bool forceApplyModsForThisApply, bool lifecycleApplyRequestedFromPlan, bool lifecycleRedrawRequestedFromPlan, CancellationToken downloadToken)
         {
                 var initialBlock = GetPairSyncExecutionBlockReason("prepare/download start");
                 if (initialBlock != null)
@@ -61,7 +61,7 @@ public sealed partial class PairHandler
                     if (waitFailure != null)
                         return waitFailure;
 
-                var commitStart = await StartPairSyncApplicationCommitAsync(applicationBase, charaData, updatedData, updateModdedPaths, updateManip, requiresFileReadyGate, prepareResult.ModdedPaths, prepareResult.AssetPlan, prepareResult.DownloadedAny, forceApplyModsForThisApply, lifecycleRedrawRequestedFromPlan, downloadToken).ConfigureAwait(false);
+                var commitStart = await StartPairSyncApplicationCommitAsync(applicationBase, charaData, updatedData, updateModdedPaths, updateManip, requiresFileReadyGate, prepareResult.ModdedPaths, prepareResult.AssetPlan, prepareResult.DownloadedAny, forceApplyModsForThisApply, lifecycleApplyRequestedFromPlan, lifecycleRedrawRequestedFromPlan, downloadToken).ConfigureAwait(false);
                 return commitStart;
             }
 
@@ -456,6 +456,7 @@ public sealed partial class PairHandler
             PairSyncAssetPlan assetPlan,
             bool downloadedAny,
             bool forceApplyModsForThisApply,
+            bool lifecycleApplyRequestedFromPlan,
             bool lifecycleRedrawRequestedFromPlan,
             CancellationToken downloadToken)
         {
@@ -487,7 +488,7 @@ public sealed partial class PairHandler
                     return PairSyncCommitResult.Cancelled("new application token was disposed before commit handoff");
                 }
 
-                var applicationTask = ApplyCharacterDataAsync(applicationBase, charaData, updatedData, updateModdedPaths, updateManip, requiresFileReadyGate, moddedPaths, assetPlan, downloadedAny, forceApplyModsForThisApply, lifecycleRedrawRequestedFromPlan, token);
+                var applicationTask = ApplyCharacterDataAsync(applicationBase, charaData, updatedData, updateModdedPaths, updateManip, requiresFileReadyGate, moddedPaths, assetPlan, downloadedAny, forceApplyModsForThisApply, lifecycleApplyRequestedFromPlan, lifecycleRedrawRequestedFromPlan, token);
                 _pairSyncApplicationTask = applicationTask;
                 _applicationTask = applicationTask;
 

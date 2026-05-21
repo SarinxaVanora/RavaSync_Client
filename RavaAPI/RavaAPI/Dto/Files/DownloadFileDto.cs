@@ -12,4 +12,5 @@ public record DownloadFileDto : ITransferFileDto
     public bool IsForbidden { get; set; } = false;
     public string ForbiddenBy { get; set; } = string.Empty;
     public long RawSize { get; set; } = 0;
+    public string PayloadEncoding { get; set; } = FilePayloadEncoding.LegacyLz4;
 }

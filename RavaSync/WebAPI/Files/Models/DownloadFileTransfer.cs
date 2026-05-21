@@ -1,4 +1,4 @@
-﻿using RavaSync.API.Dto.Files;
+using RavaSync.API.Dto.Files;
 
 namespace RavaSync.WebAPI.Files.Models;
 
@@ -27,5 +27,7 @@ public class DownloadFileTransfer : FileTransfer
     }
 
     public long TotalRaw => Dto.RawSize;
+    public bool IsRawPayload => FilePayloadEncoding.IsRaw(Dto.PayloadEncoding);
+    public string PayloadEncoding => Dto.PayloadEncoding;
     private DownloadFileDto Dto => (DownloadFileDto)TransferDto;
 }

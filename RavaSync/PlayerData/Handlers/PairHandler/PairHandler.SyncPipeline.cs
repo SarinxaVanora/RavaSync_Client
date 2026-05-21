@@ -190,7 +190,7 @@ public sealed partial class PairHandler
             => new(true, false, string.Empty, binding, snapshot);
     }
 
-    private sealed record PairSyncPlan(PairSyncRequest Request, ActorBinding Binding, ApplyFrameworkSnapshot Snapshot, ApplyPreparation Preparation, PairSyncAssetPlan AssetPlan, Dictionary<ObjectKind, HashSet<PlayerChanges>> UpdatedData, bool UpdateModdedPaths, bool UpdateManipulation, bool RequiresFileReadyGate, bool ForceApplyModsForThisApply, bool LifecycleRedrawRequested, string PayloadFingerprint)
+    private sealed record PairSyncPlan(PairSyncRequest Request, ActorBinding Binding, ApplyFrameworkSnapshot Snapshot, ApplyPreparation Preparation, PairSyncAssetPlan AssetPlan, Dictionary<ObjectKind, HashSet<PlayerChanges>> UpdatedData, bool UpdateModdedPaths, bool UpdateManipulation, bool RequiresFileReadyGate, bool ForceApplyModsForThisApply, bool LifecycleApplyRequested, bool LifecycleRedrawRequested, string PayloadFingerprint)
     {
         public bool HasWork => UpdatedData.Count > 0;
     }
@@ -822,8 +822,11 @@ public sealed partial class PairHandler
             k => k.Key,
             v => new HashSet<PlayerChanges>(v.Value));
 
-        var lifecycleRedrawRequested = _redrawOnNextApplication;
-        if (lifecycleRedrawRequested)
+        var lifecycleApplyRequested = _redrawOnNextApplication;
+        var nonPlayerOnlyDetectedChange = updatedData.Count > 0 && updatedData.Keys.All(static kind => kind != ObjectKind.Player);
+        var allowLifecyclePlayerApply = lifecycleApplyRequested && !nonPlayerOnlyDetectedChange;
+        var lifecycleRedrawRequested = allowLifecyclePlayerApply && RequiresLifecyclePlayerRedraw(assetPlan);
+        if (allowLifecyclePlayerApply)
         {
             if (!updatedData.TryGetValue(ObjectKind.Player, out var player))
             {
@@ -832,7 +835,8 @@ public sealed partial class PairHandler
             }
 
             player.Add(PlayerChanges.ModFiles);
-            player.Add(PlayerChanges.ForcedRedraw);
+            if (lifecycleRedrawRequested)
+                player.Add(PlayerChanges.ForcedRedraw);
 
             if (request.CharacterData.GlamourerData.TryGetValue(ObjectKind.Player, out var glamourerPayload)
                 && !string.IsNullOrWhiteSpace(glamourerPayload))
@@ -853,8 +857,14 @@ public sealed partial class PairHandler
                 player.Add(PlayerChanges.ModManip);
             }
 
-            _lifecycleRedrawApplications[request.ApplicationBase] = 0;
+            if (lifecycleRedrawRequested)
+                _lifecycleRedrawApplications[request.ApplicationBase] = 0;
+
             _initialApplyPending = false;
+        }
+        else if (lifecycleApplyRequested && nonPlayerOnlyDetectedChange && Logger.IsEnabled(LogLevel.Trace))
+        {
+            Logger.LogTrace("[BASE-{appBase}] Deferring pending lifecycle player apply while processing non-player-only changes for {pair}; keeping minion/mount updates from redrawing the owner", request.ApplicationBase, Pair.UserData.AliasOrUID);
         }
 
         if (!lifecycleRedrawRequested)
@@ -898,13 +908,34 @@ public sealed partial class PairHandler
             assetPlan.ContainsAnimationCritical,
             assetPlan.ContainsVfxCritical);
 
-        return PairSyncPlanBuildResult.Execute(new PairSyncPlan(request, binding, snapshot, preparation, assetPlan, updatedData, updateModdedPaths, updateManip, requiresFileReadyGate, forceApplyModsForThisApply, lifecycleRedrawRequested, payloadFingerprint));
+        return PairSyncPlanBuildResult.Execute(new PairSyncPlan(request, binding, snapshot, preparation, assetPlan, updatedData, updateModdedPaths, updateManip, requiresFileReadyGate, forceApplyModsForThisApply, allowLifecyclePlayerApply, lifecycleRedrawRequested, payloadFingerprint));
     }
 
     private static bool RequiresAppearanceFileReadyGate(Dictionary<ObjectKind, HashSet<PlayerChanges>> updatedData)
         => updatedData.Values.Any(v => v.Contains(PlayerChanges.ModFiles)
             || v.Contains(PlayerChanges.Customize)
             || v.Contains(PlayerChanges.ModManip));
+
+    private static bool RequiresLifecyclePlayerRedraw(PairSyncAssetPlan assetPlan)
+    {
+        if (!assetPlan.HasAssets)
+            return false;
+
+        return assetPlan.Entries.Any(static entry => entry.ObjectKind == ObjectKind.Player
+            && !LooksLikeOwnedObjectAssetPathForPairSync(entry.GamePath)
+            && (entry.Kind == PairSyncAssetKind.Sound
+                || PairApplyUtilities.IsTransientRedrawCriticalGamePath(entry.GamePath)
+                || PairApplyUtilities.IsSkeletonOrPhysicsCriticalGamePath(entry.GamePath)
+                || PairApplyUtilities.IsPlayerTransientSupportRefreshGamePath(entry.GamePath)));
+    }
+
+    private static bool LooksLikeOwnedObjectAssetPathForPairSync(string gamePath)
+    {
+        var normalized = PairApplyUtilities.NormalizeGamePath(gamePath);
+        return normalized.StartsWith("chara/minion/", StringComparison.OrdinalIgnoreCase)
+            || normalized.StartsWith("chara/monster/", StringComparison.OrdinalIgnoreCase)
+            || normalized.StartsWith("chara/demihuman/", StringComparison.OrdinalIgnoreCase);
+    }
 
     private void SuppressNonLifecyclePlayerForcedRedraw(Dictionary<ObjectKind, HashSet<PlayerChanges>> updatedData, Guid applicationBase)
     {
@@ -1001,7 +1032,9 @@ public sealed partial class PairHandler
             containsVfxCritical |= criticality == PairSyncAssetCriticality.VfxCritical;
             containsVfxPropSupport |= PairApplyUtilities.IsVfxPropSupportGamePath(gamePath);
 
-            var objectKind = objectKindByGamePath != null && objectKindByGamePath.TryGetValue(gamePath, out var mappedKind) ? mappedKind : ObjectKind.Player;
+            var objectKind = objectKindByGamePath != null && objectKindByGamePath.TryGetValue(gamePath, out var mappedKind)
+                ? mappedKind
+                : GuessPairSyncObjectKindFromGamePath(gamePath);
             entries.Add(new PairSyncAssetEntry(objectKind, gamePath, hash, item.Value, kind, criticality));
         }
 
@@ -1055,6 +1088,19 @@ public sealed partial class PairHandler
             kvp => kvp.Value.OrderBy(static p => p, StringComparer.OrdinalIgnoreCase).ToList());
 
         return new PairSyncAssetPlan(moddedPaths, missingFiles?.ToList() ?? [], entries, uniqueHashes, primeTransientPaths, finalizedPrimeTransientPathsByKind, transientSupportPaths, containsAnimationCritical, containsVfxCritical, containsVfxPropSupport, tempModsFingerprint, transientSupportFingerprint);
+    }
+
+    private static ObjectKind GuessPairSyncObjectKindFromGamePath(string gamePath)
+    {
+        var normalized = PairApplyUtilities.NormalizeGamePath(gamePath);
+        if (normalized.StartsWith("chara/monster/", StringComparison.OrdinalIgnoreCase)
+            || normalized.StartsWith("chara/demihuman/", StringComparison.OrdinalIgnoreCase)
+            || normalized.StartsWith("chara/minion/", StringComparison.OrdinalIgnoreCase))
+        {
+            return ObjectKind.MinionOrMount;
+        }
+
+        return ObjectKind.Player;
     }
 
     private static Dictionary<string, ObjectKind> BuildPairSyncObjectKindLookup(CharacterData charaData)
@@ -1139,7 +1185,7 @@ public sealed partial class PairHandler
         PairSyncCommitResult handoffResult;
         try
         {
-            handoffResult = await DownloadAndApplyCharacterAsync(plan.Request.ApplicationBase, plan.Request.CharacterData, plan.UpdatedData, plan.UpdateModdedPaths, plan.UpdateManipulation, plan.RequiresFileReadyGate, plan.AssetPlan, plan.ForceApplyModsForThisApply, plan.LifecycleRedrawRequested, token).ConfigureAwait(false);
+            handoffResult = await DownloadAndApplyCharacterAsync(plan.Request.ApplicationBase, plan.Request.CharacterData, plan.UpdatedData, plan.UpdateModdedPaths, plan.UpdateManipulation, plan.RequiresFileReadyGate, plan.AssetPlan, plan.ForceApplyModsForThisApply, plan.LifecycleApplyRequested, plan.LifecycleRedrawRequested, token).ConfigureAwait(false);
         }
         catch (OperationCanceledException)
         {

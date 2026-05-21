@@ -55,18 +55,46 @@ public class DalamudUtilService : IHostedService, IMediatorSubscriber
     private Lazy<ulong> _cid;
 
 
+    public readonly struct LivePlayerRef
+    {
+        public readonly string Ident;
+        public readonly string Name;
+        public readonly nint Address;
+        public readonly uint EntityId;
+        public readonly int ObjectIndex;
+        public readonly int LastSeenScan;
+
+        public LivePlayerRef(string ident, string name, nint address, uint entityId, int objectIndex, int lastSeenScan)
+        {
+            Ident = ident;
+            Name = name;
+            Address = address;
+            EntityId = entityId;
+            ObjectIndex = objectIndex;
+            LastSeenScan = lastSeenScan;
+        }
+
+        public bool IsValid => !string.IsNullOrEmpty(Ident) && Address != nint.Zero;
+    }
+
     private struct PlayerCharaInfo
     {
         public string Name;
         public nint Address;
+        public uint EntityId;
+        public int ObjectIndex;
         public int LastSeenScan;
 
-        public PlayerCharaInfo(string name, nint address, int lastSeenScan)
+        public PlayerCharaInfo(string name, nint address, uint entityId, int objectIndex, int lastSeenScan)
         {
             Name = name;
             Address = address;
+            EntityId = entityId;
+            ObjectIndex = objectIndex;
             LastSeenScan = lastSeenScan;
         }
+
+        public LivePlayerRef ToLiveRef(string ident) => new(ident, Name, Address, EntityId, ObjectIndex, LastSeenScan);
     }
 
     private readonly Dictionary<string, PlayerCharaInfo> _playerCharas = new(StringComparer.Ordinal);
@@ -80,7 +108,7 @@ public class DalamudUtilService : IHostedService, IMediatorSubscriber
     private int _playerCharaScanId = 0;
     private DateTime _nextPlayerCharaScan = DateTime.MinValue;
     private DateTime _nextPlayerCharaPrune = DateTime.MinValue;
-    private static readonly TimeSpan _playerCharaScanInterval = TimeSpan.FromMilliseconds(350);
+    private static readonly TimeSpan _playerCharaScanInterval = TimeSpan.FromMilliseconds(125);
     private static readonly TimeSpan _playerCharaPruneInterval = TimeSpan.FromSeconds(2);
 
 
@@ -423,14 +451,11 @@ public class DalamudUtilService : IHostedService, IMediatorSubscriber
         // stale pointer can raise an uncatchable AccessViolation and take the game
         // down. Only trust an address after confirming it is still present in
         // Dalamud's live object table on the framework thread.
-        var livePlayer = TryGetLivePlayerCharacterByAddress(address);
-        if (livePlayer == null)
+        if (!TryGetLivePlayerRefByAddress(address, out var livePlayer))
             return null;
 
-        if (_identByAddress.TryGetValue(address, out var cachedIdent) && !string.IsNullOrEmpty(cachedIdent))
-            return cachedIdent;
-
-        return GetIdentFromLivePlayerCharacter(livePlayer);
+        UpdateLivePlayerCache(livePlayer);
+        return livePlayer.Ident;
     }
 
     public bool AddressMatchesPlayerIdent(string? characterIdent, nint address)
@@ -440,8 +465,14 @@ public class DalamudUtilService : IHostedService, IMediatorSubscriber
         if (string.IsNullOrEmpty(characterIdent) || address == nint.Zero)
             return false;
 
-        var liveIdent = GetIdentFromAddress(address);
-        return !string.IsNullOrEmpty(liveIdent) && string.Equals(liveIdent, characterIdent, StringComparison.Ordinal);
+        if (!TryGetLivePlayerRefByAddress(address, out var livePlayer))
+            return false;
+
+        if (!string.Equals(livePlayer.Ident, characterIdent, StringComparison.Ordinal))
+            return false;
+
+        UpdateLivePlayerCache(livePlayer);
+        return true;
     }
 
     private IPlayerCharacter? TryGetLivePlayerCharacterByAddress(nint address)
@@ -502,39 +533,156 @@ public class DalamudUtilService : IHostedService, IMediatorSubscriber
         }
     }
 
+    private unsafe bool TryBuildLivePlayerRef(IPlayerCharacter chara, int scanId, out LivePlayerRef livePlayer)
+    {
+        EnsureIsOnFramework();
+        livePlayer = default;
+
+        if (chara == null || chara.Address == nint.Zero)
+            return false;
+
+        try
+        {
+            if (chara.ObjectKind == (uint)ObjectKind.None)
+                return false;
+
+            var name = chara.Name.TextValue;
+            if (string.IsNullOrEmpty(name))
+                return false;
+
+            var ident = GetIdentFromLivePlayerCharacter(chara);
+            if (string.IsNullOrEmpty(ident))
+                return false;
+
+            var entityId = ((GameObject*)chara.Address)->EntityId;
+            livePlayer = new LivePlayerRef(ident, name, chara.Address, entityId, chara.ObjectIndex, scanId);
+            return true;
+        }
+        catch
+        {
+            livePlayer = default;
+            return false;
+        }
+    }
+
+    private bool TryGetLivePlayerRefByAddress(nint address, out LivePlayerRef livePlayer)
+    {
+        EnsureIsOnFramework();
+        livePlayer = default;
+
+        var chara = TryGetLivePlayerCharacterByAddress(address);
+        if (chara == null)
+            return false;
+
+        return TryBuildLivePlayerRef(chara, _playerCharaScanId, out livePlayer);
+    }
+
+    private void UpdateLivePlayerCache(LivePlayerRef livePlayer)
+    {
+        EnsureIsOnFramework();
+
+        if (!livePlayer.IsValid)
+            return;
+
+        _identByAddress[livePlayer.Address] = livePlayer.Ident;
+
+        var sid = RavaSync.Services.Discovery.RavaSessionId.FromIdent(livePlayer.Ident);
+        if (!string.IsNullOrEmpty(sid))
+            _addressBySessionId[sid] = livePlayer.Address;
+
+        _playerCharas[livePlayer.Ident] = new PlayerCharaInfo(
+            livePlayer.Name,
+            livePlayer.Address,
+            livePlayer.EntityId,
+            livePlayer.ObjectIndex,
+            livePlayer.LastSeenScan);
+    }
+
+    private bool TryScanLivePlayerByIdent(string characterIdent, out LivePlayerRef livePlayer)
+    {
+        EnsureIsOnFramework();
+        livePlayer = default;
+
+        if (string.IsNullOrEmpty(characterIdent))
+            return false;
+
+        try
+        {
+            var scanId = unchecked(++_playerCharaScanId);
+
+            for (var i = 0; i < 200; i++)
+            {
+                var chara = _objectTable[i] as IPlayerCharacter;
+                if (chara == null)
+                    continue;
+
+                if (!TryBuildLivePlayerRef(chara, scanId, out var candidate))
+                    continue;
+
+                UpdateLivePlayerCache(candidate);
+
+                if (!string.Equals(candidate.Ident, characterIdent, StringComparison.Ordinal))
+                    continue;
+
+                livePlayer = candidate;
+                return true;
+            }
+        }
+        catch
+        {
+            livePlayer = default;
+        }
+
+        return false;
+    }
+
+    public bool TryResolveLivePlayer(string? characterIdent, out LivePlayerRef livePlayer, nint fallbackAddress = 0, bool forceLiveScan = false)
+    {
+        EnsureIsOnFramework();
+        livePlayer = default;
+
+        if (string.IsNullOrEmpty(characterIdent))
+            return false;
+
+        if (fallbackAddress != nint.Zero
+            && TryGetLivePlayerRefByAddress(fallbackAddress, out var fallbackLive)
+            && string.Equals(fallbackLive.Ident, characterIdent, StringComparison.Ordinal))
+        {
+            UpdateLivePlayerCache(fallbackLive);
+            livePlayer = fallbackLive;
+            return true;
+        }
+
+        if (!forceLiveScan
+            && _playerCharas.TryGetValue(characterIdent, out var cached)
+            && cached.Address != nint.Zero
+            && TryGetLivePlayerRefByAddress(cached.Address, out var cachedLive)
+            && string.Equals(cachedLive.Ident, characterIdent, StringComparison.Ordinal))
+        {
+            UpdateLivePlayerCache(cachedLive);
+            livePlayer = cachedLive;
+            return true;
+        }
+
+        return TryScanLivePlayerByIdent(characterIdent, out livePlayer);
+    }
+
     public IntPtr GetPlayerCharacterFromCachedTableByIdent(string characterName)
     {
         EnsureIsOnFramework();
 
-        if (_playerCharas.TryGetValue(characterName, out var pchar) && pchar.Address != nint.Zero
-            && AddressMatchesPlayerIdent(characterName, pchar.Address))
-        {
-            return pchar.Address;
-        }
-
-        return IntPtr.Zero;
+        return TryResolveLivePlayer(characterName, out var livePlayer)
+            ? livePlayer.Address
+            : IntPtr.Zero;
     }
 
     public nint ResolvePlayerAddress(string? characterIdent, nint fallbackAddress = 0)
     {
         EnsureIsOnFramework();
 
-        if (!string.IsNullOrEmpty(characterIdent)
-            && _playerCharas.TryGetValue(characterIdent, out var pchar)
-            && pchar.Address != nint.Zero
-            && AddressMatchesPlayerIdent(characterIdent, pchar.Address))
-        {
-            return pchar.Address;
-        }
-
-        if (!string.IsNullOrEmpty(characterIdent)
-            && fallbackAddress != nint.Zero
-            && AddressMatchesPlayerIdent(characterIdent, fallbackAddress))
-        {
-            return fallbackAddress;
-        }
-
-        return nint.Zero;
+        return TryResolveLivePlayer(characterIdent, out var livePlayer, fallbackAddress)
+            ? livePlayer.Address
+            : nint.Zero;
     }
 
     public unsafe IntPtr GetGameObjectAddressByEntityId(uint entityId)
@@ -896,14 +1044,9 @@ public class DalamudUtilService : IHostedService, IMediatorSubscriber
     {
         EnsureIsOnFramework();
 
-        if (_playerCharas.TryGetValue(ident, out var info)
-            && info.Address != nint.Zero
-            && AddressMatchesPlayerIdent(ident, info.Address))
-        {
-            return (info.Name, info.Address);
-        }
-
-        return default;
+        return TryResolveLivePlayer(ident, out var livePlayer)
+            ? (livePlayer.Name, livePlayer.Address)
+            : default;
     }
 
 
@@ -926,43 +1069,30 @@ public class DalamudUtilService : IHostedService, IMediatorSubscriber
         _nextPlayerCharaScan = now.Add(_playerCharaScanInterval);
         var scanId = unchecked(++_playerCharaScanId);
 
-        // rebuild fast lookup caches (used heavily by UI every frame)
+        // Rebuild the live resolver maps from the actual object table. This is the
+        // discovery source only; pair handlers still validate the ident before using
+        // any address as a live handle.
         _identByAddress.Clear();
         _addressBySessionId.Clear();
 
-        for (var i = 0; i < 200; i += 2)
+        try
         {
-            var chara = _objectTable[i] as IPlayerCharacter;
-            if (chara == null) continue;
-
-            if (chara.Address == nint.Zero || chara.ObjectKind == (uint)ObjectKind.None)
-                continue;
-
-            var charaName = chara.Name.TextValue;
-            if (string.IsNullOrEmpty(charaName))
-                continue;
-
-            var hash = GetIdentFromLivePlayerCharacter(chara);
-            if (string.IsNullOrEmpty(hash))
-                continue;
-
-            _identByAddress[chara.Address] = hash;
-
-            var sid = RavaSync.Services.Discovery.RavaSessionId.FromIdent(hash);
-            if (!string.IsNullOrEmpty(sid))
-                _addressBySessionId[sid] = chara.Address;
-
-            if (_playerCharas.TryGetValue(hash, out var existing))
+            for (var i = 0; i < 200; i++)
             {
-                existing.Name = charaName;
-                existing.Address = chara.Address;
-                existing.LastSeenScan = scanId;
-                _playerCharas[hash] = existing;
+                var chara = _objectTable[i] as IPlayerCharacter;
+                if (chara == null)
+                    continue;
+
+                if (!TryBuildLivePlayerRef(chara, scanId, out var livePlayer))
+                    continue;
+
+                UpdateLivePlayerCache(livePlayer);
             }
-            else
-            {
-                _playerCharas[hash] = new PlayerCharaInfo(charaName, chara.Address, scanId);
-            }
+        }
+        catch
+        {
+            // Object table access can race zoning/teardown. Keep whatever was already
+            // resolved this frame and let the next scan repair the cache.
         }
 
         if (now < _nextPlayerCharaPrune || _playerCharas.Count == 0)

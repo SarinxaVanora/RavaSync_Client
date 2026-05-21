@@ -539,6 +539,15 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
         return url + sep + "rava_repair=" + Guid.NewGuid().ToString("N");
     }
 
+    private static string AppendRawV2CacheKeyQuery(string url)
+    {
+        if (url.Contains("rava_rawv2=1", StringComparison.OrdinalIgnoreCase))
+            return url;
+
+        var sep = url.IndexOf('?', StringComparison.Ordinal) >= 0 ? "&" : "?";
+        return url + sep + "rava_rawv2=1";
+    }
+
     private bool TryPlanCdn404SelfHeal(string hash, string baseUrl, HttpResponseMessage response,out string cacheBustUrl, out string? cfCacheStatus, out string? age, out string? cfRay, out string reason)
     {
         cfCacheStatus = TryGetHeaderValue(response, "CF-Cache-Status");
@@ -2103,7 +2112,7 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
                 return false;
             }
 
-            if (_downloadStatus.TryGetValue(groupKey, out var statusDecode))
+            if (results.Count < transfers.Count && _downloadStatus.TryGetValue(groupKey, out var statusDecode))
             {
                 lock (statusDecode)
                 {
@@ -2180,6 +2189,9 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
                 var baseCdnUrl = MareFiles
                     .CdnGetFullPath(_orchestrator.FilesCdnUri!, transfer.Hash.ToUpperInvariant())
                     .ToString();
+
+                if (transfer.IsRawPayload)
+                    baseCdnUrl = AppendRawV2CacheKeyQuery(baseCdnUrl);
 
                 var isCacheBusted = plannedCdnUrl != null;
                 var cdnUrl = plannedCdnUrl ?? baseCdnUrl;
@@ -2356,6 +2368,68 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
 
                     var tempPath = CreateTempDownloadPath(finalPath);
                     var compressedBytes = 0L;
+
+                    if (looksHeadered && transfer.IsRawPayload)
+                    {
+                        var directSw = Stopwatch.StartNew();
+
+                        try
+                        {
+                            await using var payloadStream = new LimitedXorStream(respStream, payloadLen, munged ? (byte)42 : (byte)0);
+                            using var progressStream = new ProgressReadStream(payloadStream, read =>
+                            {
+                                AddAttemptProgress(read);
+                            });
+
+                            var expectedRaw = transfer.TotalRaw > 0 ? transfer.TotalRaw : payloadLen;
+                            var copied = await CopyRawToFileAndHashAsync(
+                                progressStream,
+                                tempPath,
+                                expectedRaw,
+                                attemptToken).ConfigureAwait(false);
+
+                            var bytesWritten = copied.BytesWritten;
+
+                            if (!string.Equals(copied.HashUpper, headerHash, StringComparison.OrdinalIgnoreCase))
+                                throw new InvalidDataException($"CDN raw-stream: raw hash mismatch for {transfer.Hash}, got {copied.HashUpper}, expected {headerHash}");
+
+                            directSw.Stop();
+
+                            if (bytesWritten <= 0)
+                                throw new InvalidDataException($"CDN raw-stream: payload was empty for {transfer.Hash}");
+
+                            if (bytesWritten >= (2 * 1024 * 1024) && directSw.Elapsed.TotalSeconds >= 1.0)
+                            {
+                                var bps = (long)(bytesWritten / directSw.Elapsed.TotalSeconds);
+                                if (bps < AutoCdnSlowBpsThreshold)
+                                    Interlocked.Exchange(ref anySlow[0], 1);
+                            }
+
+                            try
+                            {
+                                File.Move(tempPath, finalPath, overwrite: true);
+                            }
+                            catch (Exception ex)
+                            {
+                                throw new IOException($"CDN raw-stream: failed to finalize {transfer.Hash} to {finalPath}", ex);
+                            }
+
+                            results.Add(new CdnDownloadedFile(headerHash, finalPath));
+                            RegisterAndReleaseCompletedCdnFile(headerHash, finalPath);
+                            Interlocked.Increment(ref downloadedStageCount[0]);
+
+                            _cdn404State.TryRemove(headerHash, out _);
+                            _cdn404State.TryRemove(transfer.Hash, out _);
+
+                            CommitAttemptFile();
+                            return;
+                        }
+                        catch
+                        {
+                            CleanupFailedCdnDownload(tempPath);
+                            throw;
+                        }
+                    }
 
                     var directDecodeSlotTaken = false;
                     if (looksHeadered && payloadLen > 0 && payloadLen <= CdnDirectStreamMaxPayloadBytes)

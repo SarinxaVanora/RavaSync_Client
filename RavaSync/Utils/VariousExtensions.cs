@@ -117,13 +117,22 @@ public static class VariousExtensions
                             .OrderBy(g => string.IsNullOrEmpty(g.Hash) ? g.FileSwapPath : g.Hash, StringComparer.OrdinalIgnoreCase).ToList();
                         var newTransients = newFileReplacements.Where(g => g.GamePaths.Any(PairApplyUtilities.IsTransientRedrawCriticalGamePath))
                             .OrderBy(g => string.IsNullOrEmpty(g.Hash) ? g.FileSwapPath : g.Hash, StringComparer.OrdinalIgnoreCase).ToList();
+                        var existingWornEquipment = SelectPlayerWornEquipmentOrAccessoryReplacements(existingFileReplacements);
+                        var newWornEquipment = SelectPlayerWornEquipmentOrAccessoryReplacements(newFileReplacements);
 
-                        logger.LogTrace("[BASE-{appbase}] ExistingFace: {of}, NewFace: {fc}; ExistingHair: {eh}, NewHair: {nh}; ExistingTail: {et}, NewTail: {nt}; ExistingTransient: {etr}, NewTransient: {ntr}", applicationBase,
-                            existingFace.Count, newFace.Count, existingHair.Count, newHair.Count, existingTail.Count, newTail.Count, existingTransients.Count, newTransients.Count);
+                        logger.LogTrace("[BASE-{appbase}] ExistingFace: {of}, NewFace: {fc}; ExistingHair: {eh}, NewHair: {nh}; ExistingTail: {et}, NewTail: {nt}; ExistingTransient: {etr}, NewTransient: {ntr}; ExistingWornGear: {ewg}, NewWornGear: {nwg}", applicationBase,
+                            existingFace.Count, newFace.Count, existingHair.Count, newHair.Count, existingTail.Count, newTail.Count, existingTransients.Count, newTransients.Count, existingWornEquipment.Count, newWornEquipment.Count);
                         var differentFace = !existingFace.SequenceEqual(newFace, PlayerData.Data.FileReplacementDataComparer.Instance);
                         var differentHair = !existingHair.SequenceEqual(newHair, PlayerData.Data.FileReplacementDataComparer.Instance);
                         var differentTail = !existingTail.SequenceEqual(newTail, PlayerData.Data.FileReplacementDataComparer.Instance);
                         var differentTransients = !existingTransients.SequenceEqual(newTransients, PlayerData.Data.FileReplacementDataComparer.Instance);
+                        var differentWornEquipment = !existingWornEquipment.SequenceEqual(newWornEquipment, PlayerData.Data.FileReplacementDataComparer.Instance);
+
+                        if (differentWornEquipment)
+                        {
+                            logger.LogDebug("[BASE-{appbase}] Different worn equipment/accessory paths; applying receiver temp mod update without requesting a player redraw", applicationBase);
+                            charaDataToUpdate[objectKind].Add(PlayerChanges.ModFiles);
+                        }
 
                         if (differentTransients)
                         {
@@ -233,6 +242,21 @@ public static class VariousExtensions
         return charaDataToUpdate;
     }
 
+
+    private static List<FileReplacementData> SelectPlayerWornEquipmentOrAccessoryReplacements(List<FileReplacementData>? replacements)
+    {
+        if (replacements == null || replacements.Count == 0)
+            return [];
+
+        return replacements
+            .Where(static replacement => replacement.GamePaths.Any(IsPlayerWornEquipmentOrAccessoryGamePath))
+            .OrderBy(static replacement => string.IsNullOrEmpty(replacement.Hash) ? replacement.FileSwapPath : replacement.Hash, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(static replacement => string.Join("|", replacement.GamePaths.OrderBy(static path => path, StringComparer.OrdinalIgnoreCase)), StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    private static bool IsPlayerWornEquipmentOrAccessoryGamePath(string gamePath)
+        => PairApplyUtilities.IsWornEquipmentOrAccessoryGamePath(gamePath);
 
     private static bool ShouldForceOwnedObjectRedrawForFileChange(ObjectKind objectKind, List<FileReplacementData>? existingFileReplacements, List<FileReplacementData>? newFileReplacements)
     {

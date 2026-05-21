@@ -78,6 +78,26 @@ public static class PairApplyUtilities
             || gamePath.Contains("/weapon/", StringComparison.OrdinalIgnoreCase);
     }
 
+    public static bool IsWornEquipmentOrAccessoryGamePath(string gamePath)
+    {
+        gamePath = NormalizeGamePath(gamePath);
+        if (string.IsNullOrEmpty(gamePath)) return false;
+
+        return gamePath.StartsWith("chara/equipment/", StringComparison.OrdinalIgnoreCase)
+            || gamePath.StartsWith("chara/accessory/", StringComparison.OrdinalIgnoreCase)
+            || gamePath.Contains("/equipment/", StringComparison.OrdinalIgnoreCase)
+            || gamePath.Contains("/accessory/", StringComparison.OrdinalIgnoreCase);
+    }
+
+    public static bool IsWornAccessoryGamePath(string gamePath)
+    {
+        gamePath = NormalizeGamePath(gamePath);
+        if (string.IsNullOrEmpty(gamePath)) return false;
+
+        return gamePath.StartsWith("chara/accessory/", StringComparison.OrdinalIgnoreCase)
+            || gamePath.Contains("/accessory/", StringComparison.OrdinalIgnoreCase);
+    }
+
     private static bool IsDangerousTransientScope(string gamePath)
     {
         if (IsEquipmentScopedGamePath(gamePath))
@@ -97,15 +117,35 @@ public static class PairApplyUtilities
 
     public static bool IsVfxPropSupportGamePath(string gamePath)
     {
+        gamePath = NormalizeGamePath(gamePath);
         if (string.IsNullOrEmpty(gamePath)) return false;
 
-        gamePath = gamePath.Trim();
+        // Worn equipment/accessories are normal appearance files. They should not be
+        // treated as VFX prop support, otherwise every ring/neck/bracelet/earring path
+        // gets promoted into the transient-support refresh lane.
+        if (IsWornEquipmentOrAccessoryGamePath(gamePath))
+            return false;
 
         return gamePath.StartsWith("chara/weapon/", StringComparison.OrdinalIgnoreCase)
-            || gamePath.StartsWith("chara/accessory/", StringComparison.OrdinalIgnoreCase)
             || gamePath.StartsWith("chara/minion/", StringComparison.OrdinalIgnoreCase)
             || gamePath.StartsWith("chara/monster/", StringComparison.OrdinalIgnoreCase)
             || gamePath.StartsWith("chara/demihuman/", StringComparison.OrdinalIgnoreCase);
+    }
+
+    public static bool IsPlayerTransientSupportRefreshGamePath(string gamePath)
+    {
+        gamePath = NormalizeGamePath(gamePath);
+        if (string.IsNullOrEmpty(gamePath)) return false;
+
+        if (gamePath.StartsWith("chara/accessory/", StringComparison.OrdinalIgnoreCase)
+            || gamePath.StartsWith("chara/equipment/", StringComparison.OrdinalIgnoreCase)
+            || gamePath.Contains("/accessory/", StringComparison.OrdinalIgnoreCase)
+            || gamePath.Contains("/equipment/", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        return IsVfxPropSupportGamePath(gamePath);
     }
 
     public static bool IsVfxModelSupportGamePath(string gamePath)

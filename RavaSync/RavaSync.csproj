@@ -2,7 +2,7 @@
 <Project Sdk="Dalamud.NET.Sdk/15.0.0">
   <PropertyGroup>
 	  <AssemblyName>RavaSync</AssemblyName>
-    <Version>1.15.0.35</Version>
+    <Version>1.15.0.39</Version>
   </PropertyGroup>
 
   <PropertyGroup>

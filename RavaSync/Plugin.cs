@@ -165,7 +165,7 @@ public sealed class Plugin : IAsyncDalamudPlugin
                 s.GetRequiredService<MareMediator>(), s.GetRequiredService<PairManager>(), s.GetRequiredService<ApiController>(), s.GetRequiredService<UiSharedService>()));
             collection.AddSingleton(s => new PairManager(s.GetRequiredService<ILogger<PairManager>>(), s.GetRequiredService<PairFactory>(),
                 s.GetRequiredService<MareConfigService>(), s.GetRequiredService<MareMediator>(), contextMenu, s.GetRequiredService<DalamudUtilService>(), s.GetRequiredService<IpcManager>(),
-                s.GetRequiredService<CharacterRavaSidecarUtility>(), s.GetRequiredService<PlayerPerformanceService>()));
+                s.GetRequiredService<FileUploadManager>(), s.GetRequiredService<CharacterRavaSidecarUtility>(), s.GetRequiredService<PlayerPerformanceService>()));
             collection.AddSingleton<RedrawManager>();
             collection.AddSingleton((s) => new IpcCallerPenumbra(s.GetRequiredService<ILogger<IpcCallerPenumbra>>(), pluginInterface,
                 s.GetRequiredService<DalamudUtilService>(), s.GetRequiredService<MareMediator>(), s.GetRequiredService<RedrawManager>()));

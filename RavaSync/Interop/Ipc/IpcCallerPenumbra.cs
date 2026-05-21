@@ -679,9 +679,33 @@ public sealed class IpcCallerPenumbra : DisposableMediatorSubscriberBase, IIpcCa
             result = await _dalamudUtil.RunOnFrameworkThread(() =>
             {
                 logger.LogTrace("Calling On IPC: Penumbra.GetGameObjectResourcePaths");
-                var idx = handler.GetGameObject()?.ObjectIndex;
+                var gameObj = handler.GetGameObject();
+                if (gameObj == null && handler.ObjectKind == RavaSync.API.Data.Enum.ObjectKind.Player)
+                {
+                    var localPlayer = _dalamudUtil.GetPlayerPtr();
+                    if (localPlayer != nint.Zero)
+                        gameObj = _dalamudUtil.CreateGameObject(localPlayer);
+                }
+
+                var idx = gameObj?.ObjectIndex;
                 if (idx == null) return null;
-                return _penumbraResourcePaths.Invoke(idx.Value)[0];
+
+                var resourcePathSets = _penumbraResourcePaths.Invoke(idx.Value);
+                if (resourcePathSets == null)
+                    return null;
+
+                try
+                {
+                    return resourcePathSets[0];
+                }
+                catch (ArgumentOutOfRangeException)
+                {
+                    return null;
+                }
+                catch (IndexOutOfRangeException)
+                {
+                    return null;
+                }
             }).ConfigureAwait(false);
         }).ConfigureAwait(false);
 

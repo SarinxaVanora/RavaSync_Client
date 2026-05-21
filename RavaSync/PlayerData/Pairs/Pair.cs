@@ -40,12 +40,9 @@ public class Pair
 
     private CancellationTokenSource _applicationCts = new();
     private OnlineUserIdentDto? _onlineUserIdentDto = null;
-    private long _lastUploadStatusTick = 0;
-    private CancellationTokenSource? _uploadingClearCts;
     private CancellationTokenSource? _pendingEmptyApplyCts;
     private const int PendingEmptyFileListApplyDebounceMs = 500;
     private const int PendingUploadingEmptyFileListApplyDebounceMs = 900;
-    private const int RemoteUploadRecentlyWindowMs = 900;
     private string _lastAcceptedIncomingDataHash = string.Empty;
     private string _lastAcceptedIncomingPayloadFingerprint = string.Empty;
 
@@ -195,9 +192,20 @@ public class Pair
             && string.Equals(incomingHash, _lastAcceptedIncomingDataHash, StringComparison.Ordinal)
             && string.Equals(incomingPayloadFingerprint, _lastAcceptedIncomingPayloadFingerprint, StringComparison.Ordinal))
         {
-            _logger.LogTrace("Ignoring duplicate incoming character data {hash}/{payload} for {uid}", incomingHash, incomingPayloadFingerprint, data.User.UID);
+            var clearedUpload = ClearRemoteUploadStatus();
+            _logger.LogTrace("Ignoring duplicate incoming character data {hash}/{payload} for {uid}; clearedUpload={clearedUpload}", incomingHash, incomingPayloadFingerprint, data.User.UID, clearedUpload);
+
+            // If this duplicate payload is the server's final post-upload push, use it
+            // as a cheap self-heal point. A missed initial/lifecycle apply should not
+            // require the user to pause/unpause the pair to force a reapply.
+            if (clearedUpload && IsVisible && CachedPlayer != null && LastReceivedCharacterData != null && !IsPaused)
+                ApplyLastReceivedData(forced: true);
+
             return;
         }
+
+        var wasUploadingAtDataArrival = IsUploading;
+        ClearRemoteUploadStatus();
 
         if (incoming != null && LastReceivedCharacterData != null && IsVisible)
         {
@@ -214,7 +222,7 @@ public class Pair
                 _pendingEmptyApplyCts = new CancellationTokenSource();
                 var token = _pendingEmptyApplyCts.Token;
                 var pending = incoming;
-                var delayMs = IsUploadingRecently ? PendingUploadingEmptyFileListApplyDebounceMs : PendingEmptyFileListApplyDebounceMs;
+                var delayMs = wasUploadingAtDataArrival ? PendingUploadingEmptyFileListApplyDebounceMs : PendingEmptyFileListApplyDebounceMs;
 
                 var immediate = incoming.DeepClone();
                 immediate.FileReplacements = LastReceivedCharacterData.FileReplacements?
@@ -414,35 +422,94 @@ public class Pair
     public void CreateCachedPlayer(OnlineUserIdentDto? dto = null)
     {
         PairHandler? oldPlayer = null;
+        OnlineUserIdentDto? dtoToApplyAfterOldDispose = null;
         bool shouldCreate = false;
+        bool identChanged = false;
+        string oldIdent = string.Empty;
+        string newIdent = string.Empty;
 
         try
         {
             _creationSemaphore.Wait();
 
-            if (CachedPlayer != null) return;
+            oldIdent = _onlineUserIdentDto?.Ident ?? string.Empty;
+            newIdent = dto?.Ident ?? string.Empty;
+            identChanged = dto != null
+                && !string.IsNullOrEmpty(newIdent)
+                && !string.Equals(oldIdent, newIdent, StringComparison.Ordinal);
 
-            if (dto == null && _onlineUserIdentDto == null)
+            if (CachedPlayer != null && !identChanged)
+            {
+                if (dto != null)
+                    _onlineUserIdentDto = dto;
+
+                return;
+            }
+
+            if (CachedPlayer != null && identChanged)
+            {
+                // Keep Pair.Ident on the old ident until the old handler has disposed.
+                // Its teardown/vanilla restore path may still need to validate the old
+                // live actor, and swapping the ident too early can make that cleanup
+                // target the newly recreated actor instead.
+                oldPlayer = CachedPlayer;
+                CachedPlayer = null;
+                dtoToApplyAfterOldDispose = dto;
+                shouldCreate = true;
+            }
+            else if (dto == null && _onlineUserIdentDto == null)
             {
                 oldPlayer = CachedPlayer;
                 CachedPlayer = null;
                 return;
             }
+            else
+            {
+                if (dto != null)
+                    _onlineUserIdentDto = dto;
 
-            if (dto != null)
-                _onlineUserIdentDto = dto;
-
-            oldPlayer = CachedPlayer;
-            CachedPlayer = null;
-            shouldCreate = _onlineUserIdentDto != null;
+                shouldCreate = _onlineUserIdentDto != null;
+            }
         }
         finally
         {
             _creationSemaphore.Release();
         }
 
-        // Dispose outside lock
+        if (identChanged && oldPlayer != null)
+        {
+            _logger.LogDebug(
+                "Online ident changed for {uid}; recreating cached pair handler ({oldIdent} -> {newIdent})",
+                UserData.UID,
+                string.IsNullOrEmpty(oldIdent) ? "<none>" : oldIdent,
+                string.IsNullOrEmpty(newIdent) ? "<none>" : newIdent);
+        }
+
+        // Dispose outside lock, but before swapping the online ident for a recreated actor.
         oldPlayer?.Dispose();
+
+        if (dtoToApplyAfterOldDispose != null)
+        {
+            var acceptedNewIdent = false;
+
+            try
+            {
+                _creationSemaphore.Wait();
+
+                if (string.Equals(_onlineUserIdentDto?.Ident ?? string.Empty, oldIdent, StringComparison.Ordinal))
+                {
+                    _onlineUserIdentDto = dtoToApplyAfterOldDispose;
+                    acceptedNewIdent = true;
+                }
+            }
+            finally
+            {
+                _creationSemaphore.Release();
+            }
+
+            if (!acceptedNewIdent)
+                shouldCreate = false;
+        }
 
         if (!shouldCreate) return;
 
@@ -489,9 +556,6 @@ public class Pair
             _applicationCts = _applicationCts.CancelRecreate();
             _pendingEmptyApplyCts?.Cancel();
             _pendingEmptyApplyCts = null;
-            _uploadingClearCts?.Cancel();
-            _uploadingClearCts = null;
-
             LastReceivedCharacterData = null;
             LastReceivedSyncManifest = null;
             _lastAcceptedIncomingDataHash = string.Empty;
@@ -510,10 +574,7 @@ public class Pair
 
         _onlineUserIdentDto = null;
 
-        _uploadingClearCts?.Cancel();
-        _uploadingClearCts = null;
-        _isUploading = false;
-        _lastUploadStatusTick = 0;
+        SetUploadState(false);
     }
 
 
@@ -527,65 +588,37 @@ public class Pair
 
     internal void SetUploadState(bool uploading)
     {
-        if (!uploading)
-        {
-            _uploadingClearCts?.Cancel();
-            _uploadingClearCts = null;
-        }
+        if (_isUploading == uploading)
+            return;
 
         _isUploading = uploading;
-        _lastUploadStatusTick = uploading ? Environment.TickCount64 : 0;
+
+        try
+        {
+            _mediator.Publish(new RefreshUiMessage());
+        }
+        catch
+        {
+            // best effort; CompactUI/world text will also refresh naturally next frame
+        }
     }
 
     internal void SetIsUploading()
     {
-        _uploadingClearCts?.Cancel();
-        _uploadingClearCts = new CancellationTokenSource();
-
         SetUploadState(true);
         CachedPlayer?.SetUploading();
-
-        var token = _uploadingClearCts.Token;
-        var statusTick = _lastUploadStatusTick;
-
-        _ = Task.Run(async () =>
-        {
-            try
-            {
-                await Task.Delay(RemoteUploadRecentlyWindowMs, token).ConfigureAwait(false);
-
-                if (token.IsCancellationRequested)
-                    return;
-
-                if (_lastUploadStatusTick != statusTick)
-                    return;
-
-                SetUploadState(false);
-                CachedPlayer?.SetUploading(false);
-            }
-            catch (OperationCanceledException)
-            {
-            }
-            catch
-            {
-            }
-        }, token);
     }
 
-    public bool IsUploading => IsUploadingRecently;
-
-    public bool IsUploadingRecently
+    internal bool ClearRemoteUploadStatus()
     {
-        get
-        {
-            var lastTick = _lastUploadStatusTick;
-            if (lastTick <= 0)
-                return false;
-
-            var elapsed = unchecked(Environment.TickCount64 - lastTick);
-            return elapsed >= 0 && elapsed < RemoteUploadRecentlyWindowMs;
-        }
+        var wasUploading = _isUploading;
+        SetUploadState(false);
+        CachedPlayer?.SetUploading(false);
+        return wasUploading;
     }
+
+    public bool IsUploading => _isUploading;
+    public bool IsUploadingRecently => _isUploading;
 
     public sealed record DownloadProgressSummary(
         bool HasAny,

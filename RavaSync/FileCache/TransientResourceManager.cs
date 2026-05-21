@@ -93,7 +93,7 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
     private readonly string[] _handledRecordingFileTypes = ["tex", "mdl", "mtrl"];
     private static readonly string[] _manifestSupportFileTypes = ["mdl", "mtrl", "tex"];
     private readonly string[] _autoRecordTriggerFileTypes = ["tmb", "tmb2", "pap", "avfx", "atex", "scd"];
-    private const string StartupPrimeManifestRuleVersion = "startup-manifest-prime-v16-mount-rider-player-animations";
+    private const string StartupPrimeManifestRuleVersion = "startup-manifest-prime-v17-explicit-inactive-options";
     private static readonly TimeSpan _autoRecordQuietWindow = TimeSpan.FromMilliseconds(300);
     private static readonly TimeSpan _autoRecordMaximumWindow = TimeSpan.FromMilliseconds(1700);
     private static readonly TimeSpan _autoRecordRecentBaselineLifetime = TimeSpan.FromMilliseconds(2500);
@@ -323,6 +323,22 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
             if (semiTransientResources.TryGetValue(objectKind, out var semiValues))
                 result.UnionWith(semiValues);
         }
+
+        lock (_transientResourcesLock)
+        {
+            if (_transientResources.TryGetValue(objectKind, out var transientValues))
+                result.UnionWith(transientValues);
+
+            if (_pendingAutoRecordedSupportResources.TryGetValue(objectKind, out var pendingValues))
+                result.UnionWith(pendingValues);
+        }
+
+        return result;
+    }
+
+    public HashSet<string> GetPendingTransientResources(ObjectKind objectKind)
+    {
+        var result = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         lock (_transientResourcesLock)
         {
@@ -2871,8 +2887,11 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
         if (!root.TryGetProperty("Options", out var options) || options.ValueKind != JsonValueKind.Array)
             return;
 
-        var selectedOptions = GetSelectedOptionNames(root, selectedSettings, manifestPath);
-        selectedOptions.UnionWith(GetDefaultSelectedAuxiliaryOptionNames(root));
+        var selectedOptions = GetSelectedOptionNames(root, selectedSettings, manifestPath, out var explicitSelectionFound);
+        if (!explicitSelectionFound)
+            selectedOptions.UnionWith(GetDefaultSelectedAuxiliaryOptionNames(root));
+
+        RemoveInactiveManifestOptionNames(selectedOptions);
 
         foreach (var option in options.EnumerateArray())
         {
@@ -2887,7 +2906,7 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
         }
     }
 
-    private static HashSet<string> GetSelectedOptionNames(JsonElement groupRoot, Dictionary<string, List<string>>? selectedSettings, string manifestPath)
+    private static HashSet<string> GetSelectedOptionNames(JsonElement groupRoot, Dictionary<string, List<string>>? selectedSettings, string manifestPath, out bool explicitSelectionFound)
     {
         var output = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var optionNames = GetManifestOptionNames(groupRoot);
@@ -2897,13 +2916,32 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
 
         if (selectedSettings != null && TryGetSelectedSettingsForManifestGroup(groupRoot, manifestPath, selectedSettings, out var selected))
         {
+            explicitSelectionFound = true;
             AddSelectedOptionNamesFromSettingValues(output, optionNames, groupType, selected);
-            if (output.Count > 0)
-                return output;
+            RemoveInactiveManifestOptionNames(output);
+            return output;
         }
 
+        explicitSelectionFound = false;
         AddDefaultSelectedOptionNames(output, optionNames, groupType, groupRoot);
+        RemoveInactiveManifestOptionNames(output);
         return output;
+    }
+
+    private static void RemoveInactiveManifestOptionNames(HashSet<string> optionNames)
+    {
+        if (optionNames.Count == 0)
+            return;
+
+        optionNames.RemoveWhere(IsInactiveManifestOptionName);
+    }
+
+    private static bool IsInactiveManifestOptionName(string? optionName)
+    {
+        if (string.IsNullOrWhiteSpace(optionName))
+            return false;
+
+        return NormalizeManifestSelectionKey(optionName) is "off" or "none" or "no" or "false" or "null" or "disabled" or "disable" or "inactive" or "notactive";
     }
 
     private static List<string> GetManifestOptionNames(JsonElement groupRoot)

@@ -33,14 +33,18 @@ public sealed partial class PairHandler
         {
         }
 
+            private const int OwnedObjectRetryInitialDelayMs = 35;
+            private const int OwnedObjectRetryPollDelayMs = 75;
+            private const int OwnedObjectRetryBackoffMs = 150;
+
             public void QueueOwnedObjectCustomizationRetry(ObjectKind objectKind)
             {
                 if (objectKind == ObjectKind.Player) return;
 
                 _pendingOwnedObjectCustomizationRetry.Add(objectKind);
-                var nowTick = Environment.TickCount64;
-                if (_nextOwnedObjectCustomizationRetryTick < 0 || _nextOwnedObjectCustomizationRetryTick > nowTick + 250)
-                    _nextOwnedObjectCustomizationRetryTick = nowTick + 250;
+                var dueTick = Environment.TickCount64 + OwnedObjectRetryInitialDelayMs;
+                if (_nextOwnedObjectCustomizationRetryTick < 0 || _nextOwnedObjectCustomizationRetryTick > dueTick)
+                    _nextOwnedObjectCustomizationRetryTick = dueTick;
             }
 
             public bool HasPendingOwnedObjectCustomizationPayload(CharacterData charaData, ObjectKind objectKind)
@@ -66,7 +70,6 @@ public sealed partial class PairHandler
                 if (_pendingOwnedObjectCustomizationRetry.Count == 0) return;
                 if (_nextOwnedObjectCustomizationRetryTick >= 0 && nowTick < _nextOwnedObjectCustomizationRetryTick) return;
                 if (!IsVisible || _cachedData == null || _charaHandler == null || _charaHandler.Address == nint.Zero) return;
-                if (_charaHandler.CurrentDrawCondition != GameObjectHandler.DrawCondition.None) return;
 
                 var playerAddress = ResolveStablePlayerAddress();
                 if (playerAddress == nint.Zero) return;
@@ -82,31 +85,100 @@ public sealed partial class PairHandler
                     if (ResolveOwnedObjectAddressForRetry(playerAddress, objectKind) == nint.Zero)
                         continue;
 
+                    var retryChanges = BuildOwnedObjectRetryChanges(_cachedData, objectKind);
+                    if (retryChanges.Count == 0)
+                    {
+                        _pendingOwnedObjectCustomizationRetry.Remove(objectKind);
+                        continue;
+                    }
+
                     _pendingOwnedObjectCustomizationRetry.Remove(objectKind);
-                    _nextOwnedObjectCustomizationRetryTick = nowTick + 750;
-                    _redrawOnNextApplication = true;
+                    _nextOwnedObjectCustomizationRetryTick = nowTick + OwnedObjectRetryPollDelayMs;
 
                     var appData = Guid.NewGuid();
                     var cachedData = _cachedData.DeepClone();
-                    _ = Task.Run(() =>
+                    _ = Task.Run(async () =>
                     {
                         try
                         {
-                            Owner.ApplyCharacterData(appData, cachedData, forceApplyCustomization: true);
+                            var applied = await ApplyOwnedObjectCustomizationRetryAsync(appData, cachedData, objectKind, retryChanges, CancellationToken.None).ConfigureAwait(false);
+                            if (!applied && IsVisible && _cachedData != null && HasPendingOwnedObjectCustomizationPayload(_cachedData, objectKind))
+                                QueueOwnedObjectCustomizationRetry(objectKind);
                         }
                         catch (Exception ex)
                         {
-                            Logger.LogWarning(ex, "[BASE-{appBase}] Deferred owned-object customization retry dispatch failed for {player}", appData, PlayerName);
+                            Logger.LogWarning(ex, "[BASE-{appBase}] Deferred owned-object customization retry failed for {player} {objectKind}", appData, PlayerName, objectKind);
+                            if (IsVisible && _cachedData != null && HasPendingOwnedObjectCustomizationPayload(_cachedData, objectKind))
+                                QueueOwnedObjectCustomizationRetry(objectKind);
                         }
                     });
 
                     return;
                 }
 
-                _nextOwnedObjectCustomizationRetryTick = nowTick + 750;
+                _nextOwnedObjectCustomizationRetryTick = nowTick + OwnedObjectRetryBackoffMs;
             }
 
-            public async Task<bool> ApplyCustomizationDataAsync(Guid applicationId, KeyValuePair<ObjectKind, HashSet<PlayerChanges>> changes, CharacterData charaData, bool allowPlayerRedraw, bool forceLightweightMetadataReapply, bool awaitPlayerGlamourerApply, ApplyFlag glamourerApplyFlags, CancellationToken token)
+            private HashSet<PlayerChanges> BuildOwnedObjectRetryChanges(CharacterData charaData, ObjectKind objectKind)
+            {
+                var changes = new HashSet<PlayerChanges>();
+                if (objectKind == ObjectKind.Player)
+                    return changes;
+
+                if (charaData.FileReplacements.TryGetValue(objectKind, out var replacements)
+                    && HasMeaningfulFileReplacements(replacements))
+                {
+                    changes.Add(PlayerChanges.ModFiles);
+                    changes.Add(PlayerChanges.ForcedRedraw);
+                }
+
+                if (charaData.GlamourerData.TryGetValue(objectKind, out var glamourerString)
+                    && !string.IsNullOrWhiteSpace(glamourerString))
+                {
+                    changes.Add(PlayerChanges.Glamourer);
+                }
+
+                if (Pair.IsCustomizePlusEnabled
+                    && charaData.CustomizePlusData.TryGetValue(objectKind, out var customizeScale)
+                    && !string.IsNullOrWhiteSpace(customizeScale))
+                {
+                    changes.Add(PlayerChanges.Customize);
+                    changes.Add(PlayerChanges.ForcedRedraw);
+                }
+
+                return changes;
+            }
+
+
+            private static bool HasMeaningfulFileReplacements(List<FileReplacementData>? replacements)
+                => replacements != null && replacements.Any(static replacement =>
+                    !string.IsNullOrWhiteSpace(replacement.Hash)
+                    || !string.IsNullOrWhiteSpace(replacement.FileSwapPath)
+                    || (replacement.GamePaths?.Any(static gamePath => !string.IsNullOrWhiteSpace(gamePath)) ?? false));
+
+            private async Task<bool> ApplyOwnedObjectCustomizationRetryAsync(Guid applicationId, CharacterData charaData, ObjectKind objectKind, HashSet<PlayerChanges> retryChanges, CancellationToken token)
+            {
+                if (objectKind == ObjectKind.Player || retryChanges.Count == 0)
+                    return false;
+
+                if (!IsVisible || _charaHandler == null || _charaHandler.Address == nint.Zero)
+                    return false;
+
+                var playerAddress = ResolveStablePlayerAddress();
+                if (playerAddress == nint.Zero || ResolveOwnedObjectAddressForRetry(playerAddress, objectKind) == nint.Zero)
+                    return false;
+
+                var bound = await EnsurePenumbraCollectionBindingAsync(applicationId).ConfigureAwait(false);
+                if (!bound.Bound)
+                    return false;
+
+                var lightweightOwnedObjectFlags = ApplyFlag.Once | ApplyFlag.Equipment | ApplyFlag.Customization;
+                var changeSet = new KeyValuePair<ObjectKind, HashSet<PlayerChanges>>(objectKind, retryChanges);
+                await ApplyCustomizationDataAsync(applicationId, changeSet, charaData, false, false, false, false, lightweightOwnedObjectFlags, token).ConfigureAwait(false);
+                return true;
+            }
+
+            public async Task<bool> ApplyCustomizationDataAsync(Guid applicationId, KeyValuePair<ObjectKind, HashSet<PlayerChanges>> changes, CharacterData charaData, bool allowPlayerRedraw, bool forceLightweightMetadataReapply, bool awaitPlayerGlamourerApply, bool waitForPlayerGlamourerDrawSettle, ApplyFlag glamourerApplyFlags, CancellationToken token)
             {
                 if (PlayerCharacter == nint.Zero) return false;
                 var ptr = PlayerCharacter;
@@ -134,11 +206,20 @@ public sealed partial class PairHandler
                         _pendingOwnedObjectCustomizationRetry.Remove(changes.Key);
 
                     Logger.LogDebug("[{applicationId}] Applying Customization Data for {handler}", applicationId, handler);
+                    var isFileBackedOwnedObjectApply = changes.Key != ObjectKind.Player
+                        && (changes.Value.Contains(PlayerChanges.ModFiles) || changes.Value.Contains(PlayerChanges.ForcedRedraw));
                     if (changes.Key != ObjectKind.Player)
                     {
-                        var ownedObjectDrawWaitMs = SyncStorm.IsActive ? 500 : 1500;
-                        await _dalamudUtil.WaitWhileCharacterIsDrawing(Logger, handler, applicationId, ownedObjectDrawWaitMs, token).ConfigureAwait(false);
-                        token.ThrowIfCancellationRequested();
+                        if (!isFileBackedOwnedObjectApply)
+                        {
+                            var ownedObjectDrawWaitMs = SyncStorm.IsActive ? 500 : 1500;
+                            await _dalamudUtil.WaitWhileCharacterIsDrawing(Logger, handler, applicationId, ownedObjectDrawWaitMs, token).ConfigureAwait(false);
+                            token.ThrowIfCancellationRequested();
+                        }
+                        else if (handler.CurrentDrawCondition != GameObjectHandler.DrawCondition.None)
+                        {
+                            Logger.LogTrace("[{applicationId}] Applying file-backed owned-object state without waiting for draw settle for {handler}; draw state={draw}", applicationId, handler, handler.CurrentDrawCondition);
+                        }
                     }
 
                     // Coalesce redraws for this handler into a single call at the end.
@@ -199,7 +280,7 @@ public sealed partial class PairHandler
                                 if (charaData.GlamourerData.TryGetValue(changes.Key, out var glamourerData))
                                 {
                                     var waitForThisGlamourerApply = awaitPlayerGlamourerApply && changes.Key == ObjectKind.Player;
-                                    await _ipcManager.Glamourer.ApplyAllAsync(Logger, handler, glamourerData, applicationId, token, fireAndForget: !waitForThisGlamourerApply, flags: glamourerApplyFlags).ConfigureAwait(false);
+                                    await _ipcManager.Glamourer.ApplyAllAsync(Logger, handler, glamourerData, applicationId, token, fireAndForget: !waitForThisGlamourerApply, flags: glamourerApplyFlags, waitForDrawSettle: waitForThisGlamourerApply && waitForPlayerGlamourerDrawSettle).ConfigureAwait(false);
                                 }
                                 break;
 
@@ -265,7 +346,16 @@ public sealed partial class PairHandler
                         if (changes.Key == ObjectKind.Player)
                             return true;
 
-                        await _ipcManager.Penumbra.RedrawAsync(Logger, handler, applicationId, token).ConfigureAwait(false);
+                        if (isFileBackedOwnedObjectApply)
+                        {
+                            var directFired = await _ipcManager.Penumbra.RedrawDirectAndWaitAsync(Logger, handler, applicationId, token).ConfigureAwait(false);
+                            if (!directFired)
+                                await _ipcManager.Penumbra.RedrawAsync(Logger, handler, applicationId, token).ConfigureAwait(false);
+                        }
+                        else
+                        {
+                            await _ipcManager.Penumbra.RedrawAsync(Logger, handler, applicationId, token).ConfigureAwait(false);
+                        }
                     }
 
                     return false;
@@ -325,7 +415,9 @@ public sealed partial class PairHandler
                             await _ipcManager.CustomizePlus.RevertByIdAsync(customizeId.Value).ConfigureAwait(false);
                         using GameObjectHandler tempHandler = await _gameObjectHandlerFactory.Create(ObjectKind.MinionOrMount, () => minionOrMount, isWatched: false).ConfigureAwait(false);
                         _ = _ipcManager.Glamourer.RevertAsync(Logger, tempHandler, applicationId, cancelToken, fireAndForget: true);
-                        await _ipcManager.Penumbra.RedrawAsync(Logger, tempHandler, applicationId, cancelToken).ConfigureAwait(false);
+                        var directFired = await _ipcManager.Penumbra.RedrawDirectAndWaitAsync(Logger, tempHandler, applicationId, cancelToken).ConfigureAwait(false);
+                        if (!directFired)
+                            await _ipcManager.Penumbra.RedrawAsync(Logger, tempHandler, applicationId, cancelToken).ConfigureAwait(false);
 
                     }
                 }

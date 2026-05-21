@@ -146,7 +146,7 @@ public sealed class IpcCallerGlamourer : DisposableMediatorSubscriberBase, IIpcC
         }
     }
 
-    public async Task ApplyAllAsync(ILogger logger, GameObjectHandler handler, string? customization, Guid applicationId, CancellationToken token, bool fireAndForget = false, ApplyFlag? flags = null)
+    public async Task ApplyAllAsync(ILogger logger, GameObjectHandler handler, string? customization, Guid applicationId, CancellationToken token, bool fireAndForget = false, ApplyFlag? flags = null, bool waitForDrawSettle = true)
     {
         if (!APIAvailable || string.IsNullOrEmpty(customization) || _dalamudUtil.IsZoning) return;
 
@@ -155,6 +155,7 @@ public sealed class IpcCallerGlamourer : DisposableMediatorSubscriberBase, IIpcC
             await SafeIpc.TryRun(Logger, "Glamourer.ApplyAll", TimeSpan.FromSeconds(2), async ct =>
             {
                 var applyFlags = flags ?? ApplyFlagEx.StateDefault;
+                var isLightweightApply = applyFlags != ApplyFlagEx.StateDefault;
                 await RunPacedGlamourerFrameworkIpcAsync(logger, $"Glamourer.ApplyState({applyFlags})", () =>
                 {
                     try
@@ -177,9 +178,13 @@ public sealed class IpcCallerGlamourer : DisposableMediatorSubscriberBase, IIpcC
 
                 await _dalamudUtil.RunOnFrameworkThread(() => 0).ConfigureAwait(false);
 
-                if (handler.Address != nint.Zero && handler.CurrentDrawCondition != GameObjectHandler.DrawCondition.None)
+                if (waitForDrawSettle && !isLightweightApply && handler.Address != nint.Zero && handler.CurrentDrawCondition != GameObjectHandler.DrawCondition.None)
                 {
                     await _dalamudUtil.WaitWhileCharacterIsDrawing(logger, handler, applicationId, 15000, ct).ConfigureAwait(false);
+                }
+                else if (handler.Address != nint.Zero && handler.CurrentDrawCondition != GameObjectHandler.DrawCondition.None)
+                {
+                    logger.LogTrace("[{appid}] Glamourer apply flags={flags} left {name} drawing; not blocking the RavaSync apply lane", applicationId, applyFlags, handler.Name);
                 }
             }).ConfigureAwait(false);
         }

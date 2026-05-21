@@ -18,6 +18,7 @@ using RavaSync.Services.Events;
 using RavaSync.Services.Mediator;
 using RavaSync.Utils;
 using RavaSync.WebAPI;
+using RavaSync.WebAPI.Files;
 using System.Collections.Concurrent;
 using System.Text.Json;
 
@@ -33,6 +34,7 @@ public sealed class PairManager : DisposableMediatorSubscriberBase
     private readonly MareMediator _mediator;
     private readonly DalamudUtilService _dalamudUtil;
     private readonly IpcManager _ipcManager;
+    private readonly FileUploadManager _fileUploadManager;
     private readonly CharacterRavaSidecarUtility _characterRavaSidecarUtility;
     private readonly PlayerPerformanceService _playerPerformanceService;
     private sealed record PendingOtherSyncLatch(bool YieldToOtherSync, string Owner);
@@ -46,7 +48,7 @@ public sealed class PairManager : DisposableMediatorSubscriberBase
     private Lazy<Dictionary<GroupFullInfoDto, List<Pair>>> _groupPairsInternal;
     private Lazy<Dictionary<Pair, List<GroupFullInfoDto>>> _pairsWithGroupsInternal;
 
-    public PairManager(ILogger<PairManager> logger,PairFactory pairFactory,MareConfigService configurationService,MareMediator mediator,IContextMenu dalamudContextMenu,DalamudUtilService dalamudUtil,IpcManager ipcManager, CharacterRavaSidecarUtility characterRavaSidecarUtility, PlayerPerformanceService playerPerformanceService) : base(logger, mediator)
+    public PairManager(ILogger<PairManager> logger,PairFactory pairFactory,MareConfigService configurationService,MareMediator mediator,IContextMenu dalamudContextMenu,DalamudUtilService dalamudUtil,IpcManager ipcManager, FileUploadManager fileUploadManager, CharacterRavaSidecarUtility characterRavaSidecarUtility, PlayerPerformanceService playerPerformanceService) : base(logger, mediator)
     {
         _pairFactory = pairFactory;
         _configurationService = configurationService;
@@ -54,6 +56,7 @@ public sealed class PairManager : DisposableMediatorSubscriberBase
         _mediator = mediator;
         _dalamudUtil = dalamudUtil;
         _ipcManager = ipcManager;
+        _fileUploadManager = fileUploadManager;
         _characterRavaSidecarUtility = characterRavaSidecarUtility;
         _playerPerformanceService = playerPerformanceService;
         
@@ -460,6 +463,10 @@ public sealed class PairManager : DisposableMediatorSubscriberBase
         var pair = _allClientPairs[dto.User];
         if (pair.HasCachedPlayer)
         {
+            // A fresh OnlineUserIdentDto can represent a newly recreated in-game actor
+            // for the same UID. Let Pair decide whether the cached handler can stay or
+            // must be recycled instead of treating "already cached" as authoritative.
+            pair.CreateCachedPlayer(dto);
             RecreateLazy();
             return;
         }
@@ -506,16 +513,26 @@ public sealed class PairManager : DisposableMediatorSubscriberBase
 
         if (pair.IsDuplicateIncomingPayload(dto.CharaData) && manifestUnchanged)
         {
+            var clearedUpload = pair.ClearRemoteUploadStatus();
             if (Logger.IsEnabled(LogLevel.Trace))
             {
                 Logger.LogTrace(
-                    "Ignoring duplicate/sidecar-only character data for {uid}; perf={perf}, manifest={manifest}, merged={merged}",
+                    "Ignoring duplicate/sidecar-only character data for {uid}; perf={perf}, manifest={manifest}, merged={merged}, clearedUpload={clearedUpload}",
                     dto.User.UID,
                     hasPerformance,
                     currentManifestFingerprint,
-                    merged);
+                    merged,
+                    clearedUpload);
             }
 
+            // A duplicate payload can still be the sender's final post-upload push.
+            // Use that as the clean end-of-upload signal and as a lightweight self-heal
+            // for cases where the visible actor missed its first apply and would
+            // otherwise need a pause/unpause cycle.
+            if (clearedUpload && pair.IsVisible)
+                pair.ApplyLastReceivedData(forced: true);
+
+            RecreateLazy();
             return;
         }
 
@@ -668,9 +685,17 @@ public sealed class PairManager : DisposableMediatorSubscriberBase
 
     internal void ReceiveUploadStatus(UserDto dto)
     {
+        var uid = dto.User?.UID;
+        if (!string.IsNullOrWhiteSpace(uid) && _fileUploadManager.IsLocalOutboundUploadRecipient(uid))
+        {
+            Logger.LogTrace("Ignoring upload status echo for local outbound recipient {uid}", uid);
+            return;
+        }
+
         if (_allClientPairs.TryGetValue(dto.User, out var existingPair) && existingPair.IsVisible)
         {
             existingPair.SetIsUploading();
+            RecreateLazy();
         }
     }
 

@@ -50,6 +50,8 @@ public sealed class CacheCreationService : DisposableMediatorSubscriberBase
     private static readonly TimeSpan StartupImmediatePublishSettleWindow = TimeSpan.FromSeconds(4);
     private static readonly TimeSpan ConnectedImmediatePublishSettleWindow = TimeSpan.Zero;
     private static readonly TimeSpan FastPlayerAppearanceDelay = TimeSpan.FromMilliseconds(750);
+    private static readonly TimeSpan OwnedObjectBuildDelay = TimeSpan.FromMilliseconds(75);
+    private static readonly TimeSpan OwnedObjectStormBuildDelay = TimeSpan.FromMilliseconds(250);
     private static readonly TimeSpan DefaultBuildDelay = TimeSpan.FromMilliseconds(250);
     private static readonly TimeSpan ImmediatePlayerPublishCoalesceDelay = TimeSpan.FromMilliseconds(1500);
     private static readonly TimeSpan ImmediatePlayerPublishCooldown = TimeSpan.FromMilliseconds(1500);
@@ -614,9 +616,12 @@ public sealed class CacheCreationService : DisposableMediatorSubscriberBase
     private static TimeSpan GetDebounceDelay(ObjectKind kind, string? reason)
     {
         if (SyncStorm.IsActive)
-            return kind == ObjectKind.Player ? TimeSpan.FromMilliseconds(2500) : TimeSpan.FromMilliseconds(1000);
+            return kind == ObjectKind.Player ? TimeSpan.FromMilliseconds(2500) : OwnedObjectStormBuildDelay;
 
-        if (kind == ObjectKind.Player && IsFastPlayerAppearanceReason(reason))
+        if (kind != ObjectKind.Player)
+            return OwnedObjectBuildDelay;
+
+        if (IsFastPlayerAppearanceReason(reason))
             return FastPlayerAppearanceDelay;
 
         return DefaultBuildDelay;
@@ -624,6 +629,9 @@ public sealed class CacheCreationService : DisposableMediatorSubscriberBase
 
     private TimeSpan GetBuildDelay(IReadOnlyCollection<ObjectKind> objectKinds)
     {
+        if (!objectKinds.Contains(ObjectKind.Player))
+            return SyncStorm.IsActive ? OwnedObjectStormBuildDelay : OwnedObjectBuildDelay;
+
         if (objectKinds.Contains(ObjectKind.Player))
         {
             lock (_cacheCreateLockObj)
@@ -1083,6 +1091,38 @@ public sealed class CacheCreationService : DisposableMediatorSubscriberBase
         return currentReplacements.SetEquals(newReplacements);
     }
 
+
+    private bool ShouldPreserveInactiveOwnedObjectFragment(ObjectKind objectKind)
+    {
+        if (objectKind is not (ObjectKind.MinionOrMount or ObjectKind.Companion))
+            return false;
+
+        return HasMeaningfulOwnedObjectPayload(objectKind);
+    }
+
+    private bool HasMeaningfulOwnedObjectPayload(ObjectKind objectKind)
+    {
+        if (_playerData.FileReplacements.TryGetValue(objectKind, out var replacements)
+            && replacements.Any(static replacement => replacement.HasFileReplacement || replacement.IsFileSwap))
+        {
+            return true;
+        }
+
+        if (_playerData.CustomizePlusScale.TryGetValue(objectKind, out var customizeScale)
+            && !string.IsNullOrWhiteSpace(customizeScale))
+        {
+            return true;
+        }
+
+        if (_playerData.GlamourerString.TryGetValue(objectKind, out var glamourerString)
+            && !string.IsNullOrWhiteSpace(glamourerString))
+        {
+            return true;
+        }
+
+        return false;
+    }
+
     private void ProcessCacheCreation()
     {
         if (_isZoning || _haltCharaDataCreation) return;
@@ -1166,13 +1206,28 @@ public sealed class CacheCreationService : DisposableMediatorSubscriberBase
                         && (handler.Address == IntPtr.Zero
                             || handler.CurrentDrawCondition is GameObjectHandler.DrawCondition.ObjectZero or GameObjectHandler.DrawCondition.DrawObjectZero))
                     {
+                        if (ShouldPreserveInactiveOwnedObjectFragment(objectKind))
+                        {
+                            if (Logger.IsEnabled(LogLevel.Trace))
+                                Logger.LogTrace("Preserving last known {objectKind} payload while the owned object is not fully spawned yet; avoiding a temporary vanilla/clear publish", objectKind);
+
+                            return (false, null, reasonSet);
+                        }
+
                         return (true, null, reasonSet);
                     }
 
                     if (objectKind == ObjectKind.Player)
                     {
                         var combinedReason = reasonSet.Count == 0 ? null : string.Join("|", reasonSet);
-                        return (true, await BuildLocalPlayerFragmentAsync(handler, combinedReason, linkedCts.Token).ConfigureAwait(false), reasonSet);
+                        var playerFragment = await BuildLocalPlayerFragmentAsync(handler, combinedReason, linkedCts.Token).ConfigureAwait(false);
+                        if (playerFragment == null)
+                        {
+                            Logger.LogWarning("Skipping local player cache update because the player fragment build returned null; preserving last known self state instead of publishing a partial/vanilla payload");
+                            return (false, null, reasonSet);
+                        }
+
+                        return (true, playerFragment, reasonSet);
                     }
 
                     return (true, await _characterDataFactory.BuildCharacterData(handler, linkedCts.Token).ConfigureAwait(false), reasonSet);
