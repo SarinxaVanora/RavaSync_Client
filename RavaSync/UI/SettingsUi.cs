@@ -619,15 +619,6 @@ public class SettingsUi : WindowMediatorSubscriberBase
         ImGui.SameLine();
         ImGui.AlignTextToFramePadding();
         ImGui.TextDisabled(_uiShared.L("UI.SettingsUi.0e7c1b4a", "(0 = Auto)"));
-
-        if (ImGui.Checkbox(_uiShared.L("UI.SettingsUi.FastTinyFileDownloads", "Faster tiny-file downloads"), ref experimentalSpeedUp))
-        {
-            _configService.Current.ExperimentalSpeedUp = experimentalSpeedUp;
-            _configService.Save();
-        }
-        _uiShared.DrawHelpText(_uiShared.L(
-            "UI.SettingsUi.FastTinyFileDownloads.Help",
-            "Batches tiny files so large outfits and effect-heavy mods can download more smoothly."));
     }
 
     private void DrawTransferDisplaySettings()
