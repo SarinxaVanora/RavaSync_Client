@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -465,7 +465,7 @@ public sealed partial class PairHandler
                     if (!target.Valid)
                         return PairSyncCommitResult.ActorChanged(target.Reason, retryImmediately: false);
 
-                    var playerCriticalRedrawAsset = HasPlayerCriticalRedrawAsset(assetPlan);
+                    var playerCriticalRedrawAsset = HasPlayerCriticalRedrawAsset(assetPlan, updatedData, previousTempMods, tempMods);
                     var redrawFired = await OnePassRedrawAsync(applicationId, token, criticalRedraw: lifecycleRedrawRequestedFromPlan || playerCriticalRedrawAsset).ConfigureAwait(false);
                     if ((lifecycleRedrawRequestedFromPlan || playerCriticalRedrawAsset) && !redrawFired)
                     {
@@ -925,18 +925,70 @@ public sealed partial class PairHandler
 
             // Transient prop/support assets must stay part of the character's temp-mod state,
             // but they should not force a receiver redraw by themselves.  Redraw remains reserved
-            // for actual redraw-critical player assets or explicit lifecycle redraws.
+            // for actual redraw-critical player assets, Proteus-style pure overlay cache updates,
+            // or explicit lifecycle redraws.
+            if (HasPlayerProteusOverlayCacheAdditionChanged(assetPlan, previousTempMods, currentTempMods, updatedData))
+                return true;
+
             return HasPlayerCriticalRedrawAssetChanged(assetPlan, previousTempMods, currentTempMods);
         }
 
-        private static bool HasPlayerCriticalRedrawAsset(PairSyncAssetPlan assetPlan)
-            => assetPlan.Entries.Any(static entry => IsPlayerRedrawCriticalAsset(entry));
+        private static bool HasPlayerCriticalRedrawAsset(PairSyncAssetPlan assetPlan, Dictionary<ObjectKind, HashSet<PlayerChanges>> updatedData, IReadOnlyDictionary<string, string>? previousTempMods, IReadOnlyDictionary<string, string> currentTempMods)
+            => assetPlan.Entries.Any(static entry => IsPlayerRedrawCriticalAsset(entry))
+                || HasPlayerProteusOverlayCacheAdditionChanged(assetPlan, previousTempMods, currentTempMods, updatedData);
 
         private static bool RequiresPlayerTransientSupportRefresh(PairSyncAssetPlan assetPlan, string? previousTransientSupportFingerprint)
             => assetPlan.RequiresTransientSupportRefresh(previousTransientSupportFingerprint)
                 && assetPlan.Entries.Any(static entry => entry.ObjectKind == ObjectKind.Player
                     && !LooksLikeOwnedObjectAssetPath(entry.GamePath)
                     && PairApplyUtilities.IsPlayerTransientSupportRefreshGamePath(entry.GamePath));
+
+        private static bool HasPlayerProteusOverlayCacheAdditionChanged(PairSyncAssetPlan assetPlan, IReadOnlyDictionary<string, string>? previousTempMods, IReadOnlyDictionary<string, string> currentTempMods, Dictionary<ObjectKind, HashSet<PlayerChanges>> updatedData)
+        {
+            if (!IsPurePlayerModFilesOnlyApply(updatedData) || !assetPlan.HasAssets)
+                return false;
+
+            foreach (var entry in assetPlan.Entries)
+            {
+                if (entry.ObjectKind != ObjectKind.Player || LooksLikeOwnedObjectAssetPath(entry.GamePath))
+                    continue;
+
+                if (entry.Kind is not PairSyncAssetKind.Texture and not PairSyncAssetKind.Material)
+                    continue;
+
+                if (!PairApplyUtilities.IsProteusOverlayCacheCandidateGamePath(entry.GamePath))
+                    continue;
+
+                var gamePath = NormalizeGamePath(entry.GamePath);
+                if (!currentTempMods.TryGetValue(gamePath, out var currentPath) || string.IsNullOrWhiteSpace(currentPath))
+                    continue;
+
+                // Overlay enable/refresh writes a new resolved file. Overlay disable/removal
+                // already clears visually without needing the receiver redraw, so require a
+                // current path and a genuinely new/changed target.
+                if (previousTempMods == null || previousTempMods.Count == 0)
+                    return true;
+
+                if (!previousTempMods.TryGetValue(gamePath, out var previousPath))
+                    return true;
+
+                if (!string.Equals(previousPath, currentPath, StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+
+            return false;
+        }
+
+        private static bool IsPurePlayerModFilesOnlyApply(Dictionary<ObjectKind, HashSet<PlayerChanges>> updatedData)
+        {
+            if (!updatedData.TryGetValue(ObjectKind.Player, out var playerChanges))
+                return false;
+
+            if (playerChanges.Count != 1 || !playerChanges.Contains(PlayerChanges.ModFiles))
+                return false;
+
+            return updatedData.All(static item => item.Key == ObjectKind.Player || item.Value.Count == 0);
+        }
 
         private static bool HasPlayerCriticalRedrawAssetChanged(PairSyncAssetPlan assetPlan, IReadOnlyDictionary<string, string>? previousTempMods, IReadOnlyDictionary<string, string> currentTempMods)
         {

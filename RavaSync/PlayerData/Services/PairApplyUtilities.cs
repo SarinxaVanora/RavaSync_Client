@@ -1,4 +1,4 @@
-using RavaSync.API.Data;
+﻿using RavaSync.API.Data;
 using RavaSync.WebAPI.Files.Models;
 using System.Buffers;
 using System.Security.Cryptography;
@@ -103,6 +103,25 @@ public static class PairApplyUtilities
 
         return gamePath.StartsWith("chara/accessory/", StringComparison.OrdinalIgnoreCase)
             || gamePath.Contains("/accessory/", StringComparison.OrdinalIgnoreCase);
+    }
+
+    public static bool IsProteusOverlayCacheCandidateGamePath(string gamePath)
+    {
+        gamePath = NormalizeGamePath(gamePath);
+        if (string.IsNullOrEmpty(gamePath)) return false;
+
+        // Deliberately only identifies files Proteus may have rewritten. This is not
+        // redraw-critical on its own; the receiver apply lane also requires a pure
+        // ModFiles-only delta so ordinary Glamourer/equipment/body visibility changes
+        // keep the existing no-redraw cadence.
+        if (!gamePath.EndsWith(".tex", StringComparison.OrdinalIgnoreCase)
+            && !gamePath.EndsWith(".mtrl", StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        if (IsWornEquipmentOrAccessoryGamePath(gamePath))
+            return false;
+
+        return gamePath.StartsWith("chara/human/", StringComparison.OrdinalIgnoreCase);
     }
 
     private static bool IsDangerousTransientScope(string gamePath)

@@ -323,7 +323,6 @@ public class PlayerDataFactory : IMediatorSubscriber
 
         await AddSenderSelectedFullMountModReplacementsAsync(fragment, objectKind, playerRelatedObject, ct).ConfigureAwait(false);
         await AddSenderDefaultCollectionMountMusicReplacementsAsync(fragment, objectKind, ct).ConfigureAwait(false);
-        await AddSenderSelectedHumanAnimationFamilyAliasReplacementsAsync(fragment, objectKind, ct).ConfigureAwait(false);
 
         // clean up all semi transient resources that don't have any file replacement (aka null resolve)
         _transientResourceManager.CleanUpSemiTransientResources(objectKind, [.. fragment.FileReplacements]);
@@ -382,131 +381,6 @@ public class PlayerDataFactory : IMediatorSubscriber
         return fragment;
     }
 
-
-    private async Task AddSenderSelectedHumanAnimationFamilyAliasReplacementsAsync(CharacterDataFragment fragment, ObjectKind objectKind, CancellationToken ct)
-    {
-        if (objectKind != ObjectKind.Player)
-            return;
-
-        if (fragment.FileReplacements.Count == 0 || !_ipcManager.Penumbra.APIAvailable)
-            return;
-
-        var activeAnimationFamilies = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var replacement in fragment.FileReplacements)
-        {
-            foreach (var gamePath in replacement.GamePaths)
-            {
-                if (!IsCompatibleHumanAnimationPath(gamePath))
-                    continue;
-
-                if (TryGetHumanModelPathFamily(gamePath, out _, out var familyKey) && !string.IsNullOrWhiteSpace(familyKey))
-                    activeAnimationFamilies.Add(familyKey);
-            }
-        }
-
-        if (activeAnimationFamilies.Count == 0)
-            return;
-
-        var collectionState = await _localPapSafetyModService.TryGetLocalPlayerCollectionSettingsAsync(ct).ConfigureAwait(false);
-        if (collectionState == null)
-            return;
-
-        var selectedSourcesByGamePath = await _localPapSafetyModService.ResolveSelectedHumanPapSourcesAsync(collectionState, ct).ConfigureAwait(false);
-        if (selectedSourcesByGamePath.Count == 0)
-            return;
-
-        var aliasesByResolvedPath = new Dictionary<string, (HashSet<string> GamePaths, string Hash)>(StringComparer.OrdinalIgnoreCase);
-        foreach (var source in selectedSourcesByGamePath.Values)
-        {
-            ct.ThrowIfCancellationRequested();
-
-            if (string.IsNullOrWhiteSpace(source.ResolvedPath) || !File.Exists(source.ResolvedPath))
-                continue;
-
-            var matchingGamePaths = source.GamePaths
-                .Where(IsCompatibleHumanAnimationPath)
-                .Where(gamePath => TryGetHumanModelPathFamily(gamePath, out _, out var familyKey) && activeAnimationFamilies.Contains(familyKey))
-                .Distinct(StringComparer.OrdinalIgnoreCase)
-                .ToArray();
-
-            if (matchingGamePaths.Length == 0)
-                continue;
-
-            var normalizedResolvedPath = NormalizeStaticSupportResolvedPath(source.ResolvedPath);
-            if (string.IsNullOrWhiteSpace(normalizedResolvedPath))
-                continue;
-
-            if (!aliasesByResolvedPath.TryGetValue(normalizedResolvedPath, out var bucket))
-            {
-                bucket = (new HashSet<string>(StringComparer.OrdinalIgnoreCase), source.Hash ?? string.Empty);
-                aliasesByResolvedPath[normalizedResolvedPath] = bucket;
-            }
-
-            foreach (var gamePath in matchingGamePaths)
-                bucket.GamePaths.Add(gamePath);
-
-            if (string.IsNullOrWhiteSpace(bucket.Hash) && !string.IsNullOrWhiteSpace(source.Hash))
-                aliasesByResolvedPath[normalizedResolvedPath] = (bucket.GamePaths, source.Hash);
-        }
-
-        if (aliasesByResolvedPath.Count == 0)
-            return;
-
-        var existingByResolvedPath = new Dictionary<string, FileReplacement>(StringComparer.OrdinalIgnoreCase);
-        foreach (var replacement in fragment.FileReplacements)
-        {
-            var normalizedResolvedPath = NormalizeStaticSupportResolvedPath(replacement.ResolvedPath);
-            if (string.IsNullOrWhiteSpace(normalizedResolvedPath))
-                continue;
-
-            if (!existingByResolvedPath.TryGetValue(normalizedResolvedPath, out var existing))
-            {
-                existingByResolvedPath[normalizedResolvedPath] = CloneFileReplacementWithHash(replacement);
-                continue;
-            }
-
-            foreach (var gamePath in replacement.GamePaths)
-                existing.GamePaths.Add(gamePath);
-
-            if (string.IsNullOrWhiteSpace(existing.Hash) && !string.IsNullOrWhiteSpace(replacement.Hash))
-                existing.Hash = replacement.Hash;
-        }
-
-        var addedGamePaths = 0;
-        var addedReplacements = 0;
-        foreach (var alias in aliasesByResolvedPath)
-        {
-            if (!existingByResolvedPath.TryGetValue(alias.Key, out var replacement))
-            {
-                replacement = new FileReplacement(alias.Value.GamePaths.ToArray(), alias.Key)
-                {
-                    Hash = alias.Value.Hash,
-                };
-                existingByResolvedPath[alias.Key] = replacement;
-                addedGamePaths += replacement.GamePaths.Count;
-                addedReplacements++;
-                continue;
-            }
-
-            foreach (var gamePath in alias.Value.GamePaths)
-            {
-                if (replacement.GamePaths.Add(gamePath))
-                    addedGamePaths++;
-            }
-
-            if (string.IsNullOrWhiteSpace(replacement.Hash) && !string.IsNullOrWhiteSpace(alias.Value.Hash))
-                replacement.Hash = alias.Value.Hash;
-        }
-
-        if (addedGamePaths == 0 && addedReplacements == 0)
-            return;
-
-        fragment.FileReplacements = new HashSet<FileReplacement>(existingByResolvedPath.Values, FileReplacementComparer.Instance);
-        _logger.LogDebug("Added {paths} selected human animation fallback alias path(s) across {replacements} replacement(s) for active player animation family/families {families}",
-            addedGamePaths,
-            addedReplacements,
-            string.Join(",", activeAnimationFamilies.OrderBy(static family => family, StringComparer.OrdinalIgnoreCase)));
-    }
 
     private async Task AddSenderSelectedFullMountModReplacementsAsync(CharacterDataFragment fragment, ObjectKind objectKind, GameObjectHandler playerRelatedObject, CancellationToken ct)
     {
@@ -2295,20 +2169,17 @@ public class PlayerDataFactory : IMediatorSubscriber
             if (distinctCodes.Length < HumanRaceFamilyCollapseMinimumVariants)
                 continue;
 
+            if (IsCompatibleHumanAnimationFamily(family))
+            {
+                // Animation/transient PAP families can legitimately rely on sibling human race aliases/fallbacks.
+                // Do not collapse those game paths to the current race here; just preserve the entries that the
+                // normal transient/cache path already collected. This avoids expensive selected-option expansion
+                // while keeping locally working idle/emote animations available to receivers.
+                continue;
+            }
+
             var keepCodes = new HashSet<string>(activeHumanCodes, StringComparer.OrdinalIgnoreCase);
             var hasActiveVariant = family.Any(item => keepCodes.Contains(item.Code));
-
-            if (!hasActiveVariant && IsCompatibleHumanAnimationFamily(family))
-            {
-                // Some emote/loop packs deliberately omit the local race code but still work in-game because
-                // the client/Penumbra falls back to one of the declared human animation variants.
-                // When that happens, keeping only c0101 is too narrow for races such as Viera/Hrothgar;
-                // preserve every declared variant in this animation family so the receiver has the same
-                // fallback choices the sender had locally. These variants normally point at the same PAP,
-                // so this expands game-path aliases without multiplying uploaded file content.
-                keepCodes = distinctCodes.ToHashSet(StringComparer.OrdinalIgnoreCase);
-                hasActiveVariant = keepCodes.Count > 0;
-            }
 
             if (!hasActiveVariant)
                 continue;
