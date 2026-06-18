@@ -1,4 +1,4 @@
-﻿using Dalamud.Bindings.ImGui;
+using Dalamud.Bindings.ImGui;
 using Dalamud.Interface;
 using Dalamud.Interface.Colors;
 using Dalamud.Interface.Utility;
@@ -172,7 +172,7 @@ public class IdDisplayHandler
                     var num = s[..space];
                     var unit = s[space..];
 
-                    if (num.EndsWith(".00", StringComparison.Ordinal))
+                    if (num.EndsWith(".00", StringComparison.Ordinal) || num.EndsWith(",00", StringComparison.Ordinal))
                         return num[..^3] + unit;
 
                     return s;
@@ -196,15 +196,16 @@ public class IdDisplayHandler
 
                 float padX = 2f * ImGuiHelpers.GlobalScale;
                 float innerW = MathF.Max(1f, regionW - (padX * 2f));
-                float baseW = ImGui.CalcTextSize(line1).X;
+
+                float textW = ImGui.CalcTextSize(line1).X;
+                float totalW = textW;
 
                 // Keep it readable but allow compact shrink
-                float scale = baseW > 0f ? MathF.Min(1f, innerW / baseW) : 1f;
+                float scale = totalW > 0f ? MathF.Min(1f, innerW / totalW) : 1f;
                 scale = MathF.Max(0.78f, scale);
 
                 var font = ImGui.GetFont();
                 float fontSize = ImGui.GetFontSize() * scale;
-                float drawW = baseW * scale;
 
                 float x = start.X + padX;
                 float y = start.Y + (lineH - fontSize) * 0.5f;
@@ -215,6 +216,7 @@ public class IdDisplayHandler
 
                 dl1.PushClipRect(rMin, rMax, true);
                 dl1.AddText(font, fontSize, new Vector2(x, y), ImGui.GetColorU32(ImGuiCol.Text), line1);
+
                 dl1.PopClipRect();
 
                 ImGui.PopStyleColor();
@@ -375,6 +377,44 @@ public class IdDisplayHandler
         }
 
         return (textIsUid, playerText!);
+    }
+
+    private List<(FontAwesomeIcon Icon, uint Color, string Tooltip)> GetActiveResourceIconInfos(Pair pair)
+    {
+        var iconInfos = new List<(FontAwesomeIcon Icon, uint Color, string Tooltip)>();
+
+        if (pair.IsPlayingSound)
+            iconInfos.Add((FontAwesomeIcon.Music, ImGui.GetColorU32(ImGuiColors.ParsedBlue), _uiShared.L("UI.IdDisplayHandler.Icon.PlayingSound", "Currently playing synced sound")));
+
+        return iconInfos;
+    }
+
+
+    private void DrawInlineActiveResourceIcons(List<(FontAwesomeIcon Icon, uint Color, string Tooltip)> iconInfos)
+    {
+        if (iconInfos.Count == 0)
+            return;
+
+        float iconSpacing = ImGui.GetStyle().ItemInnerSpacing.X * 0.75f;
+
+        using (_uiShared.IconFont.Push())
+        {
+            for (var i = 0; i < iconInfos.Count; i++)
+            {
+                if (i > 0)
+                    ImGui.SameLine(0f, iconSpacing);
+
+                var iconText = iconInfos[i].Icon.ToIconString();
+                var size = ImGui.CalcTextSize(iconText);
+                var pos = ImGui.GetCursorScreenPos();
+
+                ImGui.InvisibleButton("##inline_active_resource_icon_" + i, size);
+                ImGui.GetWindowDrawList().AddText(pos, iconInfos[i].Color, iconText);
+
+                if (ImGui.IsItemHovered())
+                    UiSharedService.AttachToolTip(iconInfos[i].Tooltip);
+            }
+        }
     }
 
     internal void Clear()

@@ -131,7 +131,7 @@ public sealed partial class ToyBox
         if (_hostedPoker.TryGetValue(gameId, out var hostGame) &&
             string.Equals(hostGame.HostSessionId, mySessionId, StringComparison.Ordinal))
         {
-            _clientPoker.TryRemove(gameId, out _);
+            ClosePokerLobby(gameId);
             return;
         }
 
@@ -1337,7 +1337,7 @@ public sealed partial class ToyBox
         var mySessionId = GetMySessionId();
         if (string.IsNullOrEmpty(mySessionId)) return;
 
-        if (!_hostedBingo.TryRemove(gameId, out var game) ||
+        if (!_hostedPoker.TryRemove(gameId, out var game) ||
             !string.Equals(game.HostSessionId, mySessionId, StringComparison.Ordinal))
         {
             LeavePoker(gameId);
@@ -1346,7 +1346,7 @@ public sealed partial class ToyBox
             return;
         }
 
-        _clientBingo.TryRemove(gameId, out _);
+        _clientPoker.TryRemove(gameId, out _);
         Invites.TryRemove(gameId, out _);
         DirectInvites.TryRemove(gameId, out _);
 

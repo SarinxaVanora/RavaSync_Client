@@ -9,7 +9,8 @@ internal enum DownloadProgressPhase
     CheckingCache = 1,
     Queued = 2,
     Downloading = 3,
-    Decompressing = 4,
+    Repairing = 4,
+    Decompressing = 5,
 }
 
 internal static class DownloadProgressHints
@@ -22,6 +23,7 @@ internal static class DownloadProgressHints
         var hasCheckingCache = false;
         var hasQueued = false;
         var hasDownloading = false;
+        var hasRepairing = false;
         var hasDecompressing = false;
 
         foreach (var status in statuses)
@@ -33,6 +35,10 @@ internal static class DownloadProgressHints
             {
                 case DownloadStatus.Downloading:
                     hasDownloading = true;
+                    break;
+
+                case DownloadStatus.Repairing:
+                    hasRepairing = true;
                     break;
 
                 case DownloadStatus.Decompressing:
@@ -50,22 +56,26 @@ internal static class DownloadProgressHints
             }
         }
 
-        return GetPrimaryPhase(hasCheckingCache, hasQueued, hasDownloading, hasDecompressing);
+        return GetPrimaryPhase(hasCheckingCache, hasQueued, hasDownloading, hasRepairing, hasDecompressing);
     }
 
-    public static DownloadProgressPhase GetPrimaryPhase(int checkingCacheCount, int queuedCount, int downloadingCount, int decompressingCount)
+    public static DownloadProgressPhase GetPrimaryPhase(int checkingCacheCount, int queuedCount, int downloadingCount, int decompressingCount, int repairingCount = 0)
     {
         return GetPrimaryPhase(
             checkingCacheCount > 0,
             queuedCount > 0,
             downloadingCount > 0,
+            repairingCount > 0,
             decompressingCount > 0);
     }
 
-    private static DownloadProgressPhase GetPrimaryPhase(bool hasCheckingCache, bool hasQueued, bool hasDownloading, bool hasDecompressing)
+    private static DownloadProgressPhase GetPrimaryPhase(bool hasCheckingCache, bool hasQueued, bool hasDownloading, bool hasRepairing, bool hasDecompressing)
     {
         if (hasDownloading)
             return DownloadProgressPhase.Downloading;
+
+        if (hasRepairing)
+            return DownloadProgressPhase.Repairing;
 
         if (hasDecompressing)
             return DownloadProgressPhase.Decompressing;
@@ -86,14 +96,15 @@ internal static class DownloadProgressHints
             DownloadProgressPhase.CheckingCache => "Checking Cache",
             DownloadProgressPhase.Queued => "Queued",
             DownloadProgressPhase.Downloading => "Downloading",
-            DownloadProgressPhase.Decompressing => "Decompressing",
+            DownloadProgressPhase.Repairing => "Refreshing files",
+            DownloadProgressPhase.Decompressing => "Setting up files",
             _ => string.Empty,
         };
     }
 
-    public static string BuildPhaseList(int checkingCacheCount, int queuedCount, int downloadingCount, int decompressingCount)
+    public static string BuildPhaseList(int checkingCacheCount, int queuedCount, int downloadingCount, int decompressingCount, int repairingCount = 0)
     {
-        var phases = new List<string>(4);
+        var phases = new List<string>(5);
 
         if (checkingCacheCount > 0)
             phases.Add(GetPhaseLabel(DownloadProgressPhase.CheckingCache));
@@ -103,6 +114,9 @@ internal static class DownloadProgressHints
 
         if (downloadingCount > 0)
             phases.Add(GetPhaseLabel(DownloadProgressPhase.Downloading));
+
+        if (repairingCount > 0)
+            phases.Add(GetPhaseLabel(DownloadProgressPhase.Repairing));
 
         if (decompressingCount > 0)
             phases.Add(GetPhaseLabel(DownloadProgressPhase.Decompressing));

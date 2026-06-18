@@ -51,7 +51,7 @@ public record PenumbraDisposedMessage : MessageBase;
 public record PenumbraRedrawMessage(IntPtr Address, int ObjTblIdx, bool WasRequested) : SameThreadMessage;
 public record GlamourerChangedMessage(IntPtr Address) : MessageBase;
 public record HeelsOffsetMessage(string Offset) : MessageBase;
-public record PenumbraResourceLoadMessage(IntPtr GameObject, string GamePath, string FilePath) : SameThreadMessage;
+public record PenumbraResourceLoadMessage(IntPtr GameObject, string GamePath, string FilePath) : MessageBase;
 public record ObservedSupportResourceMessage(ObjectKind ObjectKind, string GamePath, string FilePath, bool IsTransientManaged) : MessageBase;
 public record CustomizePlusMessage(nint? Address) : MessageBase;
 public record HonorificMessage(string NewHonorificTitle) : MessageBase;
@@ -68,6 +68,7 @@ public record CreateCacheForObjectMessage(GameObjectHandler ObjectToCreateFor, s
 public record ImmediatePlayerStatePublishMessage(GameObjectHandler ObjectToCreateFor, string Reason = "Unspecified") : SameThreadMessage;
 public record ClearCacheForObjectMessage(GameObjectHandler ObjectToCreateFor) : SameThreadMessage;
 public record CharacterDataCreatedMessage(CharacterData CharacterData, bool ForceOutbound = false, string Reason = "") : SameThreadMessage;
+public record TransientManifestDeltaPublishMessage(IReadOnlyDictionary<ObjectKind, IReadOnlyCollection<RavaSync.PlayerData.Data.FileReplacement>> AddOrUpdateReplacementsByKind, IReadOnlyCollection<string> RemoveGamePaths, string Reason = "PenumbraModSettingChanged:TransientManifestDelta") : MessageBase;
 public record CharacterDataAnalyzedMessage : MessageBase;
 public enum DataAnalysisOptimisationTab
 {
@@ -100,6 +101,7 @@ public record CompactUiChange(Vector2 Size, Vector2 Position) : MessageBase;
 public record ProfileOpenStandaloneMessage(Pair Pair) : MessageBase;
 public record RemoveWindowMessage(WindowMediatorSubscriberBase Window) : MessageBase;
 public record RefreshUiMessage : MessageBase;
+public record LocalActiveSyncIndicatorChangedMessage(bool IsPlayingSound) : MessageBase;
 public record OpenBanUserPopupMessage(Pair PairToBan, GroupFullInfoDto GroupFullInfoDto) : MessageBase;
 public record OpenCensusPopupMessage() : MessageBase;
 public record OpenSyncshellAdminPanel(GroupFullInfoDto GroupInfo) : MessageBase;
@@ -113,7 +115,7 @@ public record InstancedContentStartMessage : MessageBase;
 public record InstancedContentEndMessage : MessageBase;
 public record EventMessage(Event Event) : MessageBase;
 public record PenumbraDirectoryChangedMessage(string? ModDirectory) : MessageBase;
-public record PenumbraFileCacheChangedMessage(IReadOnlyCollection<string> Paths) : MessageBase;
+public record PenumbraFileCacheChangedMessage(IReadOnlyCollection<string> Paths, bool ForceLocalPlayerPublish = false, string Reason = "PenumbraFileCacheChanged") : MessageBase;
 public record PenumbraRedrawCharacterMessage(ICharacter Character) : SameThreadMessage;
 public record PenumbraRedrawAddressMessage(nint Address) : MessageBase;
 public record ArmRequestedPlayerPublishAfterRedrawMessage(nint Address) : MessageBase;
@@ -132,13 +134,10 @@ public record ContextMenuPairRequestMessage(string TargetIdent, string charName)
 public record DirectPairRequestMessage(string TargetIdent, string TargetName) : MessageBase;
 public record SyncshellGameMeshMessage(string LocalSessionId, string FromSessionId, byte[] Payload) : MessageBase;
 public record RemoteMissingFileMessage(string TargetUid, string TargetIdent, string DataHash, IReadOnlyCollection<string> Hashes, string Reason) : MessageBase;
-public record RemoteOtherSyncYieldMessage(string FromUid, bool YieldToOtherSync, string Owner, TimeSpan Ttl) : MessageBase;
 public record LocalOtherSyncYieldStateChangedMessage(string AffectedUid, bool YieldToOtherSync, string Owner) : MessageBase;
+public record OtherSyncCurrentStateChangedMessage(string Reason) : MessageBase;
 public record PrimeTransientPathsMessage(IntPtr Address, ObjectKind Kind, IReadOnlyCollection<string> GamePaths) : SameThreadMessage;
-public record RemoteOtherSyncConnectedMessage(string? Owner) : MessageBase;
-public record RemoteOtherSyncDisconnectedMessage(string? Owner) : MessageBase;
 public sealed record InitialFinalRedrawConsumedMessage(nint ActorAddress) : SameThreadMessage;
-public record BlacklistUiMessage() : MessageBase;
 
 
 

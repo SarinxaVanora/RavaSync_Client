@@ -1,4 +1,4 @@
-﻿using System.Collections.Concurrent;
+using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Http;
 using System.Net.Http.Headers;
@@ -60,7 +60,7 @@ internal static class CdnPrewarmHelper
 
         if (pending.Length == 0) return;
 
-        const int maxConcurrency = 8;
+        const int maxConcurrency = 16;
         using var throttler = new SemaphoreSlim(maxConcurrency, maxConcurrency);
 
         var tasks = new Task[pending.Length];

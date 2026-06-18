@@ -75,13 +75,13 @@ public class TopTabMenu
         var spacing = ImGui.GetStyle().ItemSpacing;
         var buttonCount = 7;
         var buttonX = (availableWidth - spacing.X * (buttonCount - 1)) / buttonCount;
-        var buttonY = _uiSharedService.GetIconButtonSize(FontAwesomeIcon.Pause).Y;
+        var buttonY = ImGui.GetFrameHeight();
         var buttonSize = new Vector2(buttonX, buttonY);
         var drawList = ImGui.GetWindowDrawList();
         var underlineColor = ImGui.GetColorU32(ImGuiCol.Separator);
         using var btncolor = ImRaii.PushColor(ImGuiCol.Button, ImGui.ColorConvertFloat4ToU32(new(0, 0, 0, 0)));
 
-        ImGuiHelpers.ScaledDummy(spacing.Y / 2f);
+        ImGuiHelpers.ScaledDummy(0.35f);
 
         // --- Individual tab ---
         using (ImRaii.PushFont(UiBuilder.IconFont))
@@ -127,6 +127,15 @@ public class TopTabMenu
         }
         UiSharedService.AttachToolTip(_uiSharedService.L("UI.TopTabMenu.70fb6522", "Toy Box"));
 
+        ImGui.SameLine();
+        using (ImRaii.PushFont(UiBuilder.IconFont))
+        {
+            if (ImGui.Button(FontAwesomeIcon.Video.ToIconString(), buttonSize))
+            {
+                _mareMediator.Publish(new UiToggleMessage(typeof(RavaCastUi)));
+            }
+        }
+        UiSharedService.AttachToolTip(_uiSharedService.L("UI.TopTabMenu.RavaCast", "RavaCast"));
 
         ImGui.SameLine();
         using (ImRaii.PushFont(UiBuilder.IconFont))
@@ -158,18 +167,8 @@ public class TopTabMenu
         }
         UiSharedService.AttachToolTip(_uiSharedService.L("UI.TopTabMenu.8a912f4d", "Character Analysis"));
 
-        ImGui.SameLine();
-        using (ImRaii.PushFont(UiBuilder.IconFont))
-        {
-            if (ImGui.Button(FontAwesomeIcon.Cog.ToIconString(), buttonSize))
-            {
-                _mareMediator.Publish(new UiToggleMessage(typeof(SettingsUi)));
-            }
-        }
-        UiSharedService.AttachToolTip(_uiSharedService.L("UI.TopTabMenu.3cf1d7f3", "Settings"));
-
         // --- Below-tab content ---
-        ImGuiHelpers.ScaledDummy(spacing);
+        ImGuiHelpers.ScaledDummy(TabSelection == SelectedTab.None ? 0.35f : 1f);
 
         if (TabSelection == SelectedTab.Individual)
         {
@@ -185,7 +184,7 @@ public class TopTabMenu
 
         if (TabSelection != SelectedTab.None)
         {
-            ImGuiHelpers.ScaledDummy(3f);
+            ImGuiHelpers.ScaledDummy(0.75f);
             ImGui.Separator();
         }
     }
@@ -229,7 +228,7 @@ public class TopTabMenu
     private void DrawGlobalIndividualButtons(float availableXWidth, float spacingX)
     {
         var buttonX = (availableXWidth - (spacingX * 3)) / 4f;
-        var buttonY = _uiSharedService.GetIconButtonSize(FontAwesomeIcon.Pause).Y;
+        var buttonY = ImGui.GetFrameHeight();
         var buttonSize = new Vector2(buttonX, buttonY);
 
         using (ImRaii.PushFont(UiBuilder.IconFont))
@@ -337,7 +336,7 @@ public class TopTabMenu
     private void DrawGlobalSyncshellButtons(float availableXWidth, float spacingX)
     {
         var buttonX = (availableXWidth - (spacingX * 4)) / 5f;
-        var buttonY = _uiSharedService.GetIconButtonSize(FontAwesomeIcon.Pause).Y;
+        var buttonY = ImGui.GetFrameHeight();
         var buttonSize = new Vector2(buttonX, buttonY);
 
         using (ImRaii.PushFont(UiBuilder.IconFont))
@@ -350,7 +349,7 @@ public class TopTabMenu
             }
         }
         UiSharedService.AttachToolTip(_uiSharedService.L("UI.TopTabMenu.29eb617e", "Globally resume or pause all syncshells.") + UiSharedService.TooltipSeparator
-                        + "Note: This will not affect users with preferred permissions in syncshells."
+                        + "Users with preferred permissions are left as they are."
             + (_globalControlCountdown > 0 ? UiSharedService.TooltipSeparator + _uiSharedService.L("UI.TopTabMenu.6ca7dd20", "Available again in ") + _globalControlCountdown + _uiSharedService.L("UI.TopTabMenu.e662bb05", " seconds.") : string.Empty));
 
         ImGui.SameLine();
@@ -364,7 +363,7 @@ public class TopTabMenu
             }
         }
         UiSharedService.AttachToolTip(_uiSharedService.L("UI.TopTabMenu.faa8a140", "Globally enable or disable sound sync with all syncshells.") + UiSharedService.TooltipSeparator
-                        + "Note: This will not affect users with preferred permissions in syncshells."
+                        + "Users with preferred permissions are left as they are."
                         + (_globalControlCountdown > 0 ? UiSharedService.TooltipSeparator + _uiSharedService.L("UI.TopTabMenu.6ca7dd20", "Available again in ") + _globalControlCountdown + _uiSharedService.L("UI.TopTabMenu.e662bb05", " seconds.") : string.Empty));
 
         ImGui.SameLine();
@@ -378,7 +377,7 @@ public class TopTabMenu
             }
         }
         UiSharedService.AttachToolTip(_uiSharedService.L("UI.TopTabMenu.803c8ef0", "Globally enable or disable animation sync with all syncshells.") + UiSharedService.TooltipSeparator
-                        + "Note: This will not affect users with preferred permissions in syncshells."
+                        + "Users with preferred permissions are left as they are."
             + (_globalControlCountdown > 0 ? UiSharedService.TooltipSeparator + _uiSharedService.L("UI.TopTabMenu.6ca7dd20", "Available again in ") + _globalControlCountdown + _uiSharedService.L("UI.TopTabMenu.e662bb05", " seconds.") : string.Empty));
 
         ImGui.SameLine();
@@ -392,7 +391,7 @@ public class TopTabMenu
             }
         }
         UiSharedService.AttachToolTip(_uiSharedService.L("UI.TopTabMenu.d0e520a6", "Globally enable or disable VFX sync with all syncshells.") + UiSharedService.TooltipSeparator
-                        + "Note: This will not affect users with preferred permissions in syncshells."
+                        + "Users with preferred permissions are left as they are."
             + (_globalControlCountdown > 0 ? UiSharedService.TooltipSeparator + _uiSharedService.L("UI.TopTabMenu.6ca7dd20", "Available again in ") + _globalControlCountdown + _uiSharedService.L("UI.TopTabMenu.e662bb05", " seconds.") : string.Empty));
 
 
@@ -467,8 +466,8 @@ public class TopTabMenu
             }
         }
         UiSharedService.AttachToolTip(_uiSharedService.L("UI.TopTabMenu.5d5c21a9", "Globally align syncshell permissions to suggested syncshell permissions.") + UiSharedService.TooltipSeparator
-            + "Note: This will not affect users with preferred permissions in syncshells." + Environment.NewLine
-            + "Note: If multiple users share one syncshell the permissions to that user will be set to " + Environment.NewLine
+            + "Users with preferred permissions are left as they are." + Environment.NewLine
+            + "If multiple syncshells include the same user, the final permissions come from " + Environment.NewLine
             + _uiSharedService.L("UI.TopTabMenu.513247ef", "the ones of the last applied syncshell in alphabetical order.") + UiSharedService.TooltipSeparator
             + "Hold CTRL to enable this button"
             + (_globalControlCountdown > 0 ? UiSharedService.TooltipSeparator + _uiSharedService.L("UI.TopTabMenu.6ca7dd20", "Available again in ") + _globalControlCountdown + _uiSharedService.L("UI.TopTabMenu.e662bb05", " seconds.") : string.Empty));

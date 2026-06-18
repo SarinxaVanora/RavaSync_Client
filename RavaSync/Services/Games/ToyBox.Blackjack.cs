@@ -40,7 +40,7 @@ public record BjBetPayload(string PlayerSessionId, int Bet);
 public record BjActionPayload(string PlayerSessionId, BjActionKind Action);
 
 [MessagePackObject(keyAsPropertyName: true)]
-public record BjPlayerPublic(string SessionId, string Name, int Bet, bool Done, bool Bust, bool BetConfirmed);
+public record BjPlayerPublic(string SessionId, string Name, int Bet, bool Done, bool Bust, bool BetConfirmed, List<byte> Cards, int Total);
 
 [MessagePackObject(keyAsPropertyName: true)]
 public record BjStatePublic(Guid GameId, BjStage Stage, string HostSessionId, string CurrentTurnSessionId,
@@ -98,7 +98,7 @@ public sealed partial class ToyBox
         if (_hostedBlackjack.TryGetValue(gameId, out var hostGame) &&
             string.Equals(hostGame.HostSessionId, mySessionId, StringComparison.Ordinal))
         {
-            _clientBlackjack.TryRemove(gameId, out _);
+            CloseBJLobby(gameId);
             return;
         }
 
@@ -117,6 +117,14 @@ public sealed partial class ToyBox
         var mySessionId = GetMySessionId();
         if (string.IsNullOrEmpty(mySessionId)) return;
 
+        bet = Math.Max(0, bet);
+
+        if (_hostedBlackjack.TryGetValue(gameId, out var hostGame) &&
+            string.Equals(hostGame.HostSessionId, mySessionId, StringComparison.Ordinal))
+        {
+            return;
+        }
+
         if (!_clientBlackjack.TryGetValue(gameId, out var view)) return;
 
         Send(mySessionId, view.HostSessionId, new SyncshellGameEnvelope(
@@ -128,6 +136,12 @@ public sealed partial class ToyBox
     {
         var mySessionId = GetMySessionId();
         if (string.IsNullOrEmpty(mySessionId)) return;
+
+        if (_hostedBlackjack.TryGetValue(gameId, out var hostGame) &&
+            string.Equals(hostGame.HostSessionId, mySessionId, StringComparison.Ordinal))
+        {
+            return;
+        }
 
         if (!_clientBlackjack.TryGetValue(gameId, out var view)) return;
 
@@ -237,6 +251,9 @@ public sealed partial class ToyBox
         if (env.Payload is null) return;
 
         var bet = MessagePackSerializer.Deserialize<BjBetPayload>(env.Payload);
+        if (!string.Equals(bet.PlayerSessionId, fromSessionId, StringComparison.Ordinal)) return;
+        if (string.Equals(fromSessionId, game.HostSessionId, StringComparison.Ordinal)) return;
+
         game.SetBet(bet.PlayerSessionId, Math.Max(0, bet.Bet));
 
         PushBlackjackState(game);
@@ -249,6 +266,9 @@ public sealed partial class ToyBox
         if (env.Payload is null) return;
 
         var act = MessagePackSerializer.Deserialize<BjActionPayload>(env.Payload);
+        if (!string.Equals(act.PlayerSessionId, fromSessionId, StringComparison.Ordinal)) return;
+        if (string.Equals(fromSessionId, game.HostSessionId, StringComparison.Ordinal)) return;
+
         game.ApplyAction(act.PlayerSessionId, act.Action);
 
         PushBlackjackState(game);
@@ -300,6 +320,9 @@ public sealed partial class ToyBox
 
         foreach (var p in game.Players.Values)
         {
+            if (string.Equals(p.SessionId, game.HostSessionId, StringComparison.Ordinal))
+                continue;
+
             Send(game.HostSessionId, p.SessionId, pubEnv);
 
             var priv = game.BuildPrivateState(p.SessionId);
@@ -335,7 +358,7 @@ public sealed partial class ToyBox
         public string PasswordSalt { get; }
         public string PasswordHash { get; }
         public bool PasswordProtected => !string.IsNullOrEmpty(PasswordHash);
-        public int CurrentPlayers => 1 + Players.Count;
+        public int CurrentPlayers => Players.Count;
 
         private readonly ConcurrentDictionary<string, string> _inviteTokens = new(StringComparer.Ordinal);
 
@@ -359,6 +382,7 @@ public sealed partial class ToyBox
             MaxPlayers = Math.Max(0, maxPlayers);
             PasswordSalt = passwordSalt ?? string.Empty;
             PasswordHash = passwordHash ?? string.Empty;
+
         }
 
         public string IssueInviteToken(string targetSessionId)
@@ -379,6 +403,8 @@ public sealed partial class ToyBox
 
         public void AddPlayer(string sessionId, string name)
         {
+            if (string.Equals(sessionId, HostSessionId, StringComparison.Ordinal)) return;
+
             Players.TryAdd(sessionId, new BlackjackPlayer(sessionId, name));
 
             if (Stage == BjStage.Lobby)
@@ -396,6 +422,7 @@ public sealed partial class ToyBox
         public void SetBet(string sessionId, int bet)
         {
             if (Stage != BjStage.Betting) return;
+            if (string.Equals(sessionId, HostSessionId, StringComparison.Ordinal)) return;
 
             if (Players.TryGetValue(sessionId, out var p))
             {
@@ -606,7 +633,11 @@ public sealed partial class ToyBox
 
             var players = Players.Values
                 .OrderBy(p => p.Name, StringComparer.OrdinalIgnoreCase)
-                .Select(p => new BjPlayerPublic(p.SessionId, p.Name, p.Bet, p.Done, p.Bust, p.BetConfirmed))
+                .Select(p =>
+                {
+                    var hv = HandValue(p.Cards);
+                    return new BjPlayerPublic(p.SessionId, p.Name, p.Bet, p.Done, p.Bust, p.BetConfirmed, p.Cards.ToList(), hv.Total);
+                })
                 .ToList();
 
             if (Stage == BjStage.Results)
@@ -697,13 +728,14 @@ public sealed partial class ToyBox
                 total += v;
             }
 
+            // Aces start as 11, then collapse to 1 as needed.
             while (total > 21 && aces > 0)
             {
                 total -= 10;
                 aces--;
             }
 
-            bool soft = cards.Any(c => (c % 13) == 0) && total <= 21;
+            bool soft = aces > 0 && total <= 21;
             return (total, soft);
         }
     }
@@ -713,7 +745,7 @@ public sealed partial class ToyBox
         var mySessionId = GetMySessionId();
         if (string.IsNullOrEmpty(mySessionId)) return;
 
-        if (!_hostedBingo.TryRemove(gameId, out var game) ||
+        if (!_hostedBlackjack.TryRemove(gameId, out var game) ||
             !string.Equals(game.HostSessionId, mySessionId, StringComparison.Ordinal))
         {
             LeaveBlackjack(gameId);
@@ -722,7 +754,7 @@ public sealed partial class ToyBox
             return;
         }
 
-        _clientBingo.TryRemove(gameId, out _);
+        _clientBlackjack.TryRemove(gameId, out _);
         Invites.TryRemove(gameId, out _);
         DirectInvites.TryRemove(gameId, out _);
 

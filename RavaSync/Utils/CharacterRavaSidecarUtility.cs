@@ -18,9 +18,13 @@ public sealed class CharacterRavaSidecarUtility
     private const string VersionPropertyName = "v";
     private const string PerformancePropertyName = "performance";
     private const string SyncManifestPropertyName = "syncManifest";
+    private const string OtherSyncPropertyName = "otherSync";
+    private const string ActiveSoundIndicatorPropertyName = "activeSoundIndicator";
     private const int CurrentVersion = 1;
 
     private sealed record PerformancePayload(int v, long vb, long tr);
+    private sealed record ActiveSoundIndicatorPayload(int v, bool s);
+    public sealed record OtherSyncPayload(int v, string tu, bool a, string o);
     public sealed record SyncManifestAsset(int ok, string gp, string h, string fs, string k, string c);
     public sealed record SyncManifestPayload(int v, string pf, string af, string mf, int total, int critical, SyncManifestAsset[] assets);
 
@@ -45,6 +49,52 @@ public sealed class CharacterRavaSidecarUtility
         vramBytes = Math.Max(0, payload?.vb ?? 0);
         triangles = Math.Max(0, payload?.tr ?? 0);
         return true;
+    }
+
+    public bool TryEmbedActiveSoundIndicator(CharacterData? charaData, bool isPlayingSound)
+    {
+        if (charaData == null)
+            return false;
+
+        var payload = new ActiveSoundIndicatorPayload(CurrentVersion, isPlayingSound);
+        return TryEmbedPayload(charaData, ActiveSoundIndicatorPropertyName, EncodePayload(payload));
+    }
+
+    public bool TryExtractActiveSoundIndicator(CharacterData? charaData, out bool isPlayingSound)
+    {
+        isPlayingSound = false;
+
+        if (!TryExtractPayload<ActiveSoundIndicatorPayload>(charaData, ActiveSoundIndicatorPropertyName, p => p?.v == CurrentVersion, out var payload))
+            return false;
+
+        isPlayingSound = payload?.s == true;
+        return true;
+    }
+
+    public bool TryEmbedOtherSync(CharacterData? charaData, string targetUid, bool active, string owner)
+    {
+        if (charaData == null || string.IsNullOrWhiteSpace(targetUid))
+            return false;
+
+        owner ??= string.Empty;
+        if (!active)
+            owner = string.Empty;
+
+        var payload = new OtherSyncPayload(CurrentVersion, targetUid.Trim(), active, owner.Trim());
+        return TryEmbedPayload(charaData, OtherSyncPropertyName, EncodePayload(payload));
+    }
+
+    public bool TryExtractOtherSync(CharacterData? charaData, string expectedTargetUid, out OtherSyncPayload? otherSync)
+    {
+        otherSync = null;
+        if (string.IsNullOrWhiteSpace(expectedTargetUid))
+            return false;
+
+        return TryExtractPayload<OtherSyncPayload>(
+            charaData,
+            OtherSyncPropertyName,
+            p => p?.v == CurrentVersion && string.Equals(p.tu ?? string.Empty, expectedTargetUid, StringComparison.Ordinal),
+            out otherSync);
     }
 
     public bool TryEmbedSyncManifest(CharacterData? charaData, out SyncManifestPayload? manifest)

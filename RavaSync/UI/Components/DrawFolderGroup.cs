@@ -114,7 +114,7 @@ public class DrawFolderGroup : DrawFolderBase
             ? string.Empty : Environment.NewLine + "WARNING: This action is irreversible" + Environment.NewLine + "Leaving an owned Syncshell will transfer the ownership to a random person in the Syncshell."));
 
         ImGui.Separator();
-        ImGui.TextUnformatted(_uiSharedService.L("UI.SettingsUi.2405c5d6", "Permission Settings"));
+        ImGui.TextUnformatted(_uiSharedService.L("UI.SettingsUi.Service.Permissions", "Permissions"));
         var perm = _groupFullInfoDto.GroupUserPermissions;
         bool disableSounds = perm.IsDisableSounds();
         bool disableAnims = perm.IsDisableAnimations();

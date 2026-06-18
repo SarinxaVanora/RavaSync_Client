@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <AssemblyName>RavaCast.Media.Native</AssemblyName>
+    <TargetFramework>net10.0-windows10.0.19041.0</TargetFramework>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <Platforms>x64</Platforms>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <SelfContained>true</SelfContained>
+    <PublishAot>true</PublishAot>
+    <NativeLib>Shared</NativeLib>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <DebugSymbols>false</DebugSymbols>
+    <DebugType>none</DebugType>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <CopyDebugSymbolFilesFromPackages>false</CopyDebugSymbolFilesFromPackages>
+    <CopyDocumentationFilesFromPackages>false</CopyDocumentationFilesFromPackages>
+    <PathMap>
+      C:\Users\Jamie\Desktop\RavaSync\Working folder\RavaSync Client=R:\RavaSync
+    </PathMap>
+  </PropertyGroup>
+</Project>

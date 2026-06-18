@@ -36,7 +36,10 @@ using System.Net;
 using System.Net.Http.Headers;
 using System.Reflection;
 using RavaSync.Services.Discovery;
-using RavaSync.FileCache;
+using RavaSync.Services.Mesh;
+using RavaSync.Services.RavaCast;
+using RavaSync.Services.RavaCast.Rendering;
+using RavaSync.Services.RavaCast.WorldRender;
 using RavaSync.Utils;
 
 
@@ -47,7 +50,9 @@ public sealed class Plugin : IAsyncDalamudPlugin
     private readonly IHost _host;
     private readonly string _configDirectory;
     private readonly string _traceDir;
+    private readonly SemaphoreSlim _normalStartupGate = new(1, 1);
     private bool _hostStarted;
+    private bool _updateRequiredUiStarted;
 
     public Plugin(IDalamudPluginInterface pluginInterface, ICommandManager commandManager, IDataManager gameData,
         IFramework framework, IObjectTable objectTable, IClientState clientState, ICondition condition, IChatGui chatGui,
@@ -82,6 +87,11 @@ public sealed class Plugin : IAsyncDalamudPlugin
             collection.AddSingleton(new WindowSystem("RavaSync"));
             collection.AddSingleton<FileDialogManager>();
             collection.AddSingleton(new Dalamud.Localization("RavaSync.Localization.", "", useEmbedded: true));
+            collection.AddSingleton(pluginInterface);
+            collection.AddSingleton(pluginInterface.UiBuilder);
+            collection.AddSingleton<PluginUpdateGate>();
+            collection.AddSingleton<PluginUpdateRequiredUi>();
+            collection.AddSingleton<PluginUpdateRequiredUiService>();
 
             collection.AddSingleton<IFramework>(framework);
             collection.AddSingleton<IGameInteropProvider>(gameInteropProvider);
@@ -90,6 +100,7 @@ public sealed class Plugin : IAsyncDalamudPlugin
             collection.AddSingleton<IPartyList>(partyList);
             collection.AddSingleton<IDutyState>(dutyState);
             collection.AddSingleton<IGameGui>(gameGui);
+            collection.AddSingleton<ITextureProvider>(textureProvider);
             collection.AddSingleton<ICommandManager>(commandManager);
             collection.AddSingleton<IChatGui>(chatGui);
             collection.AddSingleton<IDataManager>(gameData);
@@ -114,6 +125,7 @@ public sealed class Plugin : IAsyncDalamudPlugin
             collection.AddSingleton<XivDataAnalyzer>();
             collection.AddSingleton<PapSanitisationService>();
             collection.AddSingleton<LocalPapSafetyModService>();
+            collection.AddSingleton<ScreenShakeSanitisationService>();
             collection.AddSingleton<CharacterAnalyzer>();
             collection.AddSingleton<CharacterRavaSidecarUtility>();
             collection.AddSingleton<GpuCapabilityService>();
@@ -134,10 +146,18 @@ public sealed class Plugin : IAsyncDalamudPlugin
             collection.AddSingleton<TagHandler>();
             collection.AddSingleton<IdDisplayHandler>();
             collection.AddSingleton<PlayerPerformanceService>();
+            collection.AddSingleton<LocalActiveSyncIndicatorService>();
             collection.AddSingleton<ThresholdPerfMeshRelayService>();
             collection.AddSingleton<MissingFileMeshService>();
             collection.AddSingleton<TransientResourceManager>();
             collection.AddSingleton<ToyBox>();
+            collection.AddSingleton<RavaCastBackendInstallerService>();
+            collection.AddSingleton<RavaCastWebView2D3DTextureBackend>();
+            collection.AddSingleton<IRavaCastTextureBackend>(p => p.GetRequiredService<RavaCastWebView2D3DTextureBackend>());
+            collection.AddSingleton<RavaCastBrowserSurface>();
+            collection.AddSingleton<RavaCastWorldImageRenderer>();
+            collection.AddSingleton<RavaCastService>();
+            collection.AddSingleton<RavaCastRenderer>();
             collection.AddSingleton<ModPathResolver>();
 
 
@@ -149,7 +169,6 @@ public sealed class Plugin : IAsyncDalamudPlugin
 
             collection.AddSingleton(s => new VfxSpawnManager(s.GetRequiredService<ILogger<VfxSpawnManager>>(),
                 gameInteropProvider, s.GetRequiredService<MareMediator>()));
-            collection.AddSingleton((s) => new BlockedCharacterHandler(s.GetRequiredService<ILogger<BlockedCharacterHandler>>(), gameInteropProvider));
             collection.AddSingleton((s) => new IpcProvider(s.GetRequiredService<ILogger<IpcProvider>>(),
                 pluginInterface,
                 s.GetRequiredService<CharaDataManager>(),
@@ -159,7 +178,7 @@ public sealed class Plugin : IAsyncDalamudPlugin
                 s.GetRequiredService<ILogger<EventAggregator>>(), s.GetRequiredService<MareMediator>()));
             collection.AddSingleton((s) => new DalamudUtilService(s.GetRequiredService<ILogger<DalamudUtilService>>(),
                 clientState, objectTable, framework, gameGui, condition, gameData, targetManager, gameConfig,
-                dutyState, s.GetRequiredService<BlockedCharacterHandler>(), s.GetRequiredService<MareMediator>(), s.GetRequiredService<PerformanceCollectorService>(),
+                dutyState, s.GetRequiredService<MareMediator>(), s.GetRequiredService<PerformanceCollectorService>(),
                 s.GetRequiredService<MareConfigService>(), partyList));
             collection.AddSingleton((s) => new DtrEntry(s.GetRequiredService<ILogger<DtrEntry>>(), dtrBar, s.GetRequiredService<MareConfigService>(),
                 s.GetRequiredService<MareMediator>(), s.GetRequiredService<PairManager>(), s.GetRequiredService<ApiController>(), s.GetRequiredService<UiSharedService>()));
@@ -254,9 +273,8 @@ public sealed class Plugin : IAsyncDalamudPlugin
                 httpClient.DefaultVersionPolicy = HttpVersionPolicy.RequestVersionOrHigher;
                 httpClient.DefaultRequestHeaders.ExpectContinue = false;
 
-                var ver = Assembly.GetExecutingAssembly().GetName().Version;
                 httpClient.DefaultRequestHeaders.UserAgent.Add(
-                    new ProductInfoHeaderValue("RavaSync", $"{ver!.Major}.{ver!.Minor}.{ver!.Build}"));
+                    new ProductInfoHeaderValue("RavaSync", PluginVersion.CurrentText));
 
                 return httpClient;
             });
@@ -356,6 +374,7 @@ public sealed class Plugin : IAsyncDalamudPlugin
             collection.AddScoped<WindowMediatorSubscriberBase, PairRequestUi>();
             collection.AddScoped<WindowMediatorSubscriberBase, ToolsHubUi>();
             collection.AddScoped<WindowMediatorSubscriberBase, ToyBoxUi>();
+            collection.AddScoped<WindowMediatorSubscriberBase, RavaCastUi>();
             collection.AddScoped<WindowMediatorSubscriberBase, DiscoveryIntroUi>();
             collection.AddScoped<WindowMediatorSubscriberBase, VanityUi>();
             collection.AddScoped<WindowMediatorSubscriberBase, DiscoverySettingsUi>();
@@ -411,6 +430,8 @@ public sealed class Plugin : IAsyncDalamudPlugin
             collection.AddHostedService(p => p.GetRequiredService<RavaPlugin>());
             collection.AddHostedService(p => p.GetRequiredService<RavaDiscoveryService>());
             collection.AddHostedService(p => p.GetRequiredService<ToyBox>());
+            collection.AddHostedService(p => p.GetRequiredService<RavaCastService>());
+            collection.AddHostedService(p => p.GetRequiredService<RavaCastRenderer>());
 
 
         })
@@ -425,20 +446,58 @@ public sealed class Plugin : IAsyncDalamudPlugin
 
         _ = Task.Run(() => DeleteOldTraceFilesBestEffortAsync(_traceDir), CancellationToken.None);
 
-        // These are intentionally activated before hosted services start because they register
-        // long-lived behaviours, mediator subscribers, context menus, or plugin-scoped handlers.
-        _ = _host.Services.GetRequiredService<VenueInviteService>();
-        _ = _host.Services.GetRequiredService<VenueRegistrationService>();
-        _ = _host.Services.GetRequiredService<PcpExportGuard>();
-        _ = _host.Services.GetRequiredService<PairRequestService>();
-        _ = _host.Services.GetRequiredService<PairRequestContextMenuService>();
-        _ = _host.Services.GetRequiredService<FriendshapedMarkerService>();
-        _ = _host.Services.GetRequiredService<ThresholdPerfMeshRelayService>();
-        _ = _host.Services.GetRequiredService<MissingFileMeshService>();
-        _ = _host.Services.GetRequiredService<ScopeAutoPauseService>();
+        var updateGate = _host.Services.GetRequiredService<PluginUpdateGate>();
+        if (await updateGate.CheckForUpdateAsync(cancellationToken).ConfigureAwait(false))
+        {
+            _host.Services.GetRequiredService<PluginUpdateRequiredUiService>().Start(ContinueStartupAfterUpdateClearsAsync);
+            _updateRequiredUiStarted = true;
+            return;
+        }
 
-        await _host.StartAsync(cancellationToken).ConfigureAwait(false);
-        _hostStarted = true;
+        await StartNormalPluginAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task ContinueStartupAfterUpdateClearsAsync(CancellationToken cancellationToken)
+    {
+        if (_updateRequiredUiStarted)
+        {
+            _host.Services.GetRequiredService<PluginUpdateRequiredUiService>().Dispose();
+            _updateRequiredUiStarted = false;
+        }
+
+        await StartNormalPluginAsync(CancellationToken.None).ConfigureAwait(false);
+    }
+
+    private async Task StartNormalPluginAsync(CancellationToken cancellationToken)
+    {
+        if (_hostStarted)
+            return;
+
+        await _normalStartupGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            if (_hostStarted)
+                return;
+
+            // These are intentionally activated before hosted services start because they register
+            // long-lived behaviours, mediator subscribers, context menus, or plugin-scoped handlers.
+            _ = _host.Services.GetRequiredService<VenueInviteService>();
+            _ = _host.Services.GetRequiredService<VenueRegistrationService>();
+            _ = _host.Services.GetRequiredService<PcpExportGuard>();
+            _ = _host.Services.GetRequiredService<PairRequestService>();
+            _ = _host.Services.GetRequiredService<PairRequestContextMenuService>();
+            _ = _host.Services.GetRequiredService<FriendshapedMarkerService>();
+            _ = _host.Services.GetRequiredService<ThresholdPerfMeshRelayService>();
+            _ = _host.Services.GetRequiredService<MissingFileMeshService>();
+            _ = _host.Services.GetRequiredService<ScopeAutoPauseService>();
+
+            await _host.StartAsync(cancellationToken).ConfigureAwait(false);
+            _hostStarted = true;
+        }
+        finally
+        {
+            _normalStartupGate.Release();
+        }
     }
 
     public async ValueTask DisposeAsync()
@@ -449,6 +508,12 @@ public sealed class Plugin : IAsyncDalamudPlugin
             {
                 await _host.StopAsync(CancellationToken.None).ConfigureAwait(false);
                 _hostStarted = false;
+            }
+
+            if (_updateRequiredUiStarted)
+            {
+                _host.Services.GetRequiredService<PluginUpdateRequiredUiService>().Dispose();
+                _updateRequiredUiStarted = false;
             }
         }
         finally

@@ -684,8 +684,14 @@ private void DrawPokerSeatsOverlay(ImDrawListPtr dl, Vector2 p0, Vector2 size, P
                 var c1 = new Vector2(x, y);
                 var c2 = new Vector2(x + (miniW - overlap), y);
 
-                DrawSingleCardAt(dl, c1, new Vector2(miniW, miniH), hole![0], false);
-                DrawSingleCardAt(dl, c2, new Vector2(miniW, miniH), hole![1], false);
+                var miniSize = new Vector2(miniW, miniH);
+                DrawSingleCardAt(dl, c1, miniSize, hole![0], false, hoverGrow: 1f);
+                DrawSingleCardAt(dl, c2, miniSize, hole![1], false, hoverGrow: 1f);
+
+                if (ImGui.IsMouseHoveringRect(c1, c1 + miniSize))
+                    DrawHoveredCardOverlay(c1, miniSize, hole![0], 2.75f);
+                if (ImGui.IsMouseHoveringRect(c2, c2 + miniSize))
+                    DrawHoveredCardOverlay(c2, miniSize, hole![1], 2.75f);
             }
         }
     }

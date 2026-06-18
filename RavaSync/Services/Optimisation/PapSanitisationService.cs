@@ -94,6 +94,24 @@ public sealed class PapSanitisationService : IHostedService
 
     public Task StopAsync(CancellationToken cancellationToken) => Task.CompletedTask;
 
+    public async Task<PapRewriteResult?> TryGetTargetIndependentRewriteResultAsync(string originalHash, CancellationToken token)
+    {
+        if (string.IsNullOrWhiteSpace(originalHash))
+            return PapRewriteResult.Blocked(string.Empty, "PAP had no hash to sanitize");
+
+        EnsureStartupCleanup();
+
+        return await Task.Run(() =>
+        {
+            var preparation = PreparePapRewrite(originalHash);
+            if (preparation.ImmediateResult != null)
+                return preparation.ImmediateResult;
+
+            CleanupPreparedPapRewrite(preparation.Context);
+            return null;
+        }, token).ConfigureAwait(false);
+    }
+
     public async Task<PapRewriteResult> RewritePapForTargetAsync(string originalHash, IReadOnlyList<TargetSkeletonSnapshot> targetSkeletons, CancellationToken token)
     {
         if (string.IsNullOrWhiteSpace(originalHash))

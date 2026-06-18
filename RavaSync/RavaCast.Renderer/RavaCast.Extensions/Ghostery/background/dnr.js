@@ -1,0 +1,127 @@
+import store_default from "../npm/hybrids/src/store.js";
+import { ENGINES, isGloballyPaused } from "../store/options.js";
+import { addListener } from "../utils/options-observer.js";
+import { ENGINE_CONFIGS_ROOT_URL } from "../utils/urls.js";
+import Resources from "../store/resources.js";
+import { isFilterConditionAccepted } from "../utils/engines.js";
+import { FIXES_ID_RANGE, getDynamicRulesIds } from "../utils/dnr.js";
+import "./adblocker/engines.js";
+import { updateRedirectProtectionRules } from "./redirect-protection.js";
+import { captureException } from "../utils/errors.js";
+//#region src/background/dnr.js
+/**
+* Ghostery Browser Extension
+* https://www.ghostery.com/
+*
+* Copyright 2017-present Ghostery GmbH. All rights reserved.
+*
+* This Source Code Form is subject to the terms of the Mozilla Public
+* License, v. 2.0. If a copy of the MPL was not distributed with this
+* file, You can obtain one at http://mozilla.org/MPL/2.0
+*/
+{
+	const DNR_RESOURCES = chrome.runtime.getManifest().declarative_net_request.rule_resources.filter(({ enabled }) => !enabled).map(({ id }) => id);
+	const DNR_FIXES_KEY = "dnr-fixes";
+	/**
+	* @param {string} rulesetId
+	* @returns {Promise<number[]>}
+	*/
+	async function disableExcludedRulesByPreprocessor(rulesetId) {
+		if (!chrome.declarativeNetRequest.updateStaticRules) return;
+		const metadata = await fetch(chrome.runtime.getURL(`/rule_resources/dnr-${rulesetId}.metadata.json`)).then(function(res) {
+			return res.json();
+		}).catch(function(e) {
+			console.debug(`[dnr] DNR metadata for the ruleset id "${rulesetId}" was not found: ${e}`);
+			return null;
+		});
+		if (!metadata) return;
+		const disableRuleIds = Object.entries(metadata).reduce(function(disabledRuleIds, [ruleId, constraints]) {
+			if (!isFilterConditionAccepted(constraints.preprocessor)) disabledRuleIds.push(Number(ruleId));
+			return disabledRuleIds;
+		}, []);
+		await chrome.declarativeNetRequest.updateStaticRules({
+			rulesetId,
+			disableRuleIds
+		});
+		console.info(`[dnr] Disabled rules in "${rulesetId}" by preprocessor: ${disableRuleIds.length}`);
+	}
+	function getIds(options) {
+		if (!options.terms || isGloballyPaused(options)) return [];
+		const ids = ENGINES.reduce((acc, { name, key }) => {
+			if (options[key] && DNR_RESOURCES.includes(name)) acc.push(name);
+			return acc;
+		}, []);
+		if (ids.length && options.regionalFilters.enabled) ids.push(...options.regionalFilters.regions.map((id) => `lang-${id}`).filter((id) => DNR_RESOURCES.includes(id)));
+		if (ids.length && options.redirectProtection.enabled && DNR_RESOURCES.includes("redirect-protection")) ids.push("redirect-protection");
+		return ids;
+	}
+	addListener(async function dnr(options, lastOptions) {
+		const nextRulesetIds = getIds(options);
+		if (lastOptions && lastOptions.filtersUpdatedAt === options.filtersUpdatedAt && lastOptions.fixesFilters === options.fixesFilters && String(nextRulesetIds) === String(getIds(lastOptions))) return;
+		const resources = await store_default.resolve(Resources);
+		if (options.fixesFilters && nextRulesetIds.length) {
+			if (!resources.checksums[DNR_FIXES_KEY] || lastOptions?.filtersUpdatedAt < options.filtersUpdatedAt) {
+				const removeRuleIds = await getDynamicRulesIds(FIXES_ID_RANGE);
+				try {
+					const list = await fetch(`${ENGINE_CONFIGS_ROOT_URL}/dnr-fixes-v2/allowed-lists.json`, { cache: lastOptions && lastOptions.filtersUpdatedAt > Date.now() - 36e5 ? "no-store" : "default" }).then((res) => res.ok ? res.json() : Promise.reject(/* @__PURE__ */ new Error(`Failed to fetch allowed lists: ${res.statusText}`)));
+					if (list.dnr.checksum !== resources.checksums[DNR_FIXES_KEY]) {
+						console.info("[dnr] Updating dynamic fixes rules...");
+						const rules = new Set(await fetch(list.dnr.url).then((res) => res.ok ? res.json() : Promise.reject(/* @__PURE__ */ new Error(`Failed to fetch DNR rules: ${res.statusText}`))));
+						const metadata = await fetch(list.dnr.metadataUrl).then((res) => res.json()).catch((error) => {
+							console.error(`Failed to fetch DNR metadata: "${list.dnr.metadataUrl}": ${error}`);
+							return {};
+						});
+						for (const rule of rules) if (rule.condition.regexFilter) {
+							const { isSupported } = await chrome.declarativeNetRequest.isRegexSupported({ regex: rule.condition.regexFilter });
+							if (!isSupported) rules.delete(rule);
+						}
+						await chrome.declarativeNetRequest.updateDynamicRules({
+							removeRuleIds: await getDynamicRulesIds(FIXES_ID_RANGE),
+							addRules: Array.from(rules).filter((rule) => !metadata[rule.id]?.preprocessor || isFilterConditionAccepted(metadata[rule.id].preprocessor)).map((rule, index) => ({
+								...rule,
+								id: FIXES_ID_RANGE.start + index
+							}))
+						});
+						console.info("[dnr] Updated dynamic fixes rules:", list.dnr.checksum);
+						await store_default.set(Resources, { checksums: { [DNR_FIXES_KEY]: list.dnr.checksum } });
+						await updateRedirectProtectionRules(options);
+					}
+				} catch (e) {
+					console.error("[dnr] Error while updating dynamic fixes rules:", e);
+					if (!removeRuleIds.length) {
+						console.warn("[dnr] Falling back to static fixes rules");
+						nextRulesetIds.push("fixes");
+						await store_default.set(Resources, { checksums: { [DNR_FIXES_KEY]: "filesystem" } });
+					}
+				}
+			}
+		} else if (resources.checksums[DNR_FIXES_KEY]) {
+			const removeRuleIds = await getDynamicRulesIds(FIXES_ID_RANGE);
+			if (removeRuleIds.length) {
+				await chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds });
+				await store_default.set(Resources, { checksums: { [DNR_FIXES_KEY]: null } });
+				console.info("[dnr] Removed dynamic fixes rules");
+			}
+		}
+		const currentRulesetIds = await chrome.declarativeNetRequest.getEnabledRulesets();
+		const enableRulesetIds = [];
+		for (const id of nextRulesetIds) if (!currentRulesetIds.includes(id)) enableRulesetIds.push(id);
+		const disableRulesetIds = [];
+		for (const id of currentRulesetIds) if (!nextRulesetIds.includes(id)) disableRulesetIds.push(id);
+		if (enableRulesetIds.length || disableRulesetIds.length) try {
+			await chrome.declarativeNetRequest.updateEnabledRulesets({
+				enableRulesetIds,
+				disableRulesetIds
+			});
+			console.info("[dnr] Updated static rulesets:", nextRulesetIds.length ? nextRulesetIds.join(", ") : "none");
+			if (enableRulesetIds.length > 0) await Promise.all(enableRulesetIds.map((id) => disableExcludedRulesByPreprocessor(id)));
+		} catch (e) {
+			console.error(`[dnr] Error while updating static rulesets:`, e);
+			captureException(e, {
+				critical: true,
+				once: true
+			});
+		}
+	});
+}
+//#endregion

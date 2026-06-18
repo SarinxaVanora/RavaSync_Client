@@ -37,7 +37,9 @@ public class ScopeAutoPauseService : MediatorSubscriberBase
 
     private volatile ScopeMode _mode;
 
-    private static readonly TimeSpan TickInterval = TimeSpan.FromMilliseconds(50);
+    // Scope enforcement is not visual-frame critical. Running it five times a second is plenty,
+    // and avoids repeated name normalisation/dictionary scans in crowded rooms.
+    private static readonly TimeSpan TickInterval = TimeSpan.FromMilliseconds(200);
     private DateTime _nextTickUtc = DateTime.MinValue;
 
     private int _saveScheduled = 0;
@@ -103,16 +105,26 @@ public class ScopeAutoPauseService : MediatorSubscriberBase
 
     private (string raw, string norm) GetBestNamePair(string uid, string? liveName)
     {
-        // Prefer live, otherwise cached;
-        string raw = !string.IsNullOrEmpty(liveName)
-            ? liveName!
-            : (_lastKnownNameRaw.TryGetValue(uid, out var cachedRaw) ? cachedRaw : string.Empty);
+        if (!string.IsNullOrEmpty(liveName))
+            return RememberLiveName(uid, liveName!);
 
-        string norm = !string.IsNullOrEmpty(liveName)
-            ? NormalizeName(liveName)
-            : (_lastKnownNameNorm.TryGetValue(uid, out var cachedNorm) ? cachedNorm : string.Empty);
-
+        var raw = _lastKnownNameRaw.TryGetValue(uid, out var cachedRaw) ? cachedRaw : string.Empty;
+        var norm = _lastKnownNameNorm.TryGetValue(uid, out var cachedNorm) ? cachedNorm : string.Empty;
         return (raw, norm);
+    }
+
+    private (string raw, string norm) RememberLiveName(string uid, string liveName)
+    {
+        if (_lastKnownNameRaw.TryGetValue(uid, out var existingRaw)
+            && string.Equals(existingRaw, liveName, StringComparison.Ordinal))
+        {
+            return (existingRaw, _lastKnownNameNorm.TryGetValue(uid, out var existingNorm) ? existingNorm : string.Empty);
+        }
+
+        var normalized = NormalizeName(liveName);
+        _lastKnownNameRaw[uid] = liveName;
+        _lastKnownNameNorm[uid] = normalized;
+        return (liveName, normalized);
     }
 
     // ---------- Scope toggle handling ----------
@@ -197,14 +209,12 @@ public class ScopeAutoPauseService : MediatorSubscriberBase
 
         if (_mode == ScopeMode.Everyone && _autoScopePausedUids.IsEmpty) return;
 
-        // Update last-known names for any visible actors with a live name
+        // Update last-known names for any visible actors with a live name, but only normalise
+        // when the raw name actually changed. This used to allocate on every scope tick.
         _pairManager.ForEachVisiblePair(pair =>
         {
             if (string.IsNullOrEmpty(pair.PlayerName)) return;
-
-            var uid = pair.UserData.UID;
-            _lastKnownNameRaw[uid] = pair.PlayerName!;
-            _lastKnownNameNorm[uid] = NormalizeName(pair.PlayerName!);
+            RememberLiveName(pair.UserData.UID, pair.PlayerName!);
         });
 
         if (_mode == ScopeMode.Everyone) return;
@@ -237,7 +247,7 @@ public class ScopeAutoPauseService : MediatorSubscriberBase
             {
                 _autoScopePausedUids[pair.UserData.UID] = true;
                 pair.AutoPausedByScope = true;
-                pair.EnterPausedVanillaState();
+                pair.GoBackToVanillaState();
                 _mediator.Publish(new PauseMessage(pair.UserData));
                 Touch(pair.UserData.UID);
                 SaveState();

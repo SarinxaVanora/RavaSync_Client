@@ -27,6 +27,7 @@ using RavaSync.Themes;
 using RavaSync.Utils;
 using RavaSync.WebAPI;
 using RavaSync.WebAPI.SignalR;
+using System.Globalization;
 using System.IdentityModel.Tokens.Jwt;
 using System.Numerics;
 using System.Reflection;
@@ -289,7 +290,9 @@ public partial class UiSharedService : DisposableMediatorSubscriberBase
             dblSByte = bytes / 1024.0;
         }
 
-        return addSuffix ? $"{dblSByte:0.00} {suffix[i]}" : $"{dblSByte:0.00}";
+        return addSuffix
+            ? string.Format(CultureInfo.InvariantCulture, "{0:0.00} {1}", dblSByte, suffix[i])
+            : string.Format(CultureInfo.InvariantCulture, "{0:0.00}", dblSByte);
     }
 
     public static void CenterNextWindow(float width, float height, ImGuiCond cond = ImGuiCond.None)
@@ -924,40 +927,48 @@ public partial class UiSharedService : DisposableMediatorSubscriberBase
 
     public bool DrawOtherPluginState()
     {
-        ImGui.TextUnformatted(L("UI.UISharedService.0f1c0453", "Mandatory Plugins:"));
+        void SameLineToken()
+        {
+            ImGui.SameLine(0f, 10f * ImGuiHelpers.GlobalScale);
+        }
 
-        ImGui.SameLine(150);
-        ColorText(L("UI.UISharedService.d2129b83", "Penumbra"), GetBoolColor(_penumbraExists));
-        AttachToolTip(L("UI.UISharedService.2d8b6db0", "Penumbra is ") + (_penumbraExists ? L("UI.UISharedService.9cd69517", "available and up to date.") : L("UI.UISharedService.50df3ed9", "unavailable or not up to date.")));
+        void DrawPluginToken(string label, bool available, string tooltipPrefix)
+        {
+            ColorText(label, GetBoolColor(available));
+            AttachToolTip(tooltipPrefix + (available ? L("UI.UISharedService.9cd69517", "available and up to date.") : L("UI.UISharedService.50df3ed9", "unavailable or not up to date.")));
+        }
 
-        ImGui.SameLine();
-        ColorText(L("UI.UISharedService.56519852", "Glamourer"), GetBoolColor(_glamourerExists));
-        AttachToolTip(L("UI.UISharedService.7115133c", "Glamourer is ") + (_glamourerExists ? L("UI.UISharedService.9cd69517", "available and up to date.") : L("UI.UISharedService.50df3ed9", "unavailable or not up to date.")));
+        if (ImGui.BeginTable("##otherPluginStateRows", 2, ImGuiTableFlags.SizingStretchProp | ImGuiTableFlags.NoSavedSettings | ImGuiTableFlags.NoPadOuterX))
+        {
+            ImGui.TableSetupColumn("##pluginStateLabel", ImGuiTableColumnFlags.WidthFixed, 122f * ImGuiHelpers.GlobalScale);
+            ImGui.TableSetupColumn("##pluginStateItems", ImGuiTableColumnFlags.WidthStretch);
 
-        ImGui.TextUnformatted(L("UI.UISharedService.52f5707f", "Optional Plugins:"));
-        ImGui.SameLine(150);
-        ColorText(L("UI.UISharedService.f9105374", "SimpleHeels"), GetBoolColor(_heelsExists));
-        AttachToolTip(L("UI.UISharedService.d34f1d6c", "SimpleHeels is ") + (_heelsExists ? L("UI.UISharedService.9cd69517", "available and up to date.") : L("UI.UISharedService.50df3ed9", "unavailable or not up to date.")));
+            ImGui.TableNextRow();
+            ImGui.TableSetColumnIndex(0);
+            ImGui.TextUnformatted(L("UI.UISharedService.0f1c0453", "Mandatory Plugins:"));
+            ImGui.TableSetColumnIndex(1);
+            DrawPluginToken(L("UI.UISharedService.d2129b83", "Penumbra"), _penumbraExists, L("UI.UISharedService.2d8b6db0", "Penumbra is "));
+            SameLineToken();
+            DrawPluginToken(L("UI.UISharedService.56519852", "Glamourer"), _glamourerExists, L("UI.UISharedService.7115133c", "Glamourer is "));
 
-        ImGui.SameLine();
-        ColorText(L("UI.UISharedService.04d09974", "Customize+"), GetBoolColor(_customizePlusExists));
-        AttachToolTip(L("UI.UISharedService.34bdebff", "Customize+ is ") + (_customizePlusExists ? L("UI.UISharedService.9cd69517", "available and up to date.") : L("UI.UISharedService.50df3ed9", "unavailable or not up to date.")));
+            ImGui.TableNextRow();
+            ImGui.TableSetColumnIndex(0);
+            ImGui.TextUnformatted(L("UI.UISharedService.52f5707f", "Optional Plugins:"));
+            ImGui.TableSetColumnIndex(1);
+            DrawPluginToken(L("UI.UISharedService.f9105374", "SimpleHeels"), _heelsExists, L("UI.UISharedService.d34f1d6c", "SimpleHeels is "));
+            SameLineToken();
+            DrawPluginToken(L("UI.UISharedService.04d09974", "Customize+"), _customizePlusExists, L("UI.UISharedService.34bdebff", "Customize+ is "));
+            SameLineToken();
+            DrawPluginToken(L("UI.UISharedService.2ab5b71f", "Honorific"), _honorificExists, L("UI.UISharedService.698dc824", "Honorific is "));
+            SameLineToken();
+            DrawPluginToken(L("UI.UISharedService.3b39cf55", "Moodles"), _moodlesExists, L("UI.UISharedService.4e9b8581", "Moodles is "));
+            SameLineToken();
+            DrawPluginToken(L("UI.UISharedService.1fd2d64f", "PetNicknames"), _petNamesExists, L("UI.UISharedService.d388ba52", "PetNicknames is "));
+            SameLineToken();
+            DrawPluginToken(L("UI.UISharedService.6473040f", "Brio"), _brioExists, L("UI.UISharedService.d3f2d22b", "Brio is "));
 
-        ImGui.SameLine();
-        ColorText(L("UI.UISharedService.2ab5b71f", "Honorific"), GetBoolColor(_honorificExists));
-        AttachToolTip(L("UI.UISharedService.698dc824", "Honorific is ") + (_honorificExists ? L("UI.UISharedService.9cd69517", "available and up to date.") : L("UI.UISharedService.50df3ed9", "unavailable or not up to date.")));
-
-        ImGui.SameLine();
-        ColorText(L("UI.UISharedService.3b39cf55", "Moodles"), GetBoolColor(_moodlesExists));
-        AttachToolTip(L("UI.UISharedService.4e9b8581", "Moodles is ") + (_moodlesExists ? L("UI.UISharedService.9cd69517", "available and up to date.") : L("UI.UISharedService.50df3ed9", "unavailable or not up to date.")));
-
-        ImGui.SameLine();
-        ColorText(L("UI.UISharedService.1fd2d64f", "PetNicknames"), GetBoolColor(_petNamesExists));
-        AttachToolTip(L("UI.UISharedService.d388ba52", "PetNicknames is ") + (_petNamesExists ? L("UI.UISharedService.9cd69517", "available and up to date.") : L("UI.UISharedService.50df3ed9", "unavailable or not up to date.")));
-
-        ImGui.SameLine();
-        ColorText(L("UI.UISharedService.6473040f", "Brio"), GetBoolColor(_brioExists));
-        AttachToolTip(L("UI.UISharedService.d3f2d22b", "Brio is ") + (_brioExists ? L("UI.UISharedService.9cd69517", "available and up to date.") : L("UI.UISharedService.50df3ed9", "unavailable or not up to date.")));
+            ImGui.EndTable();
+        }
 
         if (!_penumbraExists || !_glamourerExists)
         {
@@ -1132,7 +1143,7 @@ public partial class UiSharedService : DisposableMediatorSubscriberBase
         }
         if (string.IsNullOrEmpty(selectedServer.OAuthToken) || tokenExpiry < DateTime.UtcNow)
         {
-            ColorTextWrapped(L("UI.UISharedService.6764d997", "You have no OAuth token or the OAuth token is expired. Please use the Service Configuration to link your OAuth2 account or refresh the token."), ImGuiColors.DalamudRed);
+            ColorTextWrapped(L("UI.UISharedService.6764d997", "You have no OAuth token or the OAuth token is expired. Please open Settings -> Service -> Connection to link or refresh your OAuth2 account."), ImGuiColors.DalamudRed);
         }
     }
 

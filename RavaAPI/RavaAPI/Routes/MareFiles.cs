@@ -19,7 +19,9 @@ public class MareFiles
     public const string ServerFiles_Upload = "upload";
     public const string ServerFiles_UploadMunged = "uploadMunged";
     public const string ServerFiles_UploadTicket = "uploadTicket";
+    public const string ServerFiles_UploadTickets = "uploadTickets";
     public const string ServerFiles_UploadComplete = "uploadComplete";
+    public const string ServerFiles_UploadCompletes = "uploadCompletes";
     public const string ServerFiles_DownloadServers = "downloadServers";
 
     public const string Distribution = "/dist";
@@ -45,7 +47,9 @@ public class MareFiles
     public static Uri ServerFilesUploadFullPath(Uri baseUri, string hash) => new(baseUri, ServerFiles + "/" + ServerFiles_Upload + "/" + hash);
     public static Uri ServerFilesUploadMunged(Uri baseUri, string hash) => new(baseUri, ServerFiles + "/" + ServerFiles_UploadMunged + "/" + hash);
     public static Uri ServerFilesUploadTicketFullPath(Uri baseUri, string hash) => new(baseUri, ServerFiles + "/" + ServerFiles_UploadTicket + "/" + hash);
+    public static Uri ServerFilesUploadTicketsFullPath(Uri baseUri) => new(baseUri, ServerFiles + "/" + ServerFiles_UploadTickets);
     public static Uri ServerFilesUploadCompleteFullPath(Uri baseUri, string hash) => new(baseUri, ServerFiles + "/" + ServerFiles_UploadComplete + "/" + hash);
+    public static Uri ServerFilesUploadCompletesFullPath(Uri baseUri) => new(baseUri, ServerFiles + "/" + ServerFiles_UploadCompletes);
     public static Uri ServerFilesGetDownloadServersFullPath(Uri baseUri) => new(baseUri, ServerFiles + "/" + ServerFiles_DownloadServers);
     public static Uri DistributionGetFullPath(Uri baseUri, string hash) => new(baseUri, Distribution + "/" + Distribution_Get + "?file=" + hash);
     public static Uri SpeedtestRunFullPath(Uri baseUri) => new(baseUri, Speedtest + "/" + Speedtest_Run);

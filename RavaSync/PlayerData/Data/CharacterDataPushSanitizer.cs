@@ -9,7 +9,7 @@ namespace RavaSync.PlayerData.Data;
 
 public static partial class CharacterDataPushSanitizer
 {
-    private static readonly string[] ServerAllowedGamePathExtensions = [".mdl", ".tex", ".mtrl", ".tmb", ".pap", ".avfx", ".atex", ".sklb", ".eid", ".phyb", ".pbd", ".scd", ".skp", ".shpk"];
+    private static readonly string[] ServerAllowedGamePathExtensions = [".mdl", ".tex", ".mtrl", ".tmb", ".tmb2", ".pap", ".avfx", ".atex", ".sklb", ".atch", ".eid", ".phy", ".phyb", ".pbd", ".scd", ".skp", ".shpk"];
 
     public readonly record struct Result(int RemovedReplacements, int RemovedGamePaths, int RemovedBuckets, int RemovedHonorificData)
     {

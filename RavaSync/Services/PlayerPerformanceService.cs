@@ -534,7 +534,7 @@ public class PlayerPerformanceService : MediatorSubscriberBase
                 $"Exceeds triangle threshold: automatically paused ({triUsage}/{config.TrisAutoPauseThresholdThousands * 1000} triangles)")));
 
             AddThresholdPausedUser(pair.UserData);
-            pair.EnterPausedVanillaState();
+            pair.GoBackToVanillaState();
             _mediator.Publish(new PauseMessage(pair.UserData));
 
             return false;
@@ -658,7 +658,7 @@ public class PlayerPerformanceService : MediatorSubscriberBase
                 MareConfiguration.Models.NotificationType.Warning));
 
             AddThresholdPausedUser(pair.UserData);
-            pair.EnterPausedVanillaState();
+            pair.GoBackToVanillaState();
 
             _mediator.Publish(new PauseMessage(pair.UserData));
 
@@ -697,7 +697,7 @@ public class PlayerPerformanceService : MediatorSubscriberBase
                 if (!pair.AutoPausedByCap)
                 {
                     pair.AutoPausedByCap = true;
-                    pair.EnterPausedVanillaState();
+                    pair.GoBackToVanillaState();
                     _mediator.Publish(new PauseMessage(pair.UserData));
                     _logger.LogInformation("Auto-paused {user}  pool {total}/{cap}",
                         pair.UserData.AliasOrUID,
@@ -778,7 +778,7 @@ public class PlayerPerformanceService : MediatorSubscriberBase
                         continue;
 
                     pausedPair.AutoPausedByCap = true;
-                    pausedPair.EnterPausedVanillaState();
+                    pausedPair.GoBackToVanillaState();
                 }
 
                 _mediator.Publish(new PauseMessage(user));
@@ -1321,7 +1321,7 @@ public class PlayerPerformanceService : MediatorSubscriberBase
                 if (IsIgnored(cfg, pair.UserData)) continue;
 
                 _autoCombatPausedUsers[pair.UserData.UID] = pair.UserData;
-                pair.EnterPausedVanillaState();
+                pair.GoBackToVanillaState();
                 _mediator.Publish(new PauseMessage(pair.UserData));
             }
             catch
@@ -1413,7 +1413,7 @@ public class PlayerPerformanceService : MediatorSubscriberBase
                 if (IsIgnored(cfg, pair.UserData)) continue;
 
                 _autoInstancePausedUsers[pair.UserData.UID] = pair.UserData;
-                pair.EnterPausedVanillaState();
+                pair.GoBackToVanillaState();
                 _mediator.Publish(new PauseMessage(pair.UserData));
             }
             catch

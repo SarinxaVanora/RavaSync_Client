@@ -40,14 +40,14 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
     private static readonly TimeSpan VerifiedHashTtl = TimeSpan.FromHours(12);
     private const int MaxCdnExistenceChecks = 8;
     private const int HealthyCdnProbeAttempts = 3;
-    private const int MaxConfiguredParallelUploads = 16;
-    private const int MaxSmallFileAutoParallelUploads = 32;
-    private const int MaxTinyFileAutoParallelUploads = 48;
-    private const long TinyUploadThresholdBytes = 128L * 1024;
-    private const long SmallUploadThresholdBytes = 512L * 1024;
-    private const long RequestBoundUploadThresholdBytes = 512L * 1024;
+    private const int MaxConfiguredParallelUploads = 32;
+    private const int MaxSmallFileAutoParallelUploads = 64;
+    private const int MaxTinyFileAutoParallelUploads = 96;
+    private const long TinyUploadThresholdBytes = 256L * 1024;
+    private const long SmallUploadThresholdBytes = 1024L * 1024;
+    private const long RequestBoundUploadThresholdBytes = 1024L * 1024;
     private const long SmallUploadInMemoryThresholdBytes = 1024L * 1024;
-    private const long TinyUploadProgressThresholdBytes = 128L * 1024;
+    private const long TinyUploadProgressThresholdBytes = 512L * 1024;
     private const int LocalOutboundUploadStatusEchoSuppressMs = 2500;
     private static readonly int UploadPayloadPreparationParallelism = GetUploadPayloadPreparationParallelism();
     private static readonly SemaphoreSlim UploadPayloadPreparationSemaphore = new(UploadPayloadPreparationParallelism, UploadPayloadPreparationParallelism);
@@ -249,7 +249,7 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
         await _centralRepairUploadSemaphore.WaitAsync(ct).ConfigureAwait(false);
         try
         {
-            Logger.LogWarning("Central B2 force-upload requested for {count} missing hash(es). Reason={reason}. Hashes={hashes}",
+            Logger.LogDebug("Central B2 force-upload requested for {count} missing hash(es). Reason={reason}. Hashes={hashes}",
                 toUpload.Count,
                 reason,
                 string.Join(", ", toUpload.Take(20)));
@@ -265,7 +265,7 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
             }
             else
             {
-                Logger.LogInformation("Central B2 force-upload completed for {count} missing hash(es)", toUpload.Count);
+                Logger.LogDebug("Central B2 force-upload completed for {count} missing hash(es)", toUpload.Count);
             }
 
             return failed;
@@ -277,7 +277,7 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
     }
 
 
-    private bool TryValidateUploadSource(string fileHash, FileCacheEntity? cacheEntry)
+    private bool TryValidateUploadSource(string fileHash, FileCacheEntity? cacheEntry, bool requireHashValidation = false)
     {
         try
         {
@@ -316,11 +316,13 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
                     StringComparison.Ordinal);
             }
 
-            if (sizeMatches && ticksMatches)
+            if (!requireHashValidation && sizeMatches && ticksMatches)
                 return true;
 
             Logger.LogDebug(
-                "[{hash}] Upload source metadata changed; falling back to hash validation. CachedSize={cachedSize}, CurrentSize={currentSize}, CachedTicks={cachedTicks}, CurrentTicks={currentTicks}, Path={path}",
+                requireHashValidation
+                    ? "[{hash}] Forced repair upload source validation requested; verifying hash before upload. CachedSize={cachedSize}, CurrentSize={currentSize}, CachedTicks={cachedTicks}, CurrentTicks={currentTicks}, Path={path}"
+                    : "[{hash}] Upload source metadata changed; falling back to hash validation. CachedSize={cachedSize}, CurrentSize={currentSize}, CachedTicks={cachedTicks}, CurrentTicks={currentTicks}, Path={path}",
                 fileHash,
                 cacheEntry?.Size,
                 fi.Length,
@@ -402,11 +404,11 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
 
         if (!ticket.UploadRequired)
         {
+            if (forceUploadTicket)
+                throw new InvalidOperationException($"[{fileHash}] Forced upload ticket still reported UploadRequired=false; refusing to treat CDN/B2 as repaired without a fresh raw overwrite.");
+
             if (await VerifyCdnObjectHealthyAsync(fileHash, uploadToken).ConfigureAwait(false))
                 return;
-
-            if (forceUploadTicket)
-                throw new InvalidOperationException($"[{fileHash}] Forced upload ticket still reported UploadRequired=false while CDN/B2 object is missing.");
 
             Logger.LogWarning("[{hash}] Server reported upload not required, but CDN object was missing/empty; retrying with forced upload ticket", fileHash);
 
@@ -520,6 +522,9 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
                     }
 
                     putResp.EnsureSuccessStatusCode();
+
+                    // The B2 PUT is complete here. The metadata call may still be in flight,
+                    // but upload bytes are finished, so do not fake a 99% stall in the UI.
                     progress?.Report(new UploadProgress(rawSize, rawSize));
 
                     var etag = putResp.Headers.ETag?.Tag;
@@ -533,6 +538,7 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
                         Logger.LogDebug("[{hash}] UploadComplete Status: {status}", fileHash, completeResp.StatusCode);
                     }
                     completeResp.EnsureSuccessStatusCode();
+                    progress?.Report(new UploadProgress(rawSize, rawSize));
 
                     return;
                 }
@@ -593,7 +599,291 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
         }
     }
 
-    public async Task<(CharacterData Data, bool Success, string? Error)> UploadFiles(CharacterData data, List<UserData> visiblePlayers)
+
+
+    private async Task<UploadCompleteBatchFileDto> UploadFileStreamedFromDiskWithTicket(string fileHash, string filePath, UploadTicketBatchFileResponseDto ticket, IProgress<UploadProgress>? progress, CancellationToken uploadToken, int streamBufferSize)
+    {
+        if (!_orchestrator.IsInitialized) throw new InvalidOperationException("FileTransferManager is not initialized");
+        uploadToken.ThrowIfCancellationRequested();
+
+        if (!ticket.Success)
+            throw new InvalidOperationException($"[{fileHash}] Batch upload ticket failed: {ticket.Error}");
+
+        if (!string.Equals(ticket.Mode, "DirectB2", StringComparison.OrdinalIgnoreCase) || string.IsNullOrWhiteSpace(ticket.UploadUrl))
+            throw new InvalidOperationException($"[{fileHash}] Server did not provide a usable DirectB2 ticket (mode={ticket.Mode}).");
+
+        var fileSize = new FileInfo(filePath).Length;
+        Logger.LogDebug("[{hash}] Batch DirectB2 ticket acquired, preparing raw payload", fileHash);
+
+        byte[]? inMemoryPayload = null;
+        long rawSize;
+        long payloadSize;
+        string md5Base64;
+
+        try
+        {
+            if (fileSize <= SmallUploadInMemoryThresholdBytes)
+            {
+                var prepared = await PrepareSmallRawUploadInMemoryAsync(filePath, uploadToken).ConfigureAwait(false);
+                inMemoryPayload = prepared.PayloadBytes;
+                rawSize = prepared.RawSize;
+                payloadSize = prepared.PayloadSize;
+                md5Base64 = prepared.Md5Base64;
+            }
+            else
+            {
+                rawSize = fileSize;
+                payloadSize = fileSize;
+                md5Base64 = await ComputeFileMd5Base64Async(filePath, uploadToken).ConfigureAwait(false);
+            }
+
+            if (rawSize <= 0)
+                throw new InvalidDataException($"[{fileHash}] Refusing to upload zero-length raw payload.");
+
+            if (payloadSize <= 0)
+                throw new InvalidDataException($"[{fileHash}] Refusing to upload zero-length payload.");
+
+            if (rawSize != payloadSize)
+                throw new InvalidDataException($"[{fileHash}] RawV2 payload size mismatch (raw={rawSize}, payload={payloadSize}).");
+
+            if (inMemoryPayload != null && inMemoryPayload.LongLength != payloadSize)
+                throw new InvalidDataException($"[{fileHash}] In-memory payload size mismatch (expected {payloadSize}, got {inMemoryPayload.LongLength}).");
+
+            if (inMemoryPayload == null)
+            {
+                var fi = new FileInfo(filePath);
+                if (!fi.Exists || fi.Length != payloadSize)
+                    throw new InvalidDataException($"[{fileHash}] Source upload payload size mismatch (expected {payloadSize}, got {fi.Length}).");
+            }
+
+            progress?.Report(new UploadProgress(0, rawSize));
+
+            const int maxAttempts = 4;
+            Exception? last = null;
+
+            for (int attempt = 1; attempt <= maxAttempts; attempt++)
+            {
+                uploadToken.ThrowIfCancellationRequested();
+
+                try
+                {
+                    await using var fs0 = OpenRawUploadPayloadStream(inMemoryPayload, filePath, streamBufferSize);
+
+                    var netProgress = progress == null
+                        ? null
+                        : new Progress<long>(sent =>
+                        {
+                            var mapped = sent;
+                            if (mapped > rawSize) mapped = rawSize;
+                            progress.Report(new UploadProgress(mapped, rawSize));
+                        });
+
+                    await using Stream fs = netProgress == null ? fs0 : new ProgressReadStream(fs0, netProgress);
+
+                    using var put = new HttpRequestMessage(HttpMethod.Put, ticket.UploadUrl);
+
+                    var content = new StreamContent(fs, streamBufferSize);
+                    content.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
+                    content.Headers.ContentLength = payloadSize;
+                    try { content.Headers.ContentMD5 = Convert.FromBase64String(md5Base64); } catch { }
+
+                    put.Content = content;
+                    put.Headers.ExpectContinue = false;
+
+                    using var putResp = await _directUploadClient.SendAsync(put, HttpCompletionOption.ResponseHeadersRead, uploadToken).ConfigureAwait(false);
+
+                    if (Logger.IsEnabled(LogLevel.Debug))
+                    {
+                        Logger.LogDebug("[{hash}] Batch DirectB2 PUT attempt {attempt}/{max} Status: {status}",
+                            fileHash, attempt, maxAttempts, putResp.StatusCode);
+                    }
+
+                    putResp.EnsureSuccessStatusCode();
+
+                    // The B2 PUT is complete here. Batch metadata finalisation may still be in
+                    // flight, but the upload bytes are done, so show the sender a true 100%
+                    // instead of sitting at 99% during UploadCompletes.
+                    progress?.Report(new UploadProgress(rawSize, rawSize));
+
+                    return new UploadCompleteBatchFileDto
+                    {
+                        Hash = fileHash,
+                        RawSize = rawSize,
+                        CompressedSize = payloadSize,
+                        ContentMd5Base64 = md5Base64,
+                        ETag = putResp.Headers.ETag?.Tag,
+                        WasDirect = true,
+                        PayloadEncoding = FilePayloadEncoding.RawV2
+                    };
+                }
+                catch (Exception ex) when (attempt < maxAttempts)
+                {
+                    last = ex;
+
+                    if (Logger.IsEnabled(LogLevel.Debug))
+                        Logger.LogDebug(ex, "[{hash}] Batch DirectB2 PUT failed (attempt {attempt}/{max}); retrying", fileHash, attempt, maxAttempts);
+
+                    await Task.Delay(250 * attempt, uploadToken).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    last = ex;
+                    break;
+                }
+            }
+
+            throw new InvalidOperationException($"[{fileHash}] Batch DirectB2 upload failed after {maxAttempts} attempts.", last);
+        }
+        finally
+        {
+            // RawV2 uses either an in-memory byte array or the original cache file; no temp payload cleanup required.
+        }
+    }
+
+    private async Task UploadCompleteSingleAsync(UploadCompleteBatchFileDto completeFile, CancellationToken uploadToken)
+    {
+        var completeUri = MareFiles.ServerFilesUploadCompleteFullPath(_orchestrator.UploadCdnUri!, completeFile.Hash);
+        var complete = new UploadCompleteDto(completeFile.RawSize, completeFile.CompressedSize, completeFile.ContentMd5Base64, completeFile.ETag, completeFile.WasDirect, completeFile.PayloadEncoding);
+
+        using var completeResp = await _orchestrator.SendRequestAsync(HttpMethod.Post, completeUri, complete, uploadToken).ConfigureAwait(false);
+        if (Logger.IsEnabled(LogLevel.Debug))
+            Logger.LogDebug("[{hash}] UploadComplete Status: {status}", completeFile.Hash, completeResp.StatusCode);
+
+        completeResp.EnsureSuccessStatusCode();
+    }
+
+    private async Task<Dictionary<string, UploadTicketBatchFileResponseDto>> GetUploadTicketsBatchAsync(List<string> hashes, IReadOnlyDictionary<string, long> sizeByHash, bool forceUploadTicket, CancellationToken ct)
+    {
+        var result = new Dictionary<string, UploadTicketBatchFileResponseDto>(StringComparer.Ordinal);
+
+        if (!_orchestrator.IsInitialized || _orchestrator.UploadCdnUri == null || hashes.Count == 0)
+            return result;
+
+        const int batchSize = 256;
+        var options = new JsonSerializerOptions { PropertyNameCaseInsensitive = true };
+
+        foreach (var chunk in hashes.Distinct(StringComparer.Ordinal).Chunk(batchSize))
+        {
+            ct.ThrowIfCancellationRequested();
+
+            var req = new UploadTicketBatchRequestDto
+            {
+                Force = forceUploadTicket,
+                Files = chunk
+                    .Where(h => sizeByHash.TryGetValue(h, out var size) && size > 0)
+                    .Select(h => new UploadTicketBatchFileRequestDto
+                    {
+                        Hash = h,
+                        RawSize = sizeByHash[h],
+                        ClientWouldMunge = false,
+                        ClientParallelUploads = 0,
+                        PayloadEncoding = FilePayloadEncoding.RawV2
+                    })
+                    .ToList()
+            };
+
+            if (req.Files.Count == 0)
+                continue;
+
+            try
+            {
+                using var resp = await _orchestrator.SendRequestAsync(HttpMethod.Post, MareFiles.ServerFilesUploadTicketsFullPath(_orchestrator.UploadCdnUri!), req, ct).ConfigureAwait(false);
+                if (resp.StatusCode == HttpStatusCode.NotFound)
+                {
+                    Logger.LogDebug("Batch upload tickets endpoint not available; falling back to per-file tickets.");
+                    return result;
+                }
+
+                if (!resp.IsSuccessStatusCode)
+                {
+                    Logger.LogWarning("Batch upload tickets failed with HTTP {status}; falling back to per-file tickets for this batch.", (int)resp.StatusCode);
+                    return result;
+                }
+
+                var body = await resp.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+                var dto = JsonSerializer.Deserialize<UploadTicketBatchResponseDto>(body, options);
+                if (dto?.Files == null)
+                    continue;
+
+                foreach (var ticket in dto.Files)
+                {
+                    if (!string.IsNullOrWhiteSpace(ticket.Hash))
+                        result[ticket.Hash.ToUpperInvariant()] = ticket;
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                Logger.LogWarning(ex, "Batch upload tickets failed; falling back to per-file tickets for this batch.");
+                return result;
+            }
+        }
+
+        return result;
+    }
+
+    private async Task<HashSet<string>> UploadCompletesBatchAsync(IReadOnlyCollection<UploadCompleteBatchFileDto> completeFiles, CancellationToken ct)
+    {
+        var completed = new HashSet<string>(StringComparer.Ordinal);
+
+        if (!_orchestrator.IsInitialized || _orchestrator.UploadCdnUri == null || completeFiles.Count == 0)
+            return completed;
+
+        const int batchSize = 256;
+        var options = new JsonSerializerOptions { PropertyNameCaseInsensitive = true };
+
+        foreach (var chunk in completeFiles.Chunk(batchSize))
+        {
+            ct.ThrowIfCancellationRequested();
+
+            var request = new UploadCompleteBatchRequestDto { Files = chunk.ToList() };
+
+            try
+            {
+                using var resp = await _orchestrator.SendRequestAsync(HttpMethod.Post, MareFiles.ServerFilesUploadCompletesFullPath(_orchestrator.UploadCdnUri!), request, ct).ConfigureAwait(false);
+                if (resp.StatusCode == HttpStatusCode.NotFound || resp.StatusCode == HttpStatusCode.Conflict)
+                {
+                    Logger.LogDebug("Batch upload complete endpoint unavailable/disabled ({status}); falling back to per-file complete.", resp.StatusCode);
+                    return completed;
+                }
+
+                if (!resp.IsSuccessStatusCode)
+                {
+                    Logger.LogWarning("Batch upload complete failed with HTTP {status}; falling back to per-file complete for remaining files.", (int)resp.StatusCode);
+                    return completed;
+                }
+
+                var body = await resp.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+                var dto = JsonSerializer.Deserialize<UploadCompleteBatchResponseDto>(body, options);
+                if (dto?.Files == null)
+                    continue;
+
+                foreach (var file in dto.Files)
+                {
+                    if (file.Success && !string.IsNullOrWhiteSpace(file.Hash))
+                        completed.Add(file.Hash.ToUpperInvariant());
+                    else if (!string.IsNullOrWhiteSpace(file.Hash))
+                        Logger.LogWarning("[{hash}] Batch upload complete failed: {status} {error}", file.Hash, file.StatusCode, file.Error);
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                Logger.LogWarning(ex, "Batch upload complete failed; falling back to per-file complete for remaining files.");
+                return completed;
+            }
+        }
+
+        return completed;
+    }
+
+    public async Task<(CharacterData Data, bool Success, string? Error)> UploadFiles(CharacterData data, List<UserData> visiblePlayers, IReadOnlyCollection<string>? preflightMissingHashes = null)
     {
         CancelUpload();
 
@@ -651,12 +941,32 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
 
             SetLocalOutboundUploadRecipients(uids);
 
-            Logger.LogDebug("Authorizing/share-check for {count} hashes to {uids} recipients", presentLocal.Count, uids.Count);
+            HashSet<string> hashesForServerCheck;
+            if (preflightMissingHashes != null)
+            {
+                var meshMissing = preflightMissingHashes
+                    .Where(h => !string.IsNullOrWhiteSpace(h))
+                    .Select(h => h.Trim().ToUpperInvariant())
+                    .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
-            var auth = await FilesSend([.. presentLocal], uids, uploadToken).ConfigureAwait(false);
+                hashesForServerCheck = presentLocal
+                    .Where(h => meshMissing.Contains(h))
+                    .ToHashSet(StringComparer.Ordinal);
+            }
+            else
+            {
+                hashesForServerCheck = presentLocal;
+            }
+
+            if (hashesForServerCheck.Count == 0)
+                return (data, true, null);
+
+            Logger.LogDebug("Authorizing/share-check for {count} hashes to {uids} recipients", hashesForServerCheck.Count, uids.Count);
+
+            var auth = await FilesSend([.. hashesForServerCheck], uids, uploadToken).ConfigureAwait(false);
 
             var now = DateTime.UtcNow;
-            foreach (var h in presentLocal)
+            foreach (var h in hashesForServerCheck)
                 _verifiedUploadedHashes[h] = now;
 
             foreach (var f in auth.Where(f => f.IsForbidden))
@@ -1138,7 +1448,7 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
 
             foreach (var hash in present)
             {
-                if (!cacheEntryByHash.TryGetValue(hash, out var cacheEntry) || !TryValidateUploadSource(hash, cacheEntry))
+                if (!cacheEntryByHash.TryGetValue(hash, out var cacheEntry) || !TryValidateUploadSource(hash, cacheEntry, requireHashValidation: forceUploadTickets))
                 {
                     invalidLocal.Add(hash);
                 }
@@ -1225,6 +1535,58 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
                 }
             }
 
+            var succeeded = new System.Collections.Concurrent.ConcurrentDictionary<string, byte>(StringComparer.Ordinal);
+            var pendingBatchCompletes = new System.Collections.Concurrent.ConcurrentBag<UploadCompleteBatchFileDto>();
+
+            var batchTicketsByHash = await GetUploadTicketsBatchAsync(allowedHashes, sizeByHash, forceUploadTickets, token).ConfigureAwait(false);
+            if (batchTicketsByHash.Count > 0)
+            {
+                var alreadyCovered = new List<string>();
+
+                foreach (var hash in allowedHashes)
+                {
+                    if (!batchTicketsByHash.TryGetValue(hash, out var ticket))
+                        continue;
+
+                    if (!ticket.Success)
+                    {
+                        Logger.LogWarning("[{hash}] Batch upload ticket error, falling back to per-file ticket: {error}", hash, ticket.Error);
+                        continue;
+                    }
+
+                    if (!ticket.UploadRequired)
+                    {
+                        if (forceUploadTickets)
+                        {
+                            Logger.LogWarning("[{hash}] Forced batch upload ticket returned UploadRequired=false; falling back to per-file forced upload ticket instead of treating existing CDN/B2 object as repaired", hash);
+                            continue;
+                        }
+
+                        if (!await VerifyCdnObjectHealthyAsync(hash, token).ConfigureAwait(false))
+                        {
+                            Logger.LogWarning("[{hash}] Batch upload ticket reported UploadRequired=false, but the CDN/B2 object was missing or empty; keeping hash queued for per-file forced repair upload", hash);
+                            continue;
+                        }
+
+                        alreadyCovered.Add(hash);
+                        succeeded[hash] = 1;
+                        _verifiedUploadedHashes[hash] = DateTime.UtcNow;
+
+                        if (uploadEntryByHash.TryGetValue(hash, out var entry))
+                            entry.Transferred = entry.Total;
+                    }
+                }
+
+                if (alreadyCovered.Count > 0)
+                {
+                    allowedHashes = allowedHashes.Except(alreadyCovered, StringComparer.Ordinal).ToList();
+                    Logger.LogDebug("Batch upload tickets skipped {count} hash(es) already present on B2", alreadyCovered.Count);
+                }
+            }
+
+            if (allowedHashes.Count == 0)
+                return forbidden;
+
             const int MaxUploadAttempts = 3;
 
             // fixed if user explicitly configured, adaptive only for Auto (0)
@@ -1258,20 +1620,20 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
             {
                 // Tiny-file storms are RTT/request-overhead bound, not bandwidth bound.
                 // They need enough in-flight ticket/PUT/complete work to hide latency.
-                maxParallel = Math.Clamp(Math.Max(cpuAuto * 5, 24), 12, MaxTinyFileAutoParallelUploads);
+                maxParallel = Math.Clamp(Math.Max(cpuAuto * 8, 48), 24, MaxTinyFileAutoParallelUploads);
             }
             else if (isAuto && (mostlySmallFiles || requestBoundFiles))
             {
                 // MTRL/ATEX/PAP support packs often contain hundreds of sub-512 KiB files.
                 // Per-file request overhead dominates, so start wider instead of slowly
                 // learning that the connection can handle more lanes.
-                maxParallel = Math.Clamp(Math.Max(cpuAuto * 3, 16), 8, MaxSmallFileAutoParallelUploads);
+                maxParallel = Math.Clamp(Math.Max(cpuAuto * 5, 32), 16, MaxSmallFileAutoParallelUploads);
             }
 
             var desiredParallel = isAuto
                 ? (tinyHeavyFiles || requestBoundFiles
                     ? maxParallel
-                    : (mostlySmallFiles ? Math.Min(maxParallel, Math.Max(12, cpuAuto * 2)) : Math.Min(maxParallel, Math.Max(2, cpuAuto / 2))))
+                    : (mostlySmallFiles ? Math.Min(maxParallel, Math.Max(24, cpuAuto * 3)) : Math.Min(maxParallel, Math.Max(3, cpuAuto))))
                 : maxParallel;
             var orderedHashes = allowedHashes
                 .OrderByDescending(h => sizeByHash.TryGetValue(h, out var size) ? size : 0)
@@ -1339,8 +1701,70 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
 
             var queue = new System.Collections.Concurrent.ConcurrentQueue<string>(orderedHashes);
         var running = new List<Task>(Math.Min(allowedHashes.Count, maxParallel));
-        var succeeded = new System.Collections.Concurrent.ConcurrentDictionary<string, byte>(StringComparer.Ordinal);
         int idx = 0;
+        var rollingUploadCompletesDisabled = false;
+
+        async Task FlushPendingUploadCompletesAsync(bool final)
+        {
+            if (!final && rollingUploadCompletesDisabled)
+                return;
+
+            var threshold = final ? 1 : (tinyHeavyFiles || requestBoundFiles ? 64 : 256);
+            if (pendingBatchCompletes.Count < threshold)
+                return;
+
+            var drained = new List<UploadCompleteBatchFileDto>();
+            while (pendingBatchCompletes.TryTake(out var complete))
+                drained.Add(complete);
+
+            var pendingCompletes = drained
+                .GroupBy(c => c.Hash, StringComparer.Ordinal)
+                .Select(g => g.First())
+                .ToList();
+
+            if (pendingCompletes.Count == 0)
+                return;
+
+            Logger.LogDebug("Completing {count} direct B2 uploads via {mode} batch metadata call", pendingCompletes.Count, final ? "final" : "rolling");
+
+            var batchCompleted = await UploadCompletesBatchAsync(pendingCompletes, token).ConfigureAwait(false);
+            if (!final && batchCompleted.Count == 0)
+                rollingUploadCompletesDisabled = true;
+
+            foreach (var complete in pendingCompletes)
+            {
+                if (!batchCompleted.Contains(complete.Hash))
+                {
+                    if (!final)
+                    {
+                        pendingBatchCompletes.Add(complete);
+                        continue;
+                    }
+
+                    try
+                    {
+                        await UploadCompleteSingleAsync(complete, token).ConfigureAwait(false);
+                        batchCompleted.Add(complete.Hash);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        throw;
+                    }
+                    catch (Exception ex)
+                    {
+                        Logger.LogWarning(ex, "[{hash}] Per-file upload complete fallback failed", complete.Hash);
+                    }
+                }
+
+                if (batchCompleted.Contains(complete.Hash))
+                {
+                    _verifiedUploadedHashes[complete.Hash] = DateTime.UtcNow;
+                    succeeded[complete.Hash] = 1;
+                    if (uploadEntryByHash.TryGetValue(complete.Hash, out var finalEntry))
+                        finalEntry.Transferred = finalEntry.Total;
+                }
+            }
+        }
 
         while (!queue.IsEmpty || running.Count > 0)
         {
@@ -1448,6 +1872,9 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
 
             var finished = await Task.WhenAny(running).ConfigureAwait(false);
             running.Remove(finished);
+
+            if (tinyHeavyFiles || requestBoundFiles)
+                await FlushPendingUploadCompletesAsync(final: false).ConfigureAwait(false);
         }
 
         async Task UploadOneCoreAsync(string hash, int localIdx, CancellationToken tokenInner)
@@ -1463,7 +1890,10 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
                     }
 
                     var origSize = sizeByHash.TryGetValue(hash, out var s) ? s : new FileInfo(filePath).Length;
-                    var useLiveProgress = true;
+                    // Hundreds of sub-128 KiB files do not benefit from per-read progress callbacks.
+                    // The callback/timer/log churn can cost more than the upload itself, so tiny files
+                    // complete as whole-file units while larger files still get live progress.
+                    var useLiveProgress = origSize > TinyUploadProgressThresholdBytes;
 
                     IProgress<UploadProgress>? throttledProg = null;
                     if (useLiveProgress)
@@ -1514,16 +1944,40 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
                         ? 64 * 1024
                         : ChooseUploadStreamBufferSize(ewmaBps);
 
-                    await UploadFileStreamedFromDisk(hash, filePath, _mareConfigService.Current.UseAlternativeFileUpload, throttledProg, tokenInner, buf, forceUploadTickets).ConfigureAwait(false);
+                    UploadCompleteBatchFileDto? pendingComplete = null;
+
+                    if (batchTicketsByHash.TryGetValue(hash, out var batchTicket)
+                        && batchTicket.Success
+                        && batchTicket.UploadRequired
+                        && string.Equals(batchTicket.Mode, "DirectB2", StringComparison.OrdinalIgnoreCase)
+                        && !string.IsNullOrWhiteSpace(batchTicket.UploadUrl))
+                    {
+                        pendingComplete = await UploadFileStreamedFromDiskWithTicket(hash, filePath, batchTicket, throttledProg, tokenInner, buf).ConfigureAwait(false);
+                        pendingBatchCompletes.Add(pendingComplete);
+                    }
+                    else
+                    {
+                        await UploadFileStreamedFromDisk(hash, filePath, _mareConfigService.Current.UseAlternativeFileUpload, throttledProg, tokenInner, buf, forceUploadTickets).ConfigureAwait(false);
+                    }
 
                     if (!useLiveProgress)
                         Interlocked.Add(ref bytesSinceSample, origSize);
 
-                    _verifiedUploadedHashes[hash] = DateTime.UtcNow;
-                    succeeded[hash] = 1;
+                    if (pendingComplete == null)
+                    {
+                        _verifiedUploadedHashes[hash] = DateTime.UtcNow;
+                        succeeded[hash] = 1;
 
-                    if (uploadEntryByHash.TryGetValue(hash, out var finalEntry))
-                        finalEntry.Transferred = finalEntry.Total;
+                        if (uploadEntryByHash.TryGetValue(hash, out var finalEntry))
+                            finalEntry.Transferred = finalEntry.Total;
+                    }
+                    else if (uploadEntryByHash.TryGetValue(hash, out var pendingEntry))
+                    {
+                        // The file bytes have reached B2; only metadata finalisation remains.
+                        // Keep the UI honest by showing completed bytes rather than a fake
+                        // 99% stall while the batch UploadCompletes call is finishing.
+                        pendingEntry.Transferred = pendingEntry.Total;
+                    }
 
                     return;
                 }
@@ -1556,6 +2010,8 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
                     }
                 }
         }
+
+            await FlushPendingUploadCompletesAsync(final: true).ConfigureAwait(false);
 
             // ---- Result classification ----
             var failed = allowedHashes
@@ -1667,11 +2123,11 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
         var cpu = Environment.ProcessorCount;
 
         var auto =
-            cpu <= 4 ? 2 :
-            cpu <= 8 ? 3 :
-            cpu <= 16 ? 4 :
-            cpu <= 24 ? 6 :
-                        8;
+            cpu <= 4 ? 3 :
+            cpu <= 8 ? 4 :
+            cpu <= 16 ? 6 :
+            cpu <= 24 ? 8 :
+                        12;
 
         return Math.Clamp(auto, 1, MaxConfiguredParallelUploads);
     }
@@ -1776,7 +2232,8 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
     {
         var handler = new SocketsHttpHandler
         {
-            MaxConnectionsPerServer = 128,
+            MaxConnectionsPerServer = 512,
+            EnableMultipleHttp2Connections = true,
             PooledConnectionLifetime = TimeSpan.FromMinutes(10),
             PooledConnectionIdleTimeout = TimeSpan.FromMinutes(2),
             KeepAlivePingDelay = TimeSpan.FromSeconds(60),
@@ -1791,8 +2248,8 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
         {
             Timeout = TimeSpan.FromMinutes(120),
 
-            DefaultRequestVersion = HttpVersion.Version11,
-            DefaultVersionPolicy = HttpVersionPolicy.RequestVersionExact
+            DefaultRequestVersion = HttpVersion.Version20,
+            DefaultVersionPolicy = HttpVersionPolicy.RequestVersionOrLower
         };
 
         return client;

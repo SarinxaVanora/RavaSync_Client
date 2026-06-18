@@ -1150,7 +1150,7 @@ public sealed partial class CharaDataManager : DisposableMediatorSubscriberBase
     CancellationToken token)
     {
         Guid? cPlusId = null;
-        Guid penumbraCollection;
+        Guid penumbraCollection = Guid.Empty;
 
         try
         {
@@ -1285,7 +1285,7 @@ public sealed partial class CharaDataManager : DisposableMediatorSubscriberBase
                 Logger.LogTrace("[{appId}] Adding {name} to handled objects", applicationId, tempHandler.Name);
 
                 _characterHandler.AddHandledChara(
-                    new HandledCharaDataEntry(tempHandler.Name, isSelf, cPlusId, metaInfo));
+                    new HandledCharaDataEntry(tempHandler.Name, isSelf, cPlusId, metaInfo, penumbraCollection));
             }
         }
         finally
@@ -1298,7 +1298,7 @@ public sealed partial class CharaDataManager : DisposableMediatorSubscriberBase
             if (autoRevert)
             {
                 // normal chara data "preview" path
-                await _characterHandler.RevertChara(tempHandler.Name, cPlusId).ConfigureAwait(false);
+                await _characterHandler.RevertChara(new HandledCharaDataEntry(tempHandler.Name, isSelf, cPlusId, metaInfo, penumbraCollection == Guid.Empty ? null : penumbraCollection)).ConfigureAwait(false);
 
                 // Optional: only clean MCDF temp files when autoRevert is true.
                 List<string>? toDelete = null;

@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -266,6 +266,20 @@ public sealed partial class PairHandler
 
             lock (_gate)
             {
+                if (reason == PairSyncReason.IncomingData
+                    && !forceApplyCustomization
+                    && _stage != PairSyncStage.Idle
+                    && !string.IsNullOrEmpty(_activePayloadFingerprint)
+                    && string.Equals(_activePayloadFingerprint, payloadFingerprint, StringComparison.Ordinal))
+                {
+                    _owner.Logger.LogTrace(
+                        "Coalescing duplicate active payload for {pair}: stage={stage}, payload={payload}",
+                        _owner.Pair.UserData.AliasOrUID,
+                        _stage,
+                        payloadFingerprint);
+                    return;
+                }
+
                 _latestRequest = request;
                 CancelActivePrepareOrDownload_NoLock();
             }
@@ -512,6 +526,22 @@ public sealed partial class PairHandler
             if (request == null)
                 return;
 
+            var incomingCoalesceDelayMs = WineIncomingDataCoalesceDelayMs;
+            if (incomingCoalesceDelayMs > 0 && request.Reason == PairSyncReason.IncomingData && !request.ForceApplyCustomization)
+            {
+                await Task.Delay(incomingCoalesceDelayMs, shutdownToken).ConfigureAwait(false);
+                var latestAfterDelay = GetLatestRequest();
+                if (latestAfterDelay != null && latestAfterDelay.Version != request.Version)
+                {
+                    _owner.Logger.LogTrace(
+                        "Coalescing Linux/Wine incoming payload for {pair}: skipped version {oldVersion}, latest version is {newVersion}",
+                        _owner.Pair.UserData.AliasOrUID,
+                        request.Version,
+                        latestAfterDelay.Version);
+                    return;
+                }
+            }
+
             var totalStopwatch = Stopwatch.StartNew();
             var readinessMs = 0L;
             var planMs = 0L;
@@ -699,9 +729,6 @@ public sealed partial class PairHandler
 
         if (Pair.AutoPausedByOtherSync && !Pair.EffectiveOverrideOtherSync)
             return PairSyncReadiness.NotReady("yielded to OtherSync");
-
-        if (_localOtherSyncDecisionYield && !Pair.EffectiveOverrideOtherSync)
-            return PairSyncReadiness.NotReady("local OtherSync gate is yielded");
 
         if (_dalamudUtil.IsInCombatOrPerforming)
         {
@@ -923,10 +950,9 @@ public sealed partial class PairHandler
 
         return assetPlan.Entries.Any(static entry => entry.ObjectKind == ObjectKind.Player
             && !LooksLikeOwnedObjectAssetPathForPairSync(entry.GamePath)
-            && (entry.Kind == PairSyncAssetKind.Sound
+            && (entry.Criticality == PairSyncAssetCriticality.AppearanceCritical
                 || PairApplyUtilities.IsTransientRedrawCriticalGamePath(entry.GamePath)
-                || PairApplyUtilities.IsSkeletonOrPhysicsCriticalGamePath(entry.GamePath)
-                || PairApplyUtilities.IsPlayerTransientSupportRefreshGamePath(entry.GamePath)));
+                || PairApplyUtilities.IsSkeletonOrPhysicsCriticalGamePath(entry.GamePath)));
     }
 
     private static bool LooksLikeOwnedObjectAssetPathForPairSync(string gamePath)
@@ -983,9 +1009,6 @@ public sealed partial class PairHandler
         if (entry.Criticality == PairSyncAssetCriticality.AppearanceCritical)
             return true;
 
-        if (entry.Kind == PairSyncAssetKind.Sound)
-            return true;
-
         return PairApplyUtilities.IsTransientRedrawCriticalGamePath(entry.GamePath)
             || PairApplyUtilities.IsSkeletonOrPhysicsCriticalGamePath(entry.GamePath);
     }
@@ -1000,7 +1023,7 @@ public sealed partial class PairHandler
 
     private PairSyncAssetPlan BuildPairSyncAssetPlan(Guid applicationBase, CharacterData charaData, CancellationToken token)
     {
-        var missingFiles = _modPathResolver.Calculate(applicationBase, charaData, out var moddedPaths, token);
+        var missingFiles = _modPathResolver.Calculate(applicationBase, charaData, out var moddedPaths, token, Pair.EffectiveScreenShakeEnabled);
         return BuildPairSyncAssetPlanFromResolvedPaths(moddedPaths, missingFiles, charaData);
     }
 
@@ -1116,7 +1139,25 @@ public sealed partial class PairHandler
                     if (string.IsNullOrWhiteSpace(gamePath))
                         continue;
 
-                    lookup[gamePath.Replace('\\', '/').Trim()] = objectFiles.Key;
+                    var normalized = gamePath.Replace('\\', '/').Trim();
+                    if (string.IsNullOrWhiteSpace(normalized))
+                        continue;
+
+                    // If a prop/support path is present in the player bucket, keep it associated
+                    // with the visible character even when the path itself looks like a monster,
+                    // demihuman, minion, or weapon asset.  These support assets are part of the
+                    // player's authoritative state; they just must not automatically promote into
+                    // a player redraw request.
+                    if (lookup.TryGetValue(normalized, out var existingKind))
+                    {
+                        if (existingKind == ObjectKind.Player)
+                            continue;
+
+                        if (objectFiles.Key != ObjectKind.Player)
+                            continue;
+                    }
+
+                    lookup[normalized] = objectFiles.Key;
                 }
             }
         }
@@ -1139,7 +1180,7 @@ public sealed partial class PairHandler
                 ".tmb" or ".tmb2" => PairSyncAssetKind.Timeline,
                 ".avfx" or ".shpk" or ".eid" or ".skp" => PairSyncAssetKind.Vfx,
                 ".scd" => PairSyncAssetKind.Sound,
-                ".sklb" => PairSyncAssetKind.Skeleton,
+                ".sklb" or ".atch" => PairSyncAssetKind.Skeleton,
                 ".phyb" or ".pbd" => PairSyncAssetKind.Physics,
                 _ => string.IsNullOrWhiteSpace(hash) ? PairSyncAssetKind.FileSwap : PairSyncAssetKind.Unknown,
             };

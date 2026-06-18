@@ -1,0 +1,146 @@
+(function() {
+	//#region src/utils/notifications.js
+	var MOUNT_ACTION = "notifications:mount";
+	var UNMOUNT_ACTION = "notifications:unmount";
+	var CLEAR_ACTION = "notifications:clear";
+	//#endregion
+	//#region src/content_scripts/notifications.js
+	/**
+	* Ghostery Browser Extension
+	* https://www.ghostery.com/
+	*
+	* Copyright 2017-present Ghostery GmbH. All rights reserved.
+	*
+	* This Source Code Form is subject to the terms of the Mozilla Public
+	* License, v. 2.0. If a copy of the MPL was not distributed with this
+	* file, You can obtain one at http://mozilla.org/MPL/2.0
+	*/
+	var WRAPPER_ELEMENT = "ghostery-notification-wrapper";
+	function mount(url, position = "right", debug = false) {
+		if (document.querySelector(WRAPPER_ELEMENT)) return false;
+		const wrapper = document.createElement(WRAPPER_ELEMENT);
+		const shadowRoot = wrapper.attachShadow({ mode: debug ? "open" : "closed" });
+		const template = document.createElement("template");
+		template.innerHTML = `
+    <div id="background"></div>
+    <iframe src="${url}" frameborder="0" id="ghostery-notification-iframe"></iframe>
+    <style>
+      :host {
+        all: initial;
+        display: flex !important;
+        position: fixed;
+        overflow: hidden;
+        z-index: 2147483647;
+        right: 10px;
+        left: 10px;
+        bottom: -40px;
+        padding: 12px !important;
+        border-radius: 16px;opacity: 0;
+        transition: opacity 0.2s ease-in-out, top 0.2s ease-in-out, bottom 0.2s ease-in-out;
+        will-change: opacity, top, bottom;
+      }
+
+      @keyframes rotate {
+        0% {
+          transform: rotate(0deg);
+        }
+        100% {
+          transform: rotate(360deg);
+        }
+      }
+
+      #background {
+        z-index: -1;
+        position: absolute;
+        top: -100%;
+        left: -100%;
+        right: -100%;
+        bottom: -100%;
+        background: conic-gradient(
+          from 90deg at 49.87% 50%,
+          rgba(0, 72, 255, 0.90) 0deg,
+          rgba(85, 0, 255, 0.90) 55deg,
+          rgba(0, 72, 255, 0.90) 121deg,
+          rgba(0, 217, 255, 0.90) 188deg,
+          rgba(85, 0, 255, 0.90) 252deg,
+          rgba(0, 217, 255, 0.90) 306deg,
+          rgba(0, 72, 255, 0.90) 360deg
+        );
+        will-change: transform;
+        animation: rotate 20s linear infinite;
+      }
+
+      :host(.active) {
+        opacity: 1;
+        bottom: 10px;
+      }
+
+      iframe {
+        display: block;
+        flex-grow: 1;
+        height: 0px;
+        width: 0px;
+        border-radius: 12px;
+        box-shadow: 0px 3px 6px 0px rgba(2, 0, 51, 0.30);
+      }
+
+      @media screen and (min-width: 640px) {
+        :host {
+          ${position === "right" ? "right: 10px; left: auto;" : ""}
+          ${position === "center" ? "left: 50%; right: auto; transform: translateX(-50%);" : ""}
+          bottom: auto;
+          top: -30px;
+        }
+
+        :host(.active) {
+          top: ${position === "center" ? "4px" : "10px"};
+          bottom: auto;
+        }
+
+        iframe {
+          flex: 0 0 auto;
+        }
+      }
+    </style>
+  `;
+		shadowRoot.appendChild(template.content);
+		document.documentElement.appendChild(wrapper);
+		const iframe = shadowRoot.querySelector("iframe");
+		window.addEventListener("message", (e) => {
+			const type = e.data?.type;
+			if (type === "ghostery:notifications:resize") {
+				iframe.style.height = e.data.height + "px";
+				iframe.style.width = e.data.width + "px";
+				if (!wrapper.classList.contains("active")) setTimeout(() => wrapper.classList.add("active"));
+				return;
+			}
+			if (type === "ghostery:notifications:close") {
+				if (e.data.clear) try {
+					chrome.runtime.sendMessage({
+						action: CLEAR_ACTION,
+						id: new URL(url).pathname.split("/").pop()
+					});
+				} catch (err) {
+					console.warn("[notifications] Failed to broadcast CLEAR_ACTION:", err);
+				}
+				setTimeout(() => {
+					wrapper.remove();
+					if (e.data.reload) window.location.reload();
+				}, 500);
+				wrapper.classList.remove("active");
+			}
+		});
+		return true;
+	}
+	chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+		switch (msg.action) {
+			case MOUNT_ACTION:
+				sendResponse(mount(msg.url, msg.position, msg.debug));
+				break;
+			case UNMOUNT_ACTION:
+				document.querySelector(WRAPPER_ELEMENT)?.remove();
+				break;
+		}
+	});
+	//#endregion
+})();

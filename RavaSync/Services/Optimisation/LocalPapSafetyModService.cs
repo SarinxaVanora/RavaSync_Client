@@ -2,6 +2,7 @@ using Microsoft.Extensions.Logging;
 using Penumbra.Api.Enums;
 using RavaSync.FileCache;
 using RavaSync.Interop.Ipc;
+using RavaSync.PlayerData.Services;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -20,6 +21,8 @@ public sealed class LocalPapSafetyModService
     public sealed record ManifestPapSource(string RelativeModDirectory, string DisplayModName, string SourceGroupName, string SourceGroupType, string OptionDisplayName, string ResolvedPath, string Hash, int Priority, string[] GamePaths);
 
     public sealed record ManifestSupportSource(string ResolvedPath, string Hash, int Priority, string[] GamePaths);
+
+    private sealed record CurrentManifestGroupAliases(HashSet<string> RawAliases, HashSet<string> NormalizedAliases, HashSet<string> LooseAliases);
 
     private sealed record ManifestPapCandidate(string RelativeModDirectory, string DisplayModName, string SourceGroupName, string SourceGroupType, string OptionDisplayName, string ResolvedPath, int Priority, string[] GamePaths);
 
@@ -109,6 +112,7 @@ public sealed class LocalPapSafetyModService
             || string.Equals(fileName, "MareChara_Files_A", StringComparison.OrdinalIgnoreCase)
             || string.Equals(fileName, "MareChara_Files_B", StringComparison.OrdinalIgnoreCase)
             || string.Equals(fileName, "MareChara_Meta", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(fileName, IpcCallerPenumbra.MountMusicTemporaryModName, StringComparison.OrdinalIgnoreCase)
             || string.Equals(fileName, "RavaSync_AsyncLoadSupport", StringComparison.OrdinalIgnoreCase);
     }
 
@@ -278,6 +282,9 @@ public sealed class LocalPapSafetyModService
             if (++scannedMods % ModScanYieldStride == 0)
                 await Task.Yield();
 
+            if (!mod.Value.Enabled || mod.Value.Temporary)
+                continue;
+
             if (IsRuntimeModKey(modDirectory, mod.Key))
                 continue;
 
@@ -307,7 +314,7 @@ public sealed class LocalPapSafetyModService
         if (winnersByGamePath.Count == 0)
             return empty;
 
-        var pathHashes = _fileCacheManager.GetFileCachesByPaths(winnersByGamePath.Values.Select(v => v.ResolvedPath).Distinct(StringComparer.OrdinalIgnoreCase).ToArray());
+        var pathHashes = _fileCacheManager.GetFileHashesByPaths(winnersByGamePath.Values.Select(v => v.ResolvedPath).Distinct(StringComparer.OrdinalIgnoreCase).ToArray());
         var output = new Dictionary<string, ManifestPapSource>(StringComparer.OrdinalIgnoreCase);
         var emitted = 0;
 
@@ -318,8 +325,8 @@ public sealed class LocalPapSafetyModService
             if (++emitted % ModScanYieldStride == 0)
                 await Task.Yield();
 
-            var hash = pathHashes.TryGetValue(kvp.Value.ResolvedPath, out var cache)
-                ? cache?.Hash ?? string.Empty
+            var hash = pathHashes.TryGetValue(kvp.Value.ResolvedPath, out var resolvedHash)
+                ? resolvedHash ?? string.Empty
                 : string.Empty;
             if (string.IsNullOrWhiteSpace(hash))
                 continue;
@@ -347,6 +354,9 @@ public sealed class LocalPapSafetyModService
 
             if (++scannedMods % ModScanYieldStride == 0)
                 await Task.Yield();
+
+            if (!mod.Value.Enabled || mod.Value.Temporary)
+                continue;
 
             if (IsRuntimeModKey(modDirectory, mod.Key))
                 continue;
@@ -400,7 +410,7 @@ public sealed class LocalPapSafetyModService
         if (winnersByGamePath.Count == 0)
             return empty;
 
-        var pathHashes = _fileCacheManager.GetFileCachesByPaths(winnersByGamePath.Values.Select(v => v.ResolvedPath).Distinct(StringComparer.OrdinalIgnoreCase).ToArray());
+        var pathHashes = _fileCacheManager.GetFileHashesByPaths(winnersByGamePath.Values.Select(v => v.ResolvedPath).Distinct(StringComparer.OrdinalIgnoreCase).ToArray());
         var output = new List<ManifestSupportSource>(winnersByGamePath.Count);
         var emitted = 0;
 
@@ -411,8 +421,173 @@ public sealed class LocalPapSafetyModService
             if (++emitted % ModScanYieldStride == 0)
                 await Task.Yield();
 
-            var hash = pathHashes.TryGetValue(kvp.Value.ResolvedPath, out var cache)
-                ? cache?.Hash ?? string.Empty
+            var hash = pathHashes.TryGetValue(kvp.Value.ResolvedPath, out var resolvedHash)
+                ? resolvedHash ?? string.Empty
+                : string.Empty;
+
+            if (string.IsNullOrWhiteSpace(hash))
+                continue;
+
+            output.Add(new ManifestSupportSource(kvp.Value.ResolvedPath, hash, kvp.Value.Priority, kvp.Value.GamePaths));
+        }
+
+        return output;
+    }
+
+
+    public async Task<IReadOnlyCollection<ManifestSupportSource>> ResolveSelectedFullMountModFilesAsync(IpcCallerPenumbra.PenumbraCollectionModSettings collectionState, IReadOnlyCollection<string> activeMountIds, CancellationToken token)
+    {
+        IReadOnlyCollection<ManifestSupportSource> empty = Array.Empty<ManifestSupportSource>();
+
+        var modDirectory = _ipcManager.Penumbra.ModDirectory;
+        if (collectionState == null || activeMountIds == null || activeMountIds.Count == 0 || string.IsNullOrWhiteSpace(modDirectory) || !Directory.Exists(modDirectory))
+            return empty;
+
+        var normalizedMountIds = new HashSet<string>(activeMountIds.Select(NormalizeMountActorId).Where(static id => !string.IsNullOrWhiteSpace(id)), StringComparer.OrdinalIgnoreCase);
+        if (normalizedMountIds.Count == 0)
+            return empty;
+
+        var winnersByGamePath = new Dictionary<string, ManifestSupportCandidate>(StringComparer.OrdinalIgnoreCase);
+        var scannedMods = 0;
+        var matchedMods = 0;
+
+        foreach (var mod in collectionState.Mods)
+        {
+            token.ThrowIfCancellationRequested();
+
+            if (++scannedMods % ModScanYieldStride == 0)
+                await Task.Yield();
+
+            if (!mod.Value.Enabled || mod.Value.Temporary)
+                continue;
+
+            if (IsRuntimeModKey(modDirectory, mod.Key))
+                continue;
+
+            var modPath = ResolveModDirectory(modDirectory, mod.Key);
+            if (!Directory.Exists(modPath))
+                continue;
+
+            var selectedEntries = await LoadSelectedManifestAllFileCandidatesAsync(modPath, mod.Value.Settings, mod.Value.Priority, token).ConfigureAwait(false);
+            if (selectedEntries.Count == 0)
+                continue;
+
+            if (!selectedEntries.Any(entry => entry.GamePaths.Any(gamePath => IsActiveMountModGamePath(gamePath, normalizedMountIds))))
+                continue;
+
+            // Only use the "send the whole selected mount mod" safety net for real mounted/rider
+            // replacements. Minions also live in ObjectKind.MinionOrMount and often use chara/monster
+            // paths, but they do not have human mt_<id> rider PAPs. Without this guard, a single
+            // minion summon can match a broad selected pack and send far more than the active minion.
+            if (!selectedEntries.Any(entry => entry.GamePaths.Any(gamePath => IsActiveMountRiderGamePath(gamePath, normalizedMountIds))))
+                continue;
+
+            matchedMods++;
+            foreach (var candidate in selectedEntries)
+            {
+                token.ThrowIfCancellationRequested();
+
+                foreach (var gamePath in candidate.GamePaths)
+                {
+                    if (string.IsNullOrWhiteSpace(gamePath))
+                        continue;
+
+                    if (!winnersByGamePath.TryGetValue(gamePath, out var existing) || candidate.Priority >= existing.Priority)
+                        winnersByGamePath[gamePath] = candidate with { GamePaths = [gamePath] };
+                }
+            }
+        }
+
+        if (winnersByGamePath.Count == 0)
+            return empty;
+
+        var pathHashes = _fileCacheManager.GetFileHashesByPaths(winnersByGamePath.Values.Select(static v => v.ResolvedPath).Distinct(StringComparer.OrdinalIgnoreCase).ToArray());
+        var output = new List<ManifestSupportSource>(winnersByGamePath.Count);
+        var emitted = 0;
+
+        foreach (var kvp in winnersByGamePath)
+        {
+            token.ThrowIfCancellationRequested();
+
+            if (++emitted % ModScanYieldStride == 0)
+                await Task.Yield();
+
+            var hash = pathHashes.TryGetValue(kvp.Value.ResolvedPath, out var resolvedHash)
+                ? resolvedHash ?? string.Empty
+                : string.Empty;
+
+            if (string.IsNullOrWhiteSpace(hash))
+                continue;
+
+            output.Add(new ManifestSupportSource(kvp.Value.ResolvedPath, hash, kvp.Value.Priority, kvp.Value.GamePaths));
+        }
+
+        if (output.Count > 0)
+            _logger.LogDebug("Resolved {count} selected file(s) from {mods} active mount mod(s) for mount actor(s) {mounts}", output.Count, matchedMods, string.Join(",", normalizedMountIds.OrderBy(static id => id, StringComparer.OrdinalIgnoreCase)));
+
+        return output;
+    }
+
+    public async Task<IReadOnlyCollection<ManifestSupportSource>> ResolveSelectedMountMusicFilesAsync(IpcCallerPenumbra.PenumbraCollectionModSettings collectionState, CancellationToken token)
+    {
+        IReadOnlyCollection<ManifestSupportSource> empty = Array.Empty<ManifestSupportSource>();
+
+        var modDirectory = _ipcManager.Penumbra.ModDirectory;
+        if (collectionState == null || string.IsNullOrWhiteSpace(modDirectory) || !Directory.Exists(modDirectory))
+            return empty;
+
+        var winnersByGamePath = new Dictionary<string, ManifestSupportCandidate>(StringComparer.OrdinalIgnoreCase);
+        var scannedMods = 0;
+
+        foreach (var mod in collectionState.Mods)
+        {
+            token.ThrowIfCancellationRequested();
+
+            if (++scannedMods % ModScanYieldStride == 0)
+                await Task.Yield();
+
+            if (!mod.Value.Enabled || mod.Value.Temporary)
+                continue;
+
+            if (IsRuntimeModKey(modDirectory, mod.Key))
+                continue;
+
+            var modPath = ResolveModDirectory(modDirectory, mod.Key);
+            if (!Directory.Exists(modPath))
+                continue;
+
+            var manifestEntries = await LoadSelectedManifestMountMusicCandidatesAsync(modPath, mod.Value.Settings, mod.Value.Priority, token).ConfigureAwait(false);
+            foreach (var candidate in manifestEntries)
+            {
+                token.ThrowIfCancellationRequested();
+
+                foreach (var gamePath in candidate.GamePaths)
+                {
+                    if (string.IsNullOrWhiteSpace(gamePath))
+                        continue;
+
+                    if (!winnersByGamePath.TryGetValue(gamePath, out var existing) || candidate.Priority >= existing.Priority)
+                        winnersByGamePath[gamePath] = candidate with { GamePaths = [gamePath] };
+                }
+            }
+        }
+
+        if (winnersByGamePath.Count == 0)
+            return empty;
+
+        var pathHashes = _fileCacheManager.GetFileHashesByPaths(winnersByGamePath.Values.Select(v => v.ResolvedPath).Distinct(StringComparer.OrdinalIgnoreCase).ToArray());
+        var output = new List<ManifestSupportSource>(winnersByGamePath.Count);
+        var emitted = 0;
+
+        foreach (var kvp in winnersByGamePath)
+        {
+            token.ThrowIfCancellationRequested();
+
+            if (++emitted % ModScanYieldStride == 0)
+                await Task.Yield();
+
+            var hash = pathHashes.TryGetValue(kvp.Value.ResolvedPath, out var resolvedHash)
+                ? resolvedHash ?? string.Empty
                 : string.Empty;
 
             if (string.IsNullOrWhiteSpace(hash))
@@ -663,11 +838,365 @@ public sealed class LocalPapSafetyModService
                 }
             }
 
+            // A fingerprint-only change still means the source Penumbra selection changed. The generated
+            // runtime conversion mod may not need rebuilding, but the local player still needs a redraw so
+            // the newly-selected PAP is reflected immediately, especially while an emote is already active.
             return contentChanged || fingerprintChanged || runtimeStateChanged;
         }
         finally
         {
             _syncGate.Release();
+        }
+    }
+
+
+    private async Task<List<ManifestSupportCandidate>> LoadSelectedManifestAllFileCandidatesAsync(string modPath, Dictionary<string, List<string>> selectedSettings, int priority, CancellationToken token)
+    {
+        var output = new List<ManifestSupportCandidate>();
+
+        bool loadedCurrentManifest = false;
+        var defaultManifest = Path.Combine(modPath, "default_mod.json");
+        if (File.Exists(defaultManifest))
+        {
+            loadedCurrentManifest = true;
+            ImportCurrentManifestAllFiles(output, modPath, priority, defaultManifest, token);
+            await Task.Yield();
+        }
+
+        var scannedGroups = 0;
+        foreach (var groupManifest in Directory.EnumerateFiles(modPath, "group_*.json", SearchOption.TopDirectoryOnly))
+        {
+            token.ThrowIfCancellationRequested();
+            loadedCurrentManifest = true;
+
+            ImportCurrentGroupManifestAllFiles(output, modPath, selectedSettings, priority, groupManifest, token);
+
+            if (++scannedGroups % ManifestScanYieldStride == 0)
+                await Task.Yield();
+        }
+
+        if (!loadedCurrentManifest)
+        {
+            var legacyMeta = Path.Combine(modPath, "meta.json");
+            if (File.Exists(legacyMeta))
+            {
+                ImportLegacyMetaManifestAllFiles(output, modPath, selectedSettings, priority, legacyMeta, token);
+                await Task.Yield();
+            }
+        }
+
+        return output;
+    }
+
+    private void ImportCurrentManifestAllFiles(List<ManifestSupportCandidate> output, string modPath, int priority, string manifestPath, CancellationToken token)
+    {
+        using var stream = OpenReadShared(manifestPath);
+        using var doc = JsonDocument.Parse(stream);
+        AddAllManifestFiles(output, modPath, priority, doc.RootElement, "Files");
+    }
+
+    private void ImportCurrentGroupManifestAllFiles(List<ManifestSupportCandidate> output, string modPath, Dictionary<string, List<string>> selectedSettings, int priority, string manifestPath, CancellationToken token)
+    {
+        using var stream = OpenReadShared(manifestPath);
+        using var doc = JsonDocument.Parse(stream);
+        var root = doc.RootElement;
+
+        var selectedOptions = GetSelectedCurrentOptionNames(root, selectedSettings, manifestPath);
+        if (selectedOptions.Count == 0)
+            return;
+
+        if (!root.TryGetProperty("Options", out var options) || options.ValueKind != JsonValueKind.Array)
+            return;
+
+        foreach (var option in options.EnumerateArray())
+        {
+            token.ThrowIfCancellationRequested();
+            if (!option.TryGetProperty("Name", out var optionNameElement))
+                continue;
+
+            var optionName = optionNameElement.GetString() ?? string.Empty;
+            if (!selectedOptions.Contains(optionName))
+                continue;
+
+            AddAllManifestFiles(output, modPath, priority, option, "Files");
+        }
+    }
+
+    private void ImportLegacyMetaManifestAllFiles(List<ManifestSupportCandidate> output, string modPath, Dictionary<string, List<string>> selectedSettings, int priority, string metaPath, CancellationToken token)
+    {
+        using var stream = OpenReadShared(metaPath);
+        using var doc = JsonDocument.Parse(stream);
+        var root = doc.RootElement;
+
+        AddAllManifestFiles(output, modPath, priority, root, "Files");
+        AddAllManifestFiles(output, modPath, priority, root, "OptionFiles");
+
+        if (!root.TryGetProperty("Groups", out var groups) || groups.ValueKind != JsonValueKind.Object)
+            return;
+
+        foreach (var group in groups.EnumerateObject())
+        {
+            token.ThrowIfCancellationRequested();
+            var groupRoot = group.Value;
+            var groupName = groupRoot.TryGetProperty("GroupName", out var groupNameElement)
+                ? groupNameElement.GetString() ?? group.Name
+                : group.Name;
+
+            if (!selectedSettings.TryGetValue(groupName, out var selectedOptions) || selectedOptions == null || selectedOptions.Count == 0)
+                continue;
+
+            if (!groupRoot.TryGetProperty("Options", out var options) || options.ValueKind != JsonValueKind.Array)
+                continue;
+
+            foreach (var option in options.EnumerateArray())
+            {
+                token.ThrowIfCancellationRequested();
+                var optionName = option.TryGetProperty("OptionName", out var optionNameElement)
+                    ? optionNameElement.GetString() ?? string.Empty
+                    : string.Empty;
+
+                if (string.IsNullOrWhiteSpace(optionName) || !selectedOptions.Any(s => string.Equals(s, optionName, StringComparison.OrdinalIgnoreCase)))
+                    continue;
+
+                AddAllManifestFiles(output, modPath, priority, option, "OptionFiles");
+                AddAllManifestFiles(output, modPath, priority, option, "Files");
+            }
+        }
+    }
+
+    private void AddAllManifestFiles(List<ManifestSupportCandidate> output, string modPath, int priority, JsonElement element, string propertyName)
+    {
+        if (!element.TryGetProperty(propertyName, out var files) || files.ValueKind != JsonValueKind.Object)
+            return;
+
+        foreach (var property in files.EnumerateObject())
+        {
+            var gamePath = NormalizeGamePath(property.Name);
+            if (string.IsNullOrWhiteSpace(gamePath) || !IsAllowedManifestGamePath(gamePath) || IsMountMusicLikeGamePath(gamePath))
+                continue;
+
+            var relativeValue = property.Value.ValueKind == JsonValueKind.String
+                ? property.Value.GetString()
+                : null;
+            if (string.IsNullOrWhiteSpace(relativeValue))
+                continue;
+
+            var resolvedPath = ResolveManifestFilePath(modPath, relativeValue);
+            if (string.IsNullOrWhiteSpace(resolvedPath) || !File.Exists(resolvedPath))
+                continue;
+
+            output.Add(new ManifestSupportCandidate(resolvedPath, priority, [gamePath]));
+        }
+    }
+
+
+    private static bool IsMountMusicLikeGamePath(string? gamePath)
+    {
+        if (string.IsNullOrWhiteSpace(gamePath))
+            return false;
+
+        var normalized = NormalizeGamePath(gamePath);
+        return normalized.StartsWith("music/", StringComparison.OrdinalIgnoreCase)
+            && string.Equals(Path.GetExtension(normalized), ".scd", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsAllowedManifestGamePath(string? gamePath)
+    {
+        if (string.IsNullOrWhiteSpace(gamePath))
+            return false;
+
+        var extension = Path.GetExtension(gamePath);
+        return !string.IsNullOrWhiteSpace(extension)
+            && (CacheMonitor.AllowedFileExtensions.Contains(extension, StringComparer.OrdinalIgnoreCase)
+                || string.Equals(extension, ".atch", StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static bool IsActiveMountModGamePath(string? gamePath, HashSet<string> activeMountIds)
+    {
+        if (string.IsNullOrWhiteSpace(gamePath) || activeMountIds.Count == 0)
+            return false;
+
+        var normalized = NormalizeGamePath(gamePath);
+        foreach (var mountId in activeMountIds)
+        {
+            if (normalized.Contains($"/monster/{mountId}/", StringComparison.OrdinalIgnoreCase)
+                || normalized.Contains($"/mt_{mountId}/", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+
+    private static bool IsActiveMountRiderGamePath(string? gamePath, HashSet<string> activeMountIds)
+    {
+        if (string.IsNullOrWhiteSpace(gamePath) || activeMountIds.Count == 0)
+            return false;
+
+        var normalized = NormalizeGamePath(gamePath);
+        if (!normalized.StartsWith("chara/human/", StringComparison.OrdinalIgnoreCase) || !normalized.EndsWith(".pap", StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        foreach (var mountId in activeMountIds)
+        {
+            if (normalized.Contains($"/mt_{mountId}/", StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+
+        return false;
+    }
+
+    private static string NormalizeMountActorId(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            return string.Empty;
+
+        var normalized = value.Replace('\\', '/').Trim().ToLowerInvariant();
+        var match = System.Text.RegularExpressions.Regex.Match(normalized, @"(?:^|/|_)((?:m|d)\d{4})(?:/|$)", System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.CultureInvariant);
+        return match.Success ? match.Groups[1].Value.ToLowerInvariant() : normalized.Trim('_', '/');
+    }
+
+    private async Task<List<ManifestSupportCandidate>> LoadSelectedManifestMountMusicCandidatesAsync(string modPath, Dictionary<string, List<string>> selectedSettings, int priority, CancellationToken token)
+    {
+        var output = new List<ManifestSupportCandidate>();
+
+        bool loadedCurrentManifest = false;
+        var defaultManifest = Path.Combine(modPath, "default_mod.json");
+        if (File.Exists(defaultManifest))
+        {
+            loadedCurrentManifest = true;
+            ImportCurrentManifestMountMusicFiles(output, modPath, priority, defaultManifest, token);
+            await Task.Yield();
+        }
+
+        var scannedGroups = 0;
+        foreach (var groupManifest in Directory.EnumerateFiles(modPath, "group_*.json", SearchOption.TopDirectoryOnly))
+        {
+            token.ThrowIfCancellationRequested();
+            loadedCurrentManifest = true;
+
+            ImportCurrentGroupManifestMountMusicFiles(output, modPath, selectedSettings, priority, groupManifest, token);
+
+            if (++scannedGroups % ManifestScanYieldStride == 0)
+                await Task.Yield();
+        }
+
+        if (!loadedCurrentManifest)
+        {
+            var legacyMeta = Path.Combine(modPath, "meta.json");
+            if (File.Exists(legacyMeta))
+            {
+                ImportLegacyMetaManifestMountMusicFiles(output, modPath, selectedSettings, priority, legacyMeta, token);
+                await Task.Yield();
+            }
+        }
+
+        return output;
+    }
+
+    private void ImportCurrentManifestMountMusicFiles(List<ManifestSupportCandidate> output, string modPath, int priority, string manifestPath, CancellationToken token)
+    {
+        using var stream = OpenReadShared(manifestPath);
+        using var doc = JsonDocument.Parse(stream);
+        AddMountMusicManifestFiles(output, modPath, priority, doc.RootElement, "Files");
+    }
+
+    private void ImportCurrentGroupManifestMountMusicFiles(List<ManifestSupportCandidate> output, string modPath, Dictionary<string, List<string>> selectedSettings, int priority, string manifestPath, CancellationToken token)
+    {
+        using var stream = OpenReadShared(manifestPath);
+        using var doc = JsonDocument.Parse(stream);
+        var root = doc.RootElement;
+
+        var selectedOptions = GetSelectedCurrentOptionNames(root, selectedSettings, manifestPath);
+        if (selectedOptions.Count == 0)
+            return;
+
+        if (!root.TryGetProperty("Options", out var options) || options.ValueKind != JsonValueKind.Array)
+            return;
+
+        foreach (var option in options.EnumerateArray())
+        {
+            token.ThrowIfCancellationRequested();
+
+            if (!option.TryGetProperty("Name", out var optionNameElement))
+                continue;
+
+            var optionName = optionNameElement.GetString() ?? string.Empty;
+            if (!selectedOptions.Contains(optionName))
+                continue;
+
+            AddMountMusicManifestFiles(output, modPath, priority, option, "Files");
+        }
+    }
+
+    private void ImportLegacyMetaManifestMountMusicFiles(List<ManifestSupportCandidate> output, string modPath, Dictionary<string, List<string>> selectedSettings, int priority, string metaPath, CancellationToken token)
+    {
+        using var stream = OpenReadShared(metaPath);
+        using var doc = JsonDocument.Parse(stream);
+        var root = doc.RootElement;
+
+        AddMountMusicManifestFiles(output, modPath, priority, root, "Files");
+        AddMountMusicManifestFiles(output, modPath, priority, root, "OptionFiles");
+
+        if (!root.TryGetProperty("Groups", out var groups) || groups.ValueKind != JsonValueKind.Object)
+            return;
+
+        foreach (var group in groups.EnumerateObject())
+        {
+            token.ThrowIfCancellationRequested();
+
+            var groupRoot = group.Value;
+            var groupName = groupRoot.TryGetProperty("GroupName", out var groupNameElement)
+                ? groupNameElement.GetString() ?? group.Name
+                : group.Name;
+
+            if (!selectedSettings.TryGetValue(groupName, out var selectedOptions) || selectedOptions == null || selectedOptions.Count == 0)
+                continue;
+
+            if (!groupRoot.TryGetProperty("Options", out var options) || options.ValueKind != JsonValueKind.Array)
+                continue;
+
+            foreach (var option in options.EnumerateArray())
+            {
+                token.ThrowIfCancellationRequested();
+
+                var optionName = option.TryGetProperty("OptionName", out var optionNameElement)
+                    ? optionNameElement.GetString() ?? string.Empty
+                    : string.Empty;
+
+                if (string.IsNullOrWhiteSpace(optionName) || !selectedOptions.Any(s => string.Equals(s, optionName, StringComparison.OrdinalIgnoreCase)))
+                    continue;
+
+                AddMountMusicManifestFiles(output, modPath, priority, option, "OptionFiles");
+                AddMountMusicManifestFiles(output, modPath, priority, option, "Files");
+            }
+        }
+    }
+
+    private void AddMountMusicManifestFiles(List<ManifestSupportCandidate> output, string modPath, int priority, JsonElement element, string propertyName)
+    {
+        if (!element.TryGetProperty(propertyName, out var files) || files.ValueKind != JsonValueKind.Object)
+            return;
+
+        foreach (var property in files.EnumerateObject())
+        {
+            var gamePath = NormalizeGamePath(property.Name);
+            if (!PairApplyUtilities.IsMountMusicGamePath(gamePath))
+                continue;
+
+            var relativeValue = property.Value.ValueKind == JsonValueKind.String
+                ? property.Value.GetString()
+                : null;
+            if (string.IsNullOrWhiteSpace(relativeValue))
+                continue;
+
+            var resolvedPath = ResolveManifestFilePath(modPath, relativeValue);
+            if (string.IsNullOrWhiteSpace(resolvedPath) || !File.Exists(resolvedPath))
+                continue;
+
+            output.Add(new ManifestSupportCandidate(resolvedPath, priority, [gamePath]));
         }
     }
 
@@ -723,7 +1252,7 @@ public sealed class LocalPapSafetyModService
         using var doc = JsonDocument.Parse(stream);
         var root = doc.RootElement;
 
-        var selectedOptions = GetSelectedCurrentOptionNames(root, selectedSettings);
+        var selectedOptions = GetSelectedCurrentOptionNames(root, selectedSettings, manifestPath);
         if (selectedOptions.Count == 0)
             return;
 
@@ -832,6 +1361,7 @@ public sealed class LocalPapSafetyModService
             || normalized.EndsWith(".tex", StringComparison.OrdinalIgnoreCase)
             || normalized.EndsWith(".atex", StringComparison.OrdinalIgnoreCase)
             || normalized.EndsWith(".avfx", StringComparison.OrdinalIgnoreCase)
+            || normalized.EndsWith(".scd", StringComparison.OrdinalIgnoreCase)
             || normalized.EndsWith(".shpk", StringComparison.OrdinalIgnoreCase)))
         {
             return false;
@@ -846,6 +1376,9 @@ public sealed class LocalPapSafetyModService
             || normalized.StartsWith("chara/monster/", StringComparison.OrdinalIgnoreCase)
             || normalized.StartsWith("chara/demihuman/", StringComparison.OrdinalIgnoreCase)
             || normalized.StartsWith("vfx/", StringComparison.OrdinalIgnoreCase)
+            || normalized.StartsWith("sound/", StringComparison.OrdinalIgnoreCase)
+            || normalized.StartsWith("music/", StringComparison.OrdinalIgnoreCase)
+            || normalized.StartsWith("bgm/", StringComparison.OrdinalIgnoreCase)
             || IsHumanObjectAnimationSupportGamePath(normalized);
     }
 
@@ -913,7 +1446,7 @@ public sealed class LocalPapSafetyModService
         using var doc = JsonDocument.Parse(stream);
         var root = doc.RootElement;
 
-        var selectedOptions = GetSelectedCurrentOptionNames(root, selectedSettings);
+        var selectedOptions = GetSelectedCurrentOptionNames(root, selectedSettings, manifestPath);
         if (selectedOptions.Count == 0)
             return;
 
@@ -986,39 +1519,9 @@ public sealed class LocalPapSafetyModService
         }
     }
 
-    private static HashSet<string> GetSelectedCurrentOptionNames(JsonElement groupRoot, Dictionary<string, List<string>> selectedSettings)
+    private static HashSet<string> GetSelectedCurrentOptionNames(JsonElement groupRoot, Dictionary<string, List<string>> selectedSettings, string manifestPath)
     {
         var output = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        var groupName = groupRoot.TryGetProperty("Name", out var groupNameElement)
-            ? groupNameElement.GetString() ?? string.Empty
-            : string.Empty;
-
-        if (!string.IsNullOrWhiteSpace(groupName))
-        {
-            List<string>? selected = null;
-
-            if (!selectedSettings.TryGetValue(groupName, out selected))
-            {
-                var normalizedGroupName = groupName.Replace('\\', '/').ToLowerInvariant();
-                foreach (var kvp in selectedSettings)
-                {
-                    if (string.Equals((kvp.Key ?? string.Empty).Replace('\\', '/').ToLowerInvariant(), normalizedGroupName, StringComparison.OrdinalIgnoreCase))
-                    {
-                        selected = kvp.Value;
-                        break;
-                    }
-                }
-            }
-
-            if (selected != null)
-            {
-                foreach (var item in selected.Where(s => !string.IsNullOrWhiteSpace(s)))
-                    output.Add(item);
-
-                if (output.Count > 0)
-                    return output;
-            }
-        }
 
         if (!groupRoot.TryGetProperty("Options", out var options) || options.ValueKind != JsonValueKind.Array)
             return output;
@@ -1037,43 +1540,347 @@ public sealed class LocalPapSafetyModService
         if (optionNames.Count == 0)
             return output;
 
+        var groupType = groupRoot.TryGetProperty("Type", out var typeElement)
+            ? typeElement.GetString() ?? string.Empty
+            : string.Empty;
+
+        if (TryGetSelectedCurrentSettingsForGroup(groupRoot, manifestPath, selectedSettings, out var selected) && selected != null)
+        {
+            AddSelectedCurrentOptionNamesFromSettingValues(output, optionNames, groupType, selected);
+            RemoveInactiveCurrentOptionNames(output);
+            return output;
+        }
+
+        AddDefaultCurrentOptionNames(output, optionNames, groupType, groupRoot);
+        RemoveInactiveCurrentOptionNames(output);
+        return output;
+    }
+
+    private static bool TryGetSelectedCurrentSettingsForGroup(JsonElement groupRoot, string manifestPath, Dictionary<string, List<string>> selectedSettings, out List<string>? selected)
+    {
+        selected = null;
+        if (selectedSettings == null || selectedSettings.Count == 0)
+            return false;
+
+        var aliases = BuildCurrentManifestGroupAliases(groupRoot, manifestPath);
+        foreach (var alias in aliases.RawAliases)
+        {
+            if (selectedSettings.TryGetValue(alias, out selected))
+                return true;
+        }
+
+        foreach (var kvp in selectedSettings)
+        {
+            var key = kvp.Key ?? string.Empty;
+            if (aliases.NormalizedAliases.Contains(NormalizeGamePath(key))
+                || aliases.LooseAliases.Contains(NormalizeCurrentSelectionKey(key)))
+            {
+                selected = kvp.Value;
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static CurrentManifestGroupAliases BuildCurrentManifestGroupAliases(JsonElement groupRoot, string manifestPath)
+    {
+        var rawAliases = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var normalizedAliases = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var looseAliases = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        void AddAlias(string? value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+                return;
+
+            var trimmed = value.Trim();
+            rawAliases.Add(trimmed);
+            normalizedAliases.Add(NormalizeGamePath(trimmed));
+            looseAliases.Add(NormalizeCurrentSelectionKey(trimmed));
+        }
+
+        var groupName = groupRoot.TryGetProperty("Name", out var groupNameElement)
+            ? groupNameElement.GetString() ?? string.Empty
+            : string.Empty;
+        AddAlias(groupName);
+
+        var manifestFileName = Path.GetFileName(manifestPath);
+        var manifestStem = Path.GetFileNameWithoutExtension(manifestPath);
+        AddAlias(manifestFileName);
+        AddAlias(manifestStem);
+
+        var normalizedStem = NormalizeGamePath(manifestStem);
+        var match = System.Text.RegularExpressions.Regex.Match(normalizedStem, @"^group[_\- ]*(\d+)(?:[_\- ]+(.*))?$", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        if (match.Success)
+        {
+            var numberText = match.Groups[1].Value;
+            AddAlias(numberText);
+            if (int.TryParse(numberText, out var number))
+            {
+                AddAlias(number.ToString());
+                AddAlias($"group_{number}");
+                AddAlias($"group {number}");
+            }
+
+            AddAlias($"group_{numberText}");
+            AddAlias($"group {numberText}");
+
+            var suffix = match.Groups.Count > 2 ? match.Groups[2].Value : string.Empty;
+            if (!string.IsNullOrWhiteSpace(suffix))
+            {
+                AddAlias(suffix);
+                AddAlias(suffix.Replace('_', ' ').Replace('-', ' '));
+                AddAlias($"{numberText}_{suffix}");
+                AddAlias($"{numberText} {suffix.Replace('_', ' ').Replace('-', ' ')}");
+
+                if (int.TryParse(numberText, out var numericSuffixNumber))
+                {
+                    AddAlias($"{numericSuffixNumber}_{suffix}");
+                    AddAlias($"{numericSuffixNumber} {suffix.Replace('_', ' ').Replace('-', ' ')}");
+                }
+            }
+        }
+
+        return new CurrentManifestGroupAliases(rawAliases, normalizedAliases, looseAliases);
+    }
+
+    private static void AddDefaultCurrentOptionNames(HashSet<string> output, IReadOnlyList<string> optionNames, string groupType, JsonElement groupRoot)
+    {
         if (!groupRoot.TryGetProperty("DefaultSettings", out var defaultSettings)
             || defaultSettings.ValueKind != JsonValueKind.Number
             || !defaultSettings.TryGetInt32(out var defaultValue))
         {
-            return output;
+            return;
         }
-
-        var groupType = groupRoot.TryGetProperty("Type", out var typeElement)
-            ? typeElement.GetString() ?? string.Empty
-            : string.Empty;
 
         if (string.Equals(groupType, "Single", StringComparison.OrdinalIgnoreCase))
         {
             if (defaultValue >= 0 && defaultValue < optionNames.Count)
                 output.Add(optionNames[defaultValue]);
-
-            return output;
+            return;
         }
 
         if (string.Equals(groupType, "Multi", StringComparison.OrdinalIgnoreCase))
         {
             if (defaultValue <= 0)
-                return output;
+                return;
 
-            for (var i = 0; i < optionNames.Count; i++)
+            for (var i = 0; i < optionNames.Count && i < 31; i++)
             {
                 if ((defaultValue & (1 << i)) != 0)
                     output.Add(optionNames[i]);
             }
 
-            return output;
+            return;
         }
 
         if (defaultValue >= 0 && defaultValue < optionNames.Count)
             output.Add(optionNames[defaultValue]);
+    }
 
-        return output;
+    private static void AddSelectedCurrentOptionNamesFromSettingValues(HashSet<string> output, IReadOnlyList<string> optionNames, string groupType, IEnumerable<string>? selectedValues)
+    {
+        if (selectedValues == null || optionNames.Count == 0)
+            return;
+
+        var values = EnumerateCurrentSelectedSettingValues(selectedValues).ToList();
+        if (values.Count == 0)
+            return;
+
+        if (TryAddCurrentBooleanSelectedOptionNames(output, optionNames, values))
+            return;
+
+        var isMultiGroup = string.Equals(groupType, "Multi", StringComparison.OrdinalIgnoreCase);
+        foreach (var value in values)
+        {
+            if (TryAddCurrentSelectedOptionNameByAlias(output, optionNames, value))
+                continue;
+
+            var assignment = SplitCurrentSelectionAssignment(value);
+            if (!string.IsNullOrWhiteSpace(assignment.Name) && TryParseCurrentSelectionBoolean(assignment.Value, out var enabled))
+            {
+                if (enabled)
+                    TryAddCurrentSelectedOptionNameByAlias(output, optionNames, assignment.Name);
+
+                continue;
+            }
+
+            if (!int.TryParse(value, out var numericValue))
+                continue;
+
+            if (isMultiGroup && values.Count == 1 && numericValue > 0)
+            {
+                var addedFromBitmask = false;
+                for (var i = 0; i < optionNames.Count && i < 31; i++)
+                {
+                    if ((numericValue & (1 << i)) == 0)
+                        continue;
+
+                    output.Add(optionNames[i]);
+                    addedFromBitmask = true;
+                }
+
+                if (addedFromBitmask)
+                    continue;
+            }
+
+            if (isMultiGroup && numericValue == 0)
+                continue;
+
+            if (numericValue >= 0 && numericValue < optionNames.Count)
+            {
+                output.Add(optionNames[numericValue]);
+                continue;
+            }
+
+            if (numericValue > 0 && isMultiGroup)
+            {
+                for (var i = 0; i < optionNames.Count && i < 31; i++)
+                {
+                    if ((numericValue & (1 << i)) != 0)
+                        output.Add(optionNames[i]);
+                }
+            }
+        }
+    }
+
+    private static IEnumerable<string> EnumerateCurrentSelectedSettingValues(IEnumerable<string> selectedValues)
+    {
+        var emitted = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var rawValue in selectedValues)
+        {
+            if (string.IsNullOrWhiteSpace(rawValue))
+                continue;
+
+            foreach (var expanded in ExpandCurrentSelectedSettingValue(rawValue))
+            {
+                var value = expanded.Trim().Trim('"', '\'', '[', ']');
+                if (!string.IsNullOrWhiteSpace(value) && emitted.Add(value))
+                    yield return value;
+            }
+        }
+    }
+
+    private static IEnumerable<string> ExpandCurrentSelectedSettingValue(string rawValue)
+    {
+        var value = rawValue.Trim();
+        if (string.IsNullOrWhiteSpace(value))
+            yield break;
+
+        yield return value;
+
+        var trimmed = value.Trim().Trim('[', ']');
+        foreach (var part in trimmed.Split(['\0', '\r', '\n', ';', ',', '|'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            if (!string.IsNullOrWhiteSpace(part))
+                yield return part;
+        }
+    }
+
+    private static bool TryAddCurrentBooleanSelectedOptionNames(HashSet<string> output, IReadOnlyList<string> optionNames, IReadOnlyList<string> values)
+    {
+        if (values.Count != optionNames.Count)
+            return false;
+
+        var parsed = new bool[values.Count];
+        for (var i = 0; i < values.Count; i++)
+        {
+            if (!TryParseCurrentSelectionBoolean(values[i], out parsed[i]))
+                return false;
+        }
+
+        for (var i = 0; i < parsed.Length; i++)
+        {
+            if (parsed[i])
+                output.Add(optionNames[i]);
+        }
+
+        return true;
+    }
+
+    private static bool TryParseCurrentSelectionBoolean(string? value, out bool result)
+    {
+        result = false;
+        if (string.IsNullOrWhiteSpace(value))
+            return false;
+
+        var normalized = NormalizeCurrentSelectionKey(value);
+        if (normalized is "true" or "enabled" or "enable" or "on" or "yes" or "y")
+        {
+            result = true;
+            return true;
+        }
+
+        if (normalized is "false" or "disabled" or "disable" or "off" or "no" or "n" or "none" or "null")
+        {
+            result = false;
+            return true;
+        }
+
+        return false;
+    }
+
+    private static (string Name, string Value) SplitCurrentSelectionAssignment(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            return (string.Empty, string.Empty);
+
+        var separatorIndex = value.IndexOf('=');
+        if (separatorIndex < 0)
+            separatorIndex = value.IndexOf(':');
+
+        if (separatorIndex <= 0 || separatorIndex >= value.Length - 1)
+            return (string.Empty, string.Empty);
+
+        return (value[..separatorIndex].Trim().Trim('"', '\''), value[(separatorIndex + 1)..].Trim().Trim('"', '\''));
+    }
+
+    private static bool TryAddCurrentSelectedOptionNameByAlias(HashSet<string> output, IReadOnlyList<string> optionNames, string value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            return false;
+
+        var normalizedValue = NormalizeGamePath(value);
+        var looseValue = NormalizeCurrentSelectionKey(value);
+        foreach (var optionName in optionNames)
+        {
+            if (string.Equals(optionName, value, StringComparison.OrdinalIgnoreCase)
+                || string.Equals(NormalizeGamePath(optionName), normalizedValue, StringComparison.OrdinalIgnoreCase)
+                || string.Equals(NormalizeCurrentSelectionKey(optionName), looseValue, StringComparison.OrdinalIgnoreCase))
+            {
+                output.Add(optionName);
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static void RemoveInactiveCurrentOptionNames(HashSet<string> optionNames)
+    {
+        if (optionNames.Count == 0)
+            return;
+
+        optionNames.RemoveWhere(IsInactiveCurrentOptionName);
+    }
+
+    private static bool IsInactiveCurrentOptionName(string? optionName)
+    {
+        if (string.IsNullOrWhiteSpace(optionName))
+            return false;
+
+        return NormalizeCurrentSelectionKey(optionName) is "off" or "none" or "no" or "false" or "null" or "disabled" or "disable" or "inactive" or "notactive";
+    }
+
+    private static string NormalizeCurrentSelectionKey(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            return string.Empty;
+
+        var normalized = NormalizeGamePath(value);
+        return System.Text.RegularExpressions.Regex.Replace(normalized, @"[^a-z0-9]+", string.Empty, System.Text.RegularExpressions.RegexOptions.IgnoreCase)
+            .ToLowerInvariant();
     }
 
     private void AddManifestFiles(List<ManifestPapCandidate> output, string modPath, string relativeModDirectory, string displayName, string sourceGroupName, string sourceGroupType, string optionDisplayName, int priority, JsonElement element, string propertyName)
@@ -1417,6 +2224,8 @@ public sealed class LocalPapSafetyModService
         {
             token.ThrowIfCancellationRequested();
 
+            if (!mod.Value.Enabled || mod.Value.Temporary)
+                continue;
 
             if (IsRuntimeModKey(modDirectory, mod.Key))
                 continue;
@@ -1455,7 +2264,7 @@ public sealed class LocalPapSafetyModService
             if (++scannedMods % ModScanYieldStride == 0)
                 await Task.Yield();
 
-            if (!mod.Value.Enabled)
+            if (!mod.Value.Enabled || mod.Value.Temporary)
                 continue;
 
             if (IsRuntimeModKey(modDirectory, mod.Key))

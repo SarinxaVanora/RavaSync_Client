@@ -1,0 +1,67 @@
+import { dispatch } from "../../../npm/hybrids/src/utils.js";
+import { html } from "../../../npm/hybrids/src/template/index.js";
+//#region src/pages/settings/components/exception-toggle.js
+/**
+* Ghostery Browser Extension
+* https://www.ghostery.com/
+*
+* Copyright 2017-present Ghostery GmbH. All rights reserved.
+*
+* This Source Code Form is subject to the terms of the Mozilla Public
+* License, v. 2.0. If a copy of the MPL was not distributed with this
+* file, You can obtain one at http://mozilla.org/MPL/2.0
+*/
+function updateValue(value) {
+	return (host) => {
+		if (host.value !== value) {
+			host.value = value;
+			dispatch(host, "change", { detail: value });
+		}
+	};
+}
+var exception_toggle_default = {
+	value: false,
+	responsive: false,
+	render: ({ value, responsive }) => html`
+    <template layout="row relative">
+      <ui-action-button-group
+        class="${{ responsive }}"
+        layout.responsive="column"
+        layout.responsive@768px="row"
+      >
+        <ui-action-button grouped active="${!value}">
+          <button
+            layout="row relative gap:0.5 padding:0.5"
+            onclick="${updateValue(false)}"
+            data-qa="component:exception-toggle:block"
+          >
+            <ui-icon name="block-s"></ui-icon>
+            <ui-text type="label-xs" color="inherit">Blocked</ui-text>
+          </button>
+        </ui-action-button>
+        <ui-action-button class="trusted" grouped active="${value}">
+          <button
+            layout="row gap:0.5 padding:0.5"
+            onclick="${updateValue(true)}"
+            data-qa="component:exception-toggle:trust"
+          >
+            <ui-icon name="trust-s"></ui-icon>
+            <ui-text type="label-xs" color="inherit">Trusted</ui-text>
+          </button>
+        </ui-action-button>
+      </ui-action-button-group>
+    </template>
+  `.css`
+    ui-action-button {
+      width: auto;
+      height: 28px;
+      color: var(--color-tertiary);
+    }
+
+    ui-action-button[active] {
+      color: var(--color-primary);
+    }
+  `
+};
+//#endregion
+export { exception_toggle_default as default };

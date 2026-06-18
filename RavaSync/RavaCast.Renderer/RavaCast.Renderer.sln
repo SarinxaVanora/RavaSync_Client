@@ -1,0 +1,36 @@
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 18
+VisualStudioVersion = 18.6.11819.183 stable
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "RavaCast.Renderer", "RavaCast.Renderer.csproj", "{37713CAC-E6D1-AB7F-A1CD-39545D2124E5}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "RavaCast.Media.Native", "..\RavaCast.Media.Native\RavaCast.Media.Native.csproj", "{A8A56F0D-23D8-43BD-B82F-8CF4AD7F9476}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "RavaCast.Media.BridgeHost", "..\RavaCast.Media.BridgeHost\RavaCast.Media.BridgeHost.csproj", "{C5EDBF1F-4F32-4F5A-B3B2-3F44E62F7E71}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|x64 = Debug|x64
+		Release|x64 = Release|x64
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{37713CAC-E6D1-AB7F-A1CD-39545D2124E5}.Debug|x64.ActiveCfg = Debug|x64
+		{37713CAC-E6D1-AB7F-A1CD-39545D2124E5}.Debug|x64.Build.0 = Debug|x64
+		{37713CAC-E6D1-AB7F-A1CD-39545D2124E5}.Release|x64.ActiveCfg = Release|x64
+		{37713CAC-E6D1-AB7F-A1CD-39545D2124E5}.Release|x64.Build.0 = Release|x64
+		{A8A56F0D-23D8-43BD-B82F-8CF4AD7F9476}.Debug|x64.ActiveCfg = Debug|x64
+		{A8A56F0D-23D8-43BD-B82F-8CF4AD7F9476}.Debug|x64.Build.0 = Debug|x64
+		{A8A56F0D-23D8-43BD-B82F-8CF4AD7F9476}.Release|x64.ActiveCfg = Release|x64
+		{A8A56F0D-23D8-43BD-B82F-8CF4AD7F9476}.Release|x64.Build.0 = Release|x64
+		{C5EDBF1F-4F32-4F5A-B3B2-3F44E62F7E71}.Debug|x64.ActiveCfg = Debug|x64
+		{C5EDBF1F-4F32-4F5A-B3B2-3F44E62F7E71}.Debug|x64.Build.0 = Debug|x64
+		{C5EDBF1F-4F32-4F5A-B3B2-3F44E62F7E71}.Release|x64.ActiveCfg = Release|x64
+		{C5EDBF1F-4F32-4F5A-B3B2-3F44E62F7E71}.Release|x64.Build.0 = Release|x64
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {08371A26-F005-47D5-B804-A229D122BACE}
+	EndGlobalSection
+EndGlobal

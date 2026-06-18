@@ -90,6 +90,7 @@ public class MareConfig : IMareConfiguration
     public bool CacheFolderSubdirMigrationDone { get; set; } = false;
     public HashSet<string> LocalCustomizePlusDisabledUids { get; set; } = new(StringComparer.Ordinal);
     public HashSet<string> LocalHeightMetadataDisabledUids { get; set; } = new(StringComparer.Ordinal);
+    public HashSet<string> LocalScreenShakeDisabledUids { get; set; } = new(StringComparer.Ordinal);
     public bool HasUpgradedTransientsSystemV02 { get; set; } = false;
     public bool EditGlobalTransferOverlay { get; set; } = false;
     public float GlobalTransferOverlayX { get; set; } = -1f;
@@ -97,4 +98,25 @@ public class MareConfig : IMareConfiguration
     public float GlobalTransferOverlayScale { get; set; } = 1.0f;
     public bool GlobalTransferOverlayRowLayout { get; set; } = false;
     public bool showTransferText { get; set; } = false;
+    public bool ExperimentalSpeedUp { get; set; } = false;
+    public bool GlobalSyncSounds { get; set; } = true;
+    public bool GlobalSyncAnimations { get; set; } = true;
+    public bool GlobalSyncVfx { get; set; } = true;
+    public bool GlobalSyncCustomizePlus { get; set; } = true;
+    public bool GlobalSyncHeightEdits { get; set; } = true;
+    public bool GlobalSyncHonorific { get; set; } = true;
+    public bool GlobalSyncMoodles { get; set; } = true;
+    public bool GlobalSyncPetNames { get; set; } = true;
+    public bool GlobalSyncScreenShake { get; set; } = false;
+    public bool GlobalHideHonorificOwnerTitles { get; set; } = false;
+    public bool GlobalHideHonorificTitlesUsingKeywords { get; set; } = false;
+    public List<string> GlobalHonorificTitleHiddenKeywords { get; set; } = [];
+    public bool GlobalHideHonorificWebLinks { get; set; } = false;
+    public bool SeenRavaCastIntro { get; set; } = false;
+    public float RavaCastDefaultVolume { get; set; } = 0.50f;
+    public bool RavaCastDisableHardwareAcceleration { get; set; } = true;
+    public bool RavaCastBrowserDarkMode { get; set; } = true;
+    public bool RavaCastDirectStreamAudioDeviceFallback { get; set; } = false;
+    public List<RavaCastSavedScreenPlacement> RavaCastSavedScreenPlacements { get; set; } = [];
+    public string RavaCastSelectedScreenPlacementName { get; set; } = string.Empty;
 }

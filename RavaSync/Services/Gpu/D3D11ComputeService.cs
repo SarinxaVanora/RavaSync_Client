@@ -8,6 +8,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Vortice.Direct3D11;
 using Vortice.DXGI;
+using Image = SixLabors.ImageSharp.Image;
 
 namespace RavaSync.Services.Gpu;
 

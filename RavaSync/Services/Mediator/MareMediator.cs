@@ -2,7 +2,6 @@
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using System.Collections.Concurrent;
-using System.Reflection;
 using System.Text;
 
 namespace RavaSync.Services.Mediator;
@@ -17,8 +16,8 @@ public sealed class MareMediator : IHostedService
     private readonly PerformanceCollectorService _performanceCollector;
     private readonly MareConfigService _mareConfigService;
     private readonly ConcurrentDictionary<Type, HashSet<SubscriberAction>> _subscriberDict = [];
+    private readonly ConcurrentDictionary<Type, SubscriberAction[]> _subscriberSnapshotCache = [];
     private bool _processQueue = false;
-    private readonly ConcurrentDictionary<Type, MethodInfo?> _genericExecuteMethods = new();
     public MareMediator(ILogger<MareMediator> logger, PerformanceCollectorService performanceCollector, MareConfigService mareConfigService)
     {
         _logger = logger;
@@ -98,24 +97,29 @@ public sealed class MareMediator : IHostedService
 
     public void Subscribe<T>(IMediatorSubscriber subscriber, Action<T> action) where T : MessageBase
     {
+        var messageType = typeof(T);
         lock (_addRemoveLock)
         {
-            _subscriberDict.TryAdd(typeof(T), []);
+            _subscriberDict.TryAdd(messageType, []);
 
-            if (!_subscriberDict[typeof(T)].Add(new(subscriber, action)))
+            if (!_subscriberDict[messageType].Add(new SubscriberAction<T>(subscriber, action)))
             {
                 throw new InvalidOperationException("Already subscribed");
             }
+
+            _subscriberSnapshotCache.TryRemove(messageType, out _);
         }
     }
 
     public void Unsubscribe<T>(IMediatorSubscriber subscriber) where T : MessageBase
     {
+        var messageType = typeof(T);
         lock (_addRemoveLock)
         {
-            if (_subscriberDict.ContainsKey(typeof(T)))
+            if (_subscriberDict.ContainsKey(messageType))
             {
-                _subscriberDict[typeof(T)].RemoveWhere(p => p.Subscriber == subscriber);
+                _subscriberDict[messageType].RemoveWhere(p => p.Subscriber == subscriber);
+                _subscriberSnapshotCache.TryRemove(messageType, out _);
             }
         }
     }
@@ -129,50 +133,48 @@ public sealed class MareMediator : IHostedService
                 int unSubbed = _subscriberDict[kvp]?.RemoveWhere(p => p.Subscriber == subscriber) ?? 0;
                 if (unSubbed > 0)
                 {
+                    _subscriberSnapshotCache.TryRemove(kvp, out _);
                     _logger.LogDebug("{sub} unsubscribed from {msg}", subscriber.GetType().Name, kvp.Name);
                 }
             }
         }
     }
 
-    private void ExecuteMessage(MessageBase message)
+    private SubscriberAction[] CreateSubscriberSnapshot(Type messageType)
     {
-        if (!_subscriberDict.TryGetValue(message.GetType(), out HashSet<SubscriberAction>? subscribers) || subscribers == null || !subscribers.Any()) return;
-
-        List<SubscriberAction> subscribersCopy = [];
         lock (_addRemoveLock)
         {
-            subscribersCopy = subscribers?.Where(s => s.Subscriber != null).OrderBy(k => k.Subscriber is IHighPriorityMediatorSubscriber ? 0 : 1).ToList() ?? [];
-        }
+            if (!_subscriberDict.TryGetValue(messageType, out var subscribers) || subscribers == null || subscribers.Count == 0)
+                return [];
 
-#pragma warning disable S3011 // Reflection should not be used to increase accessibility of classes, methods, or fields
-        var msgType = message.GetType();
-        if (!_genericExecuteMethods.TryGetValue(msgType, out var methodInfo))
-        {
-            _genericExecuteMethods[msgType] = methodInfo = GetType()
-                 .GetMethod(nameof(ExecuteReflected), BindingFlags.NonPublic | BindingFlags.Instance)?
-                 .MakeGenericMethod(msgType);
+            return subscribers
+                .Where(s => s.Subscriber != null)
+                .OrderBy(static s => s.HighPriority ? 0 : 1)
+                .ToArray();
         }
-
-        methodInfo!.Invoke(this, [subscribersCopy, message]);
-#pragma warning restore S3011 // Reflection should not be used to increase accessibility of classes, methods, or fields
     }
 
-    private void ExecuteReflected<T>(List<SubscriberAction> subscribers, T message) where T : MessageBase
+    private void ExecuteMessage(MessageBase message)
     {
-        foreach (SubscriberAction subscriber in subscribers)
+        var msgType = message.GetType();
+        if (!_subscriberDict.TryGetValue(msgType, out var subscribers) || subscribers == null || subscribers.Count == 0) return;
+
+        var subscribersCopy = _subscriberSnapshotCache.GetOrAdd(msgType, CreateSubscriberSnapshot);
+        if (subscribersCopy.Length == 0) return;
+
+        foreach (SubscriberAction subscriber in subscribersCopy)
         {
             try
             {
                 if (_mareConfigService.Current.LogPerformance)
                 {
                     var isSameThread = message.KeepThreadContext ? "$" : string.Empty;
-                    _performanceCollector.LogPerformance(this, $"{isSameThread}Execute>{message.GetType().Name}+{subscriber.Subscriber.GetType().Name}>{subscriber.Subscriber}",
-                        () => ((Action<T>)subscriber.Action).Invoke(message));
+                    _performanceCollector.LogPerformance(this, $"{isSameThread}Execute>{msgType.Name}+{subscriber.Subscriber.GetType().Name}>{subscriber.Subscriber}",
+                        () => subscriber.Invoke(message));
                 }
                 else
                 {
-                    ((Action<T>)subscriber.Action).Invoke(message);
+                    subscriber.Invoke(message);
                 }
             }
             catch (Exception ex)
@@ -181,7 +183,7 @@ public sealed class MareMediator : IHostedService
                     continue;
 
                 _logger.LogError(ex.InnerException ?? ex, "Error executing {type} for subscriber {subscriber}",
-                    message.GetType().Name, subscriber.Subscriber.GetType().Name);
+                    msgType.Name, subscriber.Subscriber.GetType().Name);
                 _lastErrorTime[subscriber] = DateTime.UtcNow;
             }
         }
@@ -193,15 +195,28 @@ public sealed class MareMediator : IHostedService
         _processQueue = true;
     }
 
-    private sealed class SubscriberAction
+    private abstract class SubscriberAction
     {
-        public SubscriberAction(IMediatorSubscriber subscriber, object action)
+        protected SubscriberAction(IMediatorSubscriber subscriber)
         {
             Subscriber = subscriber;
-            Action = action;
+            HighPriority = subscriber is IHighPriorityMediatorSubscriber;
         }
 
-        public object Action { get; }
+        public bool HighPriority { get; }
         public IMediatorSubscriber Subscriber { get; }
+        public abstract void Invoke(MessageBase message);
+    }
+
+    private sealed class SubscriberAction<T> : SubscriberAction where T : MessageBase
+    {
+        private readonly Action<T> _action;
+
+        public SubscriberAction(IMediatorSubscriber subscriber, Action<T> action) : base(subscriber)
+        {
+            _action = action;
+        }
+
+        public override void Invoke(MessageBase message) => _action((T)message);
     }
 }

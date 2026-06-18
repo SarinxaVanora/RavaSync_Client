@@ -21,6 +21,7 @@ public class PermissionWindowUI : WindowMediatorSubscriberBase
     private UserPermissions _ownPermissions;
     private bool _customizePlusEnabled;
     private bool _metadataEnabled;
+    private bool _screenShakeEnabled;
     protected override IDisposable? BeginThemeScope() => _uiSharedService.BeginThemed();
     public PermissionWindowUI(ILogger<PermissionWindowUI> logger, Pair pair, MareMediator mediator, UiSharedService uiSharedService,
         ApiController apiController, PerformanceCollectorService performanceCollectorService)
@@ -32,11 +33,12 @@ public class PermissionWindowUI : WindowMediatorSubscriberBase
         _ownPermissions = pair.UserPair.OwnPermissions.DeepClone();
         _customizePlusEnabled = pair.IsCustomizePlusEnabled;
         _metadataEnabled = pair.IsMetadataEnabled;
+        _screenShakeEnabled = pair.IsScreenShakeEnabled;
         Flags = ImGuiWindowFlags.NoScrollbar | ImGuiWindowFlags.NoResize;
         SizeConstraints = new()
         {
             MinimumSize = new(450, 100),
-            MaximumSize = new(450, 500)
+            MaximumSize = new(450, 560)
         };
         IsOpen = true;
     }
@@ -50,6 +52,7 @@ public class PermissionWindowUI : WindowMediatorSubscriberBase
         var disableVfx = _ownPermissions.IsDisableVFX();
         var disableCustomize = !_customizePlusEnabled;
         var disableMetaData = !_metadataEnabled;
+        var disableScreenShake = !_screenShakeEnabled;
         var style = ImGui.GetStyle();
         var indentSize = ImGui.GetFrameHeight() + style.ItemSpacing.X;
 
@@ -145,13 +148,19 @@ public class PermissionWindowUI : WindowMediatorSubscriberBase
         }
         _uiSharedService.DrawHelpText(_uiSharedService.L("UI.PermissionWindowUI.d9598eed", "Too tall? Too Small? Not anymore. This disables height edits only, locally, without notifying the other user."));
 
+        if (ImGui.Checkbox(_uiSharedService.L("UI.PermissionWindowUI.ScreenShake.Disable", "Disable Screen Shake"), ref disableScreenShake))
+        {
+            _screenShakeEnabled = !disableScreenShake;
+        }
+        _uiSharedService.DrawHelpText(_uiSharedService.L("UI.PermissionWindowUI.ScreenShake.Help", "Locally sanitises incoming AVFX for this user so camera/screen shake is removed without blocking the effect file."));
+
 
         ImGuiHelpers.ScaledDummy(0.5f);
         ImGui.Separator();
         ImGuiHelpers.ScaledDummy(0.5f);
 
         bool serverPermissionChanges = _ownPermissions != Pair.UserPair.OwnPermissions;
-        bool localPermissionChanges = _customizePlusEnabled != Pair.IsCustomizePlusEnabled || _metadataEnabled != Pair.IsMetadataEnabled;
+        bool localPermissionChanges = _customizePlusEnabled != Pair.IsCustomizePlusEnabled || _metadataEnabled != Pair.IsMetadataEnabled || _screenShakeEnabled != Pair.IsScreenShakeEnabled;
         bool hasChanges = serverPermissionChanges || localPermissionChanges;
 
         using (ImRaii.Disabled(!hasChanges))
@@ -170,6 +179,7 @@ public class PermissionWindowUI : WindowMediatorSubscriberBase
 
                 Pair.SetCustomizePlusEnabled(_customizePlusEnabled);
                 Pair.SetMetadataEnabled(_metadataEnabled);
+                Pair.SetScreenShakeEnabled(_screenShakeEnabled);
             }
         UiSharedService.AttachToolTip(_uiSharedService.L("UI.PermissionWindowUI.b33e9980", "Save and apply all changes"));
 
@@ -185,6 +195,7 @@ public class PermissionWindowUI : WindowMediatorSubscriberBase
                 _ownPermissions = Pair.UserPair.OwnPermissions.DeepClone();
                 _customizePlusEnabled = Pair.IsCustomizePlusEnabled;
                 _metadataEnabled = Pair.IsMetadataEnabled;
+                _screenShakeEnabled = Pair.IsScreenShakeEnabled;
             }
         UiSharedService.AttachToolTip(_uiSharedService.L("UI.PermissionWindowUI.661d908b", "Revert all changes"));
 
@@ -199,8 +210,10 @@ public class PermissionWindowUI : WindowMediatorSubscriberBase
             _ownPermissions.SetDisableAnimations(Pair.IsDirectlyPaired ? defaultPermissions.DisableIndividualAnimations : defaultPermissions.DisableGroupAnimations);
             _customizePlusEnabled = true;
             _metadataEnabled = true;
+            _screenShakeEnabled = true;
             Pair.SetCustomizePlusEnabled(true);
             Pair.SetMetadataEnabled(true);
+            Pair.SetScreenShakeEnabled(true);
             _ = _apiController.SetBulkPermissions(new(
                 new(StringComparer.Ordinal)
                 {

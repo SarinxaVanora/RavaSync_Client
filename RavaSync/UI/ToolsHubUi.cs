@@ -61,6 +61,10 @@ public sealed class ToolsHubUi : WindowMediatorSubscriberBase
             "Open Toy Box Games Hub",
             () => Mediator.Publish(new UiToggleMessage(typeof(ToyBoxUi))));
 
+        ToolButton(FontAwesomeIcon.PlayCircle, "RavaCast",
+            "Open shared in-world web screen controls",
+            () => Mediator.Publish(new UiToggleMessage(typeof(RavaCastUi))));
+
         ToolButton(FontAwesomeIcon.Running, _uiSharedService.L("UI.ToolsHubUi.1827fadc", "Character data hub"),
             "Open Character Data Hub",
             () => Mediator.Publish(new UiToggleMessage(typeof(CharaDataHubUi))));
@@ -84,8 +88,8 @@ public sealed class ToolsHubUi : WindowMediatorSubscriberBase
             "Setup Vanity (custom ID) here!",
             () => Mediator.Publish(new UiToggleMessage(typeof(VanityUi))));
         
-        ToolButton(FontAwesomeIcon.Users, _uiSharedService.L("UI.ToolsHubUi.592ae45b", "Discovery Settings"),
-            "Change settings relating to the Discovery Service.",
+        ToolButton(FontAwesomeIcon.Users, _uiSharedService.L("UI.ToolsHubUi.592ae45b", "Discovery"),
+            "Choose whether nearby RavaSync users can find and pair with you.",
             () => Mediator.Publish(new UiToggleMessage(typeof(DiscoverySettingsUi))));
 
         ImGui.Columns(1);

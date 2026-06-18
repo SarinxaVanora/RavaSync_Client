@@ -1,0 +1,355 @@
+{
+  "manifest_version": 3,
+  "author": "Ghostery",
+  "name": "__MSG_manifest_name__",
+  "short_name": "Ghostery",
+  "default_locale": "en",
+  "description": "__MSG_manifest_short_description__",
+  "permissions": [
+    "alarms",
+    "contextMenus",
+    "cookies",
+    "declarativeNetRequest",
+    "declarativeNetRequestFeedback",
+    "webNavigation",
+    "storage",
+    "scripting",
+    "tabs",
+    "activeTab",
+    "webRequest",
+    "offscreen"
+  ],
+  "host_permissions": [
+    "http://*/*",
+    "https://*/*",
+    "ws://*/*",
+    "wss://*/*"
+  ],
+  "icons": {
+    "64": "icons/icon-64.png",
+    "128": "icons/icon-128.png"
+  },
+  "action": {
+    "default_icon": {
+      "64": "icons/icon-64.png",
+      "128": "icons/icon-128.png"
+    },
+    "default_title": "Ghostery",
+    "default_popup": "pages/panel/index.html"
+  },
+  "options_ui": {
+    "page": "pages/settings/index.html",
+    "open_in_tab": true
+  },
+  "background": {
+    "service_worker": "background/index.js",
+    "type": "module"
+  },
+  "storage": {
+    "managed_schema": "managed_storage.json"
+  },
+  "declarative_net_request": {
+    "rule_resources": [
+      {
+        "id": "ads",
+        "enabled": false,
+        "path": "rule_resources/dnr-ads.json"
+      },
+      {
+        "id": "tracking",
+        "enabled": false,
+        "path": "rule_resources/dnr-tracking.json"
+      },
+      {
+        "id": "annoyances",
+        "enabled": false,
+        "path": "rule_resources/dnr-annoyances.json"
+      },
+      {
+        "id": "fixes",
+        "enabled": false,
+        "path": "rule_resources/dnr-fixes.json"
+      },
+      {
+        "id": "redirect-protection",
+        "enabled": false,
+        "path": "rule_resources/dnr-redirect-protection.json"
+      },
+      {
+        "id": "lang-ar",
+        "enabled": false,
+        "path": "rule_resources/dnr-lang-ar.json"
+      },
+      {
+        "id": "lang-bg",
+        "enabled": false,
+        "path": "rule_resources/dnr-lang-bg.json"
+      },
+      {
+        "id": "lang-cs",
+        "enabled": false,
+        "path": "rule_resources/dnr-lang-cs.json"
+      },
+      {
+        "id": "lang-de",
+        "enabled": false,
+        "path": "rule_resources/dnr-lang-de.json"
+      },
+      {
+        "id": "lang-el",
+        "enabled": false,
+        "path": "rule_resources/dnr-lang-el.json"
+      },
+      {
+        "id": "lang-es",
+        "enabled": false,
+        "path": "rule_resources/dnr-lang-es.json"
+      },
+      {
+        "id": "lang-fa",
+        "enabled": false,
+        "path": "rule_resources/dnr-lang-fa.json"
+      },
+      {
+        "id": "lang-fr",
+        "enabled": false,
+        "path": "rule_resources/dnr-lang-fr.json"
+      },
+      {
+        "id": "lang-he",
+        "enabled": false,
+        "path": "rule_resources/dnr-lang-he.json"
+      },
+      {
+        "id": "lang-hi",
+        "enabled": false,
+        "path": "rule_resources/dnr-lang-hi.json"
+      },
+      {
+        "id": "lang-hu",
+        "enabled": false,
+        "path": "rule_resources/dnr-lang-hu.json"
+      },
+      {
+        "id": "lang-id",
+        "enabled": false,
+        "path": "rule_resources/dnr-lang-id.json"
+      },
+      {
+        "id": "lang-it",
+        "enabled": false,
+        "path": "rule_resources/dnr-lang-it.json"
+      },
+      {
+        "id": "lang-ja",
+        "enabled": false,
+        "path": "rule_resources/dnr-lang-ja.json"
+      },
+      {
+        "id": "lang-ko",
+        "enabled": false,
+        "path": "rule_resources/dnr-lang-ko.json"
+      },
+      {
+        "id": "lang-lt",
+        "enabled": false,
+        "path": "rule_resources/dnr-lang-lt.json"
+      },
+      {
+        "id": "lang-lv",
+        "enabled": false,
+        "path": "rule_resources/dnr-lang-lv.json"
+      },
+      {
+        "id": "lang-nl",
+        "enabled": false,
+        "path": "rule_resources/dnr-lang-nl.json"
+      },
+      {
+        "id": "lang-pl",
+        "enabled": false,
+        "path": "rule_resources/dnr-lang-pl.json"
+      },
+      {
+        "id": "lang-pt",
+        "enabled": false,
+        "path": "rule_resources/dnr-lang-pt.json"
+      },
+      {
+        "id": "lang-ro",
+        "enabled": false,
+        "path": "rule_resources/dnr-lang-ro.json"
+      },
+      {
+        "id": "lang-ru",
+        "enabled": false,
+        "path": "rule_resources/dnr-lang-ru.json"
+      },
+      {
+        "id": "lang-sv",
+        "enabled": false,
+        "path": "rule_resources/dnr-lang-sv.json"
+      },
+      {
+        "id": "lang-tr",
+        "enabled": false,
+        "path": "rule_resources/dnr-lang-tr.json"
+      },
+      {
+        "id": "lang-vi",
+        "enabled": false,
+        "path": "rule_resources/dnr-lang-vi.json"
+      },
+      {
+        "id": "lang-zh",
+        "enabled": false,
+        "path": "rule_resources/dnr-lang-zh.json"
+      }
+    ]
+  },
+  "content_scripts": [
+    {
+      "js": [
+        "content_scripts/adblocker/index.js"
+      ],
+      "matches": [
+        "http://*/*",
+        "https://*/*"
+      ],
+      "run_at": "document_start",
+      "match_about_blank": true,
+      "all_frames": true
+    },
+    {
+      "js": [
+        "content_scripts/autoconsent.js"
+      ],
+      "matches": [
+        "http://*/*",
+        "https://*/*"
+      ],
+      "run_at": "document_start",
+      "all_frames": true
+    },
+    {
+      "js": [
+        "content_scripts/notifications.js"
+      ],
+      "matches": [
+        "http://*/*",
+        "https://*/*"
+      ],
+      "run_at": "document_start"
+    },
+    {
+      "js": [
+        "content_scripts/whotracksme.js"
+      ],
+      "matches": [
+        "http://*/*",
+        "https://*/*"
+      ],
+      "run_at": "document_start"
+    },
+    {
+      "js": [
+        "content_scripts/youtube.js"
+      ],
+      "matches": [
+        "*://www.youtube.com/*"
+      ],
+      "run_at": "document_start"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "pages/trackers-preview/index.html",
+        "pages/element-picker/index.html",
+        "pages/notifications/opera-serp.html",
+        "pages/notifications/pause-assistant.html",
+        "pages/notifications/pause-resume.html",
+        "pages/notifications/pin-it.html",
+        "pages/notifications/review.html",
+        "pages/notifications/whats-new.html",
+        "pages/redirect-protection/index.html"
+      ],
+      "matches": [
+        "<all_urls>"
+      ],
+      "use_dynamic_url": true
+    },
+    {
+      "resources": [
+        "pages/notifications/youtube.html"
+      ],
+      "matches": [
+        "*://www.youtube.com/*"
+      ],
+      "use_dynamic_url": true
+    },
+    {
+      "resources": [
+        "rule_resources/redirects/1x1.gif",
+        "rule_resources/redirects/2x2.png",
+        "rule_resources/redirects/32x32.png",
+        "rule_resources/redirects/3x2.png",
+        "rule_resources/redirects/adthrive_abd.js",
+        "rule_resources/redirects/amazon_ads.js",
+        "rule_resources/redirects/amazon_apstag.js",
+        "rule_resources/redirects/ampproject_v0.js",
+        "rule_resources/redirects/chartbeat.js",
+        "rule_resources/redirects/click2load.html",
+        "rule_resources/redirects/doubleclick_instream_ad_status.js",
+        "rule_resources/redirects/empty",
+        "rule_resources/redirects/fingerprint2.js",
+        "rule_resources/redirects/fingerprint3.js",
+        "rule_resources/redirects/google-analytics_analytics.js",
+        "rule_resources/redirects/google-analytics_cx_api.js",
+        "rule_resources/redirects/google-analytics_ga.js",
+        "rule_resources/redirects/google-analytics_inpage_linkid.js",
+        "rule_resources/redirects/google-ima.js",
+        "rule_resources/redirects/googlesyndication_adsbygoogle.js",
+        "rule_resources/redirects/googletagservices_gpt.js",
+        "rule_resources/redirects/hd-main.js",
+        "rule_resources/redirects/nitropay_ads.js",
+        "rule_resources/redirects/nobab.js",
+        "rule_resources/redirects/nobab2.js",
+        "rule_resources/redirects/noeval-silent.js",
+        "rule_resources/redirects/noeval.js",
+        "rule_resources/redirects/nofab.js",
+        "rule_resources/redirects/noop-0.1s.mp3",
+        "rule_resources/redirects/noop-0.5s.mp3",
+        "rule_resources/redirects/noop-1s.mp4",
+        "rule_resources/redirects/noop-vast2.xml",
+        "rule_resources/redirects/noop-vast3.xml",
+        "rule_resources/redirects/noop-vast4.xml",
+        "rule_resources/redirects/noop-vmap1.xml",
+        "rule_resources/redirects/noop.css",
+        "rule_resources/redirects/noop.html",
+        "rule_resources/redirects/noop.js",
+        "rule_resources/redirects/noop.json",
+        "rule_resources/redirects/noop.txt",
+        "rule_resources/redirects/outbrain-widget.js",
+        "rule_resources/redirects/popads-dummy.js",
+        "rule_resources/redirects/popads.js",
+        "rule_resources/redirects/prebid-ads.js",
+        "rule_resources/redirects/scorecardresearch_beacon.js",
+        "rule_resources/redirects/sensors-analytics.js"
+      ],
+      "matches": [
+        "<all_urls>"
+      ],
+      "use_dynamic_url": true
+    }
+  ],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'"
+  },
+  "browser_specific_settings": {
+    "safari": {
+      "strict_min_version": "18.6"
+    }
+  },
+  "version": "10.5.44"
+}

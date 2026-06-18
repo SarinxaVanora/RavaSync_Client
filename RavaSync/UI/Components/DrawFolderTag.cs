@@ -151,7 +151,7 @@ public class DrawFolderTag : DrawFolderBase
             _tagHandler.RemoveTag(_id);
         }
         UiSharedService.AttachToolTip(_uiSharedService.L("UI.DrawFolderTag.f060823b", "Hold CTRL to remove this Group permanently.") + Environment.NewLine +
-            "Note: this will not unpair with users in this Group.");
+            "This will not unpair with users in this group.");
     }
 
     protected override void DrawName(float width)

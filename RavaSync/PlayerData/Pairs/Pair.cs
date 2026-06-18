@@ -19,12 +19,15 @@ using System.IO;
 using System.IO.Compression;
 using System.Linq;
 using System.Text;
+using System.Threading;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using System.Reflection;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using System.Text.Json.Nodes;
 using RavaSync.PlayerData.Services;
+using MenuItem = Dalamud.Game.Gui.ContextMenu.MenuItem;
 
 namespace RavaSync.PlayerData.Pairs;
 
@@ -37,17 +40,19 @@ public class Pair
     private readonly MareConfigService _mareConfigService;
     private readonly ServerConfigurationManager _serverConfigurationManager;
     private readonly ToyBox _toyBox;
+    private static readonly Regex HonorificWebLinkRegex = new(@"(?ix)\b(?:https?://|www\.)\S+|\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+(?:com|net|org|gg|io|dev|tv|uk|co|me|info|xyz|club|link|app|site)\b", RegexOptions.Compiled | RegexOptions.CultureInvariant | RegexOptions.IgnoreCase);
 
     private CancellationTokenSource _applicationCts = new();
     private OnlineUserIdentDto? _onlineUserIdentDto = null;
     private CancellationTokenSource? _pendingEmptyApplyCts;
     private const int PendingEmptyFileListApplyDebounceMs = 500;
     private const int PendingUploadingEmptyFileListApplyDebounceMs = 900;
+    private const int ForcedApplyDuplicateWindowMs = 1500;
     private string _lastAcceptedIncomingDataHash = string.Empty;
     private string _lastAcceptedIncomingPayloadFingerprint = string.Empty;
+    private string _lastForcedApplyPayloadFingerprint = string.Empty;
+    private long _lastForcedApplyTick = -1;
 
-
-    public static Func<string, bool>? IsBlacklistedCallback { get; set; }
 
     public Pair(ILogger<Pair> logger, UserFullPairDto userPair, PairHandlerFactory cachedPlayerFactory,
         MareMediator mediator, MareConfigService mareConfigService, ServerConfigurationManager serverConfigurationManager)
@@ -73,19 +78,21 @@ public class Pair
     UserPair.OwnPermissions.IsPaused()
     || AutoPausedByCap
     || AutoPausedByScope
-    || (AutoPausedByOtherSync && !EffectiveOverrideOtherSync)
-    || (IsBlacklistedCallback?.Invoke(UserData.UID) ?? false);
+    || (AutoPausedByOtherSync && !EffectiveOverrideOtherSync);
 
     public bool IsVisible => CachedPlayer?.IsVisible ?? false;
     // Whether Customize+ should be applied for this pair (default: ON)
     public bool IsCustomizePlusEnabled { get; set; } = true;
     public bool IsMetadataEnabled { get; set; } = true;
+    public bool IsScreenShakeEnabled { get; set; } = true;
+    public bool EffectiveScreenShakeEnabled => IsScreenShakeEnabled && _mareConfigService.Current.GlobalSyncScreenShake;
+    public bool EffectiveHeightEditsEnabled => IsMetadataEnabled && _mareConfigService.Current.GlobalSyncHeightEdits;
 
     public CharacterData? LastReceivedCharacterData { get; set; }
     public CharacterRavaSidecarUtility.SyncManifestPayload? LastReceivedSyncManifest { get; private set; }
     public string? PlayerName => CachedPlayer?.PlayerName ?? string.Empty;
+    public string LastKnownPlayerName => CachedPlayer?.LastKnownVanillaTeardownPlayerName ?? string.Empty;
     public nint PlayerCharacter => CachedPlayer?.PlayerCharacter ?? nint.Zero;
-    public long LastAppliedDataBytes => CachedPlayer?.LastAppliedDataBytes ?? -1;
     public long LastAppliedDataTris { get; set; } = -1;
     public long LastAppliedApproximateVRAMBytes { get; set; } = -1;
 
@@ -182,9 +189,28 @@ public class Pair
     }
 
 
+    private void CancelPendingEmptyFileListApply()
+    {
+        try
+        {
+            _pendingEmptyApplyCts?.Cancel();
+        }
+        catch
+        {
+            // best effort
+        }
+
+        _pendingEmptyApplyCts = null;
+    }
+
     public void ApplyData(OnlineUserCharaDataDto data)
     {
         var incoming = data.CharaData;
+
+        // Treat every received user-data payload as the sound-indicator boundary. A redirected SCD
+        // load marks this pair as actively making audible synced output; the next payload keeps it
+        // only if another SCD was observed for this pair since the previous payload.
+        ReconcileActiveSyncIndicatorsOnIncomingUserData();
 
         var incomingHash = incoming?.DataHash.Value ?? string.Empty;
         var incomingPayloadFingerprint = PairApplyUtilities.ComputeCharacterDataPayloadFingerprint(incoming);
@@ -206,6 +232,20 @@ public class Pair
 
         var wasUploadingAtDataArrival = IsUploading;
         ClearRemoteUploadStatus();
+
+        if (IsPaused)
+        {
+            // While manually paused, cap-paused, scope-paused, or yielded to another sync,
+            // receiver data should still be remembered for the eventual unpause/reclaim,
+            // but no deferred empty-file-list apply must be allowed to fire later and
+            // overwrite a freshly restored modded state with stale vanilla data.
+            CancelPendingEmptyFileListApply();
+            _applicationCts = _applicationCts.CancelRecreate();
+            LastReceivedCharacterData = incoming;
+            _lastAcceptedIncomingDataHash = incomingHash;
+            _lastAcceptedIncomingPayloadFingerprint = incomingPayloadFingerprint;
+            return;
+        }
 
         if (incoming != null && LastReceivedCharacterData != null && IsVisible)
         {
@@ -336,18 +376,47 @@ public class Pair
         if (CachedPlayer == null) return;
         if (LastReceivedCharacterData == null) return;
 
-        CachedPlayer.ApplyCharacterData(Guid.NewGuid(), PrepareCharacterDataForLocalApply(LastReceivedCharacterData.DeepClone())!, forced);
+        var preparedData = PrepareCharacterDataForLocalApply(LastReceivedCharacterData.DeepClone());
+        if (preparedData == null)
+            return;
+
+        if (forced)
+        {
+            var payloadFingerprint = PairApplyUtilities.ComputeCharacterDataPayloadFingerprint(preparedData);
+            var now = Environment.TickCount64;
+
+            if (CachedPlayer.IsPairSyncBusyForPayload(payloadFingerprint))
+            {
+                _logger.LogTrace("Skipping duplicate forced reapply for {uid}; payload {payload} is already queued/active", UserData.UID, payloadFingerprint);
+                return;
+            }
+
+            if (string.Equals(payloadFingerprint, _lastForcedApplyPayloadFingerprint, StringComparison.Ordinal)
+                && unchecked(now - _lastForcedApplyTick) >= 0
+                && unchecked(now - _lastForcedApplyTick) < ForcedApplyDuplicateWindowMs)
+            {
+                _logger.LogTrace("Skipping duplicate forced reapply for {uid}; payload {payload} was requested {elapsed}ms ago", UserData.UID, payloadFingerprint, unchecked(now - _lastForcedApplyTick));
+                return;
+            }
+
+            _lastForcedApplyPayloadFingerprint = payloadFingerprint;
+            _lastForcedApplyTick = now;
+        }
+
+        CachedPlayer.ApplyCharacterData(Guid.NewGuid(), preparedData, forced);
     }
 
-    public void EnterPausedVanillaState()
+    public void GoBackToVanillaState()
     {
-        CachedPlayer?.EnterPausedVanillaState();
+        CancelPendingEmptyFileListApply();
+        CachedPlayer?.GoBackToVanillaState(revertLiveCustomizationState: true, waitForCompletion: false);
     }
 
     public void ReclaimFromOtherSync(bool requestApplyIfPossible = true)
     {
         AutoPausedByOtherSync = false;
         AutoPausedByOtherSyncName = string.Empty;
+        CancelPendingEmptyFileListApply();
 
         CachedPlayer?.ReclaimFromOtherSync(requestApplyIfPossible, treatAsFirstVisible: false);
     }
@@ -402,6 +471,7 @@ public class Pair
 
         AutoPausedByOtherSync = false;
         AutoPausedByOtherSyncName = string.Empty;
+        CancelPendingEmptyFileListApply();
         CachedPlayer?.ReclaimFromOtherSync(requestApplyIfPossible, treatAsFirstVisible: false);
     }
 
@@ -486,7 +556,19 @@ public class Pair
         }
 
         // Dispose outside lock, but before swapping the online ident for a recreated actor.
-        oldPlayer?.Dispose();
+        if (oldPlayer != null)
+        {
+            try
+            {
+                oldPlayer.GoBackToVanillaState(revertLiveCustomizationState: true, waitForCompletion: false);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Failed to force vanilla teardown while recreating cached handler for {uid}", UserData.UID);
+            }
+
+            oldPlayer.Dispose();
+        }
 
         if (dtoToApplyAfterOldDispose != null)
         {
@@ -544,7 +626,7 @@ public class Pair
         return UserPair.Groups.Any() || UserPair.IndividualPairStatus != IndividualPairStatus.None;
     }
 
-    public void MarkOffline(bool wait = true)
+    public void MarkOffline(bool wait = true, bool queuePerPairTeardown = true)
     {
         PairHandler? player = null;
 
@@ -570,7 +652,31 @@ public class Pair
                 _creationSemaphore.Release();
         }
 
-        player?.Dispose();
+        if (player != null)
+        {
+            try
+            {
+                if (queuePerPairTeardown)
+                {
+                    // Offline/disconnect can arrive before the visibility frame sees the actor vanish.
+                    // Force the same hard vanilla path used by IsVisible=false so stale temp
+                    // collections/customisation cannot survive a leave-room + disconnect sequence.
+                    player.GoBackToVanillaState(revertLiveCustomizationState: true, waitForCompletion: false);
+                }
+                else
+                {
+                    // A global slate-wipe is already queued by PairManager. Still reset the local handler
+                    // state so Dispose does not run the old synchronous restore path on the hot disconnect path.
+                    player.GoBackToVanillaState(revertLiveCustomizationState: false, waitForCompletion: false);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Failed to queue vanilla teardown while marking {uid} offline", UserData.UID);
+            }
+
+            player.Dispose();
+        }
 
         _onlineUserIdentDto = null;
 
@@ -613,12 +719,171 @@ public class Pair
     {
         var wasUploading = _isUploading;
         SetUploadState(false);
+
         CachedPlayer?.SetUploading(false);
         return wasUploading;
     }
 
     public bool IsUploading => _isUploading;
     public bool IsUploadingRecently => _isUploading;
+
+    private readonly object _activeSyncIndicatorLock = new();
+    private bool _isPlayingSound;
+    private bool _isLongLivedSoundPlaying;
+    private bool _longLivedSoundObservedSinceLastUserDataPush;
+    private bool _hasRemoteActiveSoundIndicatorState;
+
+    internal readonly record struct ActiveSyncResourceIndicator(string GamePath, nint Address, bool Vfx, bool Sound);
+
+    // VFX indicators were intentionally removed. Audio is the only live activity marker now.
+    public bool IsUsingVfx => false;
+    public bool IsPlayingSound => IsVisible && !IsPaused && IsSyncCategoryEffectivelyEnabled(SyncPayloadKind.Sound) && HasActiveSyncIndicator(sound: true);
+
+    internal void MarkActiveSyncResource(bool vfx, bool sound, bool longLived, string? gamePath = null, nint address = 0)
+    {
+        if (!sound)
+            return;
+
+        var normalizedGamePath = NormalizeActiveSyncIndicatorPath(gamePath);
+        if (string.IsNullOrWhiteSpace(normalizedGamePath) || !IsLiveSoundActiveSyncIndicatorPath(normalizedGamePath))
+            return;
+
+        var now = Environment.TickCount64;
+        bool changed;
+        lock (_activeSyncIndicatorLock)
+        {
+            if (_hasRemoteActiveSoundIndicatorState)
+                return;
+
+            // Legacy fallback for peers that do not send the active-sound sidecar yet.
+            // Current peers mirror the sender's own local indicator state instead, because
+            // receiver-side SCD classification cannot distinguish every one-shot from every loop.
+            _longLivedSoundObservedSinceLastUserDataPush = true;
+            _isLongLivedSoundPlaying = true;
+
+            changed = RefreshPlayingSoundCompositeUnsafe(now);
+        }
+
+        if (changed)
+            PublishActiveSyncIndicatorRefresh();
+    }
+
+    internal bool ReconcileActiveSyncIndicatorsOnIncomingUserData()
+    {
+        var now = Environment.TickCount64;
+        bool changed;
+        lock (_activeSyncIndicatorLock)
+        {
+            if (_hasRemoteActiveSoundIndicatorState)
+                return false;
+
+            _isLongLivedSoundPlaying = _longLivedSoundObservedSinceLastUserDataPush;
+            _longLivedSoundObservedSinceLastUserDataPush = false;
+            changed = RefreshPlayingSoundCompositeUnsafe(now);
+        }
+
+        if (changed)
+            PublishActiveSyncIndicatorRefresh();
+
+        return changed;
+    }
+
+    internal bool ApplyRemoteActiveSoundIndicator(bool isPlayingSound)
+    {
+        bool changed;
+        lock (_activeSyncIndicatorLock)
+        {
+            _hasRemoteActiveSoundIndicatorState = true;
+            _longLivedSoundObservedSinceLastUserDataPush = false;
+            _isLongLivedSoundPlaying = isPlayingSound;
+            changed = RefreshPlayingSoundCompositeUnsafe(Environment.TickCount64);
+        }
+
+        if (changed)
+            PublishActiveSyncIndicatorRefresh();
+
+        return changed;
+    }
+
+    internal bool ClearActiveSyncIndicators()
+    {
+        bool changed;
+        lock (_activeSyncIndicatorLock)
+        {
+            changed = _isPlayingSound || _isLongLivedSoundPlaying || _longLivedSoundObservedSinceLastUserDataPush || _hasRemoteActiveSoundIndicatorState;
+            _isPlayingSound = false;
+            _isLongLivedSoundPlaying = false;
+            _longLivedSoundObservedSinceLastUserDataPush = false;
+            _hasRemoteActiveSoundIndicatorState = false;
+        }
+
+        if (changed)
+            PublishActiveSyncIndicatorRefresh();
+
+        return changed;
+    }
+
+    internal IReadOnlyList<ActiveSyncResourceIndicator> SnapshotActiveSyncResourceIndicators() => Array.Empty<ActiveSyncResourceIndicator>();
+
+    internal bool ReconcileActiveSyncResourcesForAddress(nint address, IReadOnlySet<string> liveGamePaths) => false;
+
+    internal bool ReconcileActiveSyncResourcesWithAppliedPaths(IReadOnlySet<string> appliedGamePaths) => false;
+
+    internal bool PruneExpiredActiveSyncIndicators()
+    {
+        var now = Environment.TickCount64;
+        bool changed;
+        lock (_activeSyncIndicatorLock)
+        {
+            changed = RefreshPlayingSoundCompositeUnsafe(now);
+        }
+
+        if (changed)
+            PublishActiveSyncIndicatorRefresh();
+
+        return changed;
+    }
+
+    private bool HasActiveSyncIndicator(bool vfx = false, bool sound = false)
+    {
+        lock (_activeSyncIndicatorLock)
+            return HasActiveSyncIndicatorUnsafe(vfx, sound);
+    }
+
+    private bool HasActiveSyncIndicatorUnsafe(bool vfx = false, bool sound = false)
+        => sound && _isPlayingSound;
+
+    private bool RefreshPlayingSoundCompositeUnsafe(long now)
+    {
+        var shouldPlay = _isLongLivedSoundPlaying;
+        var changed = _isPlayingSound != shouldPlay;
+        _isPlayingSound = shouldPlay;
+        return changed;
+    }
+
+    private static string NormalizeActiveSyncIndicatorPath(string? path)
+    {
+        return (path ?? string.Empty)
+            .Replace('\\', '/')
+            .Trim()
+            .TrimStart('/')
+            .ToLowerInvariant();
+    }
+
+    private static bool IsLiveSoundActiveSyncIndicatorPath(string? path)
+        => string.Equals(Path.GetExtension(NormalizeActiveSyncIndicatorPath(path)), ".scd", StringComparison.OrdinalIgnoreCase);
+
+    private void PublishActiveSyncIndicatorRefresh()
+    {
+        try
+        {
+            _mediator.Publish(new RefreshUiMessage());
+        }
+        catch
+        {
+            // best effort; Compact UI/world text will also refresh naturally next frame
+        }
+    }
 
     public sealed record DownloadProgressSummary(
         bool HasAny,
@@ -694,6 +959,27 @@ public class Pair
         SetMetadataEnabled(!IsMetadataEnabled);
     }
 
+    public void SetScreenShakeEnabled(bool enabled, bool reapply = true)
+    {
+        if (IsScreenShakeEnabled == enabled)
+            return;
+
+        IsScreenShakeEnabled = enabled;
+        PersistLocalSyncPreference(_mareConfigService.Current.LocalScreenShakeDisabledUids, enabled);
+        if (reapply)
+            ApplyLastReceivedData(forced: true);
+    }
+
+    public void ToggleScreenShakeAndReapply()
+    {
+        SetScreenShakeEnabled(!IsScreenShakeEnabled);
+    }
+
+    public void ForceManipulationReapply()
+    {
+        CachedPlayer?.ForceManipulationReapply();
+    }
+
     private void RestoreLocalSyncPreferences()
     {
         var uid = UserData.UID;
@@ -702,6 +988,7 @@ public class Pair
 
         IsCustomizePlusEnabled = !_mareConfigService.Current.LocalCustomizePlusDisabledUids.Contains(uid);
         IsMetadataEnabled = !_mareConfigService.Current.LocalHeightMetadataDisabledUids.Contains(uid);
+        IsScreenShakeEnabled = !_mareConfigService.Current.LocalScreenShakeDisabledUids.Contains(uid);
     }
 
     private void PersistLocalSyncPreference(HashSet<string> disabledUids, bool enabled)
@@ -727,14 +1014,18 @@ public class Pair
             return data;
         }
 
-        bool disableIndividualAnimations = (UserPair.OtherPermissions.IsDisableAnimations() || UserPair.OwnPermissions.IsDisableAnimations());
-        bool disableIndividualVFX = (UserPair.OtherPermissions.IsDisableVFX() || UserPair.OwnPermissions.IsDisableVFX());
-        bool disableIndividualSounds = (UserPair.OtherPermissions.IsDisableSounds() || UserPair.OwnPermissions.IsDisableSounds());
-        bool disableIndividualCustomizePlus = !IsCustomizePlusEnabled;
-        bool disableIndividualMetadata = !IsMetadataEnabled;
+        bool disableIndividualAnimations = (UserPair.OtherPermissions.IsDisableAnimations() || UserPair.OwnPermissions.IsDisableAnimations() || !_mareConfigService.Current.GlobalSyncAnimations);
+        bool disableIndividualVFX = (UserPair.OtherPermissions.IsDisableVFX() || UserPair.OwnPermissions.IsDisableVFX() || !_mareConfigService.Current.GlobalSyncVfx);
+        bool disableIndividualSounds = (UserPair.OtherPermissions.IsDisableSounds() || UserPair.OwnPermissions.IsDisableSounds() || !_mareConfigService.Current.GlobalSyncSounds);
+        bool disableIndividualCustomizePlus = !IsCustomizePlusEnabled || !_mareConfigService.Current.GlobalSyncCustomizePlus;
+        bool disableIndividualMetadata = !EffectiveHeightEditsEnabled;
+        bool disableHonorific = !_mareConfigService.Current.GlobalSyncHonorific || ShouldHideHonorificTitle(data.HonorificData);
+        bool disableMoodles = !_mareConfigService.Current.GlobalSyncMoodles;
+        bool disablePetNames = !_mareConfigService.Current.GlobalSyncPetNames;
+        bool disableScreenShake = !EffectiveScreenShakeEnabled;
 
-        _logger.LogTrace("Disable: Sounds: {disableIndividualSounds}, Anims: {disableIndividualAnims}; VFX: {disableIndividualVFX}, Customize+: {disableIndividualCustomizePlus}, Metadata: {disableIndividualMetadata}",
-            disableIndividualSounds, disableIndividualAnimations, disableIndividualVFX, disableIndividualCustomizePlus, disableIndividualMetadata);
+        _logger.LogTrace("Disable: Sounds: {disableIndividualSounds}, Anims: {disableIndividualAnims}; VFX: {disableIndividualVFX}, Customize+: {disableIndividualCustomizePlus}, HeightEdits: {disableIndividualMetadata}, Honorific: {disableHonorific}, Moodles: {disableMoodles}, PetNames: {disablePetNames}, ScreenShake: {disableScreenShake}",
+            disableIndividualSounds, disableIndividualAnimations, disableIndividualVFX, disableIndividualCustomizePlus, disableIndividualMetadata, disableHonorific, disableMoodles, disablePetNames, disableScreenShake);
 
         if (disableIndividualAnimations || disableIndividualSounds || disableIndividualVFX)
         {
@@ -752,6 +1043,7 @@ public class Pair
                     data.FileReplacements[objectKind] = data.FileReplacements[objectKind]
                         .Where(f => !f.GamePaths.Any(p =>
                             p.EndsWith("tmb", StringComparison.OrdinalIgnoreCase) ||
+                            p.EndsWith("tmb2", StringComparison.OrdinalIgnoreCase) ||
                             p.EndsWith("pap", StringComparison.OrdinalIgnoreCase)))
                         .ToList();
 
@@ -759,7 +1051,10 @@ public class Pair
                     data.FileReplacements[objectKind] = data.FileReplacements[objectKind]
                         .Where(f => !f.GamePaths.Any(p =>
                             p.EndsWith("atex", StringComparison.OrdinalIgnoreCase) ||
-                            p.EndsWith("avfx", StringComparison.OrdinalIgnoreCase)))
+                            p.EndsWith("avfx", StringComparison.OrdinalIgnoreCase) ||
+                            p.EndsWith("eid", StringComparison.OrdinalIgnoreCase) ||
+                            p.EndsWith("skp", StringComparison.OrdinalIgnoreCase) ||
+                            p.EndsWith("shpk", StringComparison.OrdinalIgnoreCase)))
                         .ToList();
             }
         }
@@ -775,13 +1070,158 @@ public class Pair
             data.ManipulationData = GetEffectiveManipulationData(data.ManipulationData);
         }
 
+        if (disableHonorific)
+        {
+            data.HonorificData = string.Empty;
+        }
+
+        if (disableMoodles)
+        {
+            data.MoodlesData = string.Empty;
+        }
+
+        if (disablePetNames)
+        {
+            data.PetNamesData = string.Empty;
+        }
+
         return data;
+    }
+
+
+    private bool ShouldHideHonorificTitle(string? honorificData)
+    {
+        if (string.IsNullOrWhiteSpace(honorificData))
+            return false;
+
+        var title = TryExtractHonorificTitleText(honorificData);
+        if (string.IsNullOrWhiteSpace(title))
+            return false;
+
+        if (_mareConfigService.Current.GlobalHideHonorificTitlesUsingKeywords
+            && ContainsHiddenHonorificTitleKeyword(title))
+            return true;
+
+        return _mareConfigService.Current.GlobalHideHonorificWebLinks
+            && HonorificWebLinkRegex.IsMatch(title);
+    }
+
+    private bool ContainsHiddenHonorificTitleKeyword(string title)
+    {
+        var keywords = _mareConfigService.Current.GlobalHonorificTitleHiddenKeywords;
+        if (keywords == null || keywords.Count == 0)
+            return false;
+
+        foreach (var rawKeyword in keywords)
+        {
+            var keyword = rawKeyword?.Trim();
+            if (string.IsNullOrWhiteSpace(keyword))
+                continue;
+
+            if (title.IndexOf(keyword, StringComparison.OrdinalIgnoreCase) >= 0)
+                return true;
+        }
+
+        return false;
+    }
+
+    private static string TryExtractHonorificTitleText(string honorificData)
+    {
+        try
+        {
+            var decoded = Encoding.UTF8.GetString(Convert.FromBase64String(honorificData));
+            if (string.IsNullOrWhiteSpace(decoded))
+                return string.Empty;
+
+            try
+            {
+                using var document = System.Text.Json.JsonDocument.Parse(decoded);
+                if (document.RootElement.ValueKind == System.Text.Json.JsonValueKind.Object
+                    && document.RootElement.TryGetProperty("Title", out var titleElement)
+                    && titleElement.ValueKind == System.Text.Json.JsonValueKind.String)
+                    return titleElement.GetString() ?? string.Empty;
+            }
+            catch
+            {
+                // Honorific payloads should be JSON, but fall back to scanning the decoded text if that ever changes.
+            }
+
+            return decoded;
+        }
+        catch
+        {
+            return string.Empty;
+        }
+    }
+
+    private enum SyncPayloadKind
+    {
+        Sound,
+        Vfx,
+    }
+
+    private bool IsSyncCategoryEffectivelyEnabled(SyncPayloadKind kind)
+    {
+        return kind switch
+        {
+            SyncPayloadKind.Sound => !UserPair.OtherPermissions.IsDisableSounds() && !UserPair.OwnPermissions.IsDisableSounds() && _mareConfigService.Current.GlobalSyncSounds,
+            SyncPayloadKind.Vfx => !UserPair.OtherPermissions.IsDisableVFX() && !UserPair.OwnPermissions.IsDisableVFX() && _mareConfigService.Current.GlobalSyncVfx,
+            _ => true,
+        };
+    }
+
+    private bool ContainsLastReceivedPayload(SyncPayloadKind kind)
+    {
+        var data = LastReceivedCharacterData;
+        if (data?.FileReplacements == null || data.FileReplacements.Count == 0)
+            return false;
+
+        foreach (var list in data.FileReplacements.Values)
+        {
+            if (list == null)
+                continue;
+
+            foreach (var replacement in list)
+            {
+                if (replacement == null)
+                    continue;
+
+                if (PathMatchesSyncPayloadKind(replacement.FileSwapPath, kind))
+                    return true;
+
+                if (replacement.GamePaths == null)
+                    continue;
+
+                foreach (var gamePath in replacement.GamePaths)
+                {
+                    if (PathMatchesSyncPayloadKind(gamePath, kind))
+                        return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private static bool PathMatchesSyncPayloadKind(string? path, SyncPayloadKind kind)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+            return false;
+
+        var normalized = path.Replace('\\', '/').Trim();
+        var ext = Path.GetExtension(normalized).ToLowerInvariant();
+        return kind switch
+        {
+            SyncPayloadKind.Sound => ext == ".scd",
+            SyncPayloadKind.Vfx => ext is ".avfx" or ".atex" or ".shpk" or ".eid" or ".skp",
+            _ => false,
+        };
     }
 
     public string GetEffectiveManipulationData(string? manipulationData)
     {
         var original = manipulationData ?? string.Empty;
-        if (IsMetadataEnabled)
+        if (EffectiveHeightEditsEnabled)
         {
             _logger.LogDebug("Height metadata enabled for {uid}: using original manipulation payload, length={length}", UserData.UID, original.Length);
             return original;

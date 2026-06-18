@@ -10,6 +10,7 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using RavaSync.API.Dto.Group;
 using RavaSync.Services.Discovery;
+using RavaSync.Services.Mesh;
 using RavaSync.Services.Mediator;
 using System;
 using System.Collections.Concurrent;
@@ -726,6 +727,7 @@ public sealed partial class ToyBox : DisposableMediatorSubscriberBase, IHostedSe
     private void BroadcastLobbyClosedNearby(Guid gameId, string hostSessionId, SyncshellGameKind kind)
     {
         Invites.TryRemove(gameId, out _);
+        DirectInvites.TryRemove(gameId, out _);
 
         var env = new SyncshellGameEnvelope(gameId, kind, SyncshellGameOp.LobbyClosed);
         var bytes = MessagePackSerializer.Serialize(env);

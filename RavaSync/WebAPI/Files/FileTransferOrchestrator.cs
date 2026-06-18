@@ -1,5 +1,6 @@
 ﻿using RavaSync.MareConfiguration;
 using RavaSync.Services.Mediator;
+using RavaSync.Utils;
 using RavaSync.WebAPI.Files.Models;
 using RavaSync.WebAPI.SignalR;
 using Microsoft.Extensions.Logging;
@@ -35,8 +36,7 @@ public class FileTransferOrchestrator : DisposableMediatorSubscriberBase
         _mareConfig = mareConfig;
         _tokenProvider = tokenProvider;
         _httpClient = httpClient;
-        var ver = Assembly.GetExecutingAssembly().GetName().Version;
-        _httpClient.DefaultRequestHeaders.UserAgent.Add(new ProductInfoHeaderValue("RavaSync", ver!.Major + "." + ver!.Minor + "." + ver!.Build));
+        _httpClient.DefaultRequestHeaders.UserAgent.Add(new ProductInfoHeaderValue("RavaSync", PluginVersion.CurrentText));
 
         _availableDownloadSlots = GetEffectiveParallelDownloads();
         _downloadSemaphore = new(_availableDownloadSlots, _availableDownloadSlots);
@@ -134,15 +134,9 @@ public class FileTransferOrchestrator : DisposableMediatorSubscriberBase
         if (configured > 0)
             return Math.Clamp(configured, 1, 12);
 
-        var cpu = Environment.ProcessorCount;
-
-        var auto =
-            cpu <= 4 ? 2 :
-            cpu <= 8 ? 3 :
-            cpu <= 16 ? 4 :
-            cpu <= 24 ? 6 :
-                        8;
-
+        // Pair lanes remain equally fast on Windows and Wine/Linux. Linux smoothness is handled
+        // at the actual pressure points (framework IPC, redraw dispatch and cache finalisation).
+        var auto = Math.Max(1, Environment.ProcessorCount);
         return Math.Clamp(auto, 1, 12);
     }
 

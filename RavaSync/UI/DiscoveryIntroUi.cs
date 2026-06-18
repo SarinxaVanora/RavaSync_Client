@@ -25,7 +25,7 @@ public sealed class DiscoveryIntroUi : WindowMediatorSubscriberBase
         MareConfigService configService,
         MareMediator mediator,
         PerformanceCollectorService performanceCollectorService)
-        : base(logger, mediator, "RavaSync — Discovery", performanceCollectorService)
+        : base(logger, mediator, "RavaSync — Discovery###RavaSyncDiscoveryIntro", performanceCollectorService)
     {
         _uiShared = uiShared;
         _configService = configService;
@@ -74,7 +74,7 @@ ImGuiHelpers.ScaledDummy(10);
         ImGui.Separator();
         ImGuiHelpers.ScaledDummy(5);
 
-        ImGui.TextWrapped(_uiShared.L("UI.DiscoveryIntroUi.2cab8f56", "You can change this again at any time in Settings - Discovery Settings."));
+        ImGui.TextWrapped(_uiShared.L("UI.DiscoveryIntroUi.2cab8f56", "You can change this again at any time in Settings - Discovery."));
 
         ImGuiHelpers.ScaledDummy(10);
 

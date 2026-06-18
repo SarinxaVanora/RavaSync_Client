@@ -10,6 +10,7 @@ using RavaSync.PlayerData.Pairs;
 using RavaSync.Services;
 using RavaSync.Services.Mediator;
 using RavaSync.Services.ServerConfiguration;
+using RavaSync.Utils;
 using RavaSync.WebAPI.SignalR;
 using RavaSync.WebAPI.SignalR.Utils;
 using Microsoft.AspNetCore.SignalR.Client;
@@ -82,14 +83,14 @@ public sealed partial class ApiController : DisposableMediatorSubscriberBase, IM
 
     public string AuthFailureMessage { get; private set; } = string.Empty;
 
-    public Version CurrentClientVersion => _connectionDto?.CurrentClientVersion ?? new Version(0, 0, 0);
+    public Version CurrentClientVersion => _connectionDto?.CurrentClientVersion ?? new Version(0, 0, 0, 0);
 
     public DefaultPermissionsDto? DefaultPermissions => _connectionDto?.DefaultPreferredPermissions ?? null;
     public string DisplayName => _connectionDto?.User.AliasOrUID ?? string.Empty;
 
     public bool IsConnected => ServerState == ServerState.Connected;
 
-    public bool IsCurrentVersion => (Assembly.GetExecutingAssembly().GetName().Version ?? new Version(0, 0, 0, 0)) >= (_connectionDto?.CurrentClientVersion ?? new Version(0, 0, 0, 0));
+    public bool IsCurrentVersion => PluginVersion.Current >= (_connectionDto?.CurrentClientVersion ?? new Version(0, 0, 0, 0));
 
     public int OnlineUsers => SystemInfoDto.OnlineUsers;
 
@@ -242,15 +243,15 @@ public sealed partial class ApiController : DisposableMediatorSubscriberBase, IM
 
                 ServerState = ServerState.Connected;
 
-                var currentClientVer = Assembly.GetExecutingAssembly().GetName().Version!;
+                var currentClientVer = PluginVersion.Current;
 
                 if (_connectionDto.ServerVersion != IMareHub.ApiVersion)
                 {
                     if (_connectionDto.CurrentClientVersion > currentClientVer)
                     {
                         Mediator.Publish(new NotificationMessage("Client incompatible",
-                            $"Your client is outdated ({currentClientVer.Major}.{currentClientVer.Minor}.{currentClientVer.Build}), current is: " +
-                            $"{_connectionDto.CurrentClientVersion.Major}.{_connectionDto.CurrentClientVersion.Minor}.{_connectionDto.CurrentClientVersion.Build}. " +
+                            $"Your client is outdated ({PluginVersion.Format(currentClientVer)}), current is: " +
+                            $"{PluginVersion.Format(_connectionDto.CurrentClientVersion)}. " +
                             $"This client version is incompatible and will not be able to connect. Please update your RavaSync client.",
                             NotificationType.Error));
                     }
@@ -261,8 +262,8 @@ public sealed partial class ApiController : DisposableMediatorSubscriberBase, IM
                 if (_connectionDto.CurrentClientVersion > currentClientVer)
                 {
                     Mediator.Publish(new NotificationMessage("Client outdated",
-                        $"Your client is outdated ({currentClientVer.Major}.{currentClientVer.Minor}.{currentClientVer.Build}), current is: " +
-                        $"{_connectionDto.CurrentClientVersion.Major}.{_connectionDto.CurrentClientVersion.Minor}.{_connectionDto.CurrentClientVersion.Build}. " +
+                        $"Your client is outdated ({PluginVersion.Format(currentClientVer)}), current is: " +
+                        $"{PluginVersion.Format(_connectionDto.CurrentClientVersion)}. " +
                         $"Please keep your RavaSync client up-to-date.",
                         NotificationType.Warning));
                 }

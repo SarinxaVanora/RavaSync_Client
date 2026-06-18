@@ -23,6 +23,7 @@ using RavaSync.Services.Optimisation;
 using RavaSync.Services.ServerConfiguration;
 using RavaSync.UI.Components;
 using RavaSync.UI.Handlers;
+using RavaSync.Utils;
 using RavaSync.WebAPI;
 using RavaSync.WebAPI.Files;
 using RavaSync.WebAPI.Files.Models;
@@ -59,6 +60,8 @@ public class CompactUi : WindowMediatorSubscriberBase
     private readonly MeshOptimisationService _meshOptimizationService;
     private readonly OptimisationPolicyService _optimisationPolicyService;
     private readonly TransientResourceManager _transientResourceManager;
+    private readonly LocalActiveSyncIndicatorService _localActiveSyncIndicatorService;
+    private readonly StorageMaintenanceService _storageMaintenanceService;
     private readonly IFramework _framework;
     private List<IDrawFolder> _drawFolders;
     private Pair? _lastAddedUser;
@@ -73,7 +76,6 @@ public class CompactUi : WindowMediatorSubscriberBase
     private bool _restoreUncollapse;
     private bool _suppressMinimizedRestoreIcon;
     private bool _wasCollapsed;
-    private bool _transientPrimeModalOpen;
     private volatile bool _drawFoldersRefreshPending;
     private volatile bool _drawFoldersRefreshDeferredUntilVisible;
     private long _nextDrawFoldersRefreshUtcTicks;
@@ -111,7 +113,7 @@ public class CompactUi : WindowMediatorSubscriberBase
         ServerConfigurationManager serverManager, MareMediator mediator, FileUploadManager fileTransferManager,
         TagHandler tagHandler, DrawEntityFactory drawEntityFactory, SelectTagForPairUi selectTagForPairUi, SelectPairForTagUi selectPairForTagUi,
         PerformanceCollectorService performanceCollectorService, IpcManager ipcManager, PlayerPerformanceConfigService playerPerformanceConfigService, PlayerPerformanceService playerPerformanceService,
-        CharacterAnalyzer characterAnalyzer, TransientConfigService transientConfigService, TransientResourceManager transientResourceManager,
+        CharacterAnalyzer characterAnalyzer, TransientConfigService transientConfigService, TransientResourceManager transientResourceManager, LocalActiveSyncIndicatorService localActiveSyncIndicatorService, StorageMaintenanceService storageMaintenanceService,
         TextureOptimisationService textureOptimizationService, MeshOptimisationService meshOptimizationService, OptimisationPolicyService optimisationPolicyService, IFramework framework)
             : base(logger, mediator, "###RavaSyncMainUI", performanceCollectorService)
     {
@@ -131,6 +133,8 @@ public class CompactUi : WindowMediatorSubscriberBase
         _characterAnalyzer = characterAnalyzer;
         _transientConfigService = transientConfigService;
         _transientResourceManager = transientResourceManager;
+        _localActiveSyncIndicatorService = localActiveSyncIndicatorService;
+        _storageMaintenanceService = storageMaintenanceService;
         _textureOptimizationService = textureOptimizationService;
         _meshOptimizationService = meshOptimizationService;
         _optimisationPolicyService = optimisationPolicyService;
@@ -199,13 +203,10 @@ public class CompactUi : WindowMediatorSubscriberBase
         _drawFolders = GetDrawFolders().ToList();
 
 #if DEBUG
-        string dev = "Dev Build";
-        var ver = Assembly.GetExecutingAssembly().GetName().Version!;
-        WindowName = $"RavaSync {dev} ({ver.Major}.{ver.Minor}.{ver.Build})###RavaSyncMainUI";
+        WindowName = "RavaSync " + PluginVersion.CurrentText + "###RavaSyncMainUI";
         Toggle();
 #else
-        var ver = Assembly.GetExecutingAssembly().GetName().Version;
-        WindowName = "RavaSync " + ver.Major + "." + ver.Minor + "." + ver.Build + "###RavaSyncMainUI";
+        WindowName = "RavaSync " + PluginVersion.CurrentText + "###RavaSyncMainUI";
 #endif
         IsOpen = _configService.Current.HasValidSetup() && _configService.Current.CompactUiLastOpen;
 
@@ -366,6 +367,7 @@ public class CompactUi : WindowMediatorSubscriberBase
         if (!_apiController.IsCurrentVersion)
         {
             var ver = _apiController.CurrentClientVersion;
+            var currentVersionText = PluginVersion.Format(ver);
             var unsupported = "UNSUPPORTED VERSION";
 
             using (_uiSharedService.UidFont.Push())
@@ -375,7 +377,9 @@ public class CompactUi : WindowMediatorSubscriberBase
                 ImGui.AlignTextToFramePadding();
                 ImGui.TextColored(ImGuiColors.DalamudRed, unsupported);
             }
-            UiSharedService.ColorTextWrapped(string.Format(_uiSharedService.L("UI.CompactUI.d6f399f2", "Your RavaSync installation is out of date, the current version is {0}.{1}.{2}. It is highly recommended to keep RavaSync up to date. Open /xlplugins and update the plugin."), ver.Major, ver.Minor, ver.Build), ImGuiColors.DalamudRed);
+            var outdatedText = _uiSharedService.L("UI.CompactUI.d6f399f2", "Your RavaSync installation is out of date, the current version is {0}. It is highly recommended to keep RavaSync up to date. Open /xlplugins and update the plugin.")
+                .Replace("{0}.{1}.{2}", "{0}", StringComparison.Ordinal);
+            UiSharedService.ColorTextWrapped(string.Format(outdatedText, currentVersionText), ImGuiColors.DalamudRed);
         }
 
         if (!_ipcManager.Initialized)
@@ -408,30 +412,31 @@ public class CompactUi : WindowMediatorSubscriberBase
         }
 
         using (ImRaii.PushId("header")) DrawUIDHeader();
-        ImGui.Separator();
 
         if (_apiController.ServerState is ServerState.Connected)
         {
             var style = ImGui.GetStyle();
             float scale = ImGuiHelpers.GlobalScale;
 
-            using (ImRaii.PushStyle(ImGuiStyleVar.FramePadding, new Vector2(style.FramePadding.X, 1f * scale)))
-            using (ImRaii.PushStyle(ImGuiStyleVar.ItemSpacing, new Vector2(style.ItemSpacing.X, 2f * scale)))
+            using (ImRaii.PushStyle(ImGuiStyleVar.FramePadding, new Vector2(style.FramePadding.X, 8f * scale)))
+            using (ImRaii.PushStyle(ImGuiStyleVar.ItemSpacing, new Vector2(style.ItemSpacing.X, 3f * scale)))
             using (ImRaii.PushId("global-topmenu"))
             {
                 _tabMenu.Draw();
             }
 
-            ImGui.Separator();
+            ImGuiHelpers.ScaledDummy(0.02f);
 
             if (_configService.Current.showTransferText)
             {
-                using (ImRaii.PushId("transfers")) DrawTransfers();
-                ImGui.Separator();
+                using (RavaUiChrome.BeginCard("##transfersCard", (ImGui.GetFrameHeight() * 2f) + (ImGui.GetStyle().ItemSpacing.Y * 2f) + (24f * scale)))
+                using (ImRaii.PushId("transfers"))
+                    DrawTransfers();
+                ImGuiHelpers.ScaledDummy(0.75f);
             }
 
             DrawPairViewHeader();
-            ImGui.Separator();
+            ImGuiHelpers.ScaledDummy(0.02f);
 
             using (ImRaii.PushId("pairlist")) DrawPairs();
 
@@ -470,31 +475,10 @@ public class CompactUi : WindowMediatorSubscriberBase
             ImGui.EndPopup();
         }
 
-        DrawTransientManifestPrimeProgressPopup();
-
         if (_bc7Task != null && !_bc7Task.IsCompleted)
         {
-            if (_bc7ShowModal && !_bc7ModalOpen)
-            {
-                ImGui.OpenPopup(_uiSharedService.L("UI.CompactUI.fa170e36", "Optimisation in Progress"));
-                _bc7ModalOpen = true;
-            }
-
-            if (ImGui.BeginPopupModal(_uiSharedService.L("UI.CompactUI.fa170e36", "Optimisation in Progress")))
-            {
-                ImGui.TextUnformatted(string.Format(_uiSharedService.L("UI.CompactUI.b8ef613e", "Optimisation in progress: {0}/{1}"), _bc7CurIndex, _bc7Total));
-                UiSharedService.TextWrapped(string.Format(_uiSharedService.L("UI.CompactUI.12a59426", "Current file: {0}"), _bc7CurFile));
-                if (_uiSharedService.IconTextButton(FontAwesomeIcon.StopCircle, _uiSharedService.L("UI.CompactUI.08eb8f15", "Cancel optimisation")))
-                {
-                    _bc7Cts.Cancel();
-                }
-                UiSharedService.SetScaledWindowSize(500);
-                ImGui.EndPopup();
-            }
-            else
-            {
-                _bc7ModalOpen = false;
-            }
+            // Progress is rendered inline in the Compact UI header alongside transient/cache work.
+            // Keep this branch intentionally modal-free so Reduce VRAM/Tris never steals focus.
         }
         else if (_bc7Task != null && _bc7Task.IsCompleted && _bc7Total > 0)
         {
@@ -508,8 +492,9 @@ public class CompactUi : WindowMediatorSubscriberBase
             _bc7CurFile = string.Empty;
             _bc7CurIndex = 0;
             _bc7Total = 0;
-            _bc7ShowModal = false;
-            _bc7ModalOpen = false;
+            _bc7TextureTotal = 0;
+            _bc7MeshTotal = 0;
+            _bc7RunLabel = string.Empty;
 
             if (completedTask.IsFaulted && completedTask.Exception != null)
                 _logger.LogWarning(completedTask.Exception.Flatten(), "Reduce My Size optimisation failed");
@@ -520,7 +505,7 @@ public class CompactUi : WindowMediatorSubscriberBase
                 // analysis against the old hashes here; first force the local outbound character data
                 // to rebuild so FileCacheManager validates the touched paths, records the new hashes,
                 // uploads them, and then lets CharacterAnalyzer rebuild from the fresh payload.
-                Mediator.Publish(new PenumbraFileCacheChangedMessage(touchedPaths));
+                Mediator.Publish(new PenumbraFileCacheChangedMessage(touchedPaths, ForceLocalPlayerPublish: true, Reason: "ReduceMySize:FilesOptimised"));
             }
             else
             {
@@ -538,49 +523,233 @@ public class CompactUi : WindowMediatorSubscriberBase
         }
     }
 
-    private void DrawTransientManifestPrimeProgressPopup()
+    private void DrawHeaderInlineWorkProgress(float contentW, float scale)
     {
-        var progress = _transientResourceManager.ManifestPrimeProgress;
-        var popupTitle = _uiSharedService.L("UI.CompactUI.TransientPrimeProgress.Title", "Transient Scan in Progress");
+        var transientProgress = _transientResourceManager.ManifestPrimeProgress;
+        var validationProgress = _storageMaintenanceService.ValidationProgress;
+        var clearCacheProgress = _storageMaintenanceService.ClearCacheProgress;
+        bool optimisationRunning = _bc7Task != null && !_bc7Task.IsCompleted && _bc7Total > 0;
 
-        var showStartupCrawlProgress = progress.IsRunning && !progress.IsTargeted;
-
-        if (showStartupCrawlProgress && !_transientPrimeModalOpen)
-        {
-            ImGui.OpenPopup(popupTitle);
-            _transientPrimeModalOpen = true;
-        }
-
-        if (!ImGui.BeginPopupModal(popupTitle))
-        {
-            if (!showStartupCrawlProgress)
-                _transientPrimeModalOpen = false;
-
+        if (!transientProgress.IsRunning && !validationProgress.IsRunning && !clearCacheProgress.IsRunning && !optimisationRunning)
             return;
-        }
 
-        if (!showStartupCrawlProgress)
+        ImGui.Dummy(new Vector2(0, 3f * scale));
+
+        if (transientProgress.IsRunning)
         {
-            ImGui.CloseCurrentPopup();
-            _transientPrimeModalOpen = false;
-            ImGui.EndPopup();
-            return;
+            var total = Math.Max(0, transientProgress.TotalMods);
+            var current = total <= 0 ? Math.Max(0, transientProgress.ScannedMods) : Math.Clamp(transientProgress.ScannedMods + 1, 1, total);
+            var currentName = !string.IsNullOrWhiteSpace(transientProgress.CurrentMod)
+                ? transientProgress.CurrentMod
+                : (!string.IsNullOrWhiteSpace(transientProgress.Phase) ? transientProgress.Phase : _uiSharedService.L("UI.CompactUI.TransientInline.Starting", "starting..."));
+
+            DrawHeaderInlineProgressCard(
+                "transient_manifest_inline_progress",
+                _uiSharedService.L("UI.CompactUI.TransientInline.Title", "Scanning transient files"),
+                transientProgress.Progress,
+                string.Format(_uiSharedService.L("UI.CompactUI.TransientInline.Current", "File {0}/{1} - {2}"), current, total, currentName),
+                string.Format(_uiSharedService.L("UI.CompactUI.TransientInline.Counts", "Imported {0}   Pruned {1}"), transientProgress.ImportedPaths, transientProgress.PrunedPaths),
+                contentW,
+                scale);
         }
 
-        var label = _uiSharedService.L("UI.CompactUI.TransientPrimeProgress.Startup", "Scanning active Penumbra mods");
+        if (validationProgress.IsRunning)
+        {
+            var total = Math.Max(0, validationProgress.TotalFiles);
+            var current = total <= 0 ? Math.Max(0, validationProgress.CurrentFile) : Math.Clamp(validationProgress.CurrentFile + 1, 1, total);
+            var currentName = !string.IsNullOrWhiteSpace(validationProgress.CurrentFileName)
+                ? validationProgress.CurrentFileName
+                : _uiSharedService.L("UI.CompactUI.ValidationInline.Starting", "starting...");
 
-        ImGui.TextUnformatted(label);
-        ImGui.TextUnformatted($"{progress.Phase}: {progress.ScannedMods}/{progress.TotalMods}");
+            DrawHeaderInlineProgressCard(
+                "storage_validation_inline_progress",
+                _uiSharedService.L("UI.CompactUI.ValidationInline.Title", "Validating local files"),
+                validationProgress.Progress,
+                string.Format(_uiSharedService.L("UI.CompactUI.ValidationInline.Current", "File {0}/{1} - {2}"), current, total, currentName),
+                _uiSharedService.L("UI.CompactUI.ValidationInline.Note", "Checking cached files and removing broken entries."),
+                contentW,
+                scale);
+        }
 
-        if (!string.IsNullOrWhiteSpace(progress.CurrentMod))
-            UiSharedService.TextWrapped(string.Format(_uiSharedService.L("UI.CompactUI.TransientPrimeProgress.Current", "Current mod: {0}"), progress.CurrentMod));
+        if (clearCacheProgress.IsRunning)
+        {
+            var total = Math.Max(0, clearCacheProgress.TotalFiles);
+            var current = total <= 0 ? Math.Max(0, clearCacheProgress.CurrentFile) : Math.Clamp(clearCacheProgress.CurrentFile + 1, 1, total);
+            var currentName = !string.IsNullOrWhiteSpace(clearCacheProgress.CurrentFileName)
+                ? clearCacheProgress.CurrentFileName
+                : _uiSharedService.L("UI.CompactUI.ClearCacheInline.Starting", "starting...");
 
-        ImGui.ProgressBar(progress.Progress, new Vector2(-1, 0), $"{MathF.Round(progress.Progress * 100f)}%");
-        UiSharedService.TextWrapped(string.Format(_uiSharedService.L("UI.CompactUI.TransientPrimeProgress.Counts", "Imported: {0}   Pruned: {1}"), progress.ImportedPaths, progress.PrunedPaths));
-        UiSharedService.TextWrapped(_uiSharedService.L("UI.CompactUI.TransientPrimeProgress.Note", "RavaSync is collecting selected transient resources."));
+            DrawHeaderInlineProgressCard(
+                "storage_clear_cache_inline_progress",
+                _uiSharedService.L("UI.CompactUI.ClearCacheInline.Title", "Clearing local cache"),
+                clearCacheProgress.Progress,
+                string.Format(_uiSharedService.L("UI.CompactUI.ClearCacheInline.Current", "File {0}/{1} - {2}"), current, total, currentName),
+                string.Format(_uiSharedService.L("UI.CompactUI.ClearCacheInline.Counts", "Deleted {0} cached file(s)."), clearCacheProgress.DeletedFiles),
+                contentW,
+                scale);
+        }
 
-        UiSharedService.SetScaledWindowSize(500);
-        ImGui.EndPopup();
+        if (optimisationRunning)
+        {
+            var total = Math.Max(1, _bc7Total);
+            var current = Math.Clamp(_bc7CurIndex <= 0 ? 1 : _bc7CurIndex, 1, total);
+            var currentName = !string.IsNullOrWhiteSpace(_bc7CurFile)
+                ? _bc7CurFile
+                : _uiSharedService.L("UI.CompactUI.OptimisationInline.Starting", "starting...");
+            var title = !string.IsNullOrWhiteSpace(_bc7RunLabel)
+                ? _bc7RunLabel
+                : _uiSharedService.L("UI.CompactUI.OptimisationInline.Title", "Optimising files");
+
+            DrawHeaderInlineProgressCard(
+                "reduce_optimisation_inline_progress",
+                title,
+                total <= 0 ? 0f : current / (float)total,
+                string.Format(_uiSharedService.L("UI.CompactUI.OptimisationInline.Current", "File {0}/{1} - {2}"), current, total, currentName),
+                BuildReduceInlineFooter(),
+                contentW,
+                scale,
+                _bc7Cts.IsCancellationRequested ? null : () => _bc7Cts.Cancel(),
+                _uiSharedService.L("UI.CompactUI.OptimisationInline.Cancel", "Cancel optimisation"));
+        }
+    }
+
+    private void DrawHeaderInlineProgressCard(string id, string title, float progress, string detailLine, string footerLine, float contentW, float scale, Action? cancelAction = null, string? cancelTooltip = null)
+    {
+        using var pushId = ImRaii.PushId(id);
+
+        var dl = ImGui.GetWindowDrawList();
+        var start = ImGui.GetCursorScreenPos();
+        var style = ImGui.GetStyle();
+        dl.ChannelsSplit(2);
+        dl.ChannelsSetCurrent(1);
+        float padX = 10f * scale;
+        float padY = 6f * scale;
+        float innerW = MathF.Max(1f, contentW - (padX * 2f));
+        float clampedProgress = Math.Clamp(progress, 0f, 1f);
+        float progressBarH = MathF.Max(5f * scale, ImGui.GetFrameHeight() * 0.48f);
+        float lineGap = 2f * scale;
+
+        ImGui.BeginGroup();
+        ImGui.Dummy(new Vector2(0, padY));
+
+        ImGui.SetCursorPosX(ImGui.GetCursorPosX() + padX);
+        if (cancelAction == null)
+        {
+            DrawHeaderInlineProgressTextLine("title", title, ImGui.GetColorU32(ImGuiCol.Text), innerW, minScale: 0.78f);
+        }
+        else
+        {
+            float cancelButtonW = MathF.Max(ImGui.GetFrameHeight(), 24f * scale);
+            float titleW = MathF.Max(1f, innerW - cancelButtonW - (6f * scale));
+            var titleStart = ImGui.GetCursorScreenPos();
+            DrawHeaderInlineProgressTextLine("title", title, ImGui.GetColorU32(ImGuiCol.Text), titleW, minScale: 0.78f);
+            ImGui.SetCursorScreenPos(new Vector2(titleStart.X + titleW + (6f * scale), titleStart.Y - (ImGui.GetFrameHeight() - ImGui.GetTextLineHeight()) * 0.5f));
+            using (_uiSharedService.IconFont.Push())
+            {
+                if (ImGui.Button(FontAwesomeIcon.StopCircle.ToIconString(), new Vector2(cancelButtonW, ImGui.GetFrameHeight())))
+                    cancelAction();
+            }
+            if (ImGui.IsItemHovered() && !string.IsNullOrWhiteSpace(cancelTooltip))
+                ImGui.SetTooltip(cancelTooltip);
+        }
+
+        ImGui.Dummy(new Vector2(0, lineGap));
+        ImGui.SetCursorPosX(ImGui.GetCursorPosX() + padX);
+        ImGui.SetNextItemWidth(innerW);
+        ImGui.ProgressBar(clampedProgress, new Vector2(innerW, progressBarH), string.Empty);
+
+        ImGui.Dummy(new Vector2(0, lineGap));
+        ImGui.SetCursorPosX(ImGui.GetCursorPosX() + padX);
+        DrawHeaderInlineProgressTextLine("detail", detailLine, ImGui.GetColorU32(ImGuiCol.Text), innerW, minScale: 0.64f);
+
+        if (!string.IsNullOrWhiteSpace(footerLine))
+        {
+            ImGui.SetCursorPosX(ImGui.GetCursorPosX() + padX);
+            DrawHeaderInlineProgressTextLine("footer", footerLine, ImGui.GetColorU32(ImGuiColors.DalamudGrey2), innerW, minScale: 0.64f);
+        }
+
+        ImGui.Dummy(new Vector2(0, MathF.Max(1f, padY - style.ItemSpacing.Y)));
+        ImGui.EndGroup();
+
+        var end = ImGui.GetCursorScreenPos();
+        var h = MathF.Max(0f, end.Y - start.Y);
+        var bg = ImGui.GetColorU32(RavaUiChrome.PanelBackground);
+        var border = ImGui.GetColorU32(RavaUiChrome.PanelBorder);
+        dl.ChannelsSetCurrent(0);
+        dl.AddRectFilled(start, start + new Vector2(contentW, h), bg, 10f * scale);
+        dl.ChannelsSetCurrent(1);
+        dl.AddRect(start, start + new Vector2(contentW, h), border, 10f * scale);
+        dl.ChannelsMerge();
+        ImGui.Dummy(new Vector2(0, 3f * scale));
+    }
+
+    private static void DrawHeaderInlineProgressTextLine(string id, string text, uint color, float width, float minScale)
+    {
+        var dl = ImGui.GetWindowDrawList();
+        var start = ImGui.GetCursorScreenPos();
+        float lineH = ImGui.GetTextLineHeight();
+        float safeWidth = MathF.Max(1f, width);
+
+        ImGui.InvisibleButton($"##{id}", new Vector2(safeWidth, lineH));
+
+        if (string.IsNullOrEmpty(text))
+            return;
+
+        float baseW = ImGui.CalcTextSize(text).X;
+        float textScale = baseW > 0f ? MathF.Min(1f, safeWidth / baseW) : 1f;
+        textScale = MathF.Max(0.45f, MathF.Min(1f, MathF.Max(minScale, textScale)));
+
+        string displayText = FitSingleLineTextToWidth(text, safeWidth, textScale);
+        float displayW = ImGui.CalcTextSize(displayText).X * textScale;
+
+        if (displayW > safeWidth && textScale > 0.45f)
+        {
+            textScale = MathF.Max(0.45f, safeWidth / MathF.Max(1f, ImGui.CalcTextSize(displayText).X));
+            displayText = FitSingleLineTextToWidth(text, safeWidth, textScale);
+        }
+
+        var font = ImGui.GetFont();
+        float fontSize = ImGui.GetFontSize() * textScale;
+        float y = start.Y + ((lineH - fontSize) * 0.5f);
+        var rMin = start;
+        var rMax = start + new Vector2(safeWidth, lineH);
+
+        dl.PushClipRect(rMin, rMax, true);
+        dl.AddText(font, fontSize, new Vector2(start.X, y), color, displayText);
+        dl.PopClipRect();
+
+        if (ImGui.IsItemHovered() && !string.Equals(displayText, text, StringComparison.Ordinal))
+            ImGui.SetTooltip(text);
+    }
+
+    private static string FitSingleLineTextToWidth(string text, float width, float textScale)
+    {
+        if (string.IsNullOrEmpty(text) || width <= 1f)
+            return string.Empty;
+
+        if (ImGui.CalcTextSize(text).X * textScale <= width)
+            return text;
+
+        const string ellipsis = "…";
+        float ellipsisW = ImGui.CalcTextSize(ellipsis).X * textScale;
+        float availableW = width - ellipsisW;
+
+        if (availableW <= 1f)
+            return ellipsis;
+
+        int lo = 0;
+        int hi = text.Length;
+        while (lo < hi)
+        {
+            int mid = (lo + hi + 1) / 2;
+            string candidate = text[..mid];
+            if (ImGui.CalcTextSize(candidate).X * textScale <= availableW)
+                lo = mid;
+            else
+                hi = mid - 1;
+        }
+
+        return lo <= 0 ? ellipsis : text[..lo] + ellipsis;
     }
 
     private void DrawPairs()
@@ -592,14 +761,19 @@ public class CompactUi : WindowMediatorSubscriberBase
                                 - style.WindowPadding.Y;
         if (availableHeight < 1f) availableHeight = 1f;
 
-        ImGui.BeginChild(_uiSharedService.L("UI.CompactUI.fe6db99f", "pairlist-main"), new Vector2(_windowContentWidth, 0), border: false);
-
-        foreach (var item in _drawFolders)
+        using (ImRaii.PushStyle(ImGuiStyleVar.ItemSpacing, new Vector2(style.ItemSpacing.X, 1f * ImGuiHelpers.GlobalScale)))
+        using (ImRaii.PushStyle(ImGuiStyleVar.FramePadding, new Vector2(style.FramePadding.X, 2f * ImGuiHelpers.GlobalScale)))
+        using (ImRaii.PushStyle(ImGuiStyleVar.CellPadding, new Vector2(style.CellPadding.X, 2f * ImGuiHelpers.GlobalScale)))
         {
-            item.Draw();
-        }
+            ImGui.BeginChild(_uiSharedService.L("UI.CompactUI.fe6db99f", "pairlist-main"), new Vector2(_windowContentWidth, 0), border: false);
 
-        ImGui.EndChild();
+            foreach (var item in _drawFolders)
+            {
+                item.Draw();
+            }
+
+            ImGui.EndChild();
+        }
     }
 
     private void DrawPairViewHeader()
@@ -607,7 +781,7 @@ public class CompactUi : WindowMediatorSubscriberBase
         using var id = ImRaii.PushId("PairViewHeader");
 
         var style = ImGui.GetStyle();
-        float contentWidth = UiSharedService.GetWindowContentRegionWidth();
+        using var headerFramePadding = ImRaii.PushStyle(ImGuiStyleVar.FramePadding, new Vector2(style.FramePadding.X, 2f * ImGuiHelpers.GlobalScale));
 
         bool tabChanged = false;
 
@@ -615,10 +789,7 @@ public class CompactUi : WindowMediatorSubscriberBase
         {
             bool selected = _currentPairViewTab == tab;
 
-            if (selected)
-                ImGui.PushStyleColor(ImGuiCol.Button, ImGuiColors.DalamudGrey3);
-
-            if (ImGui.Button(label))
+            if (RavaUiChrome.DrawSegmentTab(label, selected))
             {
                 if (_currentPairViewTab != tab)
                 {
@@ -626,20 +797,17 @@ public class CompactUi : WindowMediatorSubscriberBase
                     tabChanged = true;
                 }
             }
-
-            if (selected)
-                ImGui.PopStyleColor();
         }
 
         DrawTab(_uiSharedService.L("UI.CompactUI.Tab.Pairs", "Pairs"), PairViewTab.DirectPairs);
-        ImGui.SameLine();
+        ImGui.SameLine(0f, 4f * ImGuiHelpers.GlobalScale);
         DrawTab(_uiSharedService.L("UI.CompactUI.Tab.Shells", "Shells"), PairViewTab.Shells);
-        ImGui.SameLine();
+        ImGui.SameLine(0f, 4f * ImGuiHelpers.GlobalScale);
         DrawTab(_uiSharedService.L("UI.CompactUI.Tab.Visible", "Visible"), PairViewTab.Visible);
 
         ImGui.SameLine();
 
-        float searchWidth = contentWidth - ImGui.GetCursorPosX() - style.WindowPadding.X;
+        float searchWidth = ImGui.GetContentRegionAvail().X;
         if (searchWidth < 150f * ImGuiHelpers.GlobalScale)
             searchWidth = 150f * ImGuiHelpers.GlobalScale;
 
@@ -732,7 +900,7 @@ public class CompactUi : WindowMediatorSubscriberBase
         var num = s[..space];
         var unit = s[space..];
 
-        if (num.EndsWith(".00", StringComparison.Ordinal))
+        if (num.EndsWith(".00", StringComparison.Ordinal) || num.EndsWith(",00", StringComparison.Ordinal))
             return num[..^3] + unit;
 
         return s;
@@ -823,6 +991,9 @@ public class CompactUi : WindowMediatorSubscriberBase
             var dl = ImGui.GetWindowDrawList();
             var panelStart = ImGui.GetCursorScreenPos();
 
+            dl.ChannelsSplit(2);
+            dl.ChannelsSetCurrent(1);
+
             ImGui.BeginGroup();
 
             var name = isConnected ? (_apiController.DisplayName ?? string.Empty) : _uiSharedService.L("UI.CompactUI.OfflineHeader", "OFFLINE");
@@ -912,7 +1083,7 @@ public class CompactUi : WindowMediatorSubscriberBase
                             clickedName = DrawCenteredTextAutoFit(
                                 "##name_line",
                                 name,
-                                ImGuiColors.DalamudViolet,
+                                RavaUiChrome.PanelAccentText,
                                 colW0,
                                 padXLeft,
                                 minScale: 0.70f);
@@ -929,7 +1100,7 @@ public class CompactUi : WindowMediatorSubscriberBase
                         bool clickedUid = DrawCenteredTextAutoFit(
                             "##uid_line",
                             uid,
-                            ImGuiColors.ParsedBlue,
+                            RavaUiChrome.PanelMutedText,
                             colW0,
                             padXLeft,
                             minScale: 0.80f);
@@ -939,6 +1110,8 @@ public class CompactUi : WindowMediatorSubscriberBase
 
                         UiSharedService.AttachToolTip(_uiSharedService.L("UI.CompactUI.8ef07790", "Click to copy"));
                     }
+
+                    DrawLocalActiveSyncIndicators(colW0, padXLeft);
 
                     ImGui.EndGroup();
                     ImGui.TableSetColumnIndex(1);
@@ -1098,13 +1271,18 @@ public class CompactUi : WindowMediatorSubscriberBase
             var w = contentW;
             var h = MathF.Max(0f, panelEnd.Y - panelStart.Y);
 
-            var bg = ImGui.GetColorU32(new Vector4(0.40f, 0.20f, 0.60f, 0.10f));
-            var border = ImGui.GetColorU32(new Vector4(0.60f, 0.35f, 0.90f, 0.18f));
+            var bg = ImGui.GetColorU32(RavaUiChrome.PanelBackground);
+            var border = ImGui.GetColorU32(RavaUiChrome.PanelBorder);
 
+            dl.ChannelsSetCurrent(0);
             dl.AddRectFilled(panelStart, panelStart + new Vector2(w, h), bg, 10f * scale);
+            dl.ChannelsSetCurrent(1);
             dl.AddRect(panelStart, panelStart + new Vector2(w, h), border, 10f * scale);
+            dl.ChannelsMerge();
             ImGui.Dummy(new Vector2(0, 0.5f * scale));
         }
+
+        DrawHeaderInlineWorkProgress(contentW, scale);
 
         if (!isConnected)
         {
@@ -1162,13 +1340,16 @@ public class CompactUi : WindowMediatorSubscriberBase
             var dl = ImGui.GetWindowDrawList();
             var start = ImGui.GetCursorScreenPos();
 
+            dl.ChannelsSplit(2);
+            dl.ChannelsSetCurrent(1);
+
             ImGui.BeginGroup();
 
             float padX = 12f * scale;
             var title = "VRAM use";
             var titleSz = ImGui.CalcTextSize(title);
             ImGui.SetCursorPosX(MathF.Max(0f, (contentW - titleSz.X) * 0.5f));
-            ImGui.PushStyleColor(ImGuiCol.Text, ImGuiColors.DalamudGrey2);
+            ImGui.PushStyleColor(ImGuiCol.Text, RavaUiChrome.PanelMutedText);
             ImGui.TextUnformatted(title);
             ImGui.PopStyleColor();
 
@@ -1186,7 +1367,7 @@ public class CompactUi : WindowMediatorSubscriberBase
             DrawCenteredTextAutoFit(
                 "##vram_single_line",
                 line,
-                ImGuiColors.DalamudWhite,
+                RavaUiChrome.PanelText,
                 regionW: contentW,
                 padX: padX,
                 minScale: 0.70f);
@@ -1197,11 +1378,14 @@ public class CompactUi : WindowMediatorSubscriberBase
             var w = contentW;
             var h = MathF.Max(0f, end.Y - start.Y);
 
-            var bg = ImGui.GetColorU32(new Vector4(0.40f, 0.20f, 0.60f, 0.10f));
-            var border = ImGui.GetColorU32(new Vector4(0.60f, 0.35f, 0.90f, 0.18f));
+            var bg = ImGui.GetColorU32(RavaUiChrome.PanelBackground);
+            var border = ImGui.GetColorU32(RavaUiChrome.PanelBorder);
 
+            dl.ChannelsSetCurrent(0);
             dl.AddRectFilled(start, start + new Vector2(w, h), bg, 10f * scale);
+            dl.ChannelsSetCurrent(1);
             dl.AddRect(start, start + new Vector2(w, h), border, 10f * scale);
+            dl.ChannelsMerge();
         }
 
         ImGui.Separator();
@@ -1541,10 +1725,10 @@ public class CompactUi : WindowMediatorSubscriberBase
                 "Your plugin or the server you are connecting to is out of date. Please update your plugin now. If you already did so, contact the server provider to update their server to the latest version.",
             ServerState.RateLimited => "You are rate limited for (re)connecting too often. Disconnect, wait 10 minutes and try again.",
             ServerState.Connected => string.Empty,
-            ServerState.NoSecretKey => "You have no secret key set for this current character. Open Settings -> Service Settings and set a secret key for the current character. You can reuse the same secret key for multiple characters.",
-            ServerState.MultiChara => "Your Character Configuration has multiple characters configured with same name and world. You will not be able to connect until you fix this issue. Remove the duplicates from the configuration in Settings -> Service Settings -> Character Management and reconnect manually after.",
-            ServerState.OAuthMisconfigured => "OAuth2 is enabled...If you see this, go to C:\\Users\\YourName\\AppData\\Roaming\\XIVLauncher\\pluginConfigs\\RavaSync, open server.Json and set UseOAuth2 to false.",
-            ServerState.OAuthLoginTokenStale => "Your OAuth2 login token is stale and cannot be used to renew. Go to the Settings -> Service Settings and unlink then relink your OAuth2 configuration.",
+            ServerState.NoSecretKey => "You have no secret key set for this current character. Open Settings -> Service and set a secret key for the current character. You can reuse the same secret key for multiple characters.",
+            ServerState.MultiChara => "Your Character Configuration has multiple characters configured with same name and world. You will not be able to connect until you fix this issue. Remove the duplicates from the configuration in Settings -> Service -> Characters and reconnect manually after.",
+            ServerState.OAuthMisconfigured => "OAuth2 is enabled...If you see this, go to C:\\Users\\YourName\\AppData\\Roaming\\XIVLauncher\\pluginConfigs\\RavaSync, open Settings -> Service and relink your account or switch back to standard login.",
+            ServerState.OAuthLoginTokenStale => "Your OAuth2 login token is stale and cannot be used to renew. Go to the Settings -> Service and unlink then relink your OAuth2 configuration.",
             ServerState.NoAutoLogon => "This character has automatic login into RavaSync disabled. Press the connect button to connect to RavaSync.",
             _ => string.Empty
         };
@@ -1613,8 +1797,9 @@ public class CompactUi : WindowMediatorSubscriberBase
     private string _bc7CurFile = string.Empty;
     private int _bc7CurIndex = 0;
     private int _bc7Total = 0;
-    private bool _bc7ShowModal = false;
-    private bool _bc7ModalOpen = false;
+    private int _bc7TextureTotal = 0;
+    private int _bc7MeshTotal = 0;
+    private string _bc7RunLabel = string.Empty;
     private readonly Dictionary<string, string[]> _bc7Set = new(StringComparer.Ordinal);
     private string[] _bc7TouchedPaths = Array.Empty<string>();
 
@@ -2654,8 +2839,9 @@ public class CompactUi : WindowMediatorSubscriberBase
         if (_bc7Total <= 0)
         {
             _bc7Task = null;
-            _bc7ShowModal = false;
-            _bc7ModalOpen = false;
+            _bc7TextureTotal = 0;
+            _bc7MeshTotal = 0;
+            _bc7RunLabel = string.Empty;
             ScheduleReduceMySizeSnapshotRebuild(immediate: true);
             return;
         }
@@ -2663,6 +2849,10 @@ public class CompactUi : WindowMediatorSubscriberBase
         _bc7Cts.Cancel();
         _bc7Cts.Dispose();
         _bc7Cts = new();
+
+        _bc7TextureTotal = _bc7Set.Count;
+        _bc7MeshTotal = meshWork.Count;
+        _bc7RunLabel = BuildReduceInlineTitle(_bc7TextureTotal, _bc7MeshTotal);
 
         var targetByPrimary = new Dictionary<string, string>(textureTargets ?? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase), StringComparer.OrdinalIgnoreCase);
         var relatedModelsByTexture = BuildTextureModelReferenceMapFromAnalysis(_bc7Set.Keys);
@@ -2704,8 +2894,37 @@ public class CompactUi : WindowMediatorSubscriberBase
                     _bc7Cts.Token).ConfigureAwait(false);
             }
         }, _bc7Cts.Token);
+    }
 
-        _bc7ShowModal = true;
+    private string BuildReduceInlineTitle(int textureTotal, int meshTotal)
+    {
+        if (textureTotal > 0 && meshTotal > 0)
+            return _uiSharedService.L("UI.CompactUI.OptimisationInline.Title.Mixed", "Optimising files");
+
+        if (textureTotal > 0)
+            return _uiSharedService.L("UI.CompactUI.OptimisationInline.Title.Textures", "Compressing textures");
+
+        if (meshTotal > 0)
+            return _uiSharedService.L("UI.CompactUI.OptimisationInline.Title.Meshes", "Reducing triangles");
+
+        return _uiSharedService.L("UI.CompactUI.OptimisationInline.Title", "Optimising files");
+    }
+
+    private string BuildReduceInlineFooter()
+    {
+        if (_bc7Cts.IsCancellationRequested)
+            return _uiSharedService.L("UI.CompactUI.OptimisationInline.Footer.Cancelling", "Cancelling optimisation...");
+
+        if (_bc7TextureTotal > 0 && _bc7MeshTotal > 0)
+            return string.Format(_uiSharedService.L("UI.CompactUI.OptimisationInline.Footer.Mixed", "Textures {0}   Meshes {1}"), _bc7TextureTotal, _bc7MeshTotal);
+
+        if (_bc7TextureTotal > 0)
+            return string.Format(_uiSharedService.L("UI.CompactUI.OptimisationInline.Footer.Textures", "Compressing {0} texture(s)."), _bc7TextureTotal);
+
+        if (_bc7MeshTotal > 0)
+            return string.Format(_uiSharedService.L("UI.CompactUI.OptimisationInline.Footer.Meshes", "Reducing {0} mesh file(s)."), _bc7MeshTotal);
+
+        return string.Empty;
     }
 
     private static string[] BuildReduceTouchedPathSnapshot(params IReadOnlyDictionary<string, string[]>[] pathSets)
@@ -3161,6 +3380,71 @@ public class CompactUi : WindowMediatorSubscriberBase
         }
     }
 
+    private void DrawLocalActiveSyncIndicators(float regionW, float padX)
+    {
+        var iconInfos = new List<(FontAwesomeIcon Icon, uint Color, string Tooltip)>();
+
+        if (_localActiveSyncIndicatorService.IsPlayingSound)
+            iconInfos.Add((FontAwesomeIcon.Music, ImGui.GetColorU32(ImGuiColors.ParsedBlue), _uiSharedService.L("UI.CompactUI.LocalActiveIcon.PlayingSound", "You are currently playing synced sound")));
+
+        if (iconInfos.Count == 0)
+            return;
+
+        var iconTexts = new string[iconInfos.Count];
+        var iconSizes = new Vector2[iconInfos.Count];
+        var iconRects = new List<(Vector2 Min, Vector2 Max, string Tooltip)>();
+        float iconW = 0f;
+        float iconSpacing = ImGui.GetStyle().ItemInnerSpacing.X;
+
+        using (_uiSharedService.IconFont.Push())
+        {
+            for (var i = 0; i < iconInfos.Count; i++)
+            {
+                iconTexts[i] = iconInfos[i].Icon.ToIconString();
+                iconSizes[i] = ImGui.CalcTextSize(iconTexts[i]);
+                iconW += iconSizes[i].X;
+            }
+        }
+
+        iconW += iconSpacing * Math.Max(0, iconInfos.Count - 1);
+
+        float lineH = ImGui.GetTextLineHeight();
+        var start = ImGui.GetCursorScreenPos();
+        ImGui.InvisibleButton("##local_active_sync_icons", new Vector2(MathF.Max(1f, regionW), lineH));
+
+        float innerW = MathF.Max(0f, regionW - (padX * 2f));
+        float x = start.X + padX + MathF.Max(0f, (innerW - iconW) * 0.5f);
+
+        var dl = ImGui.GetWindowDrawList();
+        var rMin = start;
+        var rMax = start + new Vector2(regionW, lineH);
+
+        dl.PushClipRect(rMin, rMax, true);
+        using (_uiSharedService.IconFont.Push())
+        {
+            var iconFont = ImGui.GetFont();
+            float iconFontSize = ImGui.GetFontSize();
+            float iconY = start.Y + (lineH - iconFontSize) * 0.5f;
+
+            for (var i = 0; i < iconInfos.Count; i++)
+            {
+                var pos = new Vector2(x, iconY);
+
+                dl.AddText(iconFont, iconFontSize, pos, iconInfos[i].Color, iconTexts[i]);
+                iconRects.Add((pos, pos + iconSizes[i], iconInfos[i].Tooltip));
+
+                x += iconSizes[i].X + iconSpacing;
+            }
+        }
+        dl.PopClipRect();
+
+        foreach (var rect in iconRects)
+        {
+            if (ImGui.IsMouseHoveringRect(rect.Min, rect.Max))
+                UiSharedService.AttachToolTip(rect.Tooltip);
+        }
+    }
+
     private static bool DrawCenteredTextAutoFit(string id, string text, Vector4 color, float regionW, float padX, float minScale)
     {
         var dl = ImGui.GetWindowDrawList();
@@ -3199,8 +3483,7 @@ public class CompactUi : WindowMediatorSubscriberBase
 
     private void UpdateCompactWindowTitle()
     {
-        var ver = Assembly.GetExecutingAssembly().GetName().Version;
-        var versionText = $"RavaSync {ver.Major}.{ver.Minor}.{ver.Build}";
+        var versionText = $"RavaSync {PluginVersion.CurrentText}";
         if (_apiController.ServerState is ServerState.Connected)
         {
             var users = _apiController.OnlineUsers.ToString(CultureInfo.InvariantCulture);

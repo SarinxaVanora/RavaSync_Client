@@ -11,6 +11,7 @@ using RavaSync.WebAPI.SignalR.Utils;
 using Microsoft.Extensions.Logging;
 using System;
 using RavaSync.Services.Discovery;
+using MenuItem = Dalamud.Game.Gui.ContextMenu.MenuItem;
 
 
 namespace RavaSync.Services;

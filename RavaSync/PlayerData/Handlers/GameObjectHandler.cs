@@ -20,14 +20,18 @@ public sealed class GameObjectHandler : DisposableMediatorSubscriberBase, IHighP
     private bool _haltProcessing = false;
     private bool _pendingTransientPublishAfterRedraw = false;
     private bool _pendingPlayerPublishAfterRequestedRedraw = false;
+    private bool _pendingOwnedObjectStructuralPublishAfterDraw = false;
     private CancellationTokenSource _zoningCts = new();
     private long _nextUpdateTick;
     private bool _redrawPublishIssued;
     private bool _suppressNextSemanticDiffPublishAfterRedraw;
+    private static int _nextHandlerPhaseSeed;
+    private readonly int _updatePhaseJitterMs;
     private const int OwnedUpdateIntervalMs = 33;   // ~30Hz
     private const int OwnedStableUpdateIntervalMs = 66;
-    private const int OtherUpdateIntervalMs = 100;  // 10Hz
-    private const int OtherStableUpdateIntervalMs = 180;
+    private const int OtherUpdateIntervalMs = 100;  // remote actors are not local-state sensors
+    private const int OtherStableUpdateIntervalMs = 500;
+    private const int PostZoneSettleDelayMs = 3000;
 
 
     public GameObjectHandler(ILogger<GameObjectHandler> logger, PerformanceCollectorService performanceCollector,
@@ -42,6 +46,7 @@ public sealed class GameObjectHandler : DisposableMediatorSubscriberBase, IHighP
             return getAddress.Invoke();
         };
         _isOwnedObject = ownedObject;
+        _updatePhaseJitterMs = (int)((uint)Interlocked.Add(ref _nextHandlerPhaseSeed, 17) % 83);
         Name = string.Empty;
 
         if (ownedObject)
@@ -51,8 +56,16 @@ public sealed class GameObjectHandler : DisposableMediatorSubscriberBase, IHighP
                 if (!(_delayedZoningTask?.IsCompleted ?? true)) return;
                 if (msg.Address != Address) return;
 
+                // Player transient resource events are already handled by transient.json / manifest refresh now.
+                // Rebuilding and publishing the whole player payload here was the source of the expensive
+                // "transient-only" builds during animation/VFX playback, and it is not needed for correctness.
                 if (ObjectKind == ObjectKind.Player)
-                    _pendingTransientPublishAfterRedraw = true;
+                {
+                    if (Logger.IsEnabled(LogLevel.Trace))
+                        Logger.LogTrace("[{this}] Ignoring player transient-resource build request; transient manifest state is authoritative", this);
+
+                    return;
+                }
 
                 Mediator.Publish(new CreateCacheForObjectMessage(this, "GameObject:TransientResourceChanged"));
             });
@@ -87,6 +100,7 @@ public sealed class GameObjectHandler : DisposableMediatorSubscriberBase, IHighP
             _haltProcessing = true;
             _pendingTransientPublishAfterRedraw = false;
             _pendingPlayerPublishAfterRequestedRedraw = false;
+            _pendingOwnedObjectStructuralPublishAfterDraw = false;
             _redrawPublishIssued = false;
             _suppressNextSemanticDiffPublishAfterRedraw = false;
             Invalidate();
@@ -98,6 +112,7 @@ public sealed class GameObjectHandler : DisposableMediatorSubscriberBase, IHighP
         {
             _pendingTransientPublishAfterRedraw = false;
             _pendingPlayerPublishAfterRequestedRedraw = false;
+            _pendingOwnedObjectStructuralPublishAfterDraw = false;
             _redrawPublishIssued = false;
             _suppressNextSemanticDiffPublishAfterRedraw = false;
             ZoneSwitchStart();
@@ -108,6 +123,7 @@ public sealed class GameObjectHandler : DisposableMediatorSubscriberBase, IHighP
             _haltProcessing = false; //changed to false in efforts to stop issues with cutscene drawing
             _pendingTransientPublishAfterRedraw = false;
             _pendingPlayerPublishAfterRequestedRedraw = false;
+            _pendingOwnedObjectStructuralPublishAfterDraw = false;
             _redrawPublishIssued = false;
             _suppressNextSemanticDiffPublishAfterRedraw = false;
         });
@@ -235,6 +251,22 @@ public sealed class GameObjectHandler : DisposableMediatorSubscriberBase, IHighP
         Address = IntPtr.Zero;
         DrawObjectAddress = IntPtr.Zero;
         CurrentDrawCondition = DrawCondition.ObjectZero;
+        _pendingOwnedObjectStructuralPublishAfterDraw = false;
+    }
+
+    public async Task RefreshStateOnFrameworkAsync()
+    {
+        await _dalamudUtil.RunOnFrameworkThread(() =>
+        {
+            try
+            {
+                CheckAndUpdateObject();
+            }
+            catch (Exception ex)
+            {
+                Logger.LogWarning(ex, "Error refreshing framework state for {this}", this);
+            }
+        }).ConfigureAwait(false);
     }
 
     public async Task<bool> IsBeingDrawnRunOnFrameworkAsync()
@@ -318,6 +350,25 @@ public sealed class GameObjectHandler : DisposableMediatorSubscriberBase, IHighP
             {
                 Name = name;
             }
+
+            // Remote/receiver handlers only need a valid actor pointer, name, draw object
+            // and draw-state gate. They do not own local outbound state, so polling heavy
+            // Human draw data (equipment/customize bytes) for every visible remote pair is
+            // pure idle pressure and scales badly in modded rooms.
+            if (!_isOwnedObject)
+                return;
+
+            if (ObjectKind != ObjectKind.Player && CurrentDrawCondition != DrawCondition.None)
+            {
+                if (addrDiff || drawObjDiff || nameChange)
+                    _pendingOwnedObjectStructuralPublishAfterDraw = true;
+
+                if (Logger.IsEnabled(LogLevel.Trace))
+                    Logger.LogTrace("[{this}] Owned {objectKind} is still drawing ({condition}); deferring structural cache publish and skipping deep draw-data polling", this, ObjectKind, CurrentDrawCondition);
+
+                return;
+            }
+
             bool equipDiff = false;
 
             if (((DrawObject*)DrawObjectAddress)->Object.GetObjectType() == ObjectType.CharacterBase
@@ -386,7 +437,8 @@ public sealed class GameObjectHandler : DisposableMediatorSubscriberBase, IHighP
             if (_isOwnedObject)
             {
                 var semanticDiff = equipDiff || customizeDiff || nameChange;
-                var nonPlayerStructuralDiff = ObjectKind != ObjectKind.Player && (addrDiff || drawObjDiff);
+                var pendingOwnedObjectStructuralPublish = ObjectKind != ObjectKind.Player && _pendingOwnedObjectStructuralPublishAfterDraw;
+                var nonPlayerStructuralDiff = ObjectKind != ObjectKind.Player && (addrDiff || drawObjDiff || pendingOwnedObjectStructuralPublish);
 
                 if (semanticDiff || nonPlayerStructuralDiff)
                 {
@@ -409,6 +461,9 @@ public sealed class GameObjectHandler : DisposableMediatorSubscriberBase, IHighP
                         ? $"GameObject:SemanticDiff(equip={equipDiff},customize={customizeDiff},name={nameChange})"
                         : $"GameObject:StructuralDiff(addr={addrDiff},draw={drawObjDiff})";
 
+                    if (pendingOwnedObjectStructuralPublish)
+                        _pendingOwnedObjectStructuralPublishAfterDraw = false;
+
                     Logger.LogDebug("[{this}] Changed, Sending CreateCacheObjectMessage ({reason})", this, reason);
                     Mediator.Publish(new CreateCacheForObjectMessage(this, reason));
                 }
@@ -421,6 +476,7 @@ public sealed class GameObjectHandler : DisposableMediatorSubscriberBase, IHighP
         else if (addrDiff || drawObjDiff)
         {
             CurrentDrawCondition = DrawCondition.DrawObjectZero;
+            _pendingOwnedObjectStructuralPublishAfterDraw = false;
             Logger.LogTrace("[{this}] Changed", this);
             if (_isOwnedObject && ObjectKind != ObjectKind.Player)
             {
@@ -513,7 +569,12 @@ public sealed class GameObjectHandler : DisposableMediatorSubscriberBase, IHighP
             : (_isOwnedObject ? OwnedStableUpdateIntervalMs : OtherStableUpdateIntervalMs);
 
         if (nowTick < Interlocked.Read(ref _nextUpdateTick)) return;
-        Interlocked.Exchange(ref _nextUpdateTick, nowTick + intervalMs);
+
+        var nextTick = nowTick + intervalMs;
+        if (!_isOwnedObject)
+            nextTick += shouldUseFastCadence ? Math.Min(_updatePhaseJitterMs, 25) : _updatePhaseJitterMs;
+
+        Interlocked.Exchange(ref _nextUpdateTick, nextTick);
 
         try
         {
@@ -588,6 +649,11 @@ public sealed class GameObjectHandler : DisposableMediatorSubscriberBase, IHighP
         {
             Logger.LogWarning(ex, "Zoning CTS cancel issue");
         }
+
+        // Do not wait for the delayed task continuation before the next visibility pass.
+        // Zone end is the positive signal that object discovery can resume immediately.
+        _haltProcessing = false;
+        _nextUpdateTick = 0;
     }
 
     private void ZoneSwitchStart()
@@ -610,7 +676,7 @@ public sealed class GameObjectHandler : DisposableMediatorSubscriberBase, IHighP
         {
             try
             {
-                await Task.Delay(TimeSpan.FromSeconds(120), _zoningCts.Token).ConfigureAwait(false);
+                await Task.Delay(PostZoneSettleDelayMs, _zoningCts.Token).ConfigureAwait(false);
             }
             catch
             {

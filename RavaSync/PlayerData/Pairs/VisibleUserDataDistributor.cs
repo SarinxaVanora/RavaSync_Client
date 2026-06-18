@@ -1,25 +1,28 @@
 using RavaSync.API.Data;
 using RavaSync.Services;
 using RavaSync.Services.Mediator;
+using RavaSync.Services.Mesh;
 using RavaSync.Utils;
 using RavaSync.WebAPI;
 using RavaSync.WebAPI.Files;
 using RavaSync.Interop.Ipc;
 using Microsoft.Extensions.Logging;
 using RavaSync.PlayerData.Services;
-using CharacterDataPushSanitizer = RavaSync.PlayerData.Data.CharacterDataPushSanitizer;
 
 namespace RavaSync.PlayerData.Pairs;
 
 public class VisibleUserDataDistributor : DisposableMediatorSubscriberBase
 {
+    private sealed record LocalOtherSyncClaim(bool Active, string Owner);
     private readonly ApiController _apiController;
     private readonly DalamudUtilService _dalamudUtil;
     private readonly FileUploadManager _fileTransferManager;
+    private readonly MissingFileMeshService _missingFileMeshService;
     private readonly PairManager _pairManager;
     private readonly IpcManager _ipcManager;
     private readonly CharacterAnalyzer _characterAnalyzer;
     private readonly CharacterRavaSidecarUtility _characterRavaSidecarUtility;
+    private readonly LocalActiveSyncIndicatorService _localActiveSyncIndicatorService;
     private CharacterData? _lastCreatedData;
     private string _lastCreatedDataPayloadFingerprint = string.Empty;
     private CharacterData? _uploadingCharacterData = null;
@@ -39,6 +42,7 @@ public class VisibleUserDataDistributor : DisposableMediatorSubscriberBase
     private string _lastHeelsData = string.Empty;
     private long _pendingHeelsApplyTick = -1;
     private string _lastUploadBarrierKey = string.Empty;
+    private HashSet<string> _lastUploadBarrierHashes = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> _authorizedRecipientUids = new(StringComparer.Ordinal);
     private string? _pendingHeelsData;
     private bool _hasPendingHeelsUpdate;
@@ -57,32 +61,39 @@ public class VisibleUserDataDistributor : DisposableMediatorSubscriberBase
     private bool _hasPendingPetNamesUpdate;
     private bool _forceBarrierPending;
     private bool _forceOutboundPending;
+    private bool _bypassDuplicateSuppressionPending;
     private long _pendingMoodlesApplyTick = -1;
     private long _nextLocalPlayerAddressRefreshTick;
     private long _nextVisibilityScanTick;
     private nint _localPlayerAddress;
     private string _lastSidecarBroadcastSignature = string.Empty;
     private DateTime _lastSidecarBroadcastUtc = DateTime.MinValue;
+    private DateTime _lastOutboundCharacterPushUtc = DateTime.MinValue;
     private readonly Dictionary<string, string> _lastOutboundFullSignatureByUid = new(StringComparer.Ordinal);
     private readonly Dictionary<string, string> _lastOutboundAppearanceSignatureByUid = new(StringComparer.Ordinal);
     private readonly Dictionary<string, long> _lastOutboundSendTickByUid = new(StringComparer.Ordinal);
     private readonly Dictionary<string, long> _lastOutboundSidecarOnlyTickByUid = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, string> _lastOutboundOtherSyncSignatureByUid = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, LocalOtherSyncClaim> _localOtherSyncClaimByUid = new(StringComparer.Ordinal);
     private const int DisplayedMetricsPreSendWaitMs = 250;
-    private const int OutboundPushCoalesceDelayMs = 75;
+    private const int OutboundPushCoalesceDelayMs = 125;
+    private const int MaxOutboundPushCoalesceWaitMs = 500;
     private const int DuplicateOutboundSuppressWindowMs = 10_000;
     private const int SidecarOnlyOutboundMinIntervalMs = 60_000;
     private static readonly TimeSpan SidecarRefreshMinInterval = TimeSpan.FromSeconds(60);
 
     public VisibleUserDataDistributor(ILogger<VisibleUserDataDistributor> logger, ApiController apiController, DalamudUtilService dalamudUtil,
-        PairManager pairManager, MareMediator mediator, FileUploadManager fileTransferManager, IpcManager ipcManager, CharacterAnalyzer characterAnalyzer, CharacterRavaSidecarUtility characterRavaSidecarUtility) : base(logger, mediator)
+        PairManager pairManager, MareMediator mediator, FileUploadManager fileTransferManager, MissingFileMeshService missingFileMeshService, IpcManager ipcManager, CharacterAnalyzer characterAnalyzer, CharacterRavaSidecarUtility characterRavaSidecarUtility, LocalActiveSyncIndicatorService localActiveSyncIndicatorService) : base(logger, mediator)
     {
         _apiController = apiController;
         _dalamudUtil = dalamudUtil;
         _pairManager = pairManager;
         _fileTransferManager = fileTransferManager;
+        _missingFileMeshService = missingFileMeshService;
         _ipcManager = ipcManager;
         _characterAnalyzer = characterAnalyzer;
         _characterRavaSidecarUtility = characterRavaSidecarUtility;
+        _localActiveSyncIndicatorService = localActiveSyncIndicatorService;
         Mediator.Subscribe<FrameworkUpdateMessage>(this, (_) =>
         {
             var nowTick = Environment.TickCount64;
@@ -121,10 +132,14 @@ public class VisibleUserDataDistributor : DisposableMediatorSubscriberBase
                 _lastMoodlesData = newData.MoodlesData ?? string.Empty;
                 _lastPetNamesData = newData.PetNamesData ?? string.Empty;
 
-                if (barrierKeyChanged)
+                // Keep recipient authorization when the payload hash set changes.
+                // Existing hashes remain shared; the push path can now authorize only newly-added hashes.
+                // Visibility/reconnect still forces a full barrier when required.
+                if (barrierKeyChanged && Logger.IsEnabled(LogLevel.Trace))
                 {
-                    _lastUploadBarrierKey = string.Empty;
-                    _authorizedRecipientUids.Clear();
+                    Logger.LogTrace(
+                        "Local payload hash set changed for {hash}; retaining prior upload/share authorizations and letting the barrier check only new hashes when safe",
+                        newData.DataHash.Value);
                 }
 
                 Logger.LogTrace("Storing new data hash {hash}/{payload}", newData.DataHash.Value, newPayloadFingerprint);
@@ -160,7 +175,15 @@ public class VisibleUserDataDistributor : DisposableMediatorSubscriberBase
             if (string.Equals(_lastSidecarBroadcastSignature, currentSignature, StringComparison.Ordinal))
                 return;
 
-            if (DateTime.UtcNow - _lastSidecarBroadcastUtc < SidecarRefreshMinInterval)
+            var nowUtc = DateTime.UtcNow;
+            if (nowUtc - _lastSidecarBroadcastUtc < SidecarRefreshMinInterval)
+                return;
+
+            // A full outbound character push already waits briefly for metrics and carries the
+            // sidecar when it is ready. If metrics finish a few frames later, do not immediately
+            // send a second character-data packet just for the UI stats; let the normal refresh
+            // window handle it.
+            if (nowUtc - _lastOutboundCharacterPushUtc < SidecarRefreshMinInterval)
                 return;
 
             var queuedCount = QueueVisibleUsersForPush();
@@ -170,6 +193,19 @@ public class VisibleUserDataDistributor : DisposableMediatorSubscriberBase
 
             Logger.LogDebug("Scheduling sidecar-backed perf refresh for {count} visible players", queuedCount);
             PushCharacterData(includeSyncManifest: false);
+        });
+
+        Mediator.Subscribe<LocalActiveSyncIndicatorChangedMessage>(this, msg =>
+        {
+            if (!_apiController.IsConnected || _lastCreatedData == null)
+                return;
+
+            var queuedCount = QueueVisibleUsersForPush();
+            if (queuedCount == 0)
+                return;
+
+            Logger.LogDebug("Scheduling active sound indicator refresh for {count} visible players; playing={playing}", queuedCount, msg.IsPlayingSound);
+            PushCharacterData(forceOutbound: true, includeSyncManifest: false, bypassDuplicateSuppression: true);
         });
 
         //Mediator.Subscribe<ConnectedMessage>(this, (_) => PushToAllVisibleUsers(forced: true));
@@ -182,6 +218,7 @@ public class VisibleUserDataDistributor : DisposableMediatorSubscriberBase
                 _lastOutboundAppearanceSignatureByUid.Clear();
                 _lastOutboundSendTickByUid.Clear();
                 _lastOutboundSidecarOnlyTickByUid.Clear();
+                _lastOutboundOtherSyncSignatureByUid.Clear();
             }
 
             var queuedCount = QueueVisibleUsersForPush(forceBarrier: true);
@@ -189,7 +226,7 @@ public class VisibleUserDataDistributor : DisposableMediatorSubscriberBase
             if (_lastCreatedData != null && queuedCount > 0)
             {
                 Logger.LogDebug("Forcing outbound character data refresh after connection established for {count} visible players", queuedCount);
-                PushCharacterData(forced: true, forceOutbound: true);
+                PushCharacterData(forced: true, forceOutbound: true, bypassDuplicateSuppression: true);
             }
         });
 
@@ -206,6 +243,7 @@ public class VisibleUserDataDistributor : DisposableMediatorSubscriberBase
                 _queuedPushRevisionByUid.Clear();
                 _forceBarrierPending = false;
                 _forceOutboundPending = false;
+                _bypassDuplicateSuppressionPending = false;
             }
             _newVisibleUsersBuffer.Clear();
             _noLongerVisibleUsersBuffer.Clear();
@@ -217,6 +255,7 @@ public class VisibleUserDataDistributor : DisposableMediatorSubscriberBase
             _uploadingCharacterData = null;
             _fileUploadTask = null;
             _lastUploadBarrierKey = string.Empty;
+            _lastUploadBarrierHashes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             _authorizedRecipientUids.Clear();
             // Keep the last built local payload across a transport disconnect so reconnect can repush it to visible recipients.
             _pendingHeelsData = null;
@@ -232,10 +271,13 @@ public class VisibleUserDataDistributor : DisposableMediatorSubscriberBase
             _pendingMoodlesApplyTick = -1;
             _lastSidecarBroadcastSignature = string.Empty;
             _lastSidecarBroadcastUtc = DateTime.MinValue;
+            _lastOutboundCharacterPushUtc = DateTime.MinValue;
             _lastOutboundFullSignatureByUid.Clear();
             _lastOutboundAppearanceSignatureByUid.Clear();
             _lastOutboundSendTickByUid.Clear();
             _lastOutboundSidecarOnlyTickByUid.Clear();
+            _lastOutboundOtherSyncSignatureByUid.Clear();
+            _localOtherSyncClaimByUid.Clear();
         });
 
         Mediator.Subscribe<HeelsOffsetMessage>(this, (msg) =>
@@ -258,6 +300,16 @@ public class VisibleUserDataDistributor : DisposableMediatorSubscriberBase
         Mediator.Subscribe<PetNamesMessage>(this, (msg) =>
         {
             HandlePetNamesChanged(msg.PetNicknamesData);
+        });
+
+        Mediator.Subscribe<LocalOtherSyncYieldStateChangedMessage>(this, (msg) =>
+        {
+            HandleLocalOtherSyncStateChanged(msg.AffectedUid, msg.YieldToOtherSync, msg.Owner);
+        });
+
+        Mediator.Subscribe<OtherSyncCurrentStateChangedMessage>(this, (msg) =>
+        {
+            HandleOtherSyncCurrentStateChanged(msg.Reason);
         });
 
     }
@@ -322,6 +374,67 @@ public class VisibleUserDataDistributor : DisposableMediatorSubscriberBase
         }
     }
 
+    private void HandleLocalOtherSyncStateChanged(string affectedUid, bool yieldToOtherSync, string owner)
+    {
+        if (string.IsNullOrWhiteSpace(affectedUid))
+            return;
+
+        owner ??= string.Empty;
+        owner = yieldToOtherSync ? owner.Trim() : string.Empty;
+
+        lock (_pushQueueLock)
+        {
+            if (yieldToOtherSync && !string.IsNullOrWhiteSpace(owner))
+                _localOtherSyncClaimByUid[affectedUid] = new LocalOtherSyncClaim(true, owner);
+            else
+                _localOtherSyncClaimByUid.Remove(affectedUid);
+        }
+
+        if (!_apiController.IsConnected || _lastCreatedData == null)
+            return;
+
+        var pair = _pairManager.GetPairByUID(affectedUid);
+        if (pair == null || !pair.IsVisible)
+            return;
+
+        QueueUsersForPush([pair.UserData]);
+        PushCharacterData(forceOutbound: true, bypassDuplicateSuppression: true);
+    }
+
+    private void HandleOtherSyncCurrentStateChanged(string reason)
+    {
+        if (!_apiController.IsConnected || _lastCreatedData == null)
+            return;
+
+        var changedUsers = new List<UserData>();
+
+        _pairManager.ForEachVisiblePair(pair =>
+        {
+            var uid = pair.UserData?.UID ?? string.Empty;
+            if (string.IsNullOrWhiteSpace(uid))
+                return;
+
+            var currentSignature = BuildCurrentOtherSyncOutboundSignatureForTarget(uid);
+            lock (_pushQueueLock)
+            {
+                if (_lastOutboundOtherSyncSignatureByUid.TryGetValue(uid, out var lastSignature)
+                    && string.Equals(lastSignature, currentSignature, StringComparison.Ordinal))
+                {
+                    return;
+                }
+            }
+
+            changedUsers.Add(pair.UserData);
+        });
+
+        if (changedUsers.Count == 0)
+            return;
+
+        Logger.LogDebug("Scheduling OtherSync current-state user data refresh for {count} visible player(s); reason={reason}", changedUsers.Count, reason);
+        QueueUsersForPush(changedUsers);
+        PushCharacterData(forceOutbound: true, bypassDuplicateSuppression: true);
+    }
+
     private void HandleHeelsOffsetChanged(string offset)
     {
         if (!_apiController.IsConnected)
@@ -382,14 +495,63 @@ public class VisibleUserDataDistributor : DisposableMediatorSubscriberBase
         if (data.FileReplacements.Count == 0)
             return string.Empty;
 
-        var hashes = data.FileReplacements
-            .SelectMany(kvp => kvp.Value)
-            .Where(fr => string.IsNullOrWhiteSpace(fr.FileSwapPath) && !string.IsNullOrWhiteSpace(fr.Hash))
-            .Select(fr => fr.Hash)
-            .Distinct(StringComparer.Ordinal)
+        var hashes = CollectPayloadFileHashes(data)
             .OrderBy(h => h, StringComparer.Ordinal);
 
         return string.Join('|', hashes);
+    }
+
+    private static HashSet<string> CollectPayloadFileHashes(CharacterData data)
+    {
+        if (data.FileReplacements.Count == 0)
+            return new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        return data.FileReplacements
+            .SelectMany(kvp => kvp.Value)
+            .Where(fr => string.IsNullOrWhiteSpace(fr.FileSwapPath) && !string.IsNullOrWhiteSpace(fr.Hash))
+            .Select(fr => fr.Hash.Trim().ToUpperInvariant())
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+    }
+
+    private HashSet<string> GetAddedPayloadHashes(HashSet<string> currentPayloadHashes, bool forceFullBarrier)
+    {
+        if (forceFullBarrier || _lastUploadBarrierHashes.Count == 0)
+            return new HashSet<string>(currentPayloadHashes, StringComparer.OrdinalIgnoreCase);
+
+        return currentPayloadHashes
+            .Except(_lastUploadBarrierHashes, StringComparer.OrdinalIgnoreCase)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+    }
+
+    private void RecordUploadBarrierState(string barrierKey, HashSet<string> payloadHashes)
+    {
+        _lastUploadBarrierKey = barrierKey;
+        _lastUploadBarrierHashes = new HashSet<string>(payloadHashes, StringComparer.OrdinalIgnoreCase);
+    }
+
+    private Dictionary<string, string> ResolveTargetMeshSessions(IEnumerable<UserData> targetUsers)
+    {
+        var requiredUids = CollectRecipientUids(targetUsers);
+        var sessions = new Dictionary<string, string>(StringComparer.Ordinal);
+
+        if (requiredUids.Count == 0)
+            return sessions;
+
+        _pairManager.ForEachVisiblePair(pair =>
+        {
+            var uid = pair.UserData?.UID;
+            if (string.IsNullOrWhiteSpace(uid) || !requiredUids.Contains(uid))
+                return;
+
+            if (string.IsNullOrWhiteSpace(pair.Ident))
+                return;
+
+            var sessionId = RavaSessionId.FromIdent(pair.Ident);
+            if (!string.IsNullOrWhiteSpace(sessionId))
+                sessions[uid] = sessionId;
+        });
+
+        return sessions;
     }
 
     private static string BuildSidecarSignature(string? dataHash, long vramBytes, long triangles)
@@ -405,43 +567,58 @@ public class VisibleUserDataDistributor : DisposableMediatorSubscriberBase
         return PairApplyUtilities.ComputeCharacterDataPayloadFingerprint(clone);
     }
 
-    private List<UserData> FilterUsersForOutboundSend(CharacterData dataToSend, List<UserData> targetUsers, bool forceBarrier, bool forceOutbound)
+    private List<UserData> FilterUsersForOutboundSend(CharacterData dataToSend, List<UserData> targetUsers, bool forceBarrier, bool forceOutbound, bool bypassDuplicateSuppression, IReadOnlyDictionary<string, CharacterData>? dataByUid = null)
     {
         if (targetUsers.Count == 0)
             return targetUsers;
 
         var nowTick = Environment.TickCount64;
-        var fullSignature = BuildFullOutboundSignature(dataToSend);
-        var appearanceSignature = BuildAppearanceOutboundSignature(dataToSend);
         var filtered = new List<UserData>(targetUsers.Count);
 
         lock (_pushQueueLock)
         {
             foreach (var user in targetUsers)
             {
+                if (!IsCurrentlyVisibleOutboundRecipient(user))
+                    continue;
+
                 var uid = user.UID;
                 if (string.IsNullOrWhiteSpace(uid))
                     continue;
+
+                var perUserData = GetTargetedCharacterData(dataByUid, uid, dataToSend);
+                var perUserFullSignature = BuildFullOutboundSignature(perUserData);
+                var perUserAppearanceSignature = BuildAppearanceOutboundSignature(perUserData);
 
                 _lastOutboundFullSignatureByUid.TryGetValue(uid, out var lastFullSignature);
                 _lastOutboundAppearanceSignatureByUid.TryGetValue(uid, out var lastAppearanceSignature);
                 _lastOutboundSendTickByUid.TryGetValue(uid, out var lastSendTick);
                 _lastOutboundSidecarOnlyTickByUid.TryGetValue(uid, out var lastSidecarOnlyTick);
 
-                var sameFullPayload = string.Equals(fullSignature, lastFullSignature, StringComparison.Ordinal);
-                var sameAppearancePayload = string.Equals(appearanceSignature, lastAppearanceSignature, StringComparison.Ordinal);
+                var sameFullPayload = string.Equals(perUserFullSignature, lastFullSignature, StringComparison.Ordinal);
+                var sameAppearancePayload = string.Equals(perUserAppearanceSignature, lastAppearanceSignature, StringComparison.Ordinal);
                 var elapsedSinceLastSend = unchecked(nowTick - lastSendTick);
                 var elapsedSinceSidecarOnly = unchecked(nowTick - lastSidecarOnlyTick);
 
-                if (!forceOutbound && sameFullPayload && elapsedSinceLastSend >= 0 && elapsedSinceLastSend < DuplicateOutboundSuppressWindowMs)
+                // Always suppress exact duplicate payloads inside the short outbound window.
+                // Visibility gain and reconnect still send once because their per-recipient state is
+                // cleared when visibility/connection drops; the bypass flag is only allowed to skip
+                // slower sidecar-only throttles, not to double-send the same final payload.
+                if (sameFullPayload
+                    && elapsedSinceLastSend >= 0
+                    && elapsedSinceLastSend < DuplicateOutboundSuppressWindowMs
+                    && !forceBarrier)
+                {
                     continue;
+                }
 
                 var sidecarOnlyPayload = sameAppearancePayload && !sameFullPayload;
                 if (sidecarOnlyPayload
                     && elapsedSinceSidecarOnly >= 0
                     && elapsedSinceSidecarOnly < SidecarOnlyOutboundMinIntervalMs
                     && !forceBarrier
-                    && !forceOutbound)
+                    && !forceOutbound
+                    && !bypassDuplicateSuppression)
                 {
                     continue;
                 }
@@ -460,12 +637,10 @@ public class VisibleUserDataDistributor : DisposableMediatorSubscriberBase
         return filtered;
     }
 
-    private void RecordOutboundSend(CharacterData sentData, IEnumerable<UserData> sentUsers)
+    private void RecordOutboundSend(CharacterData sentData, IEnumerable<UserData> sentUsers, IReadOnlyDictionary<string, CharacterData>? dataByUid = null)
     {
         var nowTick = Environment.TickCount64;
-        var fullSignature = BuildFullOutboundSignature(sentData);
-        var appearanceSignature = BuildAppearanceOutboundSignature(sentData);
-
+        var recordedAnyRecipient = false;
         lock (_pushQueueLock)
         {
             foreach (var user in sentUsers)
@@ -474,21 +649,109 @@ public class VisibleUserDataDistributor : DisposableMediatorSubscriberBase
                 if (string.IsNullOrWhiteSpace(uid))
                     continue;
 
+                var perUserData = GetTargetedCharacterData(dataByUid, uid, sentData);
+                var perUserFullSignature = BuildFullOutboundSignature(perUserData);
+                var perUserAppearanceSignature = BuildAppearanceOutboundSignature(perUserData);
+
                 _lastOutboundFullSignatureByUid.TryGetValue(uid, out var lastFullSignature);
                 _lastOutboundAppearanceSignatureByUid.TryGetValue(uid, out var lastAppearanceSignature);
 
-                var sameAppearancePayload = string.Equals(appearanceSignature, lastAppearanceSignature, StringComparison.Ordinal);
-                var sameFullPayload = string.Equals(fullSignature, lastFullSignature, StringComparison.Ordinal);
+                var sameAppearancePayload = string.Equals(perUserAppearanceSignature, lastAppearanceSignature, StringComparison.Ordinal);
+                var sameFullPayload = string.Equals(perUserFullSignature, lastFullSignature, StringComparison.Ordinal);
                 var sidecarOnlyPayload = sameAppearancePayload && !sameFullPayload;
 
-                _lastOutboundFullSignatureByUid[uid] = fullSignature;
-                _lastOutboundAppearanceSignatureByUid[uid] = appearanceSignature;
+                _lastOutboundFullSignatureByUid[uid] = perUserFullSignature;
+                _lastOutboundAppearanceSignatureByUid[uid] = perUserAppearanceSignature;
                 _lastOutboundSendTickByUid[uid] = nowTick;
 
                 if (sidecarOnlyPayload)
                     _lastOutboundSidecarOnlyTickByUid[uid] = nowTick;
+
+                _lastOutboundOtherSyncSignatureByUid[uid] = BuildOtherSyncOutboundSignatureFromData(perUserData, uid);
+                recordedAnyRecipient = true;
             }
         }
+
+        if (recordedAnyRecipient)
+            _lastOutboundCharacterPushUtc = DateTime.UtcNow;
+    }
+
+    private async Task<bool> PushCharacterDataServerFallbackAsync(CharacterData data, List<UserData> targetUsers, IReadOnlyDictionary<string, CharacterData>? dataByUid = null)
+    {
+        targetUsers = FilterUsersToCurrentlyVisibleRecipients(targetUsers);
+        if (targetUsers.Count == 0)
+            return true;
+
+        if (dataByUid == null || dataByUid.Count == 0)
+            return await _apiController.PushCharacterData(data.DeepClone(), targetUsers).ConfigureAwait(false);
+
+        var success = true;
+        foreach (var user in targetUsers)
+        {
+            if (!IsCurrentlyVisibleOutboundRecipient(user))
+                continue;
+
+            var uid = user.UID ?? string.Empty;
+            var perUserData = GetTargetedCharacterData(dataByUid, uid, data);
+            success &= await _apiController.PushCharacterData(perUserData.DeepClone(), [user]).ConfigureAwait(false);
+        }
+
+        return success;
+    }
+
+    private async Task<bool> CompleteMeshCharacterPushOrFallbackAsync(CharacterData data, List<UserData> targetUsers, MissingFileMeshService.MeshCharacterPushOfferResult? meshOffer, IReadOnlyDictionary<string, string> targetMeshSessions, IReadOnlyDictionary<string, CharacterData>? dataByUid = null)
+    {
+        targetUsers = FilterUsersToCurrentlyVisibleRecipients(targetUsers);
+        if (targetUsers.Count == 0)
+            return true;
+
+        var currentVisibleTargetUids = CollectRecipientUids(targetUsers);
+        HashSet<string> meshReadyAcked = new(StringComparer.Ordinal);
+        HashSet<string> meshAccepted = meshOffer?.AcceptedUids
+            .Where(uid => !string.IsNullOrWhiteSpace(uid) && currentVisibleTargetUids.Contains(uid))
+            .ToHashSet(StringComparer.Ordinal)
+            ?? new HashSet<string>(StringComparer.Ordinal);
+
+        if (meshAccepted.Count > 0)
+        {
+            meshReadyAcked = await _missingFileMeshService
+                .SignalCharacterDataReadyAsync(targetMeshSessions, meshOffer!.RequestId, meshAccepted, data, _runtimeCts.Token, dataByUid)
+                .ConfigureAwait(false);
+
+            var missingReadyAck = meshAccepted.Except(meshReadyAcked, StringComparer.Ordinal).ToList();
+            if (missingReadyAck.Count > 0 && Logger.IsEnabled(LogLevel.Debug))
+            {
+                Logger.LogDebug(
+                    "Mesh character push ready ACK was not received from {count} accepted recipient(s); not server-falling back because the offer was accepted and ready was retried",
+                    missingReadyAck.Count);
+            }
+        }
+
+        var fallbackUsers = targetUsers
+            .Where(u => string.IsNullOrWhiteSpace(u.UID) || !meshAccepted.Contains(u.UID))
+            .ToList();
+
+        if (fallbackUsers.Count == 0)
+            return true;
+
+        // Server fallback is only for recipients that never accepted the Mesh offer at all
+        // (old client/no Mesh/no offer response). If an offer was accepted, do not also hit
+        // UserPushData just because the final ready ACK was slow or lost; that would create
+        // a new duplicate-push source on top of any pre-existing push coalescing issues.
+        return await PushCharacterDataServerFallbackAsync(data, fallbackUsers, dataByUid).ConfigureAwait(false);
+    }
+
+    private static void RestoreMeshRoutedPluginPayloads(CharacterData destination, CharacterData source)
+    {
+        // FileReplacement data still goes through the upload/share barrier, but rich plugin state
+        // can safely ride mesh. Preserve it after the server-facing upload path has sanitized its copy.
+        destination.GlamourerData = source.GlamourerData?.ToDictionary(k => k.Key, v => v.Value) ?? [];
+        destination.CustomizePlusData = source.CustomizePlusData?.ToDictionary(k => k.Key, v => v.Value) ?? [];
+        destination.ManipulationData = source.ManipulationData ?? string.Empty;
+        destination.HeelsData = source.HeelsData ?? string.Empty;
+        destination.HonorificData = source.HonorificData ?? string.Empty;
+        destination.MoodlesData = source.MoodlesData ?? string.Empty;
+        destination.PetNamesData = source.PetNamesData ?? string.Empty;
     }
 
     private void ForgetOutboundStateForUsers(IEnumerable<UserData> users)
@@ -505,7 +768,10 @@ public class VisibleUserDataDistributor : DisposableMediatorSubscriberBase
                 _lastOutboundAppearanceSignatureByUid.Remove(uid);
                 _lastOutboundSendTickByUid.Remove(uid);
                 _lastOutboundSidecarOnlyTickByUid.Remove(uid);
+                _lastOutboundOtherSyncSignatureByUid.Remove(uid);
                 _authorizedRecipientUids.Remove(uid);
+                _usersToPushDataTo.Remove(uid);
+                _queuedPushRevisionByUid.Remove(uid);
             }
         }
     }
@@ -521,27 +787,60 @@ public class VisibleUserDataDistributor : DisposableMediatorSubscriberBase
     {
         lock (_pushQueueLock)
         {
+            PruneQueuedUsersToCurrentlyVisibleLocked();
+
             var revision = ++_queuedPushRevisionCounter;
             foreach (var user in users)
             {
-                if (string.IsNullOrWhiteSpace(user.UID))
+                if (!IsCurrentlyVisibleOutboundRecipient(user))
                     continue;
 
                 _usersToPushDataTo[user.UID] = user;
                 _queuedPushRevisionByUid[user.UID] = revision;
             }
 
-            if (forceBarrier)
+            if (forceBarrier && _usersToPushDataTo.Count > 0)
                 _forceBarrierPending = true;
 
             return _usersToPushDataTo.Count;
         }
     }
 
-    private List<UserData> SnapshotQueuedUsers()
+    private void PruneQueuedUsersToCurrentlyVisibleLocked()
     {
-        return _usersToPushDataTo.Values.ToList();
+        if (_usersToPushDataTo.Count == 0)
+            return;
+
+        foreach (var uid in _usersToPushDataTo.Keys.ToList())
+        {
+            if (!IsCurrentlyVisibleOutboundRecipient(uid))
+            {
+                _usersToPushDataTo.Remove(uid);
+                _queuedPushRevisionByUid.Remove(uid);
+            }
+        }
     }
+
+    private bool IsCurrentlyVisibleOutboundRecipient(UserData? user)
+        => user != null && IsCurrentlyVisibleOutboundRecipient(user.UID);
+
+    private bool IsCurrentlyVisibleOutboundRecipient(string? uid)
+    {
+        if (string.IsNullOrWhiteSpace(uid))
+            return false;
+
+        var pair = _pairManager.GetPairByUID(uid);
+        return pair?.IsVisible == true;
+    }
+
+    private List<UserData> SnapshotQueuedVisibleUsersLocked()
+    {
+        PruneQueuedUsersToCurrentlyVisibleLocked();
+        return _usersToPushDataTo.Values.Where(IsCurrentlyVisibleOutboundRecipient).ToList();
+    }
+
+    private List<UserData> FilterUsersToCurrentlyVisibleRecipients(IEnumerable<UserData> users)
+        => users.Where(IsCurrentlyVisibleOutboundRecipient).ToList();
 
     private static HashSet<string> CollectRecipientUids(IEnumerable<UserData> users)
     {
@@ -549,6 +848,111 @@ public class VisibleUserDataDistributor : DisposableMediatorSubscriberBase
             .Select(u => u.UID)
             .Where(uid => !string.IsNullOrWhiteSpace(uid))
             .ToHashSet(StringComparer.Ordinal);
+    }
+
+    private Dictionary<string, CharacterData> BuildTargetedCharacterDataByUid(CharacterData baseData, IEnumerable<UserData> targetUsers)
+    {
+        var result = new Dictionary<string, CharacterData>(StringComparer.Ordinal);
+
+        foreach (var user in targetUsers)
+        {
+            var uid = user.UID ?? string.Empty;
+            if (string.IsNullOrWhiteSpace(uid) || result.ContainsKey(uid))
+                continue;
+
+            var targetData = baseData.DeepClone();
+            var owner = ResolveLocalOtherSyncOwnerForTarget(uid);
+            var active = !string.IsNullOrWhiteSpace(owner);
+            _characterRavaSidecarUtility.TryEmbedOtherSync(targetData, uid, active, owner);
+            result[uid] = targetData;
+        }
+
+        return result;
+    }
+
+    private string ResolveLocalOtherSyncOwnerForTarget(string uid)
+    {
+        if (string.IsNullOrWhiteSpace(uid))
+            return string.Empty;
+
+        var pair = _pairManager.GetPairByUID(uid);
+        if (pair == null || !pair.IsVisible || pair.OverrideOtherSync)
+            return string.Empty;
+
+        LocalOtherSyncClaim? storedClaim = null;
+        lock (_pushQueueLock)
+        {
+            _localOtherSyncClaimByUid.TryGetValue(uid, out storedClaim);
+        }
+
+        var address = pair.PlayerCharacter;
+        var preferFresh = pair.AutoPausedByOtherSync || pair.RemoteOtherSyncOverrideActive;
+
+        if (storedClaim is { Active: true } && !string.IsNullOrWhiteSpace(storedClaim.Owner))
+        {
+            if (!_ipcManager.OtherSync.IsOwnerAvailable(storedClaim.Owner))
+            {
+                lock (_pushQueueLock)
+                    _localOtherSyncClaimByUid.Remove(uid);
+            }
+            else if (address == nint.Zero)
+            {
+                // Once a pair has yielded/manual-paused through the shared vanilla teardown path,
+                // the live Rava handler may intentionally be detached. The stored claim is still
+                // the last real pair-loop handshake decision and is refreshed/released by
+                // OtherSyncCurrentStateChangedMessage, so keep sending it until the local poller
+                // proves otherwise.
+                return storedClaim.Owner;
+            }
+            else if (_ipcManager.OtherSync.IsOwnerHandlingAddress(storedClaim.Owner, address, preferFresh: true))
+            {
+                return storedClaim.Owner;
+            }
+            else
+            {
+                lock (_pushQueueLock)
+                    _localOtherSyncClaimByUid.Remove(uid);
+            }
+        }
+
+        if (address == nint.Zero)
+            return string.Empty;
+
+        if (!_ipcManager.OtherSync.TryGetOwningOtherSync(address, out var owner, preferFresh: preferFresh))
+            return string.Empty;
+
+        return _ipcManager.OtherSync.IsOwnerAvailable(owner)
+            && _ipcManager.OtherSync.IsOwnerHandlingAddress(owner, address, preferFresh: preferFresh)
+            ? owner
+            : string.Empty;
+    }
+
+    private string BuildCurrentOtherSyncOutboundSignatureForTarget(string uid)
+        => BuildOtherSyncOutboundSignature(uid, ResolveLocalOtherSyncOwnerForTarget(uid));
+
+    private static string BuildOtherSyncOutboundSignature(string uid, string? owner)
+    {
+        owner ??= string.Empty;
+        owner = owner.Trim();
+        var active = !string.IsNullOrWhiteSpace(owner);
+        return $"{uid}|{(active ? "1" : "0")}|{(active ? owner : string.Empty)}";
+    }
+
+    private string BuildOtherSyncOutboundSignatureFromData(CharacterData data, string uid)
+    {
+        var clone = data.DeepClone();
+        if (!_characterRavaSidecarUtility.TryExtractOtherSync(clone, uid, out var payload) || payload?.a != true)
+            return BuildOtherSyncOutboundSignature(uid, string.Empty);
+
+        return BuildOtherSyncOutboundSignature(uid, payload.o);
+    }
+
+    private static CharacterData GetTargetedCharacterData(IReadOnlyDictionary<string, CharacterData>? dataByUid, string uid, CharacterData fallback)
+    {
+        if (dataByUid != null && !string.IsNullOrWhiteSpace(uid) && dataByUid.TryGetValue(uid, out var data) && data != null)
+            return data;
+
+        return fallback;
     }
 
     private void RemoveQueuedUsers(IEnumerable<UserData> users, long sentRevision)
@@ -594,6 +998,7 @@ public class VisibleUserDataDistributor : DisposableMediatorSubscriberBase
 
         var visiblePlayerAddresses = _visiblePlayerAddressesBuffer;
         visiblePlayerAddresses.Clear();
+        var trackOtherSyncAddresses = _ipcManager.OtherSync.ShouldPollOwnership();
 
         _pairManager.ForEachVisiblePair(pair =>
         {
@@ -602,9 +1007,12 @@ public class VisibleUserDataDistributor : DisposableMediatorSubscriberBase
             if (!_previouslyVisiblePlayersSet.Contains(user))
                 newVisibleUsers.Add(user);
 
-            var address = pair.PlayerCharacter;
-            if (address != nint.Zero)
-                visiblePlayerAddresses.Add(address);
+            if (trackOtherSyncAddresses)
+            {
+                var address = pair.PlayerCharacter;
+                if (address != nint.Zero)
+                    visiblePlayerAddresses.Add(address);
+            }
         });
 
         foreach (var user in _previouslyVisiblePlayersSet)
@@ -619,7 +1027,7 @@ public class VisibleUserDataDistributor : DisposableMediatorSubscriberBase
             ForgetOutboundStateForUsers(noLongerVisibleUsers);
         }
 
-        _ipcManager.OtherSync.UpdateTrackedVisibleAddresses(visiblePlayerAddresses);
+        _ipcManager.OtherSync.UpdateTrackedVisibleAddresses(trackOtherSyncAddresses ? visiblePlayerAddresses : null);
 
         _previouslyVisiblePlayersSet.Clear();
         _previouslyVisiblePlayersSet.UnionWith(currentVisibleUsers);
@@ -637,28 +1045,13 @@ public class VisibleUserDataDistributor : DisposableMediatorSubscriberBase
 
         // A visibility gain is a recipient-state change, not a local payload change.
         // Send the current payload even if it matches what this UID saw shortly before.
-        PushCharacterData(forceOutbound: true);
+        PushCharacterData(forceOutbound: true, bypassDuplicateSuppression: true);
 
     }
 
-    private void LogPushSanitizerResult(CharacterDataPushSanitizer.Result result, string stage)
+    private void PushCharacterData(bool forced = false, bool forceOutbound = false, bool includeSyncManifest = true, bool bypassDuplicateSuppression = false)
     {
-        if (!result.Changed || !Logger.IsEnabled(LogLevel.Debug))
-            return;
-
-        Logger.LogDebug("Removed server-invalid outbound data at {stage}: {replacements} replacement(s), {gamePaths} game path(s), {buckets} object bucket(s), {honorific} honorific payload(s)",
-            stage,
-            result.RemovedReplacements,
-            result.RemovedGamePaths,
-            result.RemovedBuckets,
-            result.RemovedHonorificData);
-    }
-
-    private void PushCharacterData(bool forced = false, bool forceOutbound = false, bool includeSyncManifest = true)
-    {
-        var requestedImmediateSend = forced || forceOutbound;
-
-        if (forced || forceOutbound)
+        if (forced || forceOutbound || bypassDuplicateSuppression)
         {
             lock (_pushQueueLock)
             {
@@ -667,6 +1060,9 @@ public class VisibleUserDataDistributor : DisposableMediatorSubscriberBase
 
                 if (forceOutbound)
                     _forceOutboundPending = true;
+
+                if (bypassDuplicateSuppression)
+                    _bypassDuplicateSuppressionPending = true;
             }
         }
 
@@ -680,14 +1076,14 @@ public class VisibleUserDataDistributor : DisposableMediatorSubscriberBase
                 await _pushDataSemaphore.WaitAsync(_runtimeCts.Token).ConfigureAwait(false);
                 try
                 {
-                    if (!requestedImmediateSend)
-                        await Task.Delay(OutboundPushCoalesceDelayMs, _runtimeCts.Token).ConfigureAwait(false);
+                    await WaitForOutboundPushQueueToSettleAsync(_runtimeCts.Token).ConfigureAwait(false);
 
                 List<UserData> targetUsers;
                 List<UserData> originalTargetUsers;
                 CharacterData dataToSend;
                 bool forceBarrier;
                 bool forceOutboundSend;
+                bool bypassDuplicateSuppression;
                 long sendRevision;
 
                 lock (_pushQueueLock)
@@ -695,17 +1091,18 @@ public class VisibleUserDataDistributor : DisposableMediatorSubscriberBase
                     if (_lastCreatedData == null || _usersToPushDataTo.Count == 0)
                         return;
 
-                    targetUsers = SnapshotQueuedUsers();
+                    targetUsers = SnapshotQueuedVisibleUsersLocked();
                     originalTargetUsers = targetUsers;
                     if (targetUsers.Count == 0)
                         return;
 
                     dataToSend = _lastCreatedData.DeepClone();
-                    LogPushSanitizerResult(CharacterDataPushSanitizer.SanitizeForPush(dataToSend), "snapshot");
                     forceBarrier = _forceBarrierPending;
                     forceOutboundSend = _forceOutboundPending;
+                    bypassDuplicateSuppression = _bypassDuplicateSuppressionPending;
                     _forceBarrierPending = false;
                     _forceOutboundPending = false;
+                    _bypassDuplicateSuppressionPending = false;
                     sendRevision = _queuedPushRevisionCounter;
                 }
 
@@ -740,57 +1137,122 @@ public class VisibleUserDataDistributor : DisposableMediatorSubscriberBase
                     _lastSidecarBroadcastUtc = DateTime.UtcNow;
                 }
 
-                targetUsers = FilterUsersForOutboundSend(dataToSend, targetUsers, forceBarrier, forceOutboundSend);
+                _characterRavaSidecarUtility.TryEmbedActiveSoundIndicator(dataToSend, _localActiveSyncIndicatorService.IsPlayingSound);
+
+                targetUsers = FilterUsersToCurrentlyVisibleRecipients(targetUsers);
                 if (targetUsers.Count == 0)
                 {
                     RemoveQueuedUsers(originalTargetUsers, sendRevision);
                     return;
                 }
 
+                var outboundDataByUid = BuildTargetedCharacterDataByUid(dataToSend, targetUsers);
+
+                targetUsers = FilterUsersForOutboundSend(dataToSend, targetUsers, forceBarrier, forceOutboundSend, bypassDuplicateSuppression, outboundDataByUid);
+                if (targetUsers.Count == 0)
+                {
+                    RemoveQueuedUsers(originalTargetUsers, sendRevision);
+                    return;
+                }
+
+                targetUsers = FilterUsersToCurrentlyVisibleRecipients(targetUsers);
+                if (targetUsers.Count == 0)
+                {
+                    RemoveQueuedUsers(originalTargetUsers, sendRevision);
+                    return;
+                }
+
+                outboundDataByUid = BuildTargetedCharacterDataByUid(dataToSend, targetUsers);
+
                 var targetRecipientUids = CollectRecipientUids(targetUsers);
+                var targetMeshSessions = ResolveTargetMeshSessions(targetUsers);
                 var barrierKey = BuildUploadBarrierKey(dataToSend);
+                var payloadFileHashes = CollectPayloadFileHashes(dataToSend);
 
                 var barrierKeyChanged = !string.Equals(_lastUploadBarrierKey, barrierKey, StringComparison.Ordinal);
                 var hasUnauthorizedRecipients = !targetRecipientUids.IsSubsetOf(_authorizedRecipientUids);
+                var fullBarrierRequired = forceBarrier || hasUnauthorizedRecipients || string.IsNullOrEmpty(_lastUploadBarrierKey);
+                var addedPayloadHashes = GetAddedPayloadHashes(payloadFileHashes, fullBarrierRequired);
+                var removedOnlyHashChange = barrierKeyChanged && addedPayloadHashes.Count == 0;
 
-                var mustRunUploadBarrier =
-                    forceBarrier
-                    || barrierKeyChanged
-                    || hasUnauthorizedRecipients;
+                if (Logger.IsEnabled(LogLevel.Information))
+                    Logger.LogInformation("Pushing your user data to {users}", string.Join(", ", targetUsers.Select(k => k.AliasOrUID)));
+
+                MissingFileMeshService.MeshCharacterPushOfferResult? meshOffer = null;
+                if (targetMeshSessions.Count > 0 && targetRecipientUids.Count > 0)
+                {
+                    meshOffer = await _missingFileMeshService
+                        .OfferCharacterDataForUsersAsync(targetMeshSessions, dataToSend, targetUsers, payloadFileHashes, _runtimeCts.Token, outboundDataByUid)
+                        .ConfigureAwait(false);
+                }
+
+                var meshAcceptedAllRecipients = meshOffer != null && targetRecipientUids.IsSubsetOf(meshOffer.AcceptedUids);
+
+                IReadOnlyCollection<string>? scopedBarrierHashes = null;
+                var mustRunUploadBarrier = false;
+                if (meshAcceptedAllRecipients)
+                {
+                    scopedBarrierHashes = meshOffer!.MissingHashes;
+                    mustRunUploadBarrier = scopedBarrierHashes.Count > 0;
+                }
+                else if (fullBarrierRequired)
+                {
+                    scopedBarrierHashes = null;
+                    mustRunUploadBarrier = payloadFileHashes.Count > 0;
+                }
+                else if (barrierKeyChanged && addedPayloadHashes.Count > 0)
+                {
+                    scopedBarrierHashes = addedPayloadHashes;
+                    mustRunUploadBarrier = true;
+                }
+
+                if (Logger.IsEnabled(LogLevel.Debug) && barrierKeyChanged)
+                {
+                    Logger.LogDebug(
+                        "Outbound hash-set diff for {hash}: added={added}, removedOnly={removedOnly}, fullBarrier={fullBarrier}, meshAcceptedAll={meshAll}, meshMissing={meshMissing}",
+                        dataToSend.DataHash.Value,
+                        addedPayloadHashes.Count,
+                        removedOnlyHashChange,
+                        fullBarrierRequired,
+                        meshAcceptedAllRecipients,
+                        meshOffer?.MissingHashes.Count ?? -1);
+                }
 
                 if (!mustRunUploadBarrier)
                 {
                     if (Logger.IsEnabled(LogLevel.Debug))
-                        Logger.LogDebug("Sending metadata-only appearance update to {users}", string.Join(", ", targetUsers.Select(k => k.AliasOrUID)));
+                        Logger.LogDebug("Completing metadata-only user data push to {users}", string.Join(", ", targetUsers.Select(k => k.AliasOrUID)));
 
-                    if (await _apiController.PushCharacterData(dataToSend, targetUsers).ConfigureAwait(false))
+                    outboundDataByUid = BuildTargetedCharacterDataByUid(dataToSend, targetUsers);
+
+                    if (await CompleteMeshCharacterPushOrFallbackAsync(dataToSend, targetUsers, meshOffer, targetMeshSessions, outboundDataByUid).ConfigureAwait(false))
                     {
-                        RecordOutboundSend(dataToSend, targetUsers);
+                        RecordOutboundSend(dataToSend, targetUsers, outboundDataByUid);
+
+                        if (barrierKeyChanged || string.IsNullOrEmpty(_lastUploadBarrierKey))
+                            RecordUploadBarrierState(barrierKey, payloadFileHashes);
+
+                        _authorizedRecipientUids.UnionWith(targetRecipientUids);
                         RemoveQueuedUsers(originalTargetUsers, sendRevision);
                     }
                     return;
                 }
 
-                if (forceOutboundSend)
+                if (forceOutboundSend && Logger.IsEnabled(LogLevel.Debug))
                 {
-                    if (Logger.IsEnabled(LogLevel.Debug))
-                    {
-                        Logger.LogDebug(
-                            "Sending immediate appearance update to {users} before upload/share barrier completes",
-                            string.Join(", ", targetUsers.Select(k => k.AliasOrUID)));
-                    }
-
-                    if (await _apiController.PushCharacterData(dataToSend.DeepClone(), targetUsers).ConfigureAwait(false))
-                        RecordOutboundSend(dataToSend, targetUsers);
+                    Logger.LogDebug(
+                        "Delaying forced outbound character data for {users} until upload/share barrier is complete",
+                        string.Join(", ", targetUsers.Select(k => k.AliasOrUID)));
                 }
 
+                var meshSourceData = dataToSend.DeepClone();
                 _uploadingCharacterData = dataToSend;
 
                 Logger.LogDebug(
-                    "Starting UploadTask for {hash}, barrierKeyChanged: {keyChanged}, unauthorizedRecipients: {unauth}, forced: {frc}",
-                    dataToSend.DataHash.Value, barrierKeyChanged, hasUnauthorizedRecipients, forceBarrier);
+                    "Starting UploadTask for {hash}, barrierKeyChanged: {keyChanged}, unauthorizedRecipients: {unauth}, forced: {frc}, meshAcceptedAll: {meshAll}, meshMissing: {meshMissing}, scopedHashes: {scopedHashes}",
+                    dataToSend.DataHash.Value, barrierKeyChanged, hasUnauthorizedRecipients, forceBarrier, meshAcceptedAllRecipients, meshOffer?.MissingHashes.Count ?? -1, scopedBarrierHashes?.Count ?? -1);
 
-                _fileUploadTask = _fileTransferManager.UploadFiles(_uploadingCharacterData, targetUsers);
+                _fileUploadTask = _fileTransferManager.UploadFiles(meshSourceData.DeepClone(), targetUsers, scopedBarrierHashes);
 
                 if (_fileUploadTask == null)
                 {
@@ -808,25 +1270,33 @@ public class VisibleUserDataDistributor : DisposableMediatorSubscriberBase
                 }
 
                 dataToSend = uploadResult.Data;
-                LogPushSanitizerResult(CharacterDataPushSanitizer.SanitizeForPush(dataToSend), "post-upload");
+                RestoreMeshRoutedPluginPayloads(dataToSend, meshSourceData);
+
+                targetUsers = FilterUsersToCurrentlyVisibleRecipients(targetUsers);
+                if (targetUsers.Count == 0)
+                {
+                    RemoveQueuedUsers(originalTargetUsers, sendRevision);
+                    _uploadingCharacterData = null;
+                    _fileUploadTask = null;
+                    return;
+                }
 
                 if (Logger.IsEnabled(LogLevel.Debug))
-                    Logger.LogDebug("Sending your appearance to {users}", string.Join(", ", targetUsers.Select(k => k.AliasOrUID)));
+                    Logger.LogDebug("Upload/share barrier complete; releasing user data push to {users}", string.Join(", ", targetUsers.Select(k => k.AliasOrUID)));
 
-                if (!await _apiController.PushCharacterData(dataToSend, targetUsers).ConfigureAwait(false))
+                outboundDataByUid = BuildTargetedCharacterDataByUid(dataToSend, targetUsers);
+
+                if (!await CompleteMeshCharacterPushOrFallbackAsync(dataToSend, targetUsers, meshOffer, targetMeshSessions, outboundDataByUid).ConfigureAwait(false))
                 {
                     _uploadingCharacterData = null;
                     _fileUploadTask = null;
                     return;
                 }
 
-                RecordOutboundSend(dataToSend, targetUsers);
+                RecordOutboundSend(dataToSend, targetUsers, outboundDataByUid);
 
-                if (barrierKeyChanged)
-                {
-                    _lastUploadBarrierKey = barrierKey;
-                    _authorizedRecipientUids.Clear();
-                }
+                if (barrierKeyChanged || string.IsNullOrEmpty(_lastUploadBarrierKey))
+                    RecordUploadBarrierState(barrierKey, payloadFileHashes);
 
                 _authorizedRecipientUids.UnionWith(targetRecipientUids);
 
@@ -851,6 +1321,27 @@ public class VisibleUserDataDistributor : DisposableMediatorSubscriberBase
                     PushCharacterData();
             }
         });
+    }
+
+    private async Task WaitForOutboundPushQueueToSettleAsync(CancellationToken token)
+    {
+        var waitedMs = 0;
+
+        while (waitedMs < MaxOutboundPushCoalesceWaitMs)
+        {
+            long observedRevision;
+            lock (_pushQueueLock)
+                observedRevision = _queuedPushRevisionCounter;
+
+            await Task.Delay(OutboundPushCoalesceDelayMs, token).ConfigureAwait(false);
+            waitedMs += OutboundPushCoalesceDelayMs;
+
+            lock (_pushQueueLock)
+            {
+                if (observedRevision == _queuedPushRevisionCounter)
+                    return;
+            }
+        }
     }
 
     private void ProcessPendingHeelsUpdate(long nowTick)

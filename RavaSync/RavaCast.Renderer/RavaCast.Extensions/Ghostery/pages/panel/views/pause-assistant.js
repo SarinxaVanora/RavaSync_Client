@@ -1,0 +1,62 @@
+import store_default from "../../../npm/hybrids/src/store.js";
+import router_default from "../../../npm/hybrids/src/router.js";
+import { html } from "../../../npm/hybrids/src/template/index.js";
+import { PAUSE_ASSISTANT_LEARN_MORE_URL } from "../../../utils/urls.js";
+import Config from "../../../store/config.js";
+import { openHref } from "../../../utils/tabs.js";
+import TabStats from "../../../store/tab-stats.js";
+//#region src/pages/panel/views/pause-assistant.js
+/**
+* Ghostery Browser Extension
+* https://www.ghostery.com/
+*
+* Copyright 2017-present Ghostery GmbH. All rights reserved.
+*
+* This Source Code Form is subject to the terms of the Mozilla Public
+* License, v. 2.0. If a copy of the MPL was not distributed with this
+* file, You can obtain one at http://mozilla.org/MPL/2.0
+*/
+var pause_assistant_default = {
+	[router_default.connect]: { dialog: true },
+	stats: store_default(TabStats),
+	config: store_default(Config),
+	issueUrl: ({ stats, config }) => store_default.ready(stats, config) && Object.entries(config.domains).find(([domain]) => stats.hostname.includes(domain))?.[1].issueUrl,
+	render: ({ issueUrl }) => html`
+    <template layout="column">
+      <panel-dialog>
+        <ui-text slot="header" type="label-m" layout="padding:1:0"> Browsing Assistant </ui-text>
+        <div layout="column gap:2 padding:1:0">
+          ${issueUrl && html`
+            <ui-action>
+              <a href="${issueUrl}" onclick="${openHref}" layout="row gap:2">
+                <ui-icon name="doc-m" color="tertiary" layout="size:3"></ui-icon>
+                <div layout="column grow gap:0.5">
+                  <ui-text type="label-m">Broken page report</ui-text>
+                  <ui-text type="body-s" color="tertiary">
+                    View a detailed report showing which adblocker functionality may have caused the
+                    issue.
+                  </ui-text>
+                </div>
+                <ui-icon name="external-link" color="quaternary" layout="size:2"></ui-icon>
+              </a>
+            </ui-action>
+          `}
+          <ui-action>
+            <a href="${PAUSE_ASSISTANT_LEARN_MORE_URL}" onclick="${openHref}" layout="row gap:2">
+              <ui-icon name="info" color="tertiary" layout="size:3"></ui-icon>
+              <div layout="column grow gap:0.5">
+                <ui-text type="label-m">How Browsing Assistant works</ui-text>
+                <ui-text type="body-s" color="tertiary">
+                  Learn how Ghostery is automatically paused to avoid breakage.
+                </ui-text>
+              </div>
+              <ui-icon name="external-link" color="quaternary" layout="size:2"></ui-icon>
+            </a>
+          </ui-action>
+        </div>
+      </panel-dialog>
+    </template>
+  `
+};
+//#endregion
+export { pause_assistant_default as default };

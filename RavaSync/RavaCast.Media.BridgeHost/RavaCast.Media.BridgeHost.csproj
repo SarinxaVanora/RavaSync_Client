@@ -1,0 +1,71 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>RavaCast.Media.BridgeHost</AssemblyName>
+    <TargetFramework>net10.0</TargetFramework>
+    <RuntimeIdentifiers>win-x64;linux-x64</RuntimeIdentifiers>
+    <Platforms>x64</Platforms>
+    <PlatformTarget>x64</PlatformTarget>
+    <Prefer32Bit>false</Prefer32Bit>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
+    <DebugSymbols>false</DebugSymbols>
+    <DebugType>none</DebugType>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <CopyDebugSymbolFilesFromPackages>false</CopyDebugSymbolFilesFromPackages>
+    <CopyDocumentationFilesFromPackages>false</CopyDocumentationFilesFromPackages>
+    <PathMap>
+      C:\Users\Jamie\Desktop\RavaSync\Working folder\RavaSync Client=R:\RavaSync
+    </PathMap>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <BundleDirectStreamRuntime>true</BundleDirectStreamRuntime>
+    <DirectStreamRuntimeRoot>$(MSBuildProjectDirectory)\..\RavaCast.Media.Runtime\$(RuntimeIdentifier)\native</DirectStreamRuntimeRoot>
+    <DirectStreamRequireBundledRuntimeFiles Condition="'$(DirectStreamRequireBundledRuntimeFiles)' == '' and '$(RuntimeIdentifier)' == 'win-x64'">true</DirectStreamRequireBundledRuntimeFiles>
+    <DirectStreamRequireBundledRuntimeFiles Condition="'$(DirectStreamRequireBundledRuntimeFiles)' == ''">false</DirectStreamRequireBundledRuntimeFiles>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="NAudio" Version="2.2.1" />
+    <PackageReference Include="SharpDX" Version="4.2.0" />
+    <PackageReference Include="SharpDX.Direct3D11" Version="4.2.0" />
+    <PackageReference Include="SharpDX.DXGI" Version="4.2.0" />
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(BundleDirectStreamRuntime)' == 'true' and '$(RuntimeIdentifier)' != '' and Exists('$(DirectStreamRuntimeRoot)')">
+    <DirectStreamRuntimeFile Include="$(DirectStreamRuntimeRoot)\**\*"
+                             Exclude="$(DirectStreamRuntimeRoot)\**\*.md;$(DirectStreamRuntimeRoot)\**\*.txt;$(DirectStreamRuntimeRoot)\**\.keep;$(DirectStreamRuntimeRoot)\**\.gitkeep" />
+  </ItemGroup>
+
+  <Target Name="ValidateDirectStreamRuntimeDependencies"
+          BeforeTargets="Build;Publish"
+          Condition="'$(BundleDirectStreamRuntime)' == 'true' and '$(DesignTimeBuild)' != 'true' and '$(DirectStreamRequireBundledRuntimeFiles)' == 'true'">
+    <Error Condition="'$(RuntimeIdentifier)' == ''"
+           Text="Direct Stream runtime bundling needs a RuntimeIdentifier. Publish BridgeHost with -r win-x64 or -r linux-x64." />
+    <Error Condition="'$(RuntimeIdentifier)' == 'win-x64' and !Exists('$(DirectStreamRuntimeRoot)\ffmpeg.exe')"
+           Text="Missing Direct Stream FFmpeg runtime: $(DirectStreamRuntimeRoot)\ffmpeg.exe. Put the x64 FFmpeg binary in RavaCast.Media.Runtime\win-x64\native so the build can bundle it automatically." />
+    <Error Condition="'$(RuntimeIdentifier)' == 'win-x64' and !Exists('$(DirectStreamRuntimeRoot)\datachannel.dll')"
+           Text="Missing Direct Stream libdatachannel runtime: $(DirectStreamRuntimeRoot)\datachannel.dll. Put the x64 libdatachannel runtime files in RavaCast.Media.Runtime\win-x64\native so the build can bundle them automatically." />
+  </Target>
+
+  <Target Name="CopyDirectStreamRuntimeDependenciesToOutput"
+          AfterTargets="Build"
+          Condition="'$(BundleDirectStreamRuntime)' == 'true' and '$(DesignTimeBuild)' != 'true' and '@(DirectStreamRuntimeFile)' != ''">
+    <Message Importance="high" Text="Copying Direct Stream runtime files from $(DirectStreamRuntimeRoot) to $(OutDir)" />
+    <Copy SourceFiles="@(DirectStreamRuntimeFile)"
+          DestinationFiles="@(DirectStreamRuntimeFile->'$(OutDir)%(RecursiveDir)%(Filename)%(Extension)')"
+          SkipUnchangedFiles="true" />
+  </Target>
+
+  <Target Name="CopyDirectStreamRuntimeDependenciesToPublish"
+          AfterTargets="Publish"
+          Condition="'$(BundleDirectStreamRuntime)' == 'true' and '$(DesignTimeBuild)' != 'true' and '@(DirectStreamRuntimeFile)' != ''">
+    <Message Importance="high" Text="Copying Direct Stream runtime files from $(DirectStreamRuntimeRoot) to $(PublishDir)" />
+    <Copy SourceFiles="@(DirectStreamRuntimeFile)"
+          DestinationFiles="@(DirectStreamRuntimeFile->'$(PublishDir)%(RecursiveDir)%(Filename)%(Extension)')"
+          SkipUnchangedFiles="true" />
+  </Target>
+</Project>

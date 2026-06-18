@@ -10,6 +10,7 @@ public sealed class IpcCallerOtherSync : IIpcCaller
 {
     private readonly ILogger<IpcCallerOtherSync> _logger;
     private readonly IDalamudPluginInterface _pi;
+    private readonly MareMediator _mediator;
 
     private readonly ICallGateSubscriber<List<nint>> _lightlessGetHandledAddresses;
     private readonly ICallGateSubscriber<List<nint>> _snowcloakGetHandledAddresses;
@@ -27,6 +28,7 @@ public sealed class IpcCallerOtherSync : IIpcCaller
     private long _lastRefreshTick;
     private long _lastApiCheckTick;
     private long _lastRefreshRequestTick;
+    private string _lastPublishedStateSignature = string.Empty;
     private int _refreshQueued;
     private int _apiCheckQueued;
     private int _refreshRequestedWhileQueued;
@@ -68,6 +70,7 @@ public sealed class IpcCallerOtherSync : IIpcCaller
     {
         _logger = logger;
         _pi = pi;
+        _mediator = mediator;
 
         _lightlessGetHandledAddresses = pi.GetIpcSubscriber<List<nint>>("LightlessSync.GetHandledAddresses");
         _snowcloakGetHandledAddresses = pi.GetIpcSubscriber<List<nint>>("Snowcloak.GetHandledAddresses");
@@ -80,6 +83,12 @@ public sealed class IpcCallerOtherSync : IIpcCaller
     public bool APIAvailable => _apiAvailable;
 
     private bool HasAnyEnabledService => _lightlessEnabled || _snowcloakEnabled || _playerSyncEnabled;
+
+    public bool ShouldPollOwnership()
+    {
+        EnsureApiAvailable();
+        return APIAvailable;
+    }
 
     public void UpdateTrackedVisibleAddresses(IEnumerable<nint>? addresses)
     {
@@ -184,6 +193,8 @@ public sealed class IpcCallerOtherSync : IIpcCaller
 
         if (!HasAnyEnabledService || !_apiAvailable)
             ClearCachedOwnership();
+
+        PublishCurrentStateIfChanged("api-check");
     }
 
     private void EnsureApiAvailable()
@@ -402,6 +413,7 @@ public sealed class IpcCallerOtherSync : IIpcCaller
         if (!APIAvailable)
         {
             ClearCachedOwnership();
+            PublishCurrentStateIfChanged("cache-refresh:no-api");
             return;
         }
 
@@ -416,6 +428,7 @@ public sealed class IpcCallerOtherSync : IIpcCaller
         if (trackedVisibleAddresses.Count == 0)
         {
             ClearCachedOwnership();
+            PublishCurrentStateIfChanged("cache-refresh:no-visible-addresses");
             return;
         }
 
@@ -463,6 +476,8 @@ public sealed class IpcCallerOtherSync : IIpcCaller
             _lastRefreshTick = Environment.TickCount64;
             _hasBuiltCache = true;
         }
+
+        PublishCurrentStateIfChanged("cache-refresh");
     }
 
     private void RefreshOwnerCacheForService(bool enabled,ref bool available,ICallGateSubscriber<List<nint>> getHandledAddresses,HashSet<nint> trackedVisibleAddresses,HashSet<nint> set,Dictionary<nint, string> owners,string ownerName,string failureMessage)
@@ -492,6 +507,61 @@ public sealed class IpcCallerOtherSync : IIpcCaller
         {
             _logger.LogTrace(ex, failureMessage);
             available = false;
+        }
+    }
+
+    private void PublishCurrentStateIfChanged(string reason)
+    {
+        if (_disposed)
+            return;
+
+        var signature = BuildCurrentStateSignature();
+        var changed = false;
+
+        lock (_cacheGate)
+        {
+            if (!string.Equals(_lastPublishedStateSignature, signature, StringComparison.Ordinal))
+            {
+                _lastPublishedStateSignature = signature;
+                changed = true;
+            }
+        }
+
+        if (!changed)
+            return;
+
+        try
+        {
+            _mediator.Publish(new OtherSyncCurrentStateChangedMessage(reason));
+        }
+        catch (Exception ex)
+        {
+            _logger.LogTrace(ex, "Failed publishing OtherSync state change");
+        }
+    }
+
+    private string BuildCurrentStateSignature()
+    {
+        lock (_cacheGate)
+        {
+            var owned = _cachedOwners
+                .OrderBy(kvp => ((long)kvp.Key))
+                .Select(kvp => $"{((long)kvp.Key):X}:{NormalizeOwner(kvp.Value)}");
+
+            var unknownOwned = _cached
+                .Where(address => !_cachedOwners.ContainsKey(address))
+                .OrderBy(address => ((long)address))
+                .Select(address => $"{((long)address):X}:Other");
+
+            return string.Join("|",
+                _apiAvailable ? "api:1" : "api:0",
+                _lightlessEnabled ? "le:1" : "le:0",
+                _lightlessAvailable ? "la:1" : "la:0",
+                _snowcloakEnabled ? "se:1" : "se:0",
+                _snowcloakAvailable ? "sa:1" : "sa:0",
+                _playerSyncEnabled ? "pe:1" : "pe:0",
+                _playerSyncAvailable ? "pa:1" : "pa:0",
+                string.Join(",", owned.Concat(unknownOwned)));
         }
     }
 
@@ -598,6 +668,7 @@ public sealed class IpcCallerOtherSync : IIpcCaller
             _cachedOwners.Remove(address);
         }
 
+        PublishCurrentStateIfChanged("direct-check-release");
         return false;
     }
 

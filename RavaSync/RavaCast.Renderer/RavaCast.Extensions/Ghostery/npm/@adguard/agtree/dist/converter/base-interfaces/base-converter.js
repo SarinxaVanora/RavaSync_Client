@@ -1,0 +1,51 @@
+import { NotImplementedError } from "../../errors/not-implemented-error.js";
+//#region node_modules/@adguard/agtree/dist/converter/base-interfaces/base-converter.js
+/**
+* @file Base class for converters
+*
+* TS doesn't support abstract static methods, so we should use
+* a workaround and extend this class instead of implementing it
+*/
+/**
+* Basic class for rule converters
+*/
+var BaseConverter = class {
+	/**
+	* Converts some data to AdGuard format
+	*
+	* @param data Data to convert
+	* @returns An object which follows the {@link ConversionResult} interface. Its `result` property contains
+	* the converted node, and its `isConverted` flag indicates whether the original node was converted.
+	* If the node was not converted, the result will contain the original node with the same object reference
+	* @throws If the data is invalid or incompatible
+	*/
+	static convertToAdg(data) {
+		throw new NotImplementedError();
+	}
+	/**
+	* Converts some data to Adblock Plus format
+	*
+	* @param data Data to convert
+	* @returns An object which follows the {@link ConversionResult} interface. Its `result` property contains
+	* the converted node, and its `isConverted` flag indicates whether the original node was converted.
+	* If the node was not converted, the result will contain the original node with the same object reference
+	* @throws If the data is invalid or incompatible
+	*/
+	static convertToAbp(data) {
+		throw new NotImplementedError();
+	}
+	/**
+	* Converts some data to uBlock Origin format
+	*
+	* @param data Data to convert
+	* @returns An object which follows the {@link ConversionResult} interface. Its `result` property contains
+	* the converted node, and its `isConverted` flag indicates whether the original node was converted.
+	* If the node was not converted, the result will contain the original node with the same object reference
+	* @throws If the data is invalid or incompatible
+	*/
+	static convertToUbo(data) {
+		throw new NotImplementedError();
+	}
+};
+//#endregion
+export { BaseConverter };

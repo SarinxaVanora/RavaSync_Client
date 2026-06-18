@@ -1,0 +1,83 @@
+import store_default from "../npm/hybrids/src/store.js";
+import { waitForIdle } from "../utils/options-observer.js";
+import Config from "../store/config.js";
+import { hasWTMStats } from "../utils/wtm-stats.js";
+import { updateEngines } from "./adblocker/engines.js";
+import { openElementPicker } from "./element-picker.js";
+//#region src/background/helpers.js
+/**
+* Ghostery Browser Extension
+* https://www.ghostery.com/
+*
+* Copyright 2017-present Ghostery GmbH. All rights reserved.
+*
+* This Source Code Form is subject to the terms of the Mozilla Public
+* License, v. 2.0. If a copy of the MPL was not distributed with this
+* file, You can obtain one at http://mozilla.org/MPL/2.0
+*/
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+	switch (msg.action) {
+		case "hasWTMStats":
+			sendResponse(hasWTMStats(msg.domain));
+			break;
+		case "openTabWithUrl":
+			chrome.tabs.create({ url: msg.url });
+			break;
+		case "openPrivateWindowWithUrl":
+			chrome.windows.getAll().then((windows) => {
+				const inIncognito = windows.find((w) => w.incognito);
+				if (inIncognito) chrome.tabs.create({
+					url: msg.url,
+					windowId: inIncognito.id,
+					active: true
+				});
+				else chrome.windows.create({
+					url: msg.url,
+					incognito: true
+				});
+			});
+			break;
+		case "openElementPicker":
+			openElementPicker(msg.tabId).catch(console.error);
+			break;
+		case "updateEngines":
+			updateEngines({ cache: false }).then(() => {
+				sendResponse();
+				console.debug("[helpers] \"updateEngines\" finished");
+			});
+			return true;
+		case "idle":
+			waitForIdle().then(() => {
+				sendResponse();
+				console.debug("[helpers] \"idleOptionsObservers\" finished");
+			});
+			return true;
+		case "keepAlive":
+			console.debug("[helpers] Received \"keepAlive\" message");
+			break;
+		case "e2e:idleOptionsObservers":
+			waitForIdle().then(() => {
+				sendResponse("done");
+				console.debug("[helpers] \"idleOptionsObservers\" finished");
+			}, sendResponse);
+			return true;
+		case "e2e:setConfigDomains":
+			store_default.resolve(Config).then(async (config) => {
+				const domains = {};
+				for (const domain of Object.keys(config.domains)) domains[domain] = null;
+				Object.assign(domains, msg.domains);
+				await store_default.set(Config, { domains });
+				sendResponse("done");
+				console.debug("[helpers] \"setConfigDomains\" finished");
+			}, sendResponse);
+			return true;
+		case "e2e:managedConfig":
+			chrome.storage.local.set({ managedConfig: msg.config }).then(() => {
+				sendResponse("done");
+				console.debug("[helpers] \"managedConfig\" finished");
+			}, sendResponse);
+			return true;
+	}
+	return false;
+});
+//#endregion

@@ -1,4 +1,4 @@
-using System.Text;
+﻿using System.Text;
 using System.Text.RegularExpressions;
 using FFXIVClientStructs.FFXIV.Client.Game.Character;
 using Microsoft.Extensions.Logging;
@@ -9,6 +9,7 @@ using RavaSync.Interop.Ipc;
 using RavaSync.MareConfiguration.Models;
 using RavaSync.PlayerData.Data;
 using RavaSync.PlayerData.Handlers;
+using RavaSync.PlayerData.Services;
 using RavaSync.Services;
 using RavaSync.Services.Mediator;
 using RavaSync.Services.Optimisation;
@@ -39,11 +40,26 @@ public class PlayerDataFactory : IMediatorSubscriber
                 && LastWriteUtc == lastWriteUtc;
     }
 
+    private sealed record StaticSupportDependencyExpansionCacheEntry(string Signature, FileReplacement[] Replacements);
+    private sealed record StaticBuildSnapshot(ObjectKind ObjectKind, FileReplacement[] Replacements, DateTimeOffset UpdatedUtc);
+    private sealed record BuildHashCacheEntry(string Hash, long Length, DateTime LastWriteUtc);
+    private sealed record StaticResolvedBuildCacheEntry(string Signature, FileReplacement[] Replacements, DateTimeOffset UpdatedUtc);
+    private sealed record TransientResolvedBuildCacheEntry(ObjectKind ObjectKind, string Signature, FileReplacement[] Replacements, DateTimeOffset UpdatedUtc);
+
     private readonly ConcurrentDictionary<string, PapSessionDecision> _playerPapDecisionsByKey = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, PapRewriteResult> _playerPapTargetIndependentDecisionsByHash = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, StaticSupportDependencyCacheEntry> _staticSupportDependencyCacheByResolvedPath = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, StaticSupportDependencyExpansionCacheEntry> _staticSupportExpansionCacheBySignature = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<ObjectKind, StaticBuildSnapshot> _lastStaticBuildSnapshotByKind = new();
+    private readonly ConcurrentDictionary<ObjectKind, StaticResolvedBuildCacheEntry> _staticResolvedBuildCacheByKind = new();
+    private readonly ConcurrentDictionary<ObjectKind, TransientResolvedBuildCacheEntry> _transientResolvedBuildCacheByKind = new();
+    private readonly ConcurrentDictionary<string, BuildHashCacheEntry> _buildHashCacheByResolvedPath = new(StringComparer.OrdinalIgnoreCase);
+    private static readonly HashSet<string> AllowedBuildGamePathExtensions = new(CacheMonitor.AllowedFileExtensions, StringComparer.OrdinalIgnoreCase);
+    private static readonly Regex HumanModelPathRegex = new(@"(?:^|/)chara/human/(c\d{4})/", RegexOptions.IgnoreCase | RegexOptions.Compiled | RegexOptions.ECMAScript);
     private const int ReverseResolveBatchSize = 192;
     private const int CharacterBuildYieldEvery = 128;
     private const int StaticSupportDependencyCacheSoftLimit = 2048;
+    private const int HumanRaceFamilyCollapseMinimumVariants = 3;
     private static readonly TimeSpan SupportSweepBreatherDelay = TimeSpan.FromMilliseconds(1);
 
 
@@ -62,19 +78,43 @@ public class PlayerDataFactory : IMediatorSubscriber
         _localPapSafetyModService = localPapSafetyModService;
         _mareMediator = mareMediator;
 
-        _mareMediator.Subscribe<PenumbraFileCacheChangedMessage>(this, _ => InvalidatePapSessionCaches());
-        _mareMediator.Subscribe<PenumbraModSettingChangedMessage>(this, _ => InvalidatePapSessionCaches());
-        _mareMediator.Subscribe<DisconnectedMessage>(this, _ => InvalidatePapSessionCaches());
-        _mareMediator.Subscribe<DalamudLogoutMessage>(this, _ => InvalidatePapSessionCaches());
+        _mareMediator.Subscribe<PenumbraFileCacheChangedMessage>(this, _ => InvalidateLiveBuildSnapshots());
+        _mareMediator.Subscribe<PenumbraModSettingChangedMessage>(this, _ => InvalidateLiveBuildSnapshots());
+        _mareMediator.Subscribe<PenumbraDirectoryChangedMessage>(this, _ => InvalidateVolatilePlayerDataCaches());
+        _mareMediator.Subscribe<ClassJobChangedMessage>(this, _ => InvalidateLiveBuildSnapshots());
+        _mareMediator.Subscribe<PenumbraResourceLoadMessage>(this, _ => InvalidateTransientResolveCaches());
+        _mareMediator.Subscribe<ObservedSupportResourceMessage>(this, _ => InvalidateTransientResolveCaches());
+        _mareMediator.Subscribe<TransientResourceChangedMessage>(this, _ => InvalidateTransientResolveCaches());
+        _mareMediator.Subscribe<PenumbraStartRedrawMessage>(this, _ => InvalidateTransientResolveCaches());
+        _mareMediator.Subscribe<PenumbraEndRedrawMessage>(this, _ => InvalidateTransientResolveCaches());
+        _mareMediator.Subscribe<DisconnectedMessage>(this, _ => InvalidateVolatilePlayerDataCaches());
+        _mareMediator.Subscribe<DalamudLogoutMessage>(this, _ => InvalidateVolatilePlayerDataCaches());
 
         _logger.LogTrace("Creating {this}", nameof(PlayerDataFactory));
     }
 
     public MareMediator Mediator => _mareMediator;
 
-    private void InvalidatePapSessionCaches()
+    private string _lastKnownPlayerPapSkeletonFingerprint = string.Empty;
+
+    private void InvalidateLiveBuildSnapshots()
+    {
+        _lastStaticBuildSnapshotByKind.Clear();
+        _staticResolvedBuildCacheByKind.Clear();
+        InvalidateTransientResolveCaches();
+    }
+
+    private void InvalidateTransientResolveCaches()
+    {
+        _transientResolvedBuildCacheByKind.Clear();
+    }
+
+    private void InvalidateVolatilePlayerDataCaches()
     {
         _playerPapDecisionsByKey.Clear();
+        _playerPapTargetIndependentDecisionsByHash.Clear();
+        _lastKnownPlayerPapSkeletonFingerprint = string.Empty;
+        InvalidateLiveBuildSnapshots();
     }
 
 
@@ -184,12 +224,10 @@ public class PlayerDataFactory : IMediatorSubscriber
 
         ct.ThrowIfCancellationRequested();
 
-        fragment.FileReplacements =
-                new HashSet<FileReplacement>(resolvedPaths.Select(c => new FileReplacement([.. c.Value], c.Key)), FileReplacementComparer.Instance)
-                .Where(p => p.HasFileReplacement).ToHashSet(FileReplacementComparer.Instance);
-        fragment.FileReplacements.RemoveWhere(c => c.GamePaths.Any(g => !CacheMonitor.AllowedFileExtensions.Any(e => g.EndsWith(e, StringComparison.OrdinalIgnoreCase))));
-
-        ct.ThrowIfCancellationRequested();
+        var usedCachedStaticReplacements = TryGetCachedStaticResolvedBuildReplacements(objectKind, resolvedPaths, out var cachedStaticReplacements);
+        fragment.FileReplacements = usedCachedStaticReplacements
+            ? new HashSet<FileReplacement>(cachedStaticReplacements, FileReplacementComparer.Instance)
+            : BuildStaticFileReplacements(resolvedPaths);
 
         ct.ThrowIfCancellationRequested();
 
@@ -205,41 +243,69 @@ public class PlayerDataFactory : IMediatorSubscriber
             }
         }
 
+        if (!usedCachedStaticReplacements)
+        {
+            await AddStaticSupportDependencyReplacementsAsync(fragment, ct).ConfigureAwait(false);
+            ct.ThrowIfCancellationRequested();
+        }
 
-        await AddStaticSupportDependencyReplacementsAsync(fragment, ct).ConfigureAwait(false);
-        ct.ThrowIfCancellationRequested();
+        var staticReplacementReferences = fragment.FileReplacements.ToArray();
 
         await _transientResourceManager.WaitForRecording(ct).ConfigureAwait(false);
         ct.ThrowIfCancellationRequested();
 
-        // if it's pet then it's summoner, if it's summoner we actually want to keep all filereplacements alive at all times
-        // or we get into redraw city for every change and nothing works properly
+        // Persistent Summoner-style pets need their static replacements kept alive as transients,
+        // otherwise every minor pet change can turn into redraw city. Short-lived combat summons
+        // such as DRK Living Shadow are different: promoting every spawned-actor replacement into
+        // the persistent Pet transient bucket during summon creation can stall the local client.
         if (objectKind == ObjectKind.Pet)
         {
-            foreach (var item in fragment.FileReplacements.Where(i => i.HasFileReplacement).SelectMany(p => p.GamePaths))
+            if (_dalamudUtil.ShouldTreatPetAsShortLivedCombatSummonForCurrentJob)
             {
-                if (_transientResourceManager.AddTransientResource(objectKind, item))
-                {
-                    _logger.LogDebug("Marking static {item} for Pet as transient", item);
-                }
+                _logger.LogTrace("Keeping {count} Pet static replacements static for short-lived combat summon; skipping persistent Pet transient promotion", fragment.FileReplacements.Count);
             }
+            else
+            {
+                foreach (var item in fragment.FileReplacements.Where(i => i.HasFileReplacement).SelectMany(p => p.GamePaths))
+                {
+                    if (_transientResourceManager.AddTransientResource(objectKind, item))
+                    {
+                        _logger.LogDebug("Marking static {item} for Pet as transient", item);
+                    }
+                }
 
-            _logger.LogTrace("Clearing {count} Static Replacements for Pet", fragment.FileReplacements.Count);
-            fragment.FileReplacements.Clear();
+                _logger.LogTrace("Clearing {count} Static Replacements for Pet", fragment.FileReplacements.Count);
+                fragment.FileReplacements.Clear();
+            }
         }
 
         ct.ThrowIfCancellationRequested();
 
         _logger.LogDebug("Handling transient update for {obj}", playerRelatedObject);
 
+        if (objectKind == ObjectKind.Player && _transientResourceManager.HasDirtyTransientManifestForNextBuild)
+        {
+            var isLocalPlayerBuild = await _dalamudUtil.RunOnFrameworkThread(() => _dalamudUtil.GetPlayerPtr() == playerRelatedObject.Address).ConfigureAwait(false);
+            if (isLocalPlayerBuild)
+            {
+                await _transientResourceManager.EnsureTransientManifestStateForCurrentBuildAsync(objectKind, reason, ct).ConfigureAwait(false);
+                ct.ThrowIfCancellationRequested();
+            }
+            else
+            {
+                _logger.LogTrace("Skipping dirty transient manifest refresh for non-local player build {obj}", playerRelatedObject);
+            }
+        }
+        ct.ThrowIfCancellationRequested();
+
         // remove all potentially gathered paths from the transient resource manager that are resolved through static resolving
         var staticResolvedGamePaths = fragment.FileReplacements.SelectMany(c => c.GamePaths).ToList();
         _transientResourceManager.ClearTransientPaths(objectKind, staticResolvedGamePaths);
 
         // get all remaining paths and resolve them
-        var transientPaths = ManageSemiTransientData(objectKind, staticResolvedGamePaths);
-        var resolvedTransientPaths = await ResolveTransientReplacementsForBuildAsync(objectKind, transientPaths, reason, ct).ConfigureAwait(false);
-        var transientReplacements = resolvedTransientPaths.Select(c => new FileReplacement([.. c.Value], c.Key)).ToList();
+        var transientPaths = ManageSemiTransientData(objectKind, staticResolvedGamePaths, playerRelatedObject, staticReplacementReferences);
+        var transientReplacements = await ResolveTransientFileReplacementsForBuildAsync(objectKind, transientPaths, reason, ct).ConfigureAwait(false);
+        var transientReplacementReferences = transientReplacements.ToArray();
         if (_logger.IsEnabled(LogLevel.Debug))
         {
             _logger.LogDebug("== Transient Replacements ==");
@@ -255,6 +321,8 @@ public class PlayerDataFactory : IMediatorSubscriber
                 fragment.FileReplacements.Add(replacement);
         }
 
+        await AddSenderSelectedFullMountModReplacementsAsync(fragment, objectKind, playerRelatedObject, ct).ConfigureAwait(false);
+        await AddSenderDefaultCollectionMountMusicReplacementsAsync(fragment, objectKind, ct).ConfigureAwait(false);
 
         // clean up all semi transient resources that don't have any file replacement (aka null resolve)
         _transientResourceManager.CleanUpSemiTransientResources(objectKind, [.. fragment.FileReplacements]);
@@ -295,27 +363,602 @@ public class PlayerDataFactory : IMediatorSubscriber
 
         var toCompute = fragment.FileReplacements.Where(f => !f.IsFileSwap).ToArray();
         _logger.LogDebug("Getting Hashes for {amount} Files", toCompute.Length);
-        var computedPaths = _fileCacheManager.GetFileCachesByPaths(toCompute.Select(c => c.ResolvedPath).ToArray());
-        for (var i = 0; i < toCompute.Length; i++)
-        {
-            ct.ThrowIfCancellationRequested();
-            var file = toCompute[i];
-            file.Hash = computedPaths[file.ResolvedPath]?.Hash ?? string.Empty;
-
-            if ((i + 1) % CharacterBuildYieldEvery == 0)
-                await Task.Yield();
-        }
+        await PopulateReplacementHashesAsync(toCompute, ct).ConfigureAwait(false);
         var removed = fragment.FileReplacements.RemoveWhere(f => !f.IsFileSwap && string.IsNullOrEmpty(f.Hash));
         if (removed > 0)
         {
             _logger.LogDebug("Removed {amount} of invalid files", removed);
         }
 
+        RememberStaticBuildSnapshot(objectKind, staticReplacementReferences);
+        RememberStaticResolvedBuildCache(objectKind, resolvedPaths, staticReplacementReferences);
+        RememberTransientResolvedBuildCache(objectKind, transientPaths, transientReplacementReferences);
+
         ct.ThrowIfCancellationRequested();
 
-        _logger.LogInformation("Building character data for {obj} took {time}ms", objectKind, TimeSpan.FromTicks(DateTime.UtcNow.Ticks - start.Ticks).TotalMilliseconds);
+        _logger.LogInformation("Building character data for {obj} took {time}ms (reason={reason})", objectKind, TimeSpan.FromTicks(DateTime.UtcNow.Ticks - start.Ticks).TotalMilliseconds, string.IsNullOrWhiteSpace(reason) ? "<none>" : reason);
 
         return fragment;
+    }
+
+
+    private async Task AddSenderSelectedFullMountModReplacementsAsync(CharacterDataFragment fragment, ObjectKind objectKind, GameObjectHandler playerRelatedObject, CancellationToken ct)
+    {
+        if (objectKind != ObjectKind.MinionOrMount)
+            return;
+
+        if (!_ipcManager.Penumbra.APIAvailable)
+            return;
+
+        var activeMountIds = ExtractActiveMountActorIdsFromFragment(fragment);
+        if (activeMountIds.Count == 0)
+            return;
+
+        var collectionStates = new List<IpcCallerPenumbra.PenumbraCollectionModSettings>();
+        var seenCollectionIds = new HashSet<Guid>();
+
+        if (playerRelatedObject != null)
+        {
+            var mountObjectIndex = await _dalamudUtil.RunOnFrameworkThread(() => playerRelatedObject.GetGameObject()?.ObjectIndex ?? -1).ConfigureAwait(false);
+            if (mountObjectIndex >= 0)
+            {
+                var mountObjectCollectionState = await _ipcManager.Penumbra.GetLocalPlayerCollectionModSettingsAsync(_logger, mountObjectIndex).ConfigureAwait(false);
+                if (mountObjectCollectionState != null && mountObjectCollectionState.CollectionId != Guid.Empty && seenCollectionIds.Add(mountObjectCollectionState.CollectionId))
+                    collectionStates.Add(mountObjectCollectionState);
+            }
+        }
+
+        var localPlayerCollectionState = await _localPapSafetyModService.TryGetLocalPlayerCollectionSettingsAsync(ct).ConfigureAwait(false);
+        if (localPlayerCollectionState != null && localPlayerCollectionState.CollectionId != Guid.Empty && seenCollectionIds.Add(localPlayerCollectionState.CollectionId))
+            collectionStates.Add(localPlayerCollectionState);
+
+        var defaultCollectionState = await _ipcManager.Penumbra.GetDefaultCollectionModSettingsAsync(_logger).ConfigureAwait(false);
+        if (defaultCollectionState != null && defaultCollectionState.CollectionId != Guid.Empty && seenCollectionIds.Add(defaultCollectionState.CollectionId))
+            collectionStates.Add(defaultCollectionState);
+
+        if (collectionStates.Count == 0)
+            return;
+
+        var added = 0;
+        foreach (var collectionState in collectionStates)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            var selectedMountModFiles = await _localPapSafetyModService.ResolveSelectedFullMountModFilesAsync(collectionState, activeMountIds, ct).ConfigureAwait(false);
+            if (selectedMountModFiles.Count == 0)
+                continue;
+
+            foreach (var source in selectedMountModFiles.OrderBy(static source => source.ResolvedPath, StringComparer.OrdinalIgnoreCase))
+            {
+                ct.ThrowIfCancellationRequested();
+
+                var replacement = new FileReplacement(source.GamePaths, source.ResolvedPath)
+                {
+                    Hash = source.Hash,
+                };
+
+                if (!replacement.HasFileReplacement || string.IsNullOrWhiteSpace(replacement.Hash))
+                    continue;
+
+                if (fragment.FileReplacements.Add(replacement))
+                    added++;
+            }
+        }
+
+        if (added > 0)
+            _logger.LogDebug("Added {count} selected active mount mod file(s) for mount actor(s) {mounts}", added, string.Join(",", activeMountIds.OrderBy(static id => id, StringComparer.OrdinalIgnoreCase)));
+    }
+
+    private static HashSet<string> ExtractActiveMountActorIdsFromFragment(CharacterDataFragment fragment)
+    {
+        var output = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (fragment?.FileReplacements == null || fragment.FileReplacements.Count == 0)
+            return output;
+
+        foreach (var gamePath in fragment.FileReplacements.SelectMany(static replacement => replacement.GamePaths))
+        {
+            if (TryExtractMountActorIdFromGamePath(gamePath, out var mountId))
+                output.Add(mountId);
+        }
+
+        return output;
+    }
+
+    private static bool TryExtractMountActorIdFromGamePath(string? gamePath, out string mountId)
+    {
+        mountId = string.Empty;
+        var normalized = NormalizeTransientGamePathForBuild(gamePath);
+        if (string.IsNullOrWhiteSpace(normalized))
+            return false;
+
+        var match = Regex.Match(normalized, @"(?:^|/)chara/monster/((?:m|d)\d{4})(?:/|$)", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        if (!match.Success)
+            return false;
+
+        mountId = match.Groups[1].Value.ToLowerInvariant();
+        return !string.IsNullOrWhiteSpace(mountId);
+    }
+
+    private async Task AddSenderDefaultCollectionMountMusicReplacementsAsync(CharacterDataFragment fragment, ObjectKind objectKind, CancellationToken ct)
+    {
+        if (objectKind != ObjectKind.MinionOrMount)
+            return;
+
+        if (!_ipcManager.Penumbra.APIAvailable)
+            return;
+
+        var defaultCollectionState = await _ipcManager.Penumbra.GetDefaultCollectionModSettingsAsync(_logger).ConfigureAwait(false);
+        if (defaultCollectionState == null)
+            return;
+
+        var selectedMountMusic = await _localPapSafetyModService.ResolveSelectedMountMusicFilesAsync(defaultCollectionState, ct).ConfigureAwait(false);
+        if (selectedMountMusic.Count == 0)
+            return;
+
+        foreach (var source in selectedMountMusic.OrderBy(static source => source.ResolvedPath, StringComparer.OrdinalIgnoreCase))
+        {
+            ct.ThrowIfCancellationRequested();
+
+            var replacement = new FileReplacement(source.GamePaths, source.ResolvedPath)
+            {
+                Hash = source.Hash,
+            };
+
+            if (!replacement.HasFileReplacement || string.IsNullOrWhiteSpace(replacement.Hash))
+                continue;
+
+            if (fragment.FileReplacements.Add(replacement))
+            {
+                _logger.LogTrace("Added sender Default collection mount music replacement {gamePath} => {path}", string.Join(",", replacement.GamePaths), replacement.ResolvedPath);
+            }
+        }
+    }
+
+    public async Task<bool> TryBuildPlayerTransientOnlyFragmentFromSnapshotAsync(CharacterDataFragmentPlayer fragment, string? reason, CancellationToken ct)
+    {
+        if (fragment == null)
+            return false;
+
+        if (!_lastStaticBuildSnapshotByKind.TryGetValue(ObjectKind.Player, out var snapshot)
+            || snapshot.Replacements.Length == 0)
+        {
+            return false;
+        }
+
+        var start = DateTime.UtcNow;
+        fragment.FileReplacements = new HashSet<FileReplacement>(
+            snapshot.Replacements.Select(static replacement => CloneFileReplacementWithHash(replacement)),
+            FileReplacementComparer.Instance);
+
+        await _transientResourceManager.WaitForRecording(ct).ConfigureAwait(false);
+        ct.ThrowIfCancellationRequested();
+
+        var staticResolvedGamePaths = fragment.FileReplacements.SelectMany(static replacement => replacement.GamePaths).ToList();
+        _transientResourceManager.ClearTransientPaths(ObjectKind.Player, staticResolvedGamePaths);
+
+        var transientPaths = ManageSemiTransientData(ObjectKind.Player, staticResolvedGamePaths);
+        var transientReplacements = await ResolveTransientFileReplacementsForBuildAsync(ObjectKind.Player, transientPaths, reason, ct).ConfigureAwait(false);
+        var transientReplacementReferences = transientReplacements.ToArray();
+
+        foreach (var replacement in transientReplacements)
+        {
+            ct.ThrowIfCancellationRequested();
+            if (replacement.HasFileReplacement)
+                fragment.FileReplacements.Add(replacement);
+        }
+
+        _transientResourceManager.CleanUpSemiTransientResources(ObjectKind.Player, [.. fragment.FileReplacements]);
+        fragment.FileReplacements = new HashSet<FileReplacement>(
+            fragment.FileReplacements.Where(static replacement => replacement.HasFileReplacement).OrderBy(static replacement => replacement.ResolvedPath, StringComparer.Ordinal),
+            FileReplacementComparer.Instance);
+
+        var toCompute = fragment.FileReplacements
+            .Where(static replacement => !replacement.IsFileSwap && string.IsNullOrWhiteSpace(replacement.Hash))
+            .ToArray();
+        await PopulateReplacementHashesAsync(toCompute, ct).ConfigureAwait(false);
+
+        var removed = fragment.FileReplacements.RemoveWhere(static replacement => !replacement.IsFileSwap && string.IsNullOrEmpty(replacement.Hash));
+        if (removed > 0)
+            _logger.LogDebug("Removed {amount} invalid transient-only player file(s)", removed);
+
+        RememberTransientResolvedBuildCache(ObjectKind.Player, transientPaths, transientReplacementReferences);
+
+        _logger.LogInformation("Building transient-only character data for Player took {time}ms", TimeSpan.FromTicks(DateTime.UtcNow.Ticks - start.Ticks).TotalMilliseconds);
+        return true;
+    }
+
+    private HashSet<FileReplacement> BuildStaticFileReplacements(IReadOnlyDictionary<string, HashSet<string>> resolvedPaths)
+    {
+        var replacements = new HashSet<FileReplacement>(FileReplacementComparer.Instance);
+        foreach (var resolvedPath in resolvedPaths)
+        {
+            var replacement = new FileReplacement([.. resolvedPath.Value], resolvedPath.Key);
+            if (replacement.HasFileReplacement && replacement.GamePaths.All(IsAllowedBuildGamePath))
+                replacements.Add(replacement);
+        }
+
+        return replacements;
+    }
+
+    private bool TryGetCachedStaticResolvedBuildReplacements(ObjectKind objectKind, IReadOnlyDictionary<string, HashSet<string>> resolvedPaths, out FileReplacement[] replacements)
+    {
+        replacements = [];
+        if (!TryBuildStaticResolvedBuildSignature(resolvedPaths, out var signature))
+            return false;
+
+        if (!_staticResolvedBuildCacheByKind.TryGetValue(objectKind, out var cacheEntry)
+            || !string.Equals(cacheEntry.Signature, signature, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        if (!TryCloneCachedReplacementsWithValidatedHashes(cacheEntry.Replacements, out replacements))
+        {
+            _staticResolvedBuildCacheByKind.TryRemove(objectKind, out _);
+            replacements = [];
+            return false;
+        }
+
+        return true;
+    }
+
+    private void RememberStaticResolvedBuildCache(ObjectKind objectKind, IReadOnlyDictionary<string, HashSet<string>> resolvedPaths, FileReplacement[] staticReplacementReferences)
+    {
+        if (staticReplacementReferences == null || staticReplacementReferences.Length == 0)
+        {
+            _staticResolvedBuildCacheByKind.TryRemove(objectKind, out _);
+            return;
+        }
+
+        if (!TryBuildStaticResolvedBuildSignature(resolvedPaths, out var signature))
+            return;
+
+        var replacements = staticReplacementReferences
+            .Where(static replacement => replacement.HasFileReplacement
+                && (replacement.IsFileSwap || !string.IsNullOrWhiteSpace(replacement.Hash)))
+            .OrderBy(static replacement => replacement.ResolvedPath, StringComparer.OrdinalIgnoreCase)
+            .Select(static replacement => CloneFileReplacementWithHash(replacement))
+            .ToArray();
+
+        if (replacements.Length == 0)
+        {
+            _staticResolvedBuildCacheByKind.TryRemove(objectKind, out _);
+            return;
+        }
+
+        _staticResolvedBuildCacheByKind[objectKind] = new StaticResolvedBuildCacheEntry(signature, replacements, DateTimeOffset.UtcNow);
+    }
+
+    private async Task<List<FileReplacement>> ResolveTransientFileReplacementsForBuildAsync(ObjectKind objectKind, HashSet<string> transientPaths, string? reason, CancellationToken ct)
+    {
+        if (transientPaths.Count == 0)
+            return [];
+
+        if (!ShouldBypassTransientResolvedBuildCache(objectKind, reason)
+            && TryGetCachedTransientResolvedBuildReplacements(objectKind, transientPaths, out var cachedReplacements))
+        {
+            return cachedReplacements.ToList();
+        }
+
+        var resolvedTransientPaths = await ResolveTransientReplacementsForBuildAsync(objectKind, transientPaths, reason, ct).ConfigureAwait(false);
+        var transientReplacements = new List<FileReplacement>(resolvedTransientPaths.Count);
+        foreach (var resolvedTransientPath in resolvedTransientPaths)
+        {
+            ct.ThrowIfCancellationRequested();
+            var replacement = new FileReplacement([.. resolvedTransientPath.Value], resolvedTransientPath.Key);
+            if (replacement.HasFileReplacement)
+                transientReplacements.Add(replacement);
+        }
+
+        return transientReplacements;
+    }
+
+    private bool TryGetCachedTransientResolvedBuildReplacements(ObjectKind objectKind, HashSet<string> transientPaths, out FileReplacement[] replacements)
+    {
+        replacements = [];
+        if (!TryBuildTransientResolvedBuildSignature(transientPaths, out var signature))
+            return false;
+
+        if (!_transientResolvedBuildCacheByKind.TryGetValue(objectKind, out var cacheEntry)
+            || cacheEntry.ObjectKind != objectKind
+            || !string.Equals(cacheEntry.Signature, signature, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        if (!TryCloneCachedReplacementsWithValidatedHashes(cacheEntry.Replacements, out replacements))
+        {
+            _transientResolvedBuildCacheByKind.TryRemove(objectKind, out _);
+            replacements = [];
+            return false;
+        }
+
+        return true;
+    }
+
+    private void RememberTransientResolvedBuildCache(ObjectKind objectKind, HashSet<string> transientPaths, FileReplacement[] transientReplacementReferences)
+    {
+        if (transientReplacementReferences == null || transientReplacementReferences.Length == 0)
+        {
+            _transientResolvedBuildCacheByKind.TryRemove(objectKind, out _);
+            return;
+        }
+
+        if (!TryBuildTransientResolvedBuildSignature(transientPaths, out var signature))
+            return;
+
+        var replacements = transientReplacementReferences
+            .Where(static replacement => replacement.HasFileReplacement
+                && (replacement.IsFileSwap || !string.IsNullOrWhiteSpace(replacement.Hash)))
+            .OrderBy(static replacement => replacement.ResolvedPath, StringComparer.OrdinalIgnoreCase)
+            .Select(static replacement => CloneFileReplacementWithHash(replacement))
+            .ToArray();
+
+        if (replacements.Length == 0)
+        {
+            _transientResolvedBuildCacheByKind.TryRemove(objectKind, out _);
+            return;
+        }
+
+        _transientResolvedBuildCacheByKind[objectKind] = new TransientResolvedBuildCacheEntry(objectKind, signature, replacements, DateTimeOffset.UtcNow);
+    }
+
+    private bool TryCloneCachedReplacementsWithValidatedHashes(FileReplacement[] source, out FileReplacement[] clones)
+    {
+        clones = [];
+        if (source == null || source.Length == 0)
+            return false;
+
+        var output = new FileReplacement[source.Length];
+        for (var i = 0; i < source.Length; i++)
+        {
+            var replacement = source[i];
+            if (replacement == null || !replacement.HasFileReplacement)
+                return false;
+
+            var clone = CloneFileReplacementWithHash(replacement);
+            if (!clone.IsFileSwap)
+            {
+                if (string.IsNullOrWhiteSpace(clone.Hash)
+                    || !TryGetCachedBuildHash(clone.ResolvedPath, out var currentHash)
+                    || !string.Equals(currentHash, clone.Hash, StringComparison.Ordinal))
+                {
+                    return false;
+                }
+            }
+
+            output[i] = clone;
+        }
+
+        clones = output;
+        return true;
+    }
+
+    private static bool TryBuildStaticResolvedBuildSignature(IReadOnlyDictionary<string, HashSet<string>> resolvedPaths, out string signature)
+    {
+        signature = string.Empty;
+        if (resolvedPaths == null || resolvedPaths.Count == 0)
+            return false;
+
+        var sb = new StringBuilder(resolvedPaths.Count * 96);
+        sb.Append("static-resolved-v1|");
+        foreach (var kvp in resolvedPaths.OrderBy(static kvp => NormalizeStaticSupportResolvedPath(kvp.Key), StringComparer.OrdinalIgnoreCase))
+        {
+            var resolvedPath = NormalizeStaticSupportResolvedPath(kvp.Key);
+            if (string.IsNullOrWhiteSpace(resolvedPath))
+                continue;
+
+            sb.Append("r:").Append(resolvedPath).Append('|');
+            foreach (var gamePath in kvp.Value
+                         .Select(NormalizeStaticSupportGamePath)
+                         .Where(static path => !string.IsNullOrWhiteSpace(path))
+                         .Distinct(StringComparer.OrdinalIgnoreCase)
+                         .OrderBy(static path => path, StringComparer.OrdinalIgnoreCase))
+            {
+                sb.Append("g:").Append(gamePath).Append('|');
+            }
+        }
+
+        signature = sb.ToString();
+        return signature.Length > "static-resolved-v1|".Length;
+    }
+
+    private static bool TryBuildTransientResolvedBuildSignature(HashSet<string> transientPaths, out string signature)
+    {
+        signature = string.Empty;
+        if (transientPaths == null || transientPaths.Count == 0)
+            return false;
+
+        var sb = new StringBuilder(transientPaths.Count * 64);
+        sb.Append("transient-resolved-v1|");
+        foreach (var path in transientPaths
+                     .Select(NormalizeTransientGamePathForBuild)
+                     .Where(static path => !string.IsNullOrWhiteSpace(path))
+                     .Distinct(StringComparer.OrdinalIgnoreCase)
+                     .OrderBy(static path => path, StringComparer.OrdinalIgnoreCase))
+        {
+            sb.Append(path).Append('|');
+        }
+
+        signature = sb.ToString();
+        return signature.Length > "transient-resolved-v1|".Length;
+    }
+
+    private static bool ShouldBypassTransientResolvedBuildCache(ObjectKind objectKind, string? reason)
+    {
+        if (ShouldForceFullLiveTransientResolveForBuild(reason))
+            return true;
+
+        if (string.IsNullOrWhiteSpace(reason))
+            return false;
+
+        var reasons = reason.Split('|', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        foreach (var item in reasons)
+        {
+            if (item.Contains("TransientResourceChanged", StringComparison.Ordinal)
+                || item.Contains("PenumbraRedraw", StringComparison.Ordinal)
+                || item.Contains("PenumbraEndRedraw", StringComparison.Ordinal)
+                || item.StartsWith("Connected:", StringComparison.Ordinal)
+                || item.StartsWith("ImmediateFollowUp:Connected:", StringComparison.Ordinal)
+                || item.StartsWith("PenumbraFileCacheChanged", StringComparison.Ordinal)
+                || item.StartsWith("PenumbraModSettingChanged", StringComparison.Ordinal)
+                || item.StartsWith("ClassJobChanged:", StringComparison.Ordinal))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private void RememberStaticBuildSnapshot(ObjectKind objectKind, FileReplacement[] staticReplacementReferences)
+    {
+        if (objectKind != ObjectKind.Player || staticReplacementReferences == null || staticReplacementReferences.Length == 0)
+            return;
+
+        var replacements = staticReplacementReferences
+            .Where(static replacement => replacement.HasFileReplacement
+                && (replacement.IsFileSwap || !string.IsNullOrWhiteSpace(replacement.Hash)))
+            .OrderBy(static replacement => replacement.ResolvedPath, StringComparer.OrdinalIgnoreCase)
+            .Select(static replacement => CloneFileReplacementWithHash(replacement))
+            .ToArray();
+
+        if (replacements.Length == 0)
+        {
+            _lastStaticBuildSnapshotByKind.TryRemove(objectKind, out _);
+            return;
+        }
+
+        _lastStaticBuildSnapshotByKind[objectKind] = new StaticBuildSnapshot(objectKind, replacements, DateTimeOffset.UtcNow);
+    }
+
+    private async Task PopulateReplacementHashesAsync(FileReplacement[] replacements, CancellationToken ct)
+    {
+        if (replacements.Length == 0)
+            return;
+
+        var pathsNeedingLookup = new List<string>();
+        var seenMissing = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var localHashByResolvedPath = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        for (var i = 0; i < replacements.Length; i++)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            var replacement = replacements[i];
+            var resolvedPath = replacement.ResolvedPath;
+            if (string.IsNullOrWhiteSpace(resolvedPath))
+                continue;
+
+            if (localHashByResolvedPath.TryGetValue(resolvedPath, out var localHash))
+            {
+                replacement.Hash = localHash;
+            }
+            else if (TryGetCachedBuildHash(resolvedPath, out var cachedHash))
+            {
+                replacement.Hash = cachedHash;
+                localHashByResolvedPath[resolvedPath] = cachedHash;
+            }
+            else
+            {
+                replacement.Hash = string.Empty;
+                if (seenMissing.Add(resolvedPath))
+                    pathsNeedingLookup.Add(resolvedPath);
+            }
+
+            if ((i + 1) % CharacterBuildYieldEvery == 0)
+                await Task.Yield();
+        }
+
+        if (pathsNeedingLookup.Count == 0)
+            return;
+
+        var computedHashes = _fileCacheManager.GetFileHashesByPaths(pathsNeedingLookup.ToArray());
+        foreach (var item in computedHashes)
+        {
+            if (string.IsNullOrWhiteSpace(item.Key) || string.IsNullOrWhiteSpace(item.Value))
+                continue;
+
+            localHashByResolvedPath[item.Key] = item.Value;
+            RememberBuildHash(item.Key, item.Value);
+        }
+
+        for (var i = 0; i < replacements.Length; i++)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            var replacement = replacements[i];
+            if (!string.IsNullOrWhiteSpace(replacement.Hash))
+                continue;
+
+            if (!string.IsNullOrWhiteSpace(replacement.ResolvedPath)
+                && localHashByResolvedPath.TryGetValue(replacement.ResolvedPath, out var hash)
+                && !string.IsNullOrWhiteSpace(hash))
+            {
+                replacement.Hash = hash;
+            }
+
+            if ((i + 1) % CharacterBuildYieldEvery == 0)
+                await Task.Yield();
+        }
+    }
+
+    private bool TryGetCachedBuildHash(string? resolvedPath, out string hash)
+    {
+        hash = string.Empty;
+        var normalizedPath = NormalizeStaticSupportResolvedPath(resolvedPath);
+        if (string.IsNullOrWhiteSpace(normalizedPath))
+            return false;
+
+        if (!TryGetBuildFileIdentity(normalizedPath, out var length, out var lastWriteUtc))
+        {
+            _buildHashCacheByResolvedPath.TryRemove(normalizedPath, out _);
+            return false;
+        }
+
+        if (!_buildHashCacheByResolvedPath.TryGetValue(normalizedPath, out var cacheEntry)
+            || cacheEntry.Length != length
+            || cacheEntry.LastWriteUtc != lastWriteUtc
+            || string.IsNullOrWhiteSpace(cacheEntry.Hash))
+        {
+            return false;
+        }
+
+        hash = cacheEntry.Hash;
+        return true;
+    }
+
+    private void RememberBuildHash(string? resolvedPath, string? hash)
+    {
+        var normalizedPath = NormalizeStaticSupportResolvedPath(resolvedPath);
+        if (string.IsNullOrWhiteSpace(normalizedPath) || string.IsNullOrWhiteSpace(hash))
+            return;
+
+        if (!TryGetBuildFileIdentity(normalizedPath, out var length, out var lastWriteUtc))
+            return;
+
+        _buildHashCacheByResolvedPath[normalizedPath] = new BuildHashCacheEntry(hash, length, lastWriteUtc);
+    }
+
+    private static bool TryGetBuildFileIdentity(string resolvedPath, out long length, out DateTime lastWriteUtc)
+    {
+        length = 0;
+        lastWriteUtc = default;
+
+        try
+        {
+            var fileInfo = new FileInfo(resolvedPath);
+            if (!fileInfo.Exists)
+                return false;
+
+            length = fileInfo.Length;
+            lastWriteUtc = fileInfo.LastWriteTimeUtc;
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     private async Task<Dictionary<string, HashSet<string>>?> ResolvePenumbraCharacterDataWithRetriesAsync(GameObjectHandler playerRelatedObject, ObjectKind objectKind, CancellationToken ct, string? reason)
@@ -351,101 +994,136 @@ public class PlayerDataFactory : IMediatorSubscriber
         return null;
     }
 
-    private async Task AddStaticSupportDependencyReplacementsAsync(CharacterDataFragment fragment, CancellationToken ct)
+    private Task AddStaticSupportDependencyReplacementsAsync(CharacterDataFragment fragment, CancellationToken ct)
     {
         if (fragment.FileReplacements.Count == 0)
-            return;
+            return Task.CompletedTask;
 
-        const int maxDependencyPasses = 4;
-        var scannedLocalFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        var knownGamePaths = fragment.FileReplacements
-            .SelectMany(static replacement => replacement.GamePaths)
-            .Select(NormalizeStaticSupportGamePath)
-            .Where(static path => !string.IsNullOrWhiteSpace(path))
-            .ToHashSet(StringComparer.OrdinalIgnoreCase);
-        var pendingGamePaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        var addedCount = 0;
+        if (!HasStaticSupportDependencySource(fragment.FileReplacements))
+            return Task.CompletedTask;
 
-        for (var pass = 0; pass < maxDependencyPasses; pass++)
+        if (!TryBuildStaticSupportDependencyExpansionSignature(fragment, out var cacheSignature))
+            return Task.CompletedTask;
+
+        if (TryApplyCachedStaticSupportDependencyExpansion(fragment, cacheSignature, ct))
+            return Task.CompletedTask;
+
+        _staticSupportExpansionCacheBySignature[cacheSignature] = new StaticSupportDependencyExpansionCacheEntry(
+            cacheSignature,
+            Array.Empty<FileReplacement>());
+
+        return Task.CompletedTask;
+    }
+
+    private static bool HasStaticSupportDependencySource(IEnumerable<FileReplacement> replacements)
+    {
+        foreach (var replacement in replacements)
+        {
+            var resolvedExtension = Path.GetExtension(replacement.ResolvedPath);
+            if (string.Equals(resolvedExtension, ".mdl", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(resolvedExtension, ".mtrl", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+
+            foreach (var gamePath in replacement.GamePaths)
+            {
+                var gameExtension = Path.GetExtension(gamePath.Replace('\\', '/'));
+                if (string.Equals(gameExtension, ".mdl", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(gameExtension, ".mtrl", StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private bool TryApplyCachedStaticSupportDependencyExpansion(CharacterDataFragment fragment, string signature, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(signature))
+            return false;
+
+        if (!_staticSupportExpansionCacheBySignature.TryGetValue(signature, out var cacheEntry)
+            || !string.Equals(cacheEntry.Signature, signature, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        var added = 0;
+        foreach (var cachedReplacement in cacheEntry.Replacements)
         {
             ct.ThrowIfCancellationRequested();
 
-            foreach (var replacement in fragment.FileReplacements.ToArray())
-            {
-                ct.ThrowIfCancellationRequested();
+            if (string.IsNullOrWhiteSpace(cachedReplacement.ResolvedPath))
+                continue;
 
-                var resolvedPath = NormalizeStaticSupportResolvedPath(replacement.ResolvedPath);
-                if (string.IsNullOrWhiteSpace(resolvedPath) || !File.Exists(resolvedPath))
-                    continue;
-
-                if (!scannedLocalFiles.Add(resolvedPath))
-                    continue;
-
-                foreach (var dependencyPath in GetCachedStaticSupportDependencyGamePaths(resolvedPath, replacement.GamePaths))
-                {
-                    var normalizedDependencyPath = NormalizeStaticSupportGamePath(dependencyPath);
-                    if (!IsStaticSupportDependencyPath(normalizedDependencyPath))
-                        continue;
-
-                    if (knownGamePaths.Contains(normalizedDependencyPath))
-                        continue;
-
-                    pendingGamePaths.Add(normalizedDependencyPath);
-                }
-            }
-
-            if (pendingGamePaths.Count == 0)
-                break;
-
-            var pathsToResolve = pendingGamePaths.ToHashSet(StringComparer.OrdinalIgnoreCase);
-            pendingGamePaths.Clear();
-
-            var resolvedDependencies = await GetFileReplacementsFromPaths(pathsToResolve, new HashSet<string>(StringComparer.OrdinalIgnoreCase), ct).ConfigureAwait(false);
-            var passAdded = 0;
-
-            foreach (var resolvedDependency in resolvedDependencies.OrderBy(static kvp => kvp.Key, StringComparer.OrdinalIgnoreCase))
-            {
-                ct.ThrowIfCancellationRequested();
-
-                var resolvedFilePath = NormalizeStaticSupportResolvedPath(resolvedDependency.Key);
-                if (string.IsNullOrWhiteSpace(resolvedFilePath) || !File.Exists(resolvedFilePath))
-                    continue;
-
-                var dependencyGamePaths = resolvedDependency.Value
-                    .Select(NormalizeStaticSupportGamePath)
-                    .Where(path => pathsToResolve.Contains(path) && IsStaticSupportDependencyPath(path))
-                    .Distinct(StringComparer.OrdinalIgnoreCase)
-                    .OrderBy(static path => path, StringComparer.OrdinalIgnoreCase)
-                    .ToArray();
-
-                if (dependencyGamePaths.Length == 0)
-                    continue;
-
-                var dependencyReplacement = new FileReplacement(dependencyGamePaths, resolvedFilePath);
-                if (!dependencyReplacement.HasFileReplacement)
-                    continue;
-
-                foreach (var gamePath in dependencyReplacement.GamePaths)
-                    knownGamePaths.Add(gamePath);
-
-                if (fragment.FileReplacements.Add(dependencyReplacement))
-                {
-                    passAdded++;
-                    addedCount++;
-                }
-            }
-
-            if (passAdded == 0)
-                break;
-
-            await Task.Yield();
+            if (fragment.FileReplacements.Add(CloneFileReplacementWithoutHash(cachedReplacement)))
+                added++;
         }
 
-        if (addedCount > 0)
-        {
-            _logger.LogDebug("Added {count} static support dependency replacement(s) from active model/material files", addedCount);
-        }
+        if (added > 0 && _logger.IsEnabled(LogLevel.Debug))
+            _logger.LogDebug("Reused {count} cached static support dependency replacement(s)", added);
+
+        return true;
     }
+
+    private static bool TryBuildStaticSupportDependencyExpansionSignature(CharacterDataFragment fragment, out string signature)
+    {
+        signature = string.Empty;
+        if (fragment?.FileReplacements == null || fragment.FileReplacements.Count == 0)
+            return false;
+
+        var dependencySourceCount = 0;
+        var sb = new StringBuilder(fragment.FileReplacements.Count * 96);
+        sb.Append("static-support-declared-v3|");
+
+        foreach (var replacement in fragment.FileReplacements
+                     .OrderBy(static replacement => replacement.ResolvedPath, StringComparer.OrdinalIgnoreCase))
+        {
+            var resolvedPath = NormalizeStaticSupportResolvedPath(replacement.ResolvedPath);
+            if (string.IsNullOrWhiteSpace(resolvedPath))
+                continue;
+
+            var resolvedExtension = Path.GetExtension(resolvedPath);
+            var hasDependencySource = string.Equals(resolvedExtension, ".mdl", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(resolvedExtension, ".mtrl", StringComparison.OrdinalIgnoreCase)
+                || replacement.GamePaths.Any(static gamePath =>
+                {
+                    var gameExtension = Path.GetExtension((gamePath ?? string.Empty).Replace('\\', '/'));
+                    return string.Equals(gameExtension, ".mdl", StringComparison.OrdinalIgnoreCase)
+                        || string.Equals(gameExtension, ".mtrl", StringComparison.OrdinalIgnoreCase);
+                });
+
+            if (!hasDependencySource)
+                continue;
+
+            dependencySourceCount++;
+            sb.Append("r:").Append(resolvedPath).Append('|');
+
+            foreach (var gamePath in replacement.GamePaths
+                         .Select(NormalizeStaticSupportGamePath)
+                         .Where(static path => !string.IsNullOrWhiteSpace(path))
+                         .Distinct(StringComparer.OrdinalIgnoreCase)
+                         .OrderBy(static path => path, StringComparer.OrdinalIgnoreCase))
+            {
+                sb.Append("g:").Append(gamePath).Append('|');
+            }
+        }
+
+        if (dependencySourceCount == 0)
+            return false;
+
+        signature = sb.ToString();
+        return true;
+    }
+
+    private static FileReplacement CloneFileReplacementWithoutHash(FileReplacement replacement)
+        => new([.. replacement.GamePaths], replacement.ResolvedPath);
+
+    private static FileReplacement CloneFileReplacementWithHash(FileReplacement replacement)
+        => new([.. replacement.GamePaths], replacement.ResolvedPath) { Hash = replacement.Hash };
 
     private IEnumerable<string> GetCachedStaticSupportDependencyGamePaths(string resolvedPath, IEnumerable<string> gamePaths)
     {
@@ -646,6 +1324,15 @@ public class PlayerDataFactory : IMediatorSubscriber
     private static readonly Regex StaticMaterialTexturePathRegex = new(@"(?:^|[\0\s\""'])/?((?:chara|common|bgcommon|bg|cut|vfx|shader|ui|font|game_script|sound|music|exd)/[a-z0-9_ '+&,\.\-\{\}/]+\.tex)", RegexOptions.IgnoreCase | RegexOptions.Compiled | RegexOptions.ECMAScript);
 
 
+    private static bool IsAllowedBuildGamePath(string? gamePath)
+    {
+        if (string.IsNullOrWhiteSpace(gamePath))
+            return false;
+
+        return AllowedBuildGamePathExtensions.Contains(Path.GetExtension(gamePath.Replace('\\', '/')));
+    }
+
+
     private static bool IsLightweightBuildReasonSet(string? reason)
     {
         if (string.IsNullOrWhiteSpace(reason))
@@ -687,14 +1374,10 @@ public class PlayerDataFactory : IMediatorSubscriber
         if (string.IsNullOrWhiteSpace(reason))
             return false;
 
-        // Raw Penumbra selection changes can swap the physical file behind an existing transient game path
-        // before the targeted manifest refresh has finished. Keep only that immediate safety build live.
-        // The follow-up PenumbraModSettingChanged:TransientManifest build can trust transient.json.
-        if (reason.StartsWith("PenumbraModSettingChanged", StringComparison.Ordinal)
-            && !reason.Contains(":TransientManifest", StringComparison.Ordinal))
-        {
-            return true;
-        }
+        // Penumbra selection changes are now handled by the targeted transient-manifest refresh.
+        // Do not live-resolve the full transient set during the player build; that is exactly the
+        // expensive path that makes emote/VFX option changes feel sluggish. The manifest path is
+        // event-invalidated rather than TTL-based, so accuracy still comes from the mod-setting event.
 
         // Directory changes can invalidate the physical resolved-file map. Startup/targeted manifest prime will
         // reseed transient.json afterwards, but the immediate build should be conservative.
@@ -721,7 +1404,9 @@ public class PlayerDataFactory : IMediatorSubscriber
             return false;
 
         var selectedSourcesByGamePath = await _localPapSafetyModService.ResolveSelectedHumanPapSourcesAsync(collectionState, ct).ConfigureAwait(false);
-        if (selectedSourcesByGamePath.Count == 0)
+        var candidates = BuildRuntimePapCandidates(selectedSourcesByGamePath);
+
+        if (candidates.Count == 0)
         {
             var runtimeChanged = await _localPapSafetyModService.SyncRuntimeModAsync(
                 collectionState,
@@ -735,39 +1420,39 @@ public class PlayerDataFactory : IMediatorSubscriber
             return runtimeChanged;
         }
 
+        if (TryBuildRuntimePapOverridesFromCachedDecisions(candidates, out var cachedSanitizedOverrides))
+        {
+            var cachedRuntimeChanged = await _localPapSafetyModService.SyncRuntimeModAsync(collectionState, selectedSourcesByGamePath, cachedSanitizedOverrides, ct).ConfigureAwait(false);
+            if (cachedRuntimeChanged)
+                await RequestLocalPlayerRedrawForRuntimePapChangeAsync(playerRelatedObject, ct).ConfigureAwait(false);
+
+            return cachedRuntimeChanged;
+        }
+
+        var targetIndependentResult = await TryBuildRuntimePapOverridesFromTargetIndependentDecisionsAsync(candidates, ct).ConfigureAwait(false);
+        if (targetIndependentResult.Success)
+        {
+            var targetIndependentRuntimeChanged = await _localPapSafetyModService.SyncRuntimeModAsync(collectionState, selectedSourcesByGamePath, targetIndependentResult.SanitizedOverrides, ct).ConfigureAwait(false);
+            if (targetIndependentRuntimeChanged)
+                await RequestLocalPlayerRedrawForRuntimePapChangeAsync(playerRelatedObject, ct).ConfigureAwait(false);
+
+            return targetIndependentRuntimeChanged;
+        }
+
         var targetSkeletons = await _dalamudUtil.RunOnFrameworkThread(() => _papSanitisationService.GetTargetSkeletonSnapshots(playerRelatedObject)).ConfigureAwait(false);
         var canRewriteAgainstCurrentSkeleton = targetSkeletons != null && targetSkeletons.Count > 0;
         var currentSkeletonFingerprint = canRewriteAgainstCurrentSkeleton
             ? _papSanitisationService.GetTargetSkeletonFingerprint(targetSkeletons!)
             : string.Empty;
 
+        if (!string.IsNullOrWhiteSpace(currentSkeletonFingerprint))
+            _lastKnownPlayerPapSkeletonFingerprint = currentSkeletonFingerprint;
+
         List<LocalPapSafetyModService.SanitizedPapOverride> sanitizedOverrides = [];
 
-        var candidates = selectedSourcesByGamePath.Values
-            .Where(s => !string.IsNullOrWhiteSpace(s.ResolvedPath)
-                && !string.IsNullOrWhiteSpace(s.Hash)
-                && s.GamePaths.Any(XivSkeletonIdentity.IsHumanPlayerAnimationPapGamePath))
-            .GroupBy(s => s.ResolvedPath + "|" + s.Hash, StringComparer.OrdinalIgnoreCase)
-            .OrderBy(g => g.First().ResolvedPath, StringComparer.OrdinalIgnoreCase);
-
-        foreach (var group in candidates)
+        foreach (var replacement in candidates)
         {
             ct.ThrowIfCancellationRequested();
-
-            var source = group.First();
-            var gamePaths = group
-                .SelectMany(s => s.GamePaths)
-                .Where(XivSkeletonIdentity.IsHumanPlayerAnimationPapGamePath)
-                .Distinct(StringComparer.OrdinalIgnoreCase)
-                .OrderBy(g => g, StringComparer.OrdinalIgnoreCase)
-                .ToArray();
-            if (gamePaths.Length == 0)
-                continue;
-
-            var replacement = new FileReplacement(gamePaths, source.ResolvedPath)
-            {
-                Hash = source.Hash,
-            };
 
             if (TryGetReusablePapDecision(replacement, currentSkeletonFingerprint, out var reusedDecision))
             {
@@ -800,6 +1485,138 @@ public class PlayerDataFactory : IMediatorSubscriber
             await RequestLocalPlayerRedrawForRuntimePapChangeAsync(playerRelatedObject, ct).ConfigureAwait(false);
 
         return sanitizedRuntimeChanged;
+    }
+
+    private static List<FileReplacement> BuildRuntimePapCandidates(IReadOnlyDictionary<string, LocalPapSafetyModService.ManifestPapSource> selectedSourcesByGamePath)
+    {
+        var output = new List<FileReplacement>();
+        if (selectedSourcesByGamePath.Count == 0)
+            return output;
+
+        var candidates = selectedSourcesByGamePath.Values
+            .Where(s => !string.IsNullOrWhiteSpace(s.ResolvedPath)
+                && !string.IsNullOrWhiteSpace(s.Hash)
+                && s.GamePaths.Any(XivSkeletonIdentity.IsHumanPlayerAnimationPapGamePath))
+            .GroupBy(s => s.ResolvedPath + "|" + s.Hash, StringComparer.OrdinalIgnoreCase)
+            .OrderBy(g => g.First().ResolvedPath, StringComparer.OrdinalIgnoreCase);
+
+        foreach (var group in candidates)
+        {
+            var source = group.First();
+            var gamePaths = group
+                .SelectMany(s => s.GamePaths)
+                .Where(XivSkeletonIdentity.IsHumanPlayerAnimationPapGamePath)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .OrderBy(g => g, StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+            if (gamePaths.Length == 0)
+                continue;
+
+            output.Add(new FileReplacement(gamePaths, source.ResolvedPath)
+            {
+                Hash = source.Hash,
+            });
+        }
+
+        return output;
+    }
+
+    private bool TryBuildRuntimePapOverridesFromCachedDecisions(IReadOnlyList<FileReplacement> candidates, out LocalPapSafetyModService.SanitizedPapOverride[] sanitizedOverrides)
+    {
+        sanitizedOverrides = Array.Empty<LocalPapSafetyModService.SanitizedPapOverride>();
+
+        if (candidates.Count == 0 || string.IsNullOrWhiteSpace(_lastKnownPlayerPapSkeletonFingerprint))
+            return false;
+
+        var overrides = new List<LocalPapSafetyModService.SanitizedPapOverride>();
+        foreach (var replacement in candidates)
+        {
+            if (!TryGetReusablePapDecision(replacement, _lastKnownPlayerPapSkeletonFingerprint, out var reusedDecision))
+                return false;
+
+            if (reusedDecision.Status == PapRewriteStatus.Sanitized
+                && TryCreateSanitizedPapOverride(replacement, reusedDecision.EffectivePath, reusedDecision.EffectiveHash, reusedDecision.Reason, out var reusedOverride))
+            {
+                overrides.Add(reusedOverride);
+            }
+        }
+
+        sanitizedOverrides = overrides.ToArray();
+        return true;
+    }
+
+    private async Task<(bool Success, LocalPapSafetyModService.SanitizedPapOverride[] SanitizedOverrides)> TryBuildRuntimePapOverridesFromTargetIndependentDecisionsAsync(IReadOnlyList<FileReplacement> candidates, CancellationToken ct)
+    {
+        if (candidates.Count == 0)
+            return (true, Array.Empty<LocalPapSafetyModService.SanitizedPapOverride>());
+
+        var overrides = new List<LocalPapSafetyModService.SanitizedPapOverride>();
+        foreach (var replacement in candidates)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            if (replacement == null || string.IsNullOrWhiteSpace(replacement.Hash))
+                return (false, Array.Empty<LocalPapSafetyModService.SanitizedPapOverride>());
+
+            if (!TryGetReusableTargetIndependentPapDecision(replacement.Hash, out var decision))
+            {
+                var evaluated = await _papSanitisationService.TryGetTargetIndependentRewriteResultAsync(replacement.Hash, ct).ConfigureAwait(false);
+                if (evaluated == null)
+                    return (false, Array.Empty<LocalPapSafetyModService.SanitizedPapOverride>());
+
+                _playerPapTargetIndependentDecisionsByHash[replacement.Hash] = evaluated;
+                decision = evaluated;
+            }
+
+            if (decision.Status == PapRewriteStatus.Sanitized)
+            {
+                if (TryCreateSanitizedPapOverride(replacement, decision.EffectivePath, decision.EffectiveHash, decision.Reason, out var sanitizedOverride))
+                {
+                    overrides.Add(sanitizedOverride);
+                    continue;
+                }
+
+                return (false, Array.Empty<LocalPapSafetyModService.SanitizedPapOverride>());
+            }
+
+            if (decision.Status is PapRewriteStatus.OriginalSafe or PapRewriteStatus.OriginalFallback or PapRewriteStatus.Blocked)
+                continue;
+
+            return (false, Array.Empty<LocalPapSafetyModService.SanitizedPapOverride>());
+        }
+
+        return (true, overrides.ToArray());
+    }
+
+    private bool TryGetReusableTargetIndependentPapDecision(string hash, out PapRewriteResult decision)
+    {
+        decision = default!;
+        if (string.IsNullOrWhiteSpace(hash))
+            return false;
+
+        if (!_playerPapTargetIndependentDecisionsByHash.TryGetValue(hash, out var cached))
+            return false;
+
+        if (!IsReusablePapRewriteResult(cached))
+        {
+            _playerPapTargetIndependentDecisionsByHash.TryRemove(hash, out _);
+            return false;
+        }
+
+        decision = cached;
+        return true;
+    }
+
+    private static bool IsReusablePapRewriteResult(PapRewriteResult result)
+    {
+        return result.Status switch
+        {
+            PapRewriteStatus.Blocked => true,
+            PapRewriteStatus.OriginalFallback => true,
+            PapRewriteStatus.OriginalSafe => !string.IsNullOrWhiteSpace(result.EffectivePath) && File.Exists(result.EffectivePath),
+            PapRewriteStatus.Sanitized => !string.IsNullOrWhiteSpace(result.EffectivePath) && File.Exists(result.EffectivePath),
+            _ => false,
+        };
     }
 
     private async Task RequestLocalPlayerRedrawForRuntimePapChangeAsync(GameObjectHandler playerRelatedObject, CancellationToken ct)
@@ -1013,13 +1830,16 @@ public class PlayerDataFactory : IMediatorSubscriber
         if (transientPaths.Count == 0)
             return new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase).AsReadOnly();
 
+        if (objectKind == ObjectKind.Player && _ipcManager.Penumbra.APIAvailable)
+            return await ResolvePlayerTransientReplacementsForBuildAsync(transientPaths, reason, ct).ConfigureAwait(false);
+
         if (ShouldForceFullLiveTransientResolveForBuild(reason))
         {
             var liveResolved = await GetFileReplacementsFromPaths(transientPaths, new HashSet<string>(StringComparer.Ordinal), ct).ConfigureAwait(false);
             return MergeKnownTransientResolvedPathFallbacks(objectKind, transientPaths, liveResolved);
         }
 
-        var knownResolved = _transientResourceManager.GetKnownResolvedFilePaths(objectKind, transientPaths);
+        var knownResolved = _transientResourceManager.GetKnownResolvedFilePaths(objectKind, transientPaths, validateExists: false);
         if (knownResolved.Count == 0)
         {
             var liveResolved = await GetFileReplacementsFromPaths(transientPaths, new HashSet<string>(StringComparer.Ordinal), ct).ConfigureAwait(false);
@@ -1050,6 +1870,68 @@ public class PlayerDataFactory : IMediatorSubscriber
         }
 
         return output.ToDictionary(kvp => kvp.Key, kvp => kvp.Value.Distinct(StringComparer.OrdinalIgnoreCase).ToArray(), StringComparer.OrdinalIgnoreCase).AsReadOnly();
+    }
+
+    private async Task<IReadOnlyDictionary<string, string[]>> ResolvePlayerTransientReplacementsForBuildAsync(HashSet<string> transientPaths, string? reason, CancellationToken ct)
+    {
+        var liveResolved = await GetFileReplacementsFromPaths(transientPaths, new HashSet<string>(StringComparer.Ordinal), ct).ConfigureAwait(false);
+        var output = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+        var seenGamePathsByResolvedPath = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var kvp in liveResolved)
+        {
+            var resolvedPath = NormalizeTransientResolvedPathForBuild(kvp.Key);
+            if (string.IsNullOrWhiteSpace(resolvedPath)
+                || resolvedPath.StartsWith("fileswap|", StringComparison.OrdinalIgnoreCase)
+                || !File.Exists(resolvedPath))
+            {
+                continue;
+            }
+
+            var normalizedResolvedAsGamePath = NormalizeTransientGamePathForBuild(resolvedPath);
+
+            foreach (var gamePath in kvp.Value)
+            {
+                var normalizedGamePath = NormalizeTransientGamePathForBuild(gamePath);
+                if (string.IsNullOrWhiteSpace(normalizedGamePath)
+                    || string.Equals(normalizedGamePath, normalizedResolvedAsGamePath, StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                if (!output.TryGetValue(resolvedPath, out var gamePaths))
+                {
+                    output[resolvedPath] = gamePaths = [];
+                    seenGamePathsByResolvedPath[resolvedPath] = [];
+                }
+
+                if (seenGamePathsByResolvedPath[resolvedPath].Add(normalizedGamePath))
+                    gamePaths.Add(normalizedGamePath);
+
+                _transientResourceManager.RegisterKnownTransientFilePath(normalizedGamePath, resolvedPath);
+            }
+        }
+
+        if (_logger.IsEnabled(LogLevel.Debug))
+        {
+            var activeGamePaths = output
+                .SelectMany(kvp => kvp.Value.Select(NormalizeTransientGamePathForBuild))
+                .Where(path => !string.IsNullOrWhiteSpace(path))
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+            var skipped = transientPaths
+                .Select(NormalizeTransientGamePathForBuild)
+                .Count(path => !string.IsNullOrWhiteSpace(path) && !activeGamePaths.Contains(path));
+
+            _logger.LogDebug(
+                "Resolved player transient paths against current Penumbra state for reason {reason}; active={active}, skippedCached={skipped}, requested={requested}",
+                reason ?? "<none>",
+                activeGamePaths.Count,
+                skipped,
+                transientPaths.Count);
+        }
+
+        return output.ToDictionary(kvp => kvp.Key, kvp => kvp.Value.ToArray(), StringComparer.OrdinalIgnoreCase).AsReadOnly();
     }
 
     private static Dictionary<string, List<string>> BuildResolvedFilePathMapFromKnownTransientPaths(IReadOnlyDictionary<string, string> knownResolved)
@@ -1113,16 +1995,25 @@ public class PlayerDataFactory : IMediatorSubscriber
             kvp => kvp.Value.ToList(),
             StringComparer.OrdinalIgnoreCase);
 
-        static string? FindExistingOutputKey(Dictionary<string, List<string>> output, string resolvedFilePath)
-            => output.Keys.FirstOrDefault(key => string.Equals(key, resolvedFilePath, StringComparison.OrdinalIgnoreCase));
+        var canonicalOutputKeyByResolvedPath = output.Keys.ToDictionary(static key => key, static key => key, StringComparer.OrdinalIgnoreCase);
+        var owningResolvedPathByGamePath = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var kvp in output)
+        {
+            foreach (var gamePath in kvp.Value)
+            {
+                var normalizedGamePath = NormalizeTransientGamePathForBuild(gamePath);
+                if (!string.IsNullOrWhiteSpace(normalizedGamePath) && !owningResolvedPathByGamePath.ContainsKey(normalizedGamePath))
+                    owningResolvedPathByGamePath[normalizedGamePath] = kvp.Key;
+            }
+        }
 
         var fallbackCount = 0;
         var correctedPathCount = 0;
         var manifestOverrideCount = 0;
         foreach (var kvp in knownResolvedPaths)
         {
-            var gamePath = kvp.Key;
-            var resolvedFilePath = kvp.Value;
+            var gamePath = NormalizeTransientGamePathForBuild(kvp.Key);
+            var resolvedFilePath = NormalizeTransientResolvedPathForBuild(kvp.Value);
 
             if (string.IsNullOrWhiteSpace(gamePath)
                 || string.IsNullOrWhiteSpace(resolvedFilePath)
@@ -1131,12 +2022,14 @@ public class PlayerDataFactory : IMediatorSubscriber
                 continue;
             }
 
-            var outputKey = FindExistingOutputKey(output, resolvedFilePath);
+            canonicalOutputKeyByResolvedPath.TryGetValue(resolvedFilePath, out var outputKey);
             if (!string.IsNullOrWhiteSpace(outputKey)
                 && !string.Equals(outputKey, resolvedFilePath, StringComparison.Ordinal))
             {
                 var existingGamePaths = output[outputKey];
                 output.Remove(outputKey);
+                canonicalOutputKeyByResolvedPath.Remove(outputKey);
+
                 if (output.TryGetValue(resolvedFilePath, out var alreadyCorrectedGamePaths))
                 {
                     foreach (var existingGamePath in existingGamePaths)
@@ -1148,7 +2041,11 @@ public class PlayerDataFactory : IMediatorSubscriber
                 else
                 {
                     output[resolvedFilePath] = existingGamePaths;
+                    canonicalOutputKeyByResolvedPath[resolvedFilePath] = resolvedFilePath;
                 }
+
+                foreach (var existingGamePath in existingGamePaths)
+                    owningResolvedPathByGamePath[NormalizeTransientGamePathForBuild(existingGamePath)] = resolvedFilePath;
 
                 outputKey = resolvedFilePath;
                 correctedPathCount++;
@@ -1158,17 +2055,22 @@ public class PlayerDataFactory : IMediatorSubscriber
             {
                 outputKey = resolvedFilePath;
                 output[outputKey] = [];
+                canonicalOutputKeyByResolvedPath[outputKey] = outputKey;
             }
 
-            foreach (var otherKey in output.Keys.Where(key => !string.Equals(key, outputKey, StringComparison.OrdinalIgnoreCase)).ToList())
+            if (owningResolvedPathByGamePath.TryGetValue(gamePath, out var otherKey)
+                && !string.Equals(otherKey, outputKey, StringComparison.OrdinalIgnoreCase)
+                && output.TryGetValue(otherKey, out var otherGamePaths))
             {
-                var otherGamePaths = output[otherKey];
                 var removed = otherGamePaths.RemoveAll(path => string.Equals(path, gamePath, StringComparison.OrdinalIgnoreCase));
                 if (removed > 0)
                     manifestOverrideCount += removed;
 
                 if (otherGamePaths.Count == 0)
+                {
                     output.Remove(otherKey);
+                    canonicalOutputKeyByResolvedPath.Remove(otherKey);
+                }
             }
 
             var gamePaths = output[outputKey];
@@ -1177,6 +2079,8 @@ public class PlayerDataFactory : IMediatorSubscriber
                 gamePaths.Add(gamePath);
                 fallbackCount++;
             }
+
+            owningResolvedPathByGamePath[gamePath] = outputKey;
         }
 
         if (fallbackCount > 0 || correctedPathCount > 0 || manifestOverrideCount > 0)
@@ -1189,10 +2093,14 @@ public class PlayerDataFactory : IMediatorSubscriber
         return output.ToDictionary(kvp => kvp.Key, kvp => kvp.Value.Distinct(StringComparer.OrdinalIgnoreCase).ToArray(), StringComparer.OrdinalIgnoreCase).AsReadOnly();
     }
 
-    private HashSet<string> ManageSemiTransientData(ObjectKind objectKind, IReadOnlyCollection<string>? staticResolvedGamePaths)
+    private HashSet<string> ManageSemiTransientData(ObjectKind objectKind, IReadOnlyCollection<string>? staticResolvedGamePaths, GameObjectHandler? playerRelatedObject = null, IReadOnlyCollection<FileReplacement>? staticReplacementReferences = null)
     {
         var pendingObjectTransients = IsSummonedObjectKind(objectKind)
             ? _transientResourceManager.GetPendingTransientResources(objectKind)
+            : new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        var liveObservedPlayerTransients = objectKind == ObjectKind.Player
+            ? _transientResourceManager.GetPendingTransientResources(ObjectKind.Player)
             : new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         HashSet<string> pathsToResolve = new(StringComparer.OrdinalIgnoreCase);
@@ -1202,48 +2110,352 @@ public class PlayerDataFactory : IMediatorSubscriber
                 pathsToResolve.Add(path);
         }
 
+        if (objectKind == ObjectKind.Player)
+            pathsToResolve = FilterPlayerTransientsToCurrentHumanRaceFamilies(pathsToResolve, staticResolvedGamePaths, liveObservedPlayerTransients, playerRelatedObject);
+
         if (IsSummonedObjectKind(objectKind))
-            pathsToResolve = FilterSummonedObjectTransientsToCurrentActor(objectKind, pathsToResolve, pendingObjectTransients, staticResolvedGamePaths);
+            pathsToResolve = FilterSummonedObjectTransientsToCurrentActor(objectKind, pathsToResolve, pendingObjectTransients, staticResolvedGamePaths, staticReplacementReferences);
 
         return pathsToResolve;
     }
 
-    private HashSet<string> FilterSummonedObjectTransientsToCurrentActor(ObjectKind objectKind, HashSet<string> pathsToResolve, HashSet<string> pendingObjectTransients, IReadOnlyCollection<string>? staticResolvedGamePaths)
+    private HashSet<string> FilterPlayerTransientsToCurrentHumanRaceFamilies(HashSet<string> pathsToResolve, IReadOnlyCollection<string>? staticResolvedGamePaths, HashSet<string> liveObservedPlayerTransients, GameObjectHandler? playerRelatedObject)
+    {
+        if (pathsToResolve.Count == 0)
+            return pathsToResolve;
+
+        var activeHumanCodes = BuildCurrentHumanModelCodeSet(staticResolvedGamePaths, playerRelatedObject);
+        if (activeHumanCodes.Count == 0)
+            return pathsToResolve;
+
+        var protectedPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (staticResolvedGamePaths != null)
+        {
+            foreach (var path in staticResolvedGamePaths)
+            {
+                if (!string.IsNullOrWhiteSpace(path))
+                    protectedPaths.Add(path);
+            }
+        }
+
+        foreach (var path in liveObservedPlayerTransients)
+        {
+            if (!string.IsNullOrWhiteSpace(path))
+                protectedPaths.Add(path);
+        }
+
+        var humanFamilies = new Dictionary<string, List<(string Path, string Code)>>(StringComparer.OrdinalIgnoreCase);
+        foreach (var path in pathsToResolve)
+        {
+            if (!TryGetHumanModelPathFamily(path, out var code, out var familyKey))
+                continue;
+
+            if (!humanFamilies.TryGetValue(familyKey, out var family))
+                humanFamilies[familyKey] = family = [];
+
+            family.Add((path, code));
+        }
+
+        if (humanFamilies.Count == 0)
+            return pathsToResolve;
+
+        var filtered = new HashSet<string>(pathsToResolve, StringComparer.OrdinalIgnoreCase);
+        var removed = 0;
+        var collapsedFamilies = 0;
+
+        foreach (var family in humanFamilies.Values)
+        {
+            var distinctCodes = family.Select(static item => item.Code).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+            if (distinctCodes.Length < HumanRaceFamilyCollapseMinimumVariants)
+                continue;
+
+            var keepCodes = new HashSet<string>(activeHumanCodes, StringComparer.OrdinalIgnoreCase);
+            var hasActiveVariant = family.Any(item => keepCodes.Contains(item.Code));
+
+            if (!hasActiveVariant && IsCompatibleHumanAnimationFamily(family))
+            {
+                // Some emote/loop packs deliberately omit the local race code but still work in-game because
+                // the client/Penumbra falls back to one of the declared human animation variants.
+                // When that happens, keeping only c0101 is too narrow for races such as Viera/Hrothgar;
+                // preserve every declared variant in this animation family so the receiver has the same
+                // fallback choices the sender had locally. These variants normally point at the same PAP,
+                // so this expands game-path aliases without multiplying uploaded file content.
+                keepCodes = distinctCodes.ToHashSet(StringComparer.OrdinalIgnoreCase);
+                hasActiveVariant = keepCodes.Count > 0;
+            }
+
+            if (!hasActiveVariant)
+                continue;
+
+            var familyRemoved = 0;
+            foreach (var item in family)
+            {
+                if (keepCodes.Contains(item.Code) || protectedPaths.Contains(item.Path))
+                    continue;
+
+                if (filtered.Remove(item.Path))
+                    familyRemoved++;
+            }
+
+            if (familyRemoved > 0)
+            {
+                removed += familyRemoved;
+                collapsedFamilies++;
+            }
+        }
+
+        if (removed > 0)
+        {
+            _logger.LogDebug(
+                "Collapsed {removed}/{total} player transient human race-variant path(s) across {families} family/families for current/compatible model(s) {models}",
+                removed,
+                pathsToResolve.Count,
+                collapsedFamilies,
+                string.Join(",", activeHumanCodes.OrderBy(static code => code, StringComparer.OrdinalIgnoreCase)));
+        }
+
+        return filtered;
+    }
+
+    private static HashSet<string> BuildCurrentHumanModelCodeSet(IReadOnlyCollection<string>? staticResolvedGamePaths, GameObjectHandler? playerRelatedObject)
+    {
+        var result = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        if (playerRelatedObject != null && TryGetExpectedHumanModelCode(playerRelatedObject.RaceId, playerRelatedObject.TribeId, playerRelatedObject.Gender, out var expectedCode))
+            result.Add(expectedCode);
+
+        // Static paths are only used as a fallback when we genuinely do not have a player object to read from.
+        // When we do have the object, treating every static mod path as an "active race" defeats the stripper
+        // and can also hide the c0101-compatible animation fallback case.
+        if (result.Count == 0 && staticResolvedGamePaths != null)
+        {
+            foreach (var path in staticResolvedGamePaths)
+            {
+                if (TryGetHumanModelCode(path, out var code))
+                    result.Add(code);
+            }
+        }
+
+        return result;
+    }
+
+    private static bool TryGetHumanModelPathFamily(string? path, out string code, out string familyKey)
+    {
+        code = string.Empty;
+        familyKey = string.Empty;
+
+        if (string.IsNullOrWhiteSpace(path))
+            return false;
+
+        var normalized = path.Replace('\\', '/').Trim();
+        var match = HumanModelPathRegex.Match(normalized);
+        if (!match.Success)
+            return false;
+
+        code = match.Groups[1].Value.ToLowerInvariant();
+        familyKey = normalized.Remove(match.Groups[1].Index, match.Groups[1].Length).Insert(match.Groups[1].Index, "c####");
+        return true;
+    }
+
+    private static bool TryGetHumanModelCode(string? path, out string code)
+    {
+        code = string.Empty;
+        return TryGetHumanModelPathFamily(path, out code, out _);
+    }
+
+    private static bool IsCompatibleHumanAnimationFamily(IEnumerable<(string Path, string Code)> family)
+    {
+        return family.Any(static item => IsCompatibleHumanAnimationPath(item.Path));
+    }
+
+    private static bool IsCompatibleHumanAnimationPath(string? path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+            return false;
+
+        var normalized = path.Replace('\\', '/').Trim();
+        return normalized.StartsWith("chara/human/", StringComparison.OrdinalIgnoreCase)
+            && normalized.Contains("/animation/", StringComparison.OrdinalIgnoreCase)
+            && normalized.EndsWith(".pap", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool TryGetExpectedHumanModelCode(byte raceId, byte tribeId, byte gender, out string code)
+    {
+        code = string.Empty;
+        var isFemale = gender == 1;
+
+        code = raceId switch
+        {
+            1 => tribeId <= 2 ? (isFemale ? "c0201" : "c0101") : (isFemale ? "c0401" : "c0301"),
+            2 => isFemale ? "c0601" : "c0501",
+            3 => isFemale ? "c0801" : "c0701",
+            4 => isFemale ? "c1001" : "c0901",
+            5 => isFemale ? "c1201" : "c1101",
+            6 => isFemale ? "c1401" : "c1301",
+            7 => isFemale ? "c1801" : "c1501",
+            8 => isFemale ? "c1601" : "c1701",
+            _ => string.Empty,
+        };
+
+        return !string.IsNullOrWhiteSpace(code);
+    }
+
+    private HashSet<string> FilterSummonedObjectTransientsToCurrentActor(ObjectKind objectKind, HashSet<string> pathsToResolve, HashSet<string> pendingObjectTransients, IReadOnlyCollection<string>? staticResolvedGamePaths, IReadOnlyCollection<FileReplacement>? staticReplacementReferences)
     {
         if (pathsToResolve.Count == 0)
             return pathsToResolve;
 
         var activeScopes = BuildSummonedObjectPathScopes(staticResolvedGamePaths);
-        if (activeScopes.Count == 0)
+        var activeResolvedRoots = BuildActiveSummonedObjectResolvedRoots(staticReplacementReferences);
+        var scopedPendingObjectTransients = FilterPendingSummonedObjectTransientsToActiveScopes(pendingObjectTransients, activeScopes);
+
+        if (activeScopes.Count == 0 && activeResolvedRoots.Count == 0)
         {
-            if (pendingObjectTransients.Count == 0)
+            _logger.LogTrace(
+                "Suppressing {count} persisted {objectKind} transient path(s) because the current summoned actor has no provable top-priority active scope/root",
+                pathsToResolve.Count,
+                objectKind);
+            return new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        }
+
+        if (activeResolvedRoots.Count == 0)
+        {
+            if (scopedPendingObjectTransients.Count == 0)
             {
-                _logger.LogTrace("Suppressing {count} persistent {objectKind} transient path(s) because the current summoned actor has no active static scope", pathsToResolve.Count, objectKind);
+                _logger.LogTrace(
+                    "Suppressing {count} persisted {objectKind} transient path(s) because only the active actor scope was known and no pending transient matched it",
+                    pathsToResolve.Count,
+                    objectKind);
                 return new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             }
 
-            _logger.LogDebug("Using {count} pending {objectKind} transient path(s) only; current summoned actor has no active static scope", pendingObjectTransients.Count, objectKind);
-            return pendingObjectTransients;
+            _logger.LogDebug(
+                "Using {count}/{pendingTotal} pending {objectKind} transient path(s) matching the current summoned actor scope only; no active resolved root was provable",
+                scopedPendingObjectTransients.Count,
+                pendingObjectTransients.Count,
+                objectKind);
+            return scopedPendingObjectTransients;
         }
 
+        var knownResolvedPaths = _transientResourceManager.GetKnownResolvedFilePaths(objectKind, pathsToResolve, validateExists: false);
         var filtered = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var path in pathsToResolve)
         {
-            if (pendingObjectTransients.Contains(path) || BelongsToActiveSummonedObjectScope(path, activeScopes))
+            if (pendingObjectTransients.Contains(path))
+            {
+                if (activeScopes.Count == 0 || scopedPendingObjectTransients.Contains(path))
+                    filtered.Add(path);
+                continue;
+            }
+
+            if (!knownResolvedPaths.TryGetValue(path, out var resolvedPath))
+                continue;
+
+            if (!ResolvedPathBelongsToActiveRoot(resolvedPath, activeResolvedRoots))
+                continue;
+
+            if (activeScopes.Count == 0
+                || BelongsToActiveSummonedObjectScope(path, activeScopes)
+                || ResolvedPathContainsActiveSummonedObjectScope(resolvedPath, activeScopes))
+            {
                 filtered.Add(path);
+            }
         }
 
         var removed = pathsToResolve.Count - filtered.Count;
         if (removed > 0)
         {
             _logger.LogDebug(
-                "Filtered {removed}/{total} persisted {objectKind} transient path(s) out of this build because they belong to a different summoned actor",
+                "Filtered {removed}/{total} persisted {objectKind} transient path(s) out of this build because they were not from the current top-priority summoned actor source",
                 removed,
                 pathsToResolve.Count,
                 objectKind);
         }
 
         return filtered;
+    }
+
+    private static HashSet<string> FilterPendingSummonedObjectTransientsToActiveScopes(HashSet<string> pendingObjectTransients, HashSet<string> activeScopes)
+    {
+        if (pendingObjectTransients.Count == 0 || activeScopes.Count == 0)
+            return new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        var filtered = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var path in pendingObjectTransients)
+        {
+            if (BelongsToActiveSummonedObjectScope(path, activeScopes))
+                filtered.Add(path);
+        }
+
+        return filtered;
+    }
+
+    private static HashSet<string> BuildActiveSummonedObjectResolvedRoots(IReadOnlyCollection<FileReplacement>? staticReplacementReferences)
+    {
+        var roots = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (staticReplacementReferences == null)
+            return roots;
+
+        foreach (var replacement in staticReplacementReferences)
+        {
+            if (replacement == null || !replacement.HasFileReplacement)
+                continue;
+
+            foreach (var gamePath in replacement.GamePaths)
+            {
+                if (TryBuildResolvedGamePathRoot(replacement.ResolvedPath, gamePath, out var root))
+                    roots.Add(root);
+            }
+        }
+
+        return roots;
+    }
+
+    private static bool TryBuildResolvedGamePathRoot(string? resolvedPath, string? gamePath, out string root)
+    {
+        root = string.Empty;
+
+        var normalizedResolved = NormalizeTransientGamePathForBuild(resolvedPath);
+        var normalizedGamePath = NormalizeTransientGamePathForBuild(gamePath);
+        if (string.IsNullOrWhiteSpace(normalizedResolved) || string.IsNullOrWhiteSpace(normalizedGamePath))
+            return false;
+
+        if (!normalizedResolved.EndsWith(normalizedGamePath, StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        root = normalizedResolved[..^normalizedGamePath.Length];
+        return !string.IsNullOrWhiteSpace(root);
+    }
+
+    private static bool ResolvedPathBelongsToActiveRoot(string? resolvedPath, HashSet<string> activeResolvedRoots)
+    {
+        var normalizedResolved = NormalizeTransientGamePathForBuild(resolvedPath);
+        if (string.IsNullOrWhiteSpace(normalizedResolved) || activeResolvedRoots.Count == 0)
+            return false;
+
+        return activeResolvedRoots.Any(root => normalizedResolved.StartsWith(root, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static bool ResolvedPathContainsActiveSummonedObjectScope(string? resolvedPath, HashSet<string> activeScopes)
+    {
+        var normalizedResolved = NormalizeTransientGamePathForBuild(resolvedPath);
+        if (string.IsNullOrWhiteSpace(normalizedResolved) || activeScopes.Count == 0)
+            return false;
+
+        foreach (var scope in activeScopes)
+        {
+            var normalizedScope = NormalizeTransientGamePathForBuild(scope).TrimStart('/');
+            if (string.IsNullOrWhiteSpace(normalizedScope))
+                continue;
+
+            if (normalizedResolved.Contains("/" + normalizedScope, StringComparison.OrdinalIgnoreCase)
+                || normalizedResolved.StartsWith(normalizedScope, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private static bool IsSummonedObjectKind(ObjectKind objectKind)

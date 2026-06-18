@@ -1,0 +1,32 @@
+{
+  "3813": {
+    "preprocessor": "env_safari"
+  },
+  "14121": {
+    "preprocessor": "!ext_ubol"
+  },
+  "15491": {
+    "preprocessor": "env_safari"
+  },
+  "18404": {
+    "preprocessor": "env_safari"
+  },
+  "45943": {
+    "preprocessor": "env_safari"
+  },
+  "51116": {
+    "preprocessor": "env_safari"
+  },
+  "54157": {
+    "preprocessor": "env_safari"
+  },
+  "56327": {
+    "preprocessor": "env_chromium"
+  },
+  "56339": {
+    "preprocessor": "!(cap_html_filtering)"
+  },
+  "56402": {
+    "preprocessor": "env_firefox"
+  }
+}

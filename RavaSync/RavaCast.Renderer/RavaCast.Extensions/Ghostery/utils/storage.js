@@ -1,0 +1,51 @@
+//#region src/utils/storage.js
+/**
+* Ghostery Browser Extension
+* https://www.ghostery.com/
+*
+* Copyright 2017-present Ghostery GmbH. All rights reserved.
+*
+* This Source Code Form is subject to the terms of the Mozilla Public
+* License, v. 2.0. If a copy of the MPL was not distributed with this
+* file, You can obtain one at http://mozilla.org/MPL/2.0
+*/
+var STORAGE_TEST_KEY = `__storage_test__${Date.now()}`;
+async function checkStorage() {
+	try {
+		await chrome.storage.local.set({ [STORAGE_TEST_KEY]: "test" });
+		const result = await chrome.storage.local.get(STORAGE_TEST_KEY);
+		await chrome.storage.local.remove(STORAGE_TEST_KEY);
+		return result[STORAGE_TEST_KEY] === "test";
+	} catch (e) {
+		console.error("[storage] Storage check failed:", e);
+		throw e;
+	}
+}
+async function checkSessionStorage() {
+	try {
+		await chrome.storage.session.set({ [STORAGE_TEST_KEY]: "test" });
+		const result = await chrome.storage.session.get(STORAGE_TEST_KEY);
+		await chrome.storage.session.remove(STORAGE_TEST_KEY);
+		return result[STORAGE_TEST_KEY] === "test";
+	} catch (e) {
+		console.error("[storage] Session storage check failed:", e);
+		throw e;
+	}
+}
+function getLocalStorageItem(key) {
+	try {
+		return globalThis.localStorage.getItem(key);
+	} catch (e) {
+		console.error(`[storage] Failed to get localStorage item for key "${key}":`, e);
+		return null;
+	}
+}
+function setLocalStorageItem(key, value) {
+	try {
+		globalThis.localStorage.setItem(key, value);
+	} catch (e) {
+		console.error(`[storage] Failed to set localStorage item for key "${key}":`, e);
+	}
+}
+//#endregion
+export { checkSessionStorage, checkStorage, getLocalStorageItem, setLocalStorageItem };

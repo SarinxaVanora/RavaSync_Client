@@ -97,10 +97,10 @@ public class RavaPlugin : MediatorSubscriberBase, IHostedService
     public Task StartAsync(CancellationToken cancellationToken)
     {
         AppContext.SetSwitch("System.Net.SocketsHttpHandler.Http3Support", true);
-        var version = Assembly.GetExecutingAssembly().GetName().Version!;
-        Logger.LogInformation("Launching {name} {major}.{minor}.{build}", "RavaSync", version.Major, version.Minor, version.Build);
+        var versionText = PluginVersion.CurrentText;
+        Logger.LogInformation("Launching {name} {version}", "RavaSync", versionText);
         Mediator.Publish(new EventMessage(new Services.Events.Event(nameof(RavaPlugin), Services.Events.EventSeverity.Informational,
-            $"Starting RavaSync {version.Major}.{version.Minor}.{version.Build}")));
+            $"Starting RavaSync {versionText}")));
 
         Mediator.Subscribe<SwitchToMainUiMessage>(this, (_) => QueueLaunchCharacterManager());
         Mediator.Subscribe<DalamudLoginMessage>(this, (_) => DalamudUtilOnLogIn());

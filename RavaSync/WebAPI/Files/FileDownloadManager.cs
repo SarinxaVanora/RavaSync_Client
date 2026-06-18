@@ -1,613 +1,142 @@
-using Dalamud.Utility;
 using K4os.Compression.LZ4.Legacy;
+using Dalamud.Utility;
 using Microsoft.Extensions.Logging;
 using RavaSync.API.Data;
 using RavaSync.API.Dto.Files;
 using RavaSync.API.Routes;
 using RavaSync.FileCache;
-using RavaSync.Interop.GameModel;
 using RavaSync.MareConfiguration;
-using RavaSync.MareConfiguration.Configurations;
 using RavaSync.PlayerData.Handlers;
 using RavaSync.Services.Mediator;
 using RavaSync.Utils;
-using RavaSync.WebAPI.Files;
 using RavaSync.WebAPI.Files.Models;
+using System;
 using System.Buffers;
-using System.Diagnostics;
+using System.Collections.Generic;
+using System.Collections.Concurrent;
+using System.IO;
+using System.Linq;
 using System.Net;
 using System.Net.Http;
 using System.Net.Http.Json;
-using System.Net.Sockets;
 using System.Security.Cryptography;
-using System.Collections.Concurrent;
-using System.Runtime.InteropServices;
+using System.Threading;
+using System.Threading.Tasks;
 
 namespace RavaSync.WebAPI.Files;
 
 public partial class FileDownloadManager : DisposableMediatorSubscriberBase
 {
-    private Dictionary<string, FileDownloadStatus> _downloadStatus;
+    private static readonly bool IsWineRuntime = SafeIsWine();
+    private static readonly int BufferSize = IsWineRuntime ? 512 * 1024 : 1024 * 1024;
+    private const int Lz4BlockSize = 256 * 1024;
+    // Global CDN file slots across all active pair downloads. This is async request/file concurrency, not dedicated threads.
+    // Network work remains broad on Wine/Linux; expensive legacy decode and cache finalisation are
+    // pressure-gated separately so smoothness does not come from starving the connection.
+    private static readonly int MaxCdnParallelism = IsWineRuntime ? 128 : 256;
+    private static readonly int DownloadStatusPublishIntervalMs = IsWineRuntime ? 300 : 150;
+    private static readonly SemaphoreSlim GlobalCdnFileSemaphore = new(MaxCdnParallelism, MaxCdnParallelism);
+    private static readonly ConcurrentDictionary<string, Lazy<Task<bool>>> GlobalInFlightDownloadsByHash = new(StringComparer.OrdinalIgnoreCase);
+    private static readonly TimeSpan SmallFirstResponseTimeout = TimeSpan.FromSeconds(6);
+    private static readonly TimeSpan NormalFirstResponseTimeout = TimeSpan.FromSeconds(8);
+    private static readonly TimeSpan LargeFirstResponseTimeout = TimeSpan.FromSeconds(12);
+    private static readonly TimeSpan SmallReadProgressTimeout = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan NormalReadProgressTimeout = TimeSpan.FromSeconds(12);
+    private static readonly TimeSpan LargeReadProgressTimeout = TimeSpan.FromSeconds(25);
+    private const long NormalReadProgressTimeoutThreshold = 2L * 1024 * 1024;
+    private const long LargeReadProgressTimeoutThreshold = 32L * 1024 * 1024;
+    private static readonly TimeSpan DirectCdnSizeHintTtl = TimeSpan.FromMinutes(10);
+
     private readonly FileCompactor _fileCompactor;
     private readonly FileCacheManager _fileDbManager;
     private readonly FileTransferOrchestrator _orchestrator;
-    private static readonly HttpClient SharedCdnFastClient = CreateCdnFastClient();
-    private readonly HttpClient _cdnFastClient;
-    private readonly List<ThrottledStream> _activeDownloadStreams;
-    private static readonly bool IsWineRuntime = SafeIsWine();
-    private static bool IsWineOrLinuxRuntime => IsWineRuntime || RuntimeInformation.IsOSPlatform(OSPlatform.Linux);
+    private readonly MareConfigService _mareConfigService;
+    private readonly List<ThrottledStream> _activeDownloadStreams = [];
+    private readonly object _activeStreamsLock = new();
+    private Dictionary<string, FileDownloadStatus> _downloadStatus = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, long> _fileProgressBytes = new(StringComparer.OrdinalIgnoreCase);
+    private long _lastStatusPublishMs;
+
+    private string _centralFileRepairTargetUid = string.Empty;
+    private string _centralFileRepairTargetIdent = string.Empty;
+    private string _centralFileRepairDataHash = string.Empty;
+    private readonly ConcurrentDictionary<string, int> _centralFileRepairAttemptsByHash = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, string> _centralFileRepairFailedHashes = new(StringComparer.OrdinalIgnoreCase);
+    private static readonly ConcurrentDictionary<string, (long Size, long ExpiresUtcTicks)> DirectCdnSizeHintsByHash = new(StringComparer.OrdinalIgnoreCase);
+    private static int _cdnClientCursor;
+    private static readonly HttpClient[] SharedCdnClients = CreateCdnClients();
+    private static readonly int LinuxLegacyDecodeConcurrency = Math.Clamp(Environment.ProcessorCount / 8, 1, 2);
+    private static readonly SemaphoreSlim LinuxLegacyDecodeSemaphore = new(LinuxLegacyDecodeConcurrency, LinuxLegacyDecodeConcurrency);
+    private static readonly ConcurrentQueue<PendingCacheRegistration> LinuxPendingCacheRegistrations = new();
+    private static int _linuxCacheRegistrationPumpRunning;
+
+    private sealed class PendingCacheRegistration
+    {
+        public PendingCacheRegistration(FileCacheManager manager, string hash, string path)
+        {
+            Manager = manager;
+            Hash = hash;
+            Path = path;
+        }
+
+        public FileCacheManager Manager { get; }
+        public string Hash { get; }
+        public string Path { get; }
+        public TaskCompletionSource<bool> Completion { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    }
 
     private static bool SafeIsWine()
     {
         try { return Util.IsWine(); }
         catch { return false; }
     }
-    private static readonly ArrayPool<byte> _downloadBufferPool = ArrayPool<byte>.Shared;
-    private const int CdnBufferSize = 512 * 1024;
-    private const int DownloadBufferSize = CdnBufferSize;
-    const int Lz4BlockSize = 256 * 1024;
-    private const int CdnSmoothDecodeBufferSize = 256 * 1024;
-    private const long CdnSmoothYieldEveryBytes = 512L * 1024;
-    private const long CdnSmoothMicroPauseEveryBytes = 8L * 1024 * 1024;
-    private const long CdnSmoothInterFilePauseThresholdBytes = 8L * 1024 * 1024;
-    private const int NativeThreadModeBackgroundBegin = 0x00010000;
-    private readonly MareConfigService _mareConfigService;
-    private const int MaxCdnAttemptsPerFile = 3;
-    private static readonly TimeSpan CdnAttemptTimeout = TimeSpan.FromSeconds(60);
-    private const long TinyFilePayloadBytes = 2L * 1024 * 1024;
-    private const int TinyFileParallelFloor = 6;
-    private const int TinyFileParallelMax = 12;
-    private const long CdnInMemorySpoolMaxPayloadBytes = 2L * 1024 * 1024;
-    private const long CdnInMemorySpoolMaxGroupBytes = 48L * 1024 * 1024;
-    private const long CdnPressureInMemorySpoolMaxPayloadBytes = 1L * 1024 * 1024;
-    private const long CdnPressureInMemorySpoolMaxGroupBytes = 24L * 1024 * 1024;
-    private const long CdnDirectStreamMaxPayloadBytes = 0L;
 
-
-    private const int AutoCdnMinParallel = 3;
-    private const int AutoCdnMaxParallel = 12;
-
-    private const long AutoCdnSlowBpsThreshold = 768 * 1024;
-
-    private int _autoCdnParallel = 8;
-
-    // Keep CPU-heavy LZ4/SHA1 work in one low-impact lane. The CDN/network side can still keep fetching,
-    // but decode/finalize must not stampede the game process.
-    private static readonly SemaphoreSlim CdnDecodeConcurrencySemaphore = new(1, 1);
-    private static readonly SemaphoreSlim CdnValidationConcurrencySemaphore = new(1, 1);
-    private static readonly SemaphoreSlim CdnSpoolFileWriteSemaphore = new(2, 2);
-
-    [DllImport("kernel32.dll")]
-    private static extern IntPtr GetCurrentThread();
-
-    [DllImport("kernel32.dll")]
-    private static extern bool SetThreadPriority(IntPtr hThread, int nPriority);
-
-    private readonly ConcurrentDictionary<string, byte> _createdDirs = new(StringComparer.OrdinalIgnoreCase);
-
-    private readonly ConcurrentDictionary<string, string> _pendingCacheEntryByPath = new(StringComparer.OrdinalIgnoreCase);
-    private readonly CancellationTokenSource _cachePersistCts = new();
-    private Task _cachePersistLoop = Task.CompletedTask;
-    private int _cachePersistLoopStarted;
-    private int _cachePersistFlushRunning;
-    private const int CachePersistBatchSize = 32;
-    private const int CdnFinalCacheRegistrationBatchSize = 32;
-    private static readonly TimeSpan CachePersistFlushInterval = TimeSpan.FromMilliseconds(250);
-
-    private static long GetEffectiveInMemorySpoolPayloadBudgetBytes()
-        => SyncStorm.IsDownloadPressureHigh ? CdnPressureInMemorySpoolMaxPayloadBytes : CdnInMemorySpoolMaxPayloadBytes;
-
-    private static long GetEffectiveInMemorySpoolGroupBudgetBytes()
-        => SyncStorm.IsDownloadPressureHigh ? CdnPressureInMemorySpoolMaxGroupBytes : CdnInMemorySpoolMaxGroupBytes;
-
-
-    private sealed class CdnInMemorySpoolBudget
+    public FileDownloadManager(ILogger<FileDownloadManager> logger, MareMediator mediator, FileTransferOrchestrator orchestrator, FileCacheManager fileCacheManager, FileCompactor fileCompactor, MareConfigService mareConfigService) : base(logger, mediator)
     {
-        private long _usedBytes;
-
-        public bool TryReserve(long bytes)
-        {
-            if (bytes <= 0) return true;
-
-            var groupBudget = FileDownloadManager.GetEffectiveInMemorySpoolGroupBudgetBytes();
-            if (bytes > groupBudget) return false;
-
-            while (true)
-            {
-                var used = Volatile.Read(ref _usedBytes);
-                var next = used + bytes;
-                if (next > groupBudget)
-                    return false;
-
-                if (Interlocked.CompareExchange(ref _usedBytes, next, used) == used)
-                    return true;
-            }
-        }
-
-        public void Release(long bytes)
-        {
-            if (bytes <= 0) return;
-            var after = Interlocked.Add(ref _usedBytes, -bytes);
-            if (after < 0)
-                Interlocked.Exchange(ref _usedBytes, 0);
-        }
-    }
-
-    private sealed class GroupProgressState
-    {
-        public long PendingBytes;
-        public long PendingFiles;
-        public long LastFlushTicks;
-        public long LastPublishTicks;
-    }
-
-    private sealed class VisibleProgressState
-    {
-        public long TotalBytes;
-        public int TotalFiles;
-        public long TransferredBytes;
-        public int TransferredFiles;
-    }
-
-    private readonly ConcurrentDictionary<string, GroupProgressState> _groupProgress
-        = new(StringComparer.Ordinal);
-
-    private readonly ConcurrentDictionary<string, VisibleProgressState> _visibleProgressByGroup
-        = new(StringComparer.Ordinal);
-
-    private Dictionary<string, FileDownloadStatus> SnapshotDownloadStatusForUi(Dictionary<string, FileDownloadStatus>? source)
-    {
-        if (source == null || source.Count == 0)
-            return new Dictionary<string, FileDownloadStatus>(StringComparer.Ordinal);
-
-        var snapshot = new Dictionary<string, FileDownloadStatus>(source.Count, StringComparer.Ordinal);
-
-        foreach (var kv in source)
-        {
-            var current = kv.Value;
-            if (current == null)
-                continue;
-
-            DownloadStatus phase;
-            long totalBytes;
-            int totalFiles;
-            long transferredBytes;
-            int transferredFiles;
-
-            lock (current)
-            {
-                phase = current.DownloadStatus;
-                totalBytes = Math.Max(0, current.TotalBytes);
-                totalFiles = Math.Max(0, current.TotalFiles);
-                transferredBytes = Math.Max(0, current.TransferredBytes);
-                transferredFiles = Math.Max(0, current.TransferredFiles);
-            }
-
-            var visible = _visibleProgressByGroup.GetOrAdd(kv.Key, _ => new VisibleProgressState());
-
-            lock (visible)
-            {
-                if (totalBytes > visible.TotalBytes)
-                    visible.TotalBytes = totalBytes;
-
-                if (totalFiles > visible.TotalFiles)
-                    visible.TotalFiles = totalFiles;
-
-                var stableTotalBytes = Math.Max(visible.TotalBytes, totalBytes);
-                var stableTotalFiles = Math.Max(visible.TotalFiles, totalFiles);
-
-                if (transferredBytes > visible.TransferredBytes)
-                    visible.TransferredBytes = transferredBytes;
-
-                if (transferredFiles > visible.TransferredFiles)
-                    visible.TransferredFiles = transferredFiles;
-
-                var stableTransferredBytes = Math.Clamp(visible.TransferredBytes, 0, stableTotalBytes > 0 ? stableTotalBytes : long.MaxValue);
-                var stableTransferredFiles = stableTotalFiles > 0
-                    ? Math.Clamp(visible.TransferredFiles, 0, stableTotalFiles)
-                    : visible.TransferredFiles;
-
-                snapshot[kv.Key] = new FileDownloadStatus
-                {
-                    DownloadStatus = phase,
-                    TotalBytes = stableTotalBytes,
-                    TotalFiles = stableTotalFiles,
-                    TransferredBytes = stableTransferredBytes,
-                    TransferredFiles = stableTransferredFiles
-                };
-            }
-        }
-
-        return snapshot;
-    }
-
-    private void PublishDownloadStatus(GameObjectHandler downloadId)
-    {
-        Mediator.Publish(new DownloadStartedMessage(downloadId, SnapshotDownloadStatusForUi(_downloadStatus)));
-    }
-
-    private void PublishDownloadStatus(GameObjectHandler downloadId, Dictionary<string, FileDownloadStatus> status, bool countsTowardGlobal)
-    {
-        Mediator.Publish(new DownloadStartedMessage(downloadId, SnapshotDownloadStatusForUi(status), countsTowardGlobal));
-    }
-
-    private void AddGroupProgress(GameObjectHandler downloadId, string groupKey, long bytes, long files)
-    {
-        var state = _groupProgress.GetOrAdd(groupKey, _ => new GroupProgressState());
-
-        Interlocked.Add(ref state.PendingBytes, bytes);
-        Interlocked.Add(ref state.PendingFiles, files);
-
-        TryFlushGroupProgress(groupKey, state, force: false);
-        var now = Stopwatch.GetTimestamp();
-        var last = Volatile.Read(ref state.LastPublishTicks);
-
-        long intervalTicks = (long)(Stopwatch.Frequency * 0.15);
-
-        if ((now - last) >= intervalTicks &&
-            Interlocked.CompareExchange(ref state.LastPublishTicks, now, last) == last)
-        {
-            TryFlushGroupProgress(groupKey, state, force: true);
-            PublishDownloadStatus(downloadId);
-        }
-    }
-
-    private void TryFlushGroupProgress(string groupKey, GroupProgressState state, bool force)
-    {
-        // Flush at most ~20Hz unless forced.
-        var now = Stopwatch.GetTimestamp();
-        var last = Volatile.Read(ref state.LastFlushTicks);
-
-        // 50ms in Stopwatch ticks
-        long flushIntervalTicks = (long)(Stopwatch.Frequency * 0.05);
-
-        if (!force && (now - last) < flushIntervalTicks)
-            return;
-
-        // If another thread just flushed, bail.
-        if (!force && Interlocked.CompareExchange(ref state.LastFlushTicks, now, last) != last)
-            return;
-
-        var bytes = Interlocked.Exchange(ref state.PendingBytes, 0);
-        var files = Interlocked.Exchange(ref state.PendingFiles, 0);
-
-        if (bytes == 0 && files == 0 && !force)
-            return;
-
-        if (_downloadStatus.TryGetValue(groupKey, out var st))
-        {
-            lock (st)
-            {
-                if (files != 0)
-                {
-                    var nextFiles = Math.Max(0, st.TransferredFiles + (int)files);
-
-                    if (st.TotalFiles > 0)
-                        nextFiles = Math.Min(st.TotalFiles, nextFiles);
-
-                    st.TransferredFiles = nextFiles;
-                }
-
-                if (bytes != 0)
-                {
-                    var nextBytes = Math.Max(0, st.TransferredBytes + bytes);
-
-                    if (st.TotalBytes > 0)
-                        nextBytes = Math.Min(st.TotalBytes, nextBytes);
-
-                    st.TransferredBytes = nextBytes;
-                }
-            }
-        }
-    }
-
-    private void ForceFlushGroupProgress(string groupKey)
-    {
-        if (_groupProgress.TryGetValue(groupKey, out var state))
-            TryFlushGroupProgress(groupKey, state, force: true);
-    }
-
-
-    private void EnsureDirectoryForFile(string filePath)
-    {
-        var dir = Path.GetDirectoryName(filePath);
-        if (string.IsNullOrWhiteSpace(dir)) return;
-
-        if (_createdDirs.TryAdd(dir, 0))
-        {
-            Directory.CreateDirectory(dir);
-        }
-    }
-
-
-    private static int GetCdnDecodeParallelism() => 1;
-
-    private static int GetEffectiveAutoCdnMaxParallel()
-        => IsWineOrLinuxRuntime ? 8 : AutoCdnMaxParallel;
-
-    private static int GetEffectiveTinyFileParallelMax()
-        => IsWineOrLinuxRuntime ? 8 : TinyFileParallelMax;
-
-    private int GetCdnParallelTarget(int configuredParallel, int filesInGroup)
-    {
-        // CDN transfer speed should stay high even during room pressure. Smoothness is handled by
-        // keeping decode/hash/finalise polite and letting the UI sit in Decompressing if local work lags.
-        var maxParallel = GetEffectiveAutoCdnMaxParallel();
-
-        if (configuredParallel > 0)
-            return Math.Clamp(configuredParallel, 1, Math.Min(maxParallel, Math.Max(1, filesInGroup)));
-
-        var p = Volatile.Read(ref _autoCdnParallel);
-        p = Math.Clamp(p, AutoCdnMinParallel, maxParallel);
-        return Math.Clamp(p, 1, Math.Max(1, filesInGroup));
-    }
-
-    private static bool IsTinyFileHeavy(IReadOnlyList<DownloadFileTransfer> transfers)
-    {
-        if (transfers.Count < 16) return false;
-
-        var tinyCount = 0;
-        for (var i = 0; i < transfers.Count; i++)
-        {
-            var total = transfers[i].Total;
-            if (total > 0 && total <= TinyFilePayloadBytes)
-                tinyCount++;
-        }
-
-        return tinyCount * 4 >= transfers.Count * 3;
-    }
-
-    private void UpdateAutoCdnParallel(int usedParallel, bool success, bool hadTimeoutOrBackoff, bool hadSlow)
-    {
-        // Only adjust when config is Auto (0)
-        if (_mareConfigService.Current.ParallelDownloads > 0) return;
-
-        var cur = Volatile.Read(ref _autoCdnParallel);
-        var next = cur;
-
-        if (!success)
-            next = Math.Max(AutoCdnMinParallel, cur - 2);
-        else if (hadTimeoutOrBackoff)
-            next = Math.Max(AutoCdnMinParallel, cur - 1);
-        else if (hadSlow)
-            next = Math.Max(AutoCdnMinParallel, cur - 1);
-        else
-        {
-            if (usedParallel >= cur)
-            {
-                var step = 1;
-                next = Math.Min(AutoCdnMaxParallel, cur + step);
-            }
-
-        }
-
-        if (next != cur)
-        {
-            Volatile.Write(ref _autoCdnParallel, next);
-            Logger.LogDebug("CDN auto parallel: {cur} => {next} (success={success}, timeout/backoff={timeout}, slow={slow}, used={used})",
-                cur, next, success, hadTimeoutOrBackoff, hadSlow, usedParallel);
-        }
-    }
-
-    private readonly ConcurrentDictionary<string, DateTime> _lastCentralFileRepairRequestByKey = new(StringComparer.OrdinalIgnoreCase);
-
-    // Shared across all per-pair download managers. Room/reconnect bursts often need the
-    // same hashes for several visible users; only one pair should actually fetch a hash
-    // while the rest wait for the cache to be populated.
-    private static readonly ConcurrentDictionary<string, TaskCompletionSource<bool>> GlobalInflightDownloadsByHash = new(StringComparer.OrdinalIgnoreCase);
-
-    private static bool TryClaimGlobalInflightDownload(string hash, out Task<bool>? existingDownload)
-    {
-        existingDownload = null;
-
-        if (string.IsNullOrWhiteSpace(hash))
-            return false;
-
-        var claim = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-        if (GlobalInflightDownloadsByHash.TryAdd(hash, claim))
-            return true;
-
-        if (GlobalInflightDownloadsByHash.TryGetValue(hash, out var existing))
-            existingDownload = existing.Task;
-
-        return false;
-    }
-
-    private static void CompleteGlobalInflightDownload(string hash, bool success)
-    {
-        if (string.IsNullOrWhiteSpace(hash))
-            return;
-
-        if (GlobalInflightDownloadsByHash.TryRemove(hash, out var completion))
-            completion.TrySetResult(success);
-    }
-
-    private static async Task WaitForGlobalInflightDownloadsAsync(List<Task<bool>> waits, CancellationToken ct)
-    {
-        if (waits.Count == 0)
-            return;
-
-        try
-        {
-            await Task.WhenAll(waits.Select(t => t.WaitAsync(ct))).ConfigureAwait(false);
-        }
-        catch (OperationCanceledException)
-        {
-            throw;
-        }
-        catch
-        {
-            // Failed owners will clear their global claims and the caller's normal
-            // recalculate/retry path will decide what remains missing.
-        }
-    }
-
-    private string _centralFileRepairTargetUid = string.Empty;
-    private string _centralFileRepairTargetIdent = string.Empty;
-    private string _centralFileRepairDataHash = string.Empty;
-
-    private static readonly TimeSpan CentralFileRepairRequestCooldown = TimeSpan.FromMinutes(2);
-    private static readonly TimeSpan CentralFileRepairGraceDelay = TimeSpan.FromSeconds(8);
-    private const int MaxCentralFileRepairAttemptsPerFile = 2;
-
-    private readonly ConcurrentDictionary<string, int> _centralFileRepairAttemptsByHash = new(StringComparer.OrdinalIgnoreCase);
-    private readonly ConcurrentDictionary<string, Cdn404State> _cdn404State = new(StringComparer.OrdinalIgnoreCase);
-
-    private sealed class Cdn404State
-    {
-        public DateTime FirstSeenUtc;
-        public DateTime LastSeenUtc;
-        public int Count;
-        public DateTime LastSelfHealUtc;
-    }
-
-    public FileDownloadManager(ILogger<FileDownloadManager> logger, MareMediator mediator,
-        FileTransferOrchestrator orchestrator,
-        FileCacheManager fileCacheManager, FileCompactor fileCompactor, MareConfigService mareConfigService) : base(logger, mediator)
-    {
-        _downloadStatus = new Dictionary<string, FileDownloadStatus>(StringComparer.Ordinal);
         _orchestrator = orchestrator;
         _fileDbManager = fileCacheManager;
         _fileCompactor = fileCompactor;
-        _activeDownloadStreams = [];
         _mareConfigService = mareConfigService;
-        _cdnFastClient = SharedCdnFastClient;
 
-        Mediator.Subscribe<DownloadLimitChangedMessage>(this, (msg) =>
+        Mediator.Subscribe<DownloadLimitChangedMessage>(this, _ =>
         {
-            if (_activeDownloadStreams.Count == 0) return;
-
             var limit = _orchestrator.DownloadLimitPerSlot();
             var newLimit = limit <= 0 ? ThrottledStream.Infinite : limit;
-            Logger.LogTrace("Setting new Download Speed Limit to {newLimit}", newLimit);
 
-            foreach (var stream in _activeDownloadStreams.ToArray())
+            lock (_activeStreamsLock)
             {
-                stream.BandwidthLimit = newLimit;
+                foreach (var stream in _activeDownloadStreams.ToArray())
+                    stream.BandwidthLimit = newLimit;
             }
         });
-
-
     }
 
-    private static HttpClient CreateCdnFastClient()
+    public List<DownloadFileTransfer> CurrentDownloads { get; private set; } = [];
+    public List<FileTransfer> ForbiddenTransfers => _orchestrator.ForbiddenTransfers;
+    public bool IsDownloading => CurrentDownloads.Any();
+
+    public static void RegisterDirectCdnSizeHints(IReadOnlyDictionary<string, long>? sizeHints)
     {
-        var handler = new SocketsHttpHandler
-        {
-            AutomaticDecompression = DecompressionMethods.None,
-            PooledConnectionLifetime = TimeSpan.FromMinutes(10),
-            PooledConnectionIdleTimeout = TimeSpan.FromMinutes(2),
-            ConnectTimeout = TimeSpan.FromSeconds(60),
-            MaxConnectionsPerServer = 512,
-            EnableMultipleHttp2Connections = true,
-        };
+        if (sizeHints == null || sizeHints.Count == 0)
+            return;
 
-        var client = new HttpClient(handler, disposeHandler: true)
+        var expires = DateTime.UtcNow.Add(DirectCdnSizeHintTtl).Ticks;
+        foreach (var item in sizeHints)
         {
-            Timeout = Timeout.InfiniteTimeSpan,
-            DefaultRequestVersion = HttpVersion.Version20,
-            DefaultVersionPolicy = HttpVersionPolicy.RequestVersionOrHigher,
-        };
+            if (string.IsNullOrWhiteSpace(item.Key) || item.Value <= 0)
+                continue;
 
-        return client;
+            DirectCdnSizeHintsByHash[item.Key.Trim().ToUpperInvariant()] = (item.Value, expires);
+        }
     }
 
-    private static string? TryGetHeaderValue(HttpResponseMessage response, string headerName)
+    public static bool HasSessionDownloadFailedHash(string? hash) => false;
+    public static int MarkSessionDownloadFailedHashes(IEnumerable<string?> hashes, string reason) => 0;
+
+    public static void MungeBuffer(Span<byte> buffer)
     {
-        if (response.Headers.TryGetValues(headerName, out var values))
-        {
-            foreach (var v in values)
-            {
-                if (!string.IsNullOrEmpty(v)) return v;
-            }
-        }
-
-        if (response.Content?.Headers != null && response.Content.Headers.TryGetValues(headerName, out var values2))
-        {
-            foreach (var v in values2)
-            {
-                if (!string.IsNullOrEmpty(v)) return v;
-            }
-        }
-
-        return null;
-    }
-
-    private static string AppendCacheBustQuery(string url)
-    {
-        var sep = url.IndexOf('?', StringComparison.Ordinal) >= 0 ? "&" : "?";
-        return url + sep + "rava_repair=" + Guid.NewGuid().ToString("N");
-    }
-
-    private static string AppendRawV2CacheKeyQuery(string url)
-    {
-        if (url.Contains("rava_rawv2=1", StringComparison.OrdinalIgnoreCase))
-            return url;
-
-        var sep = url.IndexOf('?', StringComparison.Ordinal) >= 0 ? "&" : "?";
-        return url + sep + "rava_rawv2=1";
-    }
-
-    private bool TryPlanCdn404SelfHeal(string hash, string baseUrl, HttpResponseMessage response,out string cacheBustUrl, out string? cfCacheStatus, out string? age, out string? cfRay, out string reason)
-    {
-        cfCacheStatus = TryGetHeaderValue(response, "CF-Cache-Status");
-        age = TryGetHeaderValue(response, "Age");
-        cfRay = TryGetHeaderValue(response, "CF-RAY");
-
-        var cachey = false;
-        if (!string.IsNullOrEmpty(cfCacheStatus))
-        {
-            cachey =
-                !cfCacheStatus.Equals("MISS", StringComparison.OrdinalIgnoreCase) &&
-                !cfCacheStatus.Equals("BYPASS", StringComparison.OrdinalIgnoreCase) &&
-                !cfCacheStatus.Equals("DYNAMIC", StringComparison.OrdinalIgnoreCase);
-        }
-
-        if (!cachey && !string.IsNullOrEmpty(age))
-        {
-            cachey = true;
-        }
-
-        var now = DateTime.UtcNow;
-        var state = _cdn404State.GetOrAdd(hash, _ => new Cdn404State
-        {
-            FirstSeenUtc = now,
-            LastSeenUtc = now,
-            Count = 0,
-            LastSelfHealUtc = DateTime.MinValue
-        });
-
-        lock (state)
-        {
-            if ((now - state.LastSeenUtc) > TimeSpan.FromMinutes(10))
-            {
-                state.FirstSeenUtc = now;
-                state.Count = 0;
-                state.LastSelfHealUtc = DateTime.MinValue;
-            }
-
-            state.LastSeenUtc = now;
-            state.Count++;
-
-            if ((now - state.LastSelfHealUtc) < TimeSpan.FromMinutes(2))
-            {
-                cacheBustUrl = string.Empty;
-                reason = "self-heal recently attempted";
-                return false;
-            }
-
-            if (cachey || (state.Count >= 2 && (now - state.FirstSeenUtc) < TimeSpan.FromMinutes(5)))
-            {
-                state.LastSelfHealUtc = now;
-                cacheBustUrl = AppendCacheBustQuery(baseUrl);
-                reason = cachey ? "cached 404 suspected" : "repeat 404";
-                return true;
-            }
-        }
-
-        cacheBustUrl = string.Empty;
-        reason = "not eligible for self-heal";
-        return false;
+        for (var i = 0; i < buffer.Length; i++)
+            buffer[i] ^= 42;
     }
 
     public void ConfigureFileRepairContext(string targetUid, string targetIdent, string dataHash)
@@ -615,112 +144,87 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
         _centralFileRepairTargetUid = targetUid ?? string.Empty;
         _centralFileRepairTargetIdent = targetIdent ?? string.Empty;
         _centralFileRepairDataHash = dataHash ?? string.Empty;
+        _centralFileRepairFailedHashes.Clear();
     }
 
-    private bool TryPublishCentralFileRepairRequest(string hash, string reason)
-    {
-        if (string.IsNullOrWhiteSpace(hash))
-            return false;
-
-        var repairAttempts = _centralFileRepairAttemptsByHash.AddOrUpdate(
-            hash,
-            1,
-            (_, current) => current + 1);
-
-        if (repairAttempts > MaxCentralFileRepairAttemptsPerFile)
-        {
-            Logger.LogWarning(
-                "Central B2 repair retry limit reached for {hash}; not requesting another repair. Reason={reason}",
-                hash,
-                reason);
-
-            return false;
-        }
-
-        PublishCentralFileRepairRequest(hash, reason);
-
-        Logger.LogWarning(
-            "Requested central B2 repair for {hash}. Repair attempt {attempt}/{max}. Reason={reason}",
-            hash,
-            repairAttempts,
-            MaxCentralFileRepairAttemptsPerFile,
-            reason);
-
-        return true;
-    }
-
-    private static bool IsLikelyCdnPayloadDecodeFailure(Exception ex)
-    {
-        var root = ex.GetBaseException();
-        var message = root.Message ?? string.Empty;
-
-        if (root is InvalidDataException || root is EndOfStreamException)
-            return true;
-
-        return message.Contains("did not match expected size", StringComparison.OrdinalIgnoreCase)
-            || message.Contains("exceeded expected size", StringComparison.OrdinalIgnoreCase)
-            || message.Contains("CDN header", StringComparison.OrdinalIgnoreCase)
-            || message.Contains("LZ4", StringComparison.OrdinalIgnoreCase)
-            || message.Contains("Unexpected end", StringComparison.OrdinalIgnoreCase);
-    }
-
-    private void PublishCentralFileRepairRequest(string hash, string reason)
-    {
-        if (string.IsNullOrWhiteSpace(hash)
-            || string.IsNullOrWhiteSpace(_centralFileRepairTargetUid)
-            || string.IsNullOrWhiteSpace(_centralFileRepairTargetIdent))
-        {
-            return;
-        }
-
-        var dataHash = _centralFileRepairDataHash ?? string.Empty;
-        var key = string.Join('|', _centralFileRepairTargetUid, dataHash, hash);
-        var now = DateTime.UtcNow;
-
-        if (_lastCentralFileRepairRequestByKey.TryGetValue(key, out var last) && now - last < CentralFileRepairRequestCooldown)
-            return;
-
-        _lastCentralFileRepairRequestByKey[key] = now;
-
-        Logger.LogWarning(
-            "CDN/B2 object {hash} was still missing after CDN retries; requesting source {uid} to force-upload it to central B2 ({reason})",
-            hash,
-            _centralFileRepairTargetUid,
-            reason);
-
-        Mediator.Publish(new RemoteMissingFileMessage(
-            _centralFileRepairTargetUid,
-            _centralFileRepairTargetIdent,
-            dataHash,
-            [hash],
-            reason));
-    }
-
-    public List<DownloadFileTransfer> CurrentDownloads { get; private set; } = [];
-
-    public List<FileTransfer> ForbiddenTransfers => _orchestrator.ForbiddenTransfers;
-
-    public bool IsDownloading => !CurrentDownloads.Any();
-
-    public static void MungeBuffer(Span<byte> buffer)
-    {
-        for (int i = 0; i < buffer.Length; ++i)
-        {
-            buffer[i] ^= 42;
-        }
-    }
+    public bool HasCentralFileRepairFailedHash(string? hash)
+        => !string.IsNullOrWhiteSpace(hash) && _centralFileRepairFailedHashes.ContainsKey(hash);
 
     public void ClearDownload()
     {
-        ReleaseInflight(CurrentDownloads);
         CurrentDownloads.Clear();
-
         _downloadStatus = new Dictionary<string, FileDownloadStatus>(StringComparer.Ordinal);
-
-        _createdDirs.Clear();
-        _groupProgress.Clear();
-        _visibleProgressByGroup.Clear();
+        _fileProgressBytes.Clear();
         _centralFileRepairAttemptsByHash.Clear();
+        lock (_activeStreamsLock)
+            _activeDownloadStreams.Clear();
+    }
+
+    public async Task<List<DownloadFileTransfer>> InitiateDownloadList(GameObjectHandler gameObjectHandler, List<FileReplacementData> fileReplacement, CancellationToken ct)
+    {
+        Logger.LogDebug("Download start: {id}", gameObjectHandler.Name);
+
+        var requestedHashes = fileReplacement
+            .Select(static f => f.Hash)
+            .Where(static h => !string.IsNullOrWhiteSpace(h))
+            .Select(static h => h.Trim().ToUpperInvariant())
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        if (requestedHashes.Count == 0)
+        {
+            CurrentDownloads = [];
+            return CurrentDownloads;
+        }
+
+        var dtos = await FilesGetSizes(requestedHashes, ct).ConfigureAwait(false);
+        var returnedHashes = dtos
+            .Select(static d => d.Hash)
+            .Where(static h => !string.IsNullOrWhiteSpace(h))
+            .Select(static h => h.Trim().ToUpperInvariant())
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        var extensionByHash = BuildExtensionByHash(fileReplacement);
+        var transfers = new List<DownloadFileTransfer>();
+        var missingOrForbidden = requestedHashes
+            .Where(h => !returnedHashes.Contains(h))
+            .ToList();
+
+        foreach (var dto in dtos.GroupBy(static d => d.Hash, StringComparer.OrdinalIgnoreCase).Select(static g => g.First()))
+        {
+            ct.ThrowIfCancellationRequested();
+
+            if (string.IsNullOrWhiteSpace(dto.Hash))
+                continue;
+
+
+            if (dto.IsForbidden)
+            {
+                if (!_orchestrator.ForbiddenTransfers.Exists(f => string.Equals(f.Hash, dto.Hash, StringComparison.OrdinalIgnoreCase)))
+                    _orchestrator.ForbiddenTransfers.Add(new DownloadFileTransfer(dto));
+
+                missingOrForbidden.Add(dto.Hash);
+                continue;
+            }
+
+            if (IsHashAlreadyCached(dto.Hash, extensionByHash))
+                continue;
+
+            var transfer = new DownloadFileTransfer(dto);
+            if (!transfer.CanBeTransferred)
+            {
+                missingOrForbidden.Add(dto.Hash);
+                continue;
+            }
+
+            transfers.Add(transfer);
+        }
+
+        if (missingOrForbidden.Count > 0)
+            TryPublishCentralFileRepairRequestBatch(missingOrForbidden, "file service reported missing/forbidden/untransferable file(s)");
+
+        CurrentDownloads = transfers;
+        return CurrentDownloads;
     }
 
     public async Task DownloadFiles(GameObjectHandler gameObject, List<FileReplacementData> fileReplacementDto, CancellationToken ct)
@@ -730,9 +234,15 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
         {
             await DownloadFilesInternal(gameObject, fileReplacementDto, ct).ConfigureAwait(false);
         }
+        catch (OperationCanceledException)
+        {
+            ClearDownload();
+            throw;
+        }
         catch
         {
             ClearDownload();
+            throw;
         }
         finally
         {
@@ -741,131 +251,1245 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
         }
     }
 
-
-    private static async Task YieldForDownloadResponsivenessAsync(bool microPause, CancellationToken ct)
+    private async Task DownloadFilesInternal(GameObjectHandler gameObjectHandler, List<FileReplacementData> fileReplacement, CancellationToken ct)
     {
-        if (microPause && IsWineOrLinuxRuntime)
-            await Task.Delay(1, ct).ConfigureAwait(false);
-        else
-            await Task.Yield();
+        if (CurrentDownloads.Count == 0)
+            return;
 
-        ct.ThrowIfCancellationRequested();
+        var extensionByHash = BuildExtensionByHash(fileReplacement);
+        var mainSet = CurrentDownloads.ToList();
+
+        var failed = await DownloadBatchAsync(gameObjectHandler, mainSet, extensionByHash, cacheBust: false, ct).ConfigureAwait(false);
+
+        var unresolved = failed.Where(t => !IsHashAlreadyCached(t.Hash, extensionByHash)).DistinctBy(t => t.Hash, StringComparer.OrdinalIgnoreCase).ToList();
+        if (unresolved.Count > 0)
+        {
+            var unresolvedBytes = unresolved.Sum(static t => Math.Max(1, t.Total));
+            var unresolvedDetails = DescribeTransfersForLog(unresolved, extensionByHash);
+
+            TryPublishCentralFileRepairRequestBatch(unresolved.Select(t => t.Hash), "download main pass left unresolved file(s)");
+            Logger.LogWarning("Download main pass finished with {count} unresolved file(s), approx {bytes} bytes ({mib:0.00} MiB). Completing the visible bar and failing this pass so the normal outer retry only requests the missing file(s). Details: {details}", unresolved.Count, unresolvedBytes, unresolvedBytes / 1024d / 1024d, unresolvedDetails);
+
+            CompleteAllDownloadStatus(gameObjectHandler);
+            ClearDownload();
+            throw new InvalidOperationException($"Download pass finished with {unresolved.Count} unresolved file(s): {unresolvedDetails}");
+        }
+
+        CompleteAllDownloadStatus(gameObjectHandler);
+        Logger.LogDebug("Download end: {id}", gameObjectHandler.Name);
+        ClearDownload();
     }
 
-
-    private static async Task CopyExactlyWithProgressAsync(Stream src, Stream dst, long bytes, Action<int> onRead, CancellationToken ct)
+    private async Task<bool> TryDownloadFilesFromCdnAsync(GameObjectHandler gameObjectHandler, IGrouping<string, DownloadFileTransfer> fileGroup, List<FileReplacementData> fileReplacement, CancellationToken ct)
     {
-        var buffer = ArrayPool<byte>.Shared.Rent(CdnBufferSize);
-        long sinceYield = 0;
-        long sinceMicroPause = 0;
+        var transfers = fileGroup.ToList();
+        if (transfers.Count == 0)
+            return true;
 
+        var extensionByHash = BuildExtensionByHash(fileReplacement);
+        var failed = await DownloadBatchAsync(gameObjectHandler, transfers, extensionByHash, cacheBust: false, ct).ConfigureAwait(false);
+        return failed.Count == 0;
+    }
+
+    private async Task<List<DownloadFileTransfer>> DownloadBatchAsync(GameObjectHandler gameObjectHandler, IReadOnlyCollection<DownloadFileTransfer> transfers, IReadOnlyDictionary<string, string> extensionByHash, bool cacheBust, CancellationToken ct)
+    {
+        var failed = new ConcurrentBag<DownloadFileTransfer>();
+        var externalWaits = new List<(DownloadFileTransfer Transfer, Lazy<Task<bool>> SharedDownload)>();
+        var actualNetworkTransfers = new List<DownloadFileTransfer>();
+
+        foreach (var transfer in transfers
+            .Where(static t => !string.IsNullOrWhiteSpace(t.Hash))
+            .GroupBy(static t => t.Hash.Trim().ToUpperInvariant(), StringComparer.OrdinalIgnoreCase)
+            .Select(static g => g.First()))
+        {
+            ct.ThrowIfCancellationRequested();
+
+            var hash = transfer.Hash.Trim().ToUpperInvariant();
+            if (IsHashAlreadyCached(hash, extensionByHash))
+                continue;
+
+            if (GlobalInFlightDownloadsByHash.TryGetValue(hash, out var sharedDownload))
+            {
+                // This pair still needs the file, but this client is not actually grabbing another
+                // copy. Keep it out of this pair's visible payload so duplicate pair/retry bars do
+                // not show the original full room size while they are only waiting for global de-dupe.
+                externalWaits.Add((transfer, sharedDownload));
+                continue;
+            }
+
+            actualNetworkTransfers.Add(transfer);
+        }
+
+        ResetDownloadStatus(gameObjectHandler, actualNetworkTransfers, DownloadStatus.Downloading);
+
+        var options = new ParallelOptions { MaxDegreeOfParallelism = MaxCdnParallelism, CancellationToken = ct };
+
+        await Parallel.ForEachAsync(actualNetworkTransfers, options, async (transfer, token) =>
+        {
+            var hash = transfer.Hash?.Trim().ToUpperInvariant();
+            if (string.IsNullOrWhiteSpace(hash))
+                return;
+
+            if (IsHashAlreadyCached(hash, extensionByHash))
+            {
+                AddProgress(gameObjectHandler, transfer, 0, fileComplete: true, forcePublish: false);
+                return;
+            }
+
+            Lazy<Task<bool>>? newDownload = null;
+            newDownload = new Lazy<Task<bool>>(
+                () => DownloadOneFileThroughGlobalDedupeSlotAsync(gameObjectHandler, transfer, extensionByHash, cacheBust, token, hash, newDownload!),
+                LazyThreadSafetyMode.ExecutionAndPublication);
+
+            var activeDownload = GlobalInFlightDownloadsByHash.GetOrAdd(hash, newDownload);
+            var ownsDownload = ReferenceEquals(activeDownload, newDownload);
+
+            if (!ownsDownload)
+            {
+                // Race-safe path: another pair/batch started this hash after our preflight but before
+                // our GetOrAdd. Remove it from this visible payload instead of pretending this pair is
+                // downloading those bytes too.
+                RemovePendingTransferFromDownloadStatus(gameObjectHandler, transfer, forcePublish: true);
+            }
+
+            var ok = false;
+            try
+            {
+                ok = await activeDownload.Value.WaitAsync(token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (!token.IsCancellationRequested)
+            {
+                ok = false;
+            }
+            catch (Exception ex)
+            {
+                Logger.LogDebug(ex, "Shared CDN download failed for {hash}", hash);
+                ok = false;
+            }
+
+            if (ok || IsHashAlreadyCached(hash, extensionByHash))
+                return;
+
+            if (ownsDownload)
+                AddProgress(gameObjectHandler, transfer, 0, fileComplete: true, forcePublish: true);
+
+            failed.Add(transfer);
+        }).ConfigureAwait(false);
+
+        if (externalWaits.Count > 0)
+        {
+            var waitOptions = new ParallelOptions { MaxDegreeOfParallelism = Math.Min(MaxCdnParallelism, Math.Max(1, externalWaits.Count)), CancellationToken = ct };
+            await Parallel.ForEachAsync(externalWaits, waitOptions, async (wait, token) =>
+            {
+                var hash = wait.Transfer.Hash?.Trim().ToUpperInvariant();
+                if (string.IsNullOrWhiteSpace(hash))
+                    return;
+
+                var ok = false;
+                try
+                {
+                    ok = await wait.SharedDownload.Value.WaitAsync(token).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (!token.IsCancellationRequested)
+                {
+                    ok = false;
+                }
+                catch (Exception ex)
+                {
+                    Logger.LogDebug(ex, "Global de-dupe wait failed for {hash}", hash);
+                    ok = false;
+                }
+
+                if (ok || IsHashAlreadyCached(hash, extensionByHash))
+                    return;
+
+                failed.Add(wait.Transfer);
+            }).ConfigureAwait(false);
+        }
+
+        PublishDownloadStatus(gameObjectHandler, force: true);
+        return failed.ToList();
+    }
+
+    private async Task<bool> DownloadOneFileThroughGlobalDedupeSlotAsync(GameObjectHandler gameObjectHandler, DownloadFileTransfer transfer, IReadOnlyDictionary<string, string> extensionByHash, bool cacheBust, CancellationToken ct, string hash, Lazy<Task<bool>> owner)
+    {
         try
         {
-            long remaining = bytes;
-            while (remaining > 0)
+            if (IsHashAlreadyCached(hash, extensionByHash))
             {
-                int want = (int)Math.Min(buffer.Length, remaining);
-                int read = await src.ReadAsync(buffer.AsMemory(0, want), ct).ConfigureAwait(false);
-                if (read <= 0) throw new EndOfStreamException($"Expected {bytes} bytes, got {bytes - remaining}");
+                AddProgress(gameObjectHandler, transfer, 0, fileComplete: true, forcePublish: false);
+                return true;
+            }
 
-                await dst.WriteAsync(buffer.AsMemory(0, read), ct).ConfigureAwait(false);
-                remaining -= read;
-
-                onRead(read);
-                sinceYield += read;
-                sinceMicroPause += read;
-
-                if (sinceYield >= CdnSmoothYieldEveryBytes)
+            await LinuxSmoothMode.YieldBackgroundWorkIfNeededAsync(ct).ConfigureAwait(false);
+            await GlobalCdnFileSemaphore.WaitAsync(ct).ConfigureAwait(false);
+            try
+            {
+                // Another active pair may have completed the same hash while this file was waiting for
+                // the shared CDN slot. Re-check here so shared slots are spent on real network work only.
+                if (IsHashAlreadyCached(hash, extensionByHash))
                 {
-                    var microPause = sinceMicroPause >= CdnSmoothMicroPauseEveryBytes;
-                    sinceYield = 0;
-                    if (microPause)
-                        sinceMicroPause = 0;
-
-                    await YieldForDownloadResponsivenessAsync(microPause, ct).ConfigureAwait(false);
+                    AddProgress(gameObjectHandler, transfer, 0, fileComplete: true, forcePublish: false);
+                    return true;
                 }
+
+                return await DownloadOneFileAsync(gameObjectHandler, transfer, extensionByHash, cacheBust, ct).ConfigureAwait(false);
+            }
+            finally
+            {
+                GlobalCdnFileSemaphore.Release();
             }
         }
         finally
         {
-            ArrayPool<byte>.Shared.Return(buffer);
+            if (GlobalInFlightDownloadsByHash.TryGetValue(hash, out var currentOwner) && ReferenceEquals(currentOwner, owner))
+                GlobalInFlightDownloadsByHash.TryRemove(hash, out _);
         }
     }
 
-    private static async Task CopyToWithProgressAsync(Stream src, Stream dst, Action<int> onRead, CancellationToken ct)
+    private async Task<bool> DownloadOneFileAsync(GameObjectHandler gameObjectHandler, DownloadFileTransfer transfer, IReadOnlyDictionary<string, string> extensionByHash, bool cacheBust, CancellationToken ct)
     {
-        var buffer = ArrayPool<byte>.Shared.Rent(CdnBufferSize);
-        long sinceYield = 0;
-        long sinceMicroPause = 0;
+        var hash = transfer.Hash.Trim().ToUpperInvariant();
+        var ext = extensionByHash.TryGetValue(hash, out var mappedExt) ? mappedExt : "dat";
+        var finalPath = _fileDbManager.GetCacheFilePath(hash, ext);
+        var tempPath = CreateTempPath(finalPath);
+        var url = BuildDownloadUrl(transfer, cacheBust);
 
         try
         {
+            EnsureDirectory(finalPath);
+
+            using var response = await GetCdnResponseAsync(url, transfer, ct).ConfigureAwait(false);
+            if (response.StatusCode == HttpStatusCode.NotFound)
+            {
+                TryPublishCentralFileRepairRequest(hash, cacheBust ? "cache-busted CDN 404" : "CDN 404");
+                return false;
+            }
+
+            if (!response.IsSuccessStatusCode)
+            {
+                Logger.LogDebug("CDN download failed for {hash}: HTTP {status} from {url}", hash, (int)response.StatusCode, url);
+                return false;
+            }
+
+            await using var responseStream = await response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
+            var readProgressTimeout = GetReadProgressTimeout(transfer);
+            using var guarded = new StalledReadGuardStream(responseStream, readProgressTimeout, ct);
+            using var throttled = RegisterActiveStream(guarded);
+
+            try
+            {
+                var firstByte = new byte[1];
+                var firstRead = await throttled.ReadAsync(firstByte.AsMemory(0, 1), ct).ConfigureAwait(false);
+                if (firstRead <= 0)
+                    throw new InvalidDataException($"CDN response stream was empty for {hash}");
+
+                if (!transfer.IsRawPayload)
+                {
+                    var spoolPath = CreateSpoolPath(hash);
+                    try
+                    {
+                        await using var fullResponse = new PrefixedReadStream(throttled, firstByte, firstRead);
+                        await CopyStreamToFileAsync(fullResponse, spoolPath, read => AddProgress(gameObjectHandler, transfer, read, fileComplete: false, forcePublish: false), ct).ConfigureAwait(false);
+                        SetGroupPhase(gameObjectHandler, GetGroupKey(transfer), DownloadStatus.Decompressing);
+
+                        const long legacyExpectedRawSize = 0;
+                        var decodedLegacy = await DecodeLegacyPayloadWithPressureGateAsync(spoolPath, tempPath, legacyExpectedRawSize, hash, ct).ConfigureAwait(false);
+                        if (!string.Equals(decodedLegacy.ComputedHash, hash, StringComparison.OrdinalIgnoreCase))
+                        {
+                            Logger.LogWarning("Downloaded legacy hash mismatch for {hash}; computed {computed}, bytes={bytes}, expectedBytes={expectedBytes}, ext={ext}, mode={mode}", hash, decodedLegacy.ComputedHash, decodedLegacy.BytesWritten, Math.Max(1, transfer.Total), ext, GetPayloadMode(transfer));
+                            TryDelete(tempPath);
+                            return false;
+                        }
+
+                        await LinuxSmoothMode.YieldBackgroundWorkIfNeededAsync(ct).ConfigureAwait(false);
+                        File.Move(tempPath, finalPath, overwrite: true);
+                        await RegisterDownloadedCacheFileAsync(_fileDbManager, hash, finalPath).ConfigureAwait(false);
+                        AddProgress(gameObjectHandler, transfer, 0, fileComplete: true, forcePublish: false);
+                        return true;
+                    }
+                    finally
+                    {
+                        TryDelete(spoolPath);
+                    }
+                }
+
+                var detected = await DetectCdnHeaderAsync(throttled, firstByte, firstRead, ct).ConfigureAwait(false);
+                await using var payloadBase = detected.PayloadStream;
+
+                if (detected.HasHeader)
+                {
+                    if (!string.Equals(detected.HeaderHash, hash, StringComparison.OrdinalIgnoreCase))
+                        throw new InvalidDataException($"CDN header hash mismatch for {hash}, got {detected.HeaderHash}");
+
+                    if (detected.PayloadLength <= 0)
+                        throw new InvalidDataException($"CDN header had invalid payload length {detected.PayloadLength} for {hash}");
+                }
+
+                var expectedRawSize = detected.PayloadLength > 0 ? detected.PayloadLength : transfer.TotalRaw > 0 ? transfer.TotalRaw : 0;
+                await using var payloadStream = detected.HasHeader
+                    ? new LimitedXorStream(payloadBase, detected.PayloadLength, detected.Munged ? (byte)42 : (byte)0)
+                    : payloadBase;
+
+                (string ComputedHash, long BytesWritten) decoded;
+
+                decoded = await CopyRawToFileAndHashAsync(payloadStream, tempPath, expectedRawSize, read => AddProgress(gameObjectHandler, transfer, read, fileComplete: false, forcePublish: false), ct).ConfigureAwait(false);
+
+                if (!string.Equals(decoded.ComputedHash, hash, StringComparison.OrdinalIgnoreCase))
+                {
+                    // Direct CDN plans can occasionally point at a legacy/headered LZ4 object while the client only has
+                    // a hash-based RawV2 plan. Treat the raw bytes we just wrote as a legacy spool before failing.
+                    var fallbackSpoolPath = CreateSpoolPath(hash);
+                    try
+                    {
+                        File.Move(tempPath, fallbackSpoolPath, overwrite: true);
+                        SetGroupPhase(gameObjectHandler, GetGroupKey(transfer), DownloadStatus.Decompressing);
+                        const long legacyExpectedRawSize = 0;
+                        decoded = await DecodeLegacyPayloadWithPressureGateAsync(fallbackSpoolPath, tempPath, legacyExpectedRawSize, hash, ct).ConfigureAwait(false);
+                    }
+                    catch
+                    {
+                        Logger.LogWarning("Downloaded hash mismatch for {hash}; computed {computed}, bytes={bytes}, expectedBytes={expectedBytes}, ext={ext}, mode={mode}", hash, decoded.ComputedHash, decoded.BytesWritten, Math.Max(1, transfer.Total), ext, GetPayloadMode(transfer));
+                        TryDelete(tempPath);
+                        return false;
+                    }
+                    finally
+                    {
+                        TryDelete(fallbackSpoolPath);
+                    }
+                }
+
+                if (!string.Equals(decoded.ComputedHash, hash, StringComparison.OrdinalIgnoreCase))
+                {
+                    Logger.LogWarning("Downloaded hash mismatch for {hash}; computed {computed}, bytes={bytes}, expectedBytes={expectedBytes}, ext={ext}, mode={mode}", hash, decoded.ComputedHash, decoded.BytesWritten, Math.Max(1, transfer.Total), ext, GetPayloadMode(transfer));
+                    TryDelete(tempPath);
+                    return false;
+                }
+
+                await LinuxSmoothMode.YieldBackgroundWorkIfNeededAsync(ct).ConfigureAwait(false);
+                File.Move(tempPath, finalPath, overwrite: true);
+                await RegisterDownloadedCacheFileAsync(_fileDbManager, hash, finalPath).ConfigureAwait(false);
+                AddProgress(gameObjectHandler, transfer, 0, fileComplete: true, forcePublish: false);
+                return true;
+            }
+            finally
+            {
+                UnregisterActiveStream(throttled);
+            }
+
+        }
+        catch (OperationCanceledException ex) when (!ct.IsCancellationRequested)
+        {
+            Logger.LogDebug(ex, "Download timed out or stalled for {hash}; expectedBytes={expectedBytes}, ext={ext}, mode={mode}. Leaving it unresolved for the normal outer missing-file retry. Url={url}", hash, Math.Max(1, transfer.Total), ext, GetPayloadMode(transfer), url);
+            TryDelete(tempPath);
+            return false;
+        }
+        catch (OperationCanceledException)
+        {
+            TryDelete(tempPath);
+            throw;
+        }
+        catch (Exception ex)
+        {
+            Logger.LogDebug(ex, "Download failed for {hash} from {url}", hash, url);
+            TryDelete(tempPath);
+            return false;
+        }
+    }
+
+    private async Task<HttpResponseMessage> GetCdnResponseAsync(string url, DownloadFileTransfer transfer, CancellationToken ct)
+    {
+        var client = GetNextCdnClient();
+        using var firstResponseCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        firstResponseCts.CancelAfter(GetFirstResponseTimeout(transfer));
+        return await client.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, firstResponseCts.Token).ConfigureAwait(false);
+    }
+
+    private ThrottledStream RegisterActiveStream(Stream source)
+    {
+        var limit = _orchestrator.DownloadLimitPerSlot();
+        var stream = new ThrottledStream(source, limit <= 0 ? ThrottledStream.Infinite : limit);
+
+        lock (_activeStreamsLock)
+            _activeDownloadStreams.Add(stream);
+
+        return stream;
+    }
+
+    private void UnregisterActiveStream(ThrottledStream stream)
+    {
+        lock (_activeStreamsLock)
+            _activeDownloadStreams.Remove(stream);
+    }
+
+    private static Task RegisterDownloadedCacheFileAsync(FileCacheManager manager, string hash, string path)
+    {
+        if (!IsWineRuntime)
+        {
+            manager.RegisterDownloadedCacheFiles([(hash, path)]);
+            return Task.CompletedTask;
+        }
+
+        var pending = new PendingCacheRegistration(manager, hash, path);
+        LinuxPendingCacheRegistrations.Enqueue(pending);
+        EnsureLinuxCacheRegistrationPump();
+        return pending.Completion.Task;
+    }
+
+    private static void EnsureLinuxCacheRegistrationPump()
+    {
+        if (Interlocked.CompareExchange(ref _linuxCacheRegistrationPumpRunning, 1, 0) == 0)
+            _ = Task.Run(ProcessLinuxCacheRegistrationQueueAsync);
+    }
+
+    private static async Task ProcessLinuxCacheRegistrationQueueAsync()
+    {
+        while (true)
+        {
+            await Task.Delay(10).ConfigureAwait(false);
+
+            var batch = new List<PendingCacheRegistration>(256);
+            while (batch.Count < 1024 && LinuxPendingCacheRegistrations.TryDequeue(out var pending))
+                batch.Add(pending);
+
+            foreach (var group in batch.GroupBy(static item => item.Manager))
+            {
+                try
+                {
+                    await LinuxSmoothMode.YieldBackgroundWorkIfNeededAsync(CancellationToken.None).ConfigureAwait(false);
+                    group.Key.RegisterDownloadedCacheFiles(group.Select(static item => (item.Hash, item.Path)));
+                    foreach (var item in group)
+                        item.Completion.TrySetResult(true);
+                }
+                catch (Exception ex)
+                {
+                    foreach (var item in group)
+                        item.Completion.TrySetException(ex);
+                }
+            }
+
+            if (!LinuxPendingCacheRegistrations.IsEmpty)
+                continue;
+
+            Interlocked.Exchange(ref _linuxCacheRegistrationPumpRunning, 0);
+            if (LinuxPendingCacheRegistrations.IsEmpty || Interlocked.CompareExchange(ref _linuxCacheRegistrationPumpRunning, 1, 0) != 0)
+                return;
+        }
+    }
+
+    private static Task<(string ComputedHash, long BytesWritten)> DecodeLegacyPayloadWithPressureGateAsync(string spoolPath, string tempPath, long expectedRawSize, string expectedHash, CancellationToken ct)
+    {
+        if (!IsWineRuntime)
+            return DecodeLegacyPayloadWithCompatAsync(spoolPath, tempPath, expectedRawSize, expectedHash, ct);
+
+        return DecodeLegacyPayloadWithPressureGateCoreAsync(spoolPath, tempPath, expectedRawSize, expectedHash, ct);
+    }
+
+    private static async Task<(string ComputedHash, long BytesWritten)> DecodeLegacyPayloadWithPressureGateCoreAsync(string spoolPath, string tempPath, long expectedRawSize, string expectedHash, CancellationToken ct)
+    {
+        await LinuxLegacyDecodeSemaphore.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            return await DecodeLegacyPayloadWithCompatAsync(spoolPath, tempPath, expectedRawSize, expectedHash, ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            LinuxLegacyDecodeSemaphore.Release();
+        }
+    }
+
+    private static HttpClient[] CreateCdnClients()
+    {
+        var clients = new HttpClient[IsWineRuntime ? 4 : 8];
+        for (var i = 0; i < clients.Length; i++)
+        {
+            var handler = new SocketsHttpHandler
+            {
+                AutomaticDecompression = DecompressionMethods.None,
+                PooledConnectionLifetime = TimeSpan.FromMinutes(10),
+                PooledConnectionIdleTimeout = TimeSpan.FromMinutes(2),
+                ConnectTimeout = TimeSpan.FromSeconds(IsWineRuntime ? 15 : 10),
+                MaxConnectionsPerServer = IsWineRuntime ? 512 : 2048,
+                EnableMultipleHttp2Connections = true,
+            };
+
+            clients[i] = new HttpClient(handler, disposeHandler: true)
+            {
+                Timeout = Timeout.InfiniteTimeSpan,
+                DefaultRequestVersion = HttpVersion.Version20,
+                DefaultVersionPolicy = HttpVersionPolicy.RequestVersionOrHigher,
+            };
+        }
+
+        return clients;
+    }
+
+    private static HttpClient GetNextCdnClient()
+    {
+        var index = (int)((uint)Interlocked.Increment(ref _cdnClientCursor) % (uint)SharedCdnClients.Length);
+        return SharedCdnClients[index];
+    }
+
+    private async Task<List<DownloadFileDto>> FilesGetSizes(List<string> hashes, CancellationToken ct)
+    {
+        if (!_orchestrator.IsInitialized)
+            throw new InvalidOperationException("FileTransferManager is not initialized");
+
+        if (_orchestrator.FilesCdnUri != null)
+            return await BuildDirectCdnDownloadPlanAsync(hashes, ct).ConfigureAwait(false);
+
+        var response = await _orchestrator.SendRequestAsync(HttpMethod.Get, MareFiles.ServerFilesGetSizesFullPath(_orchestrator.UploadCdnUri!), hashes, ct).ConfigureAwait(false);
+        response.EnsureSuccessStatusCode();
+        return await response.Content.ReadFromJsonAsync<List<DownloadFileDto>>(cancellationToken: ct).ConfigureAwait(false) ?? [];
+    }
+
+    private Task<List<DownloadFileDto>> BuildDirectCdnDownloadPlanAsync(List<string> hashes, CancellationToken ct)
+    {
+        ct.ThrowIfCancellationRequested();
+
+        if (_orchestrator.FilesCdnUri == null)
+            return Task.FromResult(new List<DownloadFileDto>());
+
+        var result = hashes
+            .Where(static h => !string.IsNullOrWhiteSpace(h))
+            .Select(static h => h.Trim().ToUpperInvariant())
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Select(hash => new DownloadFileDto
+            {
+                FileExists = true,
+                ForbiddenBy = string.Empty,
+                IsForbidden = false,
+                Hash = hash,
+                Size = GetDirectCdnSizeHint(hash),
+                Url = MareFiles.CdnGetFullPath(_orchestrator.FilesCdnUri!, hash).ToString(),
+                RawSize = 0,
+                PayloadEncoding = FilePayloadEncoding.RawV2
+            })
+            .ToList();
+
+        return Task.FromResult(result);
+    }
+
+    private static long GetDirectCdnSizeHint(string hash)
+    {
+        if (string.IsNullOrWhiteSpace(hash))
+            return 1;
+
+        var normalized = hash.Trim().ToUpperInvariant();
+        if (!DirectCdnSizeHintsByHash.TryGetValue(normalized, out var hint))
+            return 1;
+
+        if (hint.ExpiresUtcTicks <= DateTime.UtcNow.Ticks)
+        {
+            DirectCdnSizeHintsByHash.TryRemove(normalized, out _);
+            return 1;
+        }
+
+        return hint.Size > 0 ? hint.Size : 1;
+    }
+
+    private bool IsHashAlreadyCached(string hash, IReadOnlyDictionary<string, string> extensionByHash)
+    {
+        if (string.IsNullOrWhiteSpace(hash))
+            return true;
+
+        var normalized = hash.Trim().ToUpperInvariant();
+        var entry = _fileDbManager.GetFileCacheByHash(normalized);
+        if (entry != null && !string.IsNullOrWhiteSpace(entry.ResolvedFilepath) && File.Exists(entry.ResolvedFilepath))
+        {
+            try
+            {
+                if (new FileInfo(entry.ResolvedFilepath).Length > 0)
+                    return true;
+            }
+            catch
+            {
+                return true;
+            }
+        }
+
+        var ext = extensionByHash.TryGetValue(normalized, out var mappedExt) ? mappedExt : "dat";
+        var expectedPath = _fileDbManager.GetCacheFilePath(normalized, ext);
+        if (!File.Exists(expectedPath))
+            return false;
+
+        try
+        {
+            if (new FileInfo(expectedPath).Length <= 0)
+                return false;
+
+            var computed = ComputeSha1(expectedPath, CancellationToken.None);
+            if (!string.Equals(computed, normalized, StringComparison.OrdinalIgnoreCase))
+                return false;
+
+            _fileDbManager.RegisterDownloadedCacheFiles([(normalized, expectedPath)]);
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private Dictionary<string, string> BuildExtensionByHash(IEnumerable<FileReplacementData> replacements)
+    {
+        var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var replacement in replacements ?? [])
+        {
+            if (string.IsNullOrWhiteSpace(replacement.Hash))
+                continue;
+
+            var ext = "dat";
+            var gamePath = replacement.GamePaths?.FirstOrDefault(static p => !string.IsNullOrWhiteSpace(p));
+            if (!string.IsNullOrWhiteSpace(gamePath))
+            {
+                var candidate = Path.GetExtension(gamePath).TrimStart('.');
+                if (!string.IsNullOrWhiteSpace(candidate))
+                    ext = candidate;
+            }
+
+            result[replacement.Hash.Trim().ToUpperInvariant()] = ext;
+        }
+
+        return result;
+    }
+
+    private static TimeSpan GetFirstResponseTimeout(DownloadFileTransfer transfer)
+    {
+        var expectedBytes = Math.Max(1, transfer.Total);
+        if (IsWineRuntime)
+        {
+            if (expectedBytes >= LargeReadProgressTimeoutThreshold)
+                return TimeSpan.FromSeconds(18);
+
+            if (expectedBytes >= NormalReadProgressTimeoutThreshold)
+                return TimeSpan.FromSeconds(12);
+
+            return TimeSpan.FromSeconds(10);
+        }
+
+        if (expectedBytes >= LargeReadProgressTimeoutThreshold)
+            return LargeFirstResponseTimeout;
+
+        if (expectedBytes >= NormalReadProgressTimeoutThreshold)
+            return NormalFirstResponseTimeout;
+
+        return SmallFirstResponseTimeout;
+    }
+
+    private static TimeSpan GetReadProgressTimeout(DownloadFileTransfer transfer)
+    {
+        var expectedBytes = Math.Max(1, transfer.Total);
+        if (IsWineRuntime)
+        {
+            if (expectedBytes >= LargeReadProgressTimeoutThreshold)
+                return TimeSpan.FromSeconds(35);
+
+            if (expectedBytes >= NormalReadProgressTimeoutThreshold)
+                return TimeSpan.FromSeconds(18);
+
+            return TimeSpan.FromSeconds(8);
+        }
+
+        if (expectedBytes >= LargeReadProgressTimeoutThreshold)
+            return LargeReadProgressTimeout;
+
+        if (expectedBytes >= NormalReadProgressTimeoutThreshold)
+            return NormalReadProgressTimeout;
+
+        return SmallReadProgressTimeout;
+    }
+
+    private static string GetPayloadMode(DownloadFileTransfer transfer)
+        => transfer.IsRawPayload ? "RawV2" : "LegacyLZ4";
+
+    private static string DescribeTransfersForLog(IEnumerable<DownloadFileTransfer> transfers, IReadOnlyDictionary<string, string> extensionByHash)
+    {
+        return string.Join("; ", transfers
+            .OrderByDescending(static t => Math.Max(1, t.Total))
+            .Take(30)
+            .Select(t => DescribeTransferForLog(t, extensionByHash)));
+    }
+
+    private static string DescribeTransferForLog(DownloadFileTransfer transfer, IReadOnlyDictionary<string, string> extensionByHash)
+    {
+        var hash = transfer.Hash?.Trim().ToUpperInvariant() ?? string.Empty;
+        var ext = extensionByHash.TryGetValue(hash, out var mappedExt) ? mappedExt : "dat";
+        var bytes = Math.Max(1, transfer.Total);
+        return $"{hash}.{ext} {bytes} bytes ({bytes / 1024d / 1024d:0.00} MiB) {GetPayloadMode(transfer)}";
+    }
+
+    private string BuildDownloadUrl(DownloadFileTransfer transfer, bool cacheBust)
+    {
+        string url;
+        try
+        {
+            url = transfer.DownloadUri.ToString();
+        }
+        catch
+        {
+            url = MareFiles.CdnGetFullPath(_orchestrator.FilesCdnUri!, transfer.Hash.ToUpperInvariant()).ToString();
+        }
+
+        if (!cacheBust)
+            return url;
+
+        var sep = url.Contains('?', StringComparison.Ordinal) ? "&" : "?";
+        return url + sep + "rava_retry=" + Guid.NewGuid().ToString("N");
+    }
+
+    private void ResetDownloadStatus(GameObjectHandler gameObjectHandler, IReadOnlyCollection<DownloadFileTransfer> transfers, DownloadStatus phase)
+    {
+        var activeTransfers = transfers.ToList();
+        CurrentDownloads = activeTransfers;
+        _fileProgressBytes.Clear();
+
+        var grouped = activeTransfers.GroupBy(GetGroupKey, StringComparer.Ordinal).ToList();
+        var next = new Dictionary<string, FileDownloadStatus>(StringComparer.Ordinal);
+
+        foreach (var group in grouped)
+        {
+            next[group.Key] = new FileDownloadStatus
+            {
+                DownloadStatus = phase,
+                TotalBytes = group.Sum(static t => Math.Max(1, t.Total)),
+                TotalFiles = group.Count(),
+                TransferredBytes = 0,
+                TransferredFiles = 0,
+            };
+        }
+
+        _downloadStatus = next;
+        PublishDownloadStatus(gameObjectHandler, force: true);
+    }
+
+    private void SetGroupPhase(GameObjectHandler gameObjectHandler, string groupKey, DownloadStatus phase)
+    {
+        if (_downloadStatus.TryGetValue(groupKey, out var status))
+        {
+            lock (status)
+                status.DownloadStatus = phase;
+        }
+
+        PublishDownloadStatus(gameObjectHandler, force: false);
+    }
+
+    private void AddProgress(GameObjectHandler gameObjectHandler, DownloadFileTransfer transfer, long bytes, bool fileComplete, bool forcePublish)
+    {
+        var groupKey = GetGroupKey(transfer);
+        if (!_downloadStatus.TryGetValue(groupKey, out var status))
+            return;
+
+        var hash = transfer.Hash?.Trim().ToUpperInvariant() ?? string.Empty;
+        var expectedBytes = Math.Max(1, transfer.Total);
+
+        lock (status)
+        {
+            if (bytes > 0)
+            {
+                _fileProgressBytes.AddOrUpdate(hash, bytes, (_, existing) => existing + bytes);
+                status.TransferredBytes += bytes;
+                if (status.TransferredBytes > status.TotalBytes)
+                    status.TotalBytes = status.TransferredBytes;
+            }
+
+            if (fileComplete)
+            {
+                var alreadyCounted = _fileProgressBytes.TryGetValue(hash, out var counted) ? counted : 0;
+                var remainingVisualBytes = Math.Max(0, expectedBytes - alreadyCounted);
+                if (remainingVisualBytes > 0)
+                {
+                    _fileProgressBytes[hash] = expectedBytes;
+                    status.TransferredBytes += remainingVisualBytes;
+                    if (status.TransferredBytes > status.TotalBytes)
+                        status.TotalBytes = status.TransferredBytes;
+                }
+
+                status.TransferredFiles = Math.Min(status.TotalFiles, status.TransferredFiles + 1);
+                if (status.TransferredFiles >= status.TotalFiles && status.TotalBytes > 0)
+                    status.TransferredBytes = status.TotalBytes;
+            }
+        }
+
+        PublishDownloadStatus(gameObjectHandler, forcePublish);
+    }
+
+
+    private void RemovePendingTransferFromDownloadStatus(GameObjectHandler gameObjectHandler, DownloadFileTransfer transfer, bool forcePublish)
+    {
+        var groupKey = GetGroupKey(transfer);
+        if (!_downloadStatus.TryGetValue(groupKey, out var status))
+            return;
+
+        var hash = transfer.Hash?.Trim().ToUpperInvariant() ?? string.Empty;
+        var expectedBytes = Math.Max(1, transfer.Total);
+
+        lock (status)
+        {
+            var alreadyCounted = _fileProgressBytes.TryGetValue(hash, out var counted) ? counted : 0;
+            var remainingVisualBytes = Math.Max(0, expectedBytes - alreadyCounted);
+
+            status.TotalBytes = Math.Max(status.TransferredBytes, status.TotalBytes - remainingVisualBytes);
+            status.TotalFiles = Math.Max(status.TransferredFiles, status.TotalFiles - 1);
+
+            if (status.TotalFiles == 0)
+                status.TransferredBytes = status.TotalBytes = 0;
+        }
+
+        PublishDownloadStatus(gameObjectHandler, forcePublish);
+    }
+
+    private void CompleteAllDownloadStatus(GameObjectHandler gameObjectHandler)
+    {
+        foreach (var status in _downloadStatus.Values)
+        {
+            lock (status)
+            {
+                status.DownloadStatus = DownloadStatus.Decompressing;
+                status.TransferredBytes = Math.Max(status.TransferredBytes, status.TotalBytes);
+                status.TransferredFiles = Math.Max(status.TransferredFiles, status.TotalFiles);
+            }
+        }
+
+        PublishDownloadStatus(gameObjectHandler, force: true);
+    }
+
+    private void PublishDownloadStatus(GameObjectHandler gameObjectHandler, bool force = false)
+    {
+        var now = Environment.TickCount64;
+        if (!force)
+        {
+            var last = Interlocked.Read(ref _lastStatusPublishMs);
+            if (now - last < DownloadStatusPublishIntervalMs)
+                return;
+
+            if (Interlocked.CompareExchange(ref _lastStatusPublishMs, now, last) != last)
+                return;
+        }
+        else
+        {
+            Interlocked.Exchange(ref _lastStatusPublishMs, now);
+        }
+
+        var snapshot = new Dictionary<string, FileDownloadStatus>(StringComparer.Ordinal);
+        foreach (var kv in _downloadStatus)
+        {
+            var current = kv.Value;
+            lock (current)
+            {
+                snapshot[kv.Key] = new FileDownloadStatus
+                {
+                    DownloadStatus = current.DownloadStatus,
+                    TotalBytes = current.TotalBytes,
+                    TotalFiles = current.TotalFiles,
+                    TransferredBytes = current.TransferredBytes,
+                    TransferredFiles = current.TransferredFiles,
+                };
+            }
+        }
+
+        Mediator.Publish(new DownloadStartedMessage(gameObjectHandler, snapshot));
+    }
+
+    private static string GetGroupKey(DownloadFileTransfer transfer)
+    {
+        try
+        {
+            var uri = transfer.DownloadUri;
+            return uri.Host + ":" + uri.Port;
+        }
+        catch
+        {
+            return "cdn";
+        }
+    }
+
+    private static async Task CopyStreamToFileAsync(Stream input, string path, Action<long> progress, CancellationToken ct)
+    {
+        var buffer = ArrayPool<byte>.Shared.Rent(BufferSize);
+        try
+        {
+            await using var output = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.Read, BufferSize, FileOptions.Asynchronous | FileOptions.SequentialScan);
             while (true)
             {
-                int read = await src.ReadAsync(buffer.AsMemory(0, buffer.Length), ct).ConfigureAwait(false);
-                if (read <= 0) break;
+                await LinuxSmoothMode.YieldBackgroundWorkIfNeededAsync(ct).ConfigureAwait(false);
+                var read = await input.ReadAsync(buffer.AsMemory(0, buffer.Length), ct).ConfigureAwait(false);
+                if (read <= 0)
+                    break;
 
-                await dst.WriteAsync(buffer.AsMemory(0, read), ct).ConfigureAwait(false);
-                onRead(read);
-                sinceYield += read;
-                sinceMicroPause += read;
-
-                if (sinceYield >= CdnSmoothYieldEveryBytes)
-                {
-                    var microPause = sinceMicroPause >= CdnSmoothMicroPauseEveryBytes;
-                    sinceYield = 0;
-                    if (microPause)
-                        sinceMicroPause = 0;
-
-                    await YieldForDownloadResponsivenessAsync(microPause, ct).ConfigureAwait(false);
-                }
+                await output.WriteAsync(buffer.AsMemory(0, read), ct).ConfigureAwait(false);
+                progress(read);
             }
         }
         finally
         {
             ArrayPool<byte>.Shared.Return(buffer);
+        }
+    }
+
+    private static async Task<(string ComputedHash, long BytesWritten)> CopyRawToFileAndHashAsync(Stream input, string path, long expectedRawSize, Action<long> progress, CancellationToken ct)
+    {
+        using var sha1 = IncrementalHash.CreateHash(HashAlgorithmName.SHA1);
+        var buffer = ArrayPool<byte>.Shared.Rent(BufferSize);
+        long total = 0;
+
+        try
+        {
+            await using var output = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.Read, BufferSize, FileOptions.Asynchronous | FileOptions.SequentialScan);
+            while (true)
+            {
+                await LinuxSmoothMode.YieldBackgroundWorkIfNeededAsync(ct).ConfigureAwait(false);
+                var read = await input.ReadAsync(buffer.AsMemory(0, buffer.Length), ct).ConfigureAwait(false);
+                if (read <= 0)
+                    break;
+
+                sha1.AppendData(buffer, 0, read);
+                await output.WriteAsync(buffer.AsMemory(0, read), ct).ConfigureAwait(false);
+                total += read;
+                progress(read);
+
+                if (expectedRawSize > 0 && total > expectedRawSize)
+                    throw new InvalidDataException($"Raw payload exceeded expected size for download; expected {expectedRawSize}, got {total}");
+            }
+
+            if (expectedRawSize > 0 && total != expectedRawSize)
+                throw new InvalidDataException($"Raw payload did not match expected size for download; expected {expectedRawSize}, got {total}");
+
+            return (Convert.ToHexString(sha1.GetHashAndReset()), total);
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buffer);
+        }
+    }
+
+    private static async Task<(string ComputedHash, long BytesWritten)> DecodeLegacyPayloadWithCompatAsync(string spoolPath, string tempPath, long expectedRawSize, string expectedHash, CancellationToken ct)
+    {
+        var attempts = new List<Func<Task<(string ComputedHash, long BytesWritten)>>>
+        {
+            () => TryDecodeHeaderedAsync(spoolPath, tempPath, expectedRawSize, useRaw: false, ct),
+            () => TryDecodeHeaderedAsync(spoolPath, tempPath, expectedRawSize, useRaw: true, ct),
+            () => DecodeHeaderlessAsync(spoolPath, tempPath, expectedRawSize, xor: false, useRaw: false, ct),
+            () => DecodeHeaderlessAsync(spoolPath, tempPath, expectedRawSize, xor: true, useRaw: false, ct),
+            () => DecodeHeaderlessAsync(spoolPath, tempPath, expectedRawSize, xor: false, useRaw: true, ct),
+            () => DecodeHeaderlessAsync(spoolPath, tempPath, expectedRawSize, xor: true, useRaw: true, ct),
+        };
+
+        Exception? firstError = null;
+        foreach (var attempt in attempts)
+        {
+            ct.ThrowIfCancellationRequested();
+            TryDelete(tempPath);
+
+            try
+            {
+                var decoded = await attempt().ConfigureAwait(false);
+                if (decoded.BytesWritten > 0 && string.Equals(decoded.ComputedHash, expectedHash, StringComparison.OrdinalIgnoreCase))
+                    return decoded;
+
+                firstError ??= new InvalidDataException($"Legacy decode produced hash {decoded.ComputedHash}, expected {expectedHash}");
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                firstError ??= ex;
+            }
+        }
+
+        throw firstError ?? new InvalidDataException($"Could not decode legacy payload for {expectedHash}");
+    }
+
+    private static async Task<(string ComputedHash, long BytesWritten)> TryDecodeHeaderedAsync(string spoolPath, string tempPath, long expectedRawSize, bool useRaw, CancellationToken ct)
+    {
+        await using var input = new FileStream(spoolPath, FileMode.Open, FileAccess.Read, FileShare.Read, BufferSize, FileOptions.Asynchronous | FileOptions.SequentialScan);
+        var header = await ReadCdnHeaderAsync(input, ct).ConfigureAwait(false);
+        Stream payload = header.Munged ? new XorReadStream(input, 42) : input;
+        try
+        {
+            var decodeExpectedSize = useRaw
+                ? header.Length > 0 ? header.Length : expectedRawSize
+                : expectedRawSize;
+
+            return useRaw
+                ? await CopyRawToFileAndHashAsync(payload, tempPath, decodeExpectedSize, _ => { }, ct).ConfigureAwait(false)
+                : await DecompressLz4ToFileAndHashAsync(payload, tempPath, decodeExpectedSize, ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            if (!ReferenceEquals(payload, input))
+                payload.Dispose();
+        }
+    }
+
+    private static async Task<(string ComputedHash, long BytesWritten)> DecodeHeaderlessAsync(string spoolPath, string tempPath, long expectedRawSize, bool xor, bool useRaw, CancellationToken ct)
+    {
+        await using var input = new FileStream(spoolPath, FileMode.Open, FileAccess.Read, FileShare.Read, BufferSize, FileOptions.Asynchronous | FileOptions.SequentialScan);
+        Stream payload = xor ? new XorReadStream(input, 42) : input;
+        try
+        {
+            return useRaw
+                ? await CopyRawToFileAndHashAsync(payload, tempPath, expectedRawSize, _ => { }, ct).ConfigureAwait(false)
+                : await DecompressLz4ToFileAndHashAsync(payload, tempPath, expectedRawSize, ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            if (!ReferenceEquals(payload, input))
+                payload.Dispose();
+        }
+    }
+
+    private static async Task<(string ComputedHash, long BytesWritten)> DecompressLz4ToFileAndHashAsync(Stream input, string path, long expectedRawSize, CancellationToken ct)
+    {
+        using var sha1 = IncrementalHash.CreateHash(HashAlgorithmName.SHA1);
+        var buffer = ArrayPool<byte>.Shared.Rent(256 * 1024);
+        long total = 0;
+
+        try
+        {
+            await using var output = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.Read, BufferSize, FileOptions.Asynchronous | FileOptions.SequentialScan);
+            using var fullRead = new FullReadStream(input);
+            await using var lz4 = new LZ4Stream(fullRead, LZ4StreamMode.Decompress, LZ4StreamFlags.None, Lz4BlockSize);
+
+            while (true)
+            {
+                await LinuxSmoothMode.YieldBackgroundWorkIfNeededAsync(ct).ConfigureAwait(false);
+                var read = await lz4.ReadAsync(buffer.AsMemory(0, buffer.Length), ct).ConfigureAwait(false);
+                if (read <= 0)
+                    break;
+
+                sha1.AppendData(buffer, 0, read);
+                await output.WriteAsync(buffer.AsMemory(0, read), ct).ConfigureAwait(false);
+                total += read;
+
+                if (expectedRawSize > 0 && total > expectedRawSize)
+                    throw new InvalidDataException($"LZ4 payload exceeded expected size; expected {expectedRawSize}, got {total}");
+            }
+
+            if (expectedRawSize > 0 && total != expectedRawSize)
+                throw new InvalidDataException($"LZ4 payload did not match expected size; expected {expectedRawSize}, got {total}");
+
+            return (Convert.ToHexString(sha1.GetHashAndReset()), total);
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buffer);
+        }
+    }
+
+    private static async Task<(bool HasHeader, string HeaderHash, long PayloadLength, bool Munged, Stream PayloadStream)> DetectCdnHeaderAsync(Stream stream, byte[] firstBytes, int firstByteCount, CancellationToken ct)
+    {
+        if (firstByteCount <= 0)
+            return (false, string.Empty, 0, false, new PrefixedReadStream(stream, Array.Empty<byte>(), 0));
+
+        var bytes = new List<byte>(256);
+        for (var i = 0; i < firstByteCount; i++)
+            bytes.Add(firstBytes[i]);
+
+        static bool CouldBeHeaderStart(byte b) => b == (byte)'#' || (b ^ 42) == (byte)'#';
+
+        if (!CouldBeHeaderStart(bytes[0]))
+            return (false, string.Empty, 0, false, new PrefixedReadStream(stream, bytes.ToArray(), bytes.Count));
+
+        var one = new byte[1];
+        while (bytes.Count < 256)
+        {
+            var arr = bytes.ToArray();
+            if (TryParseHeader(arr, munged: false, out var hash, out var length))
+                return (true, hash, length, false, new PrefixedReadStream(stream, Array.Empty<byte>(), 0));
+
+            if (TryParseHeader(arr, munged: true, out hash, out length))
+                return (true, hash, length, true, new PrefixedReadStream(stream, Array.Empty<byte>(), 0));
+
+            var read = await stream.ReadAsync(one.AsMemory(0, 1), ct).ConfigureAwait(false);
+            if (read <= 0)
+                break;
+
+            bytes.Add(one[0]);
+        }
+
+        return (false, string.Empty, 0, false, new PrefixedReadStream(stream, bytes.ToArray(), bytes.Count));
+    }
+
+    private static async Task<(string Hash, long Length, bool Munged)> ReadCdnHeaderAsync(Stream stream, CancellationToken ct)
+    {
+        var bytes = new List<byte>(128);
+        var one = new byte[1];
+
+        while (bytes.Count < 256)
+        {
+            var read = await stream.ReadAsync(one.AsMemory(0, 1), ct).ConfigureAwait(false);
+            if (read <= 0)
+                throw new EndOfStreamException("Unexpected end of CDN header");
+
+            bytes.Add(one[0]);
+            if (one[0] != (byte)'#' && (one[0] ^ 42) != (byte)'#')
+                continue;
+
+            var arr = bytes.ToArray();
+            if (TryParseHeader(arr, munged: false, out var hash, out var length))
+                return (hash, length, false);
+
+            if (TryParseHeader(arr, munged: true, out hash, out length))
+                return (hash, length, true);
+        }
+
+        throw new InvalidDataException("CDN header was missing or too large");
+    }
+
+    private static bool TryParseHeader(ReadOnlySpan<byte> headerBytes, bool munged, out string fileHash, out long fileLengthBytes)
+    {
+        fileHash = string.Empty;
+        fileLengthBytes = 0;
+
+        if (headerBytes.Length < 4)
+            return false;
+
+        Span<char> chars = stackalloc char[headerBytes.Length];
+        for (var i = 0; i < headerBytes.Length; i++)
+            chars[i] = munged ? (char)(headerBytes[i] ^ 42) : (char)headerBytes[i];
+
+        if (chars[0] != '#')
+            return false;
+
+        var colonIndex = chars.IndexOf(':');
+        if (colonIndex <= 1)
+            return false;
+
+        var endIndex = chars[(colonIndex + 1)..].IndexOf('#');
+        if (endIndex < 0)
+            return false;
+
+        endIndex += colonIndex + 1;
+        var hashSpan = chars[1..colonIndex];
+        var lenSpan = chars[(colonIndex + 1)..endIndex];
+
+        if (!long.TryParse(lenSpan, out fileLengthBytes))
+            return false;
+
+        fileHash = new string(hashSpan).Trim().ToUpperInvariant();
+        return fileHash.Length > 0;
+    }
+
+    private int TryPublishCentralFileRepairRequestBatch(IEnumerable<string?> hashes, string reason)
+    {
+        var filtered = hashes
+            .Where(static h => !string.IsNullOrWhiteSpace(h))
+            .Select(static h => h!.Trim().ToUpperInvariant())
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        if (filtered.Count == 0 || string.IsNullOrWhiteSpace(_centralFileRepairTargetUid) || string.IsNullOrWhiteSpace(_centralFileRepairTargetIdent))
+            return 0;
+
+        var allowed = new List<string>(filtered.Count);
+        foreach (var hash in filtered)
+        {
+            var attempts = _centralFileRepairAttemptsByHash.AddOrUpdate(hash, 1, (_, current) => current + 1);
+            if (attempts <= 2)
+            {
+                allowed.Add(hash);
+                continue;
+            }
+
+            _centralFileRepairFailedHashes[hash] = reason;
+        }
+
+        if (allowed.Count == 0)
+            return 0;
+
+        Logger.LogDebug("Requesting central B2 repair for {count} hash(es). Reason={reason}. Hashes={hashes}", allowed.Count, reason, string.Join(", ", allowed.Take(20)));
+        Mediator.Publish(new RemoteMissingFileMessage(_centralFileRepairTargetUid, _centralFileRepairTargetIdent, _centralFileRepairDataHash, allowed, reason));
+        return allowed.Count;
+    }
+
+    private bool TryPublishCentralFileRepairRequest(string hash, string reason)
+        => TryPublishCentralFileRepairRequestBatch([hash], reason) > 0;
+
+    private static string ComputeSha1(string path, CancellationToken ct)
+    {
+        using var sha1 = IncrementalHash.CreateHash(HashAlgorithmName.SHA1);
+        var buffer = ArrayPool<byte>.Shared.Rent(BufferSize);
+
+        try
+        {
+            using var input = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, BufferSize, FileOptions.SequentialScan);
+            while (true)
+            {
+                ct.ThrowIfCancellationRequested();
+                var read = input.Read(buffer, 0, buffer.Length);
+                if (read <= 0)
+                    break;
+
+                sha1.AppendData(buffer, 0, read);
+            }
+
+            return Convert.ToHexString(sha1.GetHashAndReset());
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buffer);
+        }
+    }
+
+    private static void EnsureDirectory(string path)
+    {
+        var dir = Path.GetDirectoryName(path);
+        if (!string.IsNullOrWhiteSpace(dir))
+            Directory.CreateDirectory(dir);
+    }
+
+    private static string CreateTempPath(string finalPath)
+    {
+        var dir = Path.GetDirectoryName(finalPath);
+        if (string.IsNullOrWhiteSpace(dir))
+            dir = Path.GetTempPath();
+
+        Directory.CreateDirectory(dir);
+        return Path.Combine(dir, Path.GetFileName(finalPath) + "." + Guid.NewGuid().ToString("N") + ".tmp");
+    }
+
+    private static string CreateSpoolPath(string hash)
+        => Path.Combine(Path.GetTempPath(), "ravasync_dl_" + hash + "_" + Guid.NewGuid().ToString("N") + ".payload");
+
+    private static void TryDelete(string? path)
+    {
+        try
+        {
+            if (!string.IsNullOrWhiteSpace(path) && File.Exists(path))
+                File.Delete(path);
+        }
+        catch
+        {
+            // ignored
         }
     }
 
     protected override void Dispose(bool disposing)
     {
-        ClearDownload();
-        foreach (var stream in _activeDownloadStreams.ToArray())
-        {
-            try
-            {
-                stream.Dispose();
-            }
-            catch
-            {
-                // do nothing
-                //
-            }
-        }
         if (disposing)
         {
-            try { FlushPendingCacheEntries(allowDuringShutdown: true).GetAwaiter().GetResult(); } catch { /* ignore */ }
-            try { _cachePersistCts.Cancel(); } catch { /* ignore */ }
-            try { _cachePersistLoop.GetAwaiter().GetResult(); } catch { /* ignore */ }
-            try { FlushPendingCacheEntries(allowDuringShutdown: true).GetAwaiter().GetResult(); } catch { /* ignore */ }
-            try { _cachePersistCts.Dispose(); } catch { /* ignore */ }
-            // SharedCdnFastClient is process/plugin-lifetime shared; do not dispose it from per-pair managers.
+            lock (_activeStreamsLock)
+                _activeDownloadStreams.Clear();
         }
 
         base.Dispose(disposing);
     }
 
-
-
-    private sealed class ProgressReadStream : Stream
+    private sealed class StalledReadGuardStream : Stream
     {
         private readonly Stream _inner;
-        private readonly Action<int> _onRead;
+        private readonly TimeSpan _idleTimeout;
+        private readonly CancellationToken _outerToken;
 
-        public ProgressReadStream(Stream inner, Action<int> onRead)
+        public StalledReadGuardStream(Stream inner, TimeSpan idleTimeout, CancellationToken outerToken)
         {
             _inner = inner;
-            _onRead = onRead;
+            _idleTimeout = idleTimeout;
+            _outerToken = outerToken;
         }
 
         public override bool CanRead => _inner.CanRead;
@@ -874,19 +1498,21 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
         public override long Length => throw new NotSupportedException();
         public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
         public override void Flush() => throw new NotSupportedException();
-
-        public override int Read(byte[] buffer, int offset, int count)
-        {
-            var r = _inner.Read(buffer, offset, count);
-            if (r > 0) _onRead(r);
-            return r;
-        }
+        public override int Read(byte[] buffer, int offset, int count) => _inner.Read(buffer, offset, count);
 
         public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
         {
-            var r = await _inner.ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
-            if (r > 0) _onRead(r);
-            return r;
+            using var linked = CancellationTokenSource.CreateLinkedTokenSource(_outerToken, cancellationToken);
+            linked.CancelAfter(_idleTimeout);
+
+            try
+            {
+                return await _inner.ReadAsync(buffer, linked.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (!_outerToken.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+            {
+                throw new OperationCanceledException($"CDN stream made no progress for {_idleTimeout.TotalSeconds:0}s", null, CancellationToken.None);
+            }
         }
 
         public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
@@ -901,14 +1527,14 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
     {
         private readonly Stream _inner;
         private readonly byte[] _prefix;
-        private int _offset;
         private readonly int _count;
+        private int _offset;
 
         public PrefixedReadStream(Stream inner, byte[] prefix, int count)
         {
             _inner = inner;
             _prefix = prefix;
-            _count = count;
+            _count = Math.Clamp(count, 0, prefix.Length);
         }
 
         public override bool CanRead => true;
@@ -922,7 +1548,7 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
         {
             if (_offset < _count)
             {
-                int n = Math.Min(count, _count - _offset);
+                var n = Math.Min(count, _count - _offset);
                 Buffer.BlockCopy(_prefix, _offset, buffer, offset, n);
                 _offset += n;
                 return n;
@@ -935,2560 +1561,13 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
         {
             if (_offset < _count)
             {
-                int n = Math.Min(buffer.Length, _count - _offset);
+                var n = Math.Min(buffer.Length, _count - _offset);
                 _prefix.AsMemory(_offset, n).CopyTo(buffer);
                 _offset += n;
                 return n;
             }
 
             return await _inner.ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
-        }
-
-        public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
-        {
-            if (_offset < _count)
-            {
-                int n = Math.Min(count, _count - _offset);
-                Buffer.BlockCopy(_prefix, _offset, buffer, offset, n);
-                _offset += n;
-                return Task.FromResult(n);
-            }
-
-            return _inner.ReadAsync(buffer, offset, count, cancellationToken);
-        }
-
-        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
-        public override void SetLength(long value) => throw new NotSupportedException();
-        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
-    }
-
-    public async Task<List<DownloadFileTransfer>> InitiateDownloadList(GameObjectHandler gameObjectHandler, List<FileReplacementData> fileReplacement, CancellationToken ct)
-    {
-        Logger.LogDebug("Download start: {id}", gameObjectHandler.Name);
-
-        List<DownloadFileDto> downloadFileInfoFromService =
-        [
-            .. await FilesGetSizes(fileReplacement.Select(f => f.Hash).Distinct(StringComparer.Ordinal).ToList(), ct).ConfigureAwait(false),
-        ];
-
-        Logger.LogDebug("Files with size 0 or less: {files}",
-            string.Join(", ", downloadFileInfoFromService.Where(f => f.Size <= 0).Select(f => f.Hash)));
-
-        foreach (var dto in downloadFileInfoFromService.Where(c => c.IsForbidden))
-        {
-            if (!_orchestrator.ForbiddenTransfers.Exists(f => string.Equals(f.Hash, dto.Hash, StringComparison.Ordinal)))
-            {
-                _orchestrator.ForbiddenTransfers.Add(new DownloadFileTransfer(dto));
-            }
-        }
-
-        var expectedPathByHash = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var fr in fileReplacement)
-        {
-            if (string.IsNullOrEmpty(fr.Hash) || fr.GamePaths == null || fr.GamePaths.Count() == 0)
-                continue;
-
-            var gamePath = fr.GamePaths[0];
-            var ext = "dat";
-
-            if (!string.IsNullOrEmpty(gamePath))
-            {
-                var dot = gamePath.LastIndexOf('.');
-                if (dot >= 0 && dot < gamePath.Length - 1)
-                    ext = gamePath[(dot + 1)..];
-            }
-
-            var localPath = _fileDbManager.GetCacheFilePath(fr.Hash, ext);
-            expectedPathByHash[fr.Hash] = localPath;
-        }
-
-        // de-dupe strictly by hash, then:
-        // - use filesystem as truth for presence + validate cache entries against expected sizes
-        // - DO NOT mark hashes inflight unless they are actually transferable (dto.FileExists=true)
-        // - self-heal stray on-disk files without DB entries when possible
-        var candidates = downloadFileInfoFromService
-            .GroupBy(d => d.Hash, StringComparer.OrdinalIgnoreCase)
-            .Select(g => g.First())
-            .Where(dto =>
-            {
-                // Prefer RawSize if provided, otherwise fall back to Size for basic length checks.
-                var expected = dto.RawSize > 0 ? dto.RawSize : 0;
-
-                var cacheEntry = _fileDbManager.GetFileCacheByHash(dto.Hash);
-                if (cacheEntry != null)
-                {
-                    var resolved = cacheEntry.ResolvedFilepath;
-
-                    if (!string.IsNullOrWhiteSpace(resolved) && File.Exists(resolved))
-                    {
-                        // Fast cache path: this is already a registered cache entry. During
-                        // reconnect/room-entry bursts, hashing every existing multi-GB file per
-                        // pair makes cached rooms feel like fresh downloads. If the server gives
-                        // us a raw size, use that. If it does not, trust the registered non-empty
-                        // cache entry and skip the expensive SHA pass.
-                        try
-                        {
-                            var len = new FileInfo(resolved).Length;
-                            if (len > 0 && (expected <= 0 || len == expected))
-                            {
-                                Logger.LogTrace("Skip download for {Hash}: registered cache entry present at {Path} (len={Length}, expected={Expected})", dto.Hash, resolved, len, expected);
-                                return false;
-                            }
-                        }
-                        catch
-                        {
-                            // fall through to validation below
-                        }
-
-                        // Only do the expensive full hash validation when we have useful size
-                        // information and the quick path did not prove the file good.
-                        if (expected > 0 && ValidateDownloadedFileLowPri(resolved, dto.Hash, expectedRawSize: expected, ct))
-                        {
-                            Logger.LogTrace("Skip download for {Hash}: present and validated at {Path}", dto.Hash, resolved);
-                            return false;
-                        }
-
-                        Logger.LogWarning("Cache file for {Hash} exists but failed validation/size at {Path}; forcing re-download", dto.Hash, resolved);
-
-                        try { File.Delete(resolved); } catch { /* ignore */ }
-                        try { _fileDbManager.RemoveHashedFile(cacheEntry.Hash, cacheEntry.PrefixedFilePath); } catch { /* ignore */ }
-                    }
-                    else
-                    {
-                        Logger.LogWarning("Cache entry for {Hash} exists but file is missing at {Path}; forcing re-download", dto.Hash, resolved);
-                        try { _fileDbManager.RemoveHashedFile(cacheEntry.Hash, cacheEntry.PrefixedFilePath); } catch { /* ignore */ }
-                    }
-                }
-
-                // Stray file at expected cache path? Validate and register.
-                if (expectedPathByHash.TryGetValue(dto.Hash, out var path) && File.Exists(path))
-                {
-                    if (ValidateDownloadedFileLowPri(path, dto.Hash, expectedRawSize: expected, ct))
-                    {
-                        PersistFileToStorageLowPri(dto.Hash, path, ct);
-                        Logger.LogTrace("Skip download for {Hash}: existing file at {Path} validated and registered in cache", dto.Hash, path);
-                        return false;
-                    }
-
-                    try
-                    {
-                        Logger.LogWarning("Existing file for {Hash} at {Path} failed validation, deleting to force clean re-download", dto.Hash, path);
-                        File.Delete(path);
-                    }
-                    catch (Exception ex)
-                    {
-                        Logger.LogWarning(ex, "Failed to delete invalid existing file for {Hash} at {Path}", dto.Hash, path);
-                    }
-                }
-
-                return true;
-            })
-            .ToList();
-
-        // Only keep transfers that the server says actually exist and can be downloaded right now.
-        var candidateTransfers = candidates.Select(d => new DownloadFileTransfer(d)).ToList();
-
-        var untransferable = candidateTransfers.Where(t => !t.CanBeTransferred).ToList();
-        if (untransferable.Count > 0)
-        {
-            Logger.LogDebug("Skipping {count} hashes because they are not transferable yet (FileExists=false or forbidden): {hashes}",
-                untransferable.Count,
-                string.Join(", ", untransferable.Select(t => t.Hash)));
-        }
-
-        var transferable = candidateTransfers.Where(t => t.CanBeTransferred).ToList();
-
-        var sharedWaits = new List<Task<bool>>();
-        var claimedTransfers = new List<DownloadFileTransfer>(transferable.Count);
-
-        foreach (var transfer in transferable)
-        {
-            if (TryClaimGlobalInflightDownload(transfer.Hash, out var existingDownload))
-            {
-                claimedTransfers.Add(transfer);
-                continue;
-            }
-
-            if (existingDownload != null)
-            {
-                sharedWaits.Add(existingDownload);
-                Logger.LogTrace("Hash {hash} is already downloading in another pair; waiting for shared cache result instead of duplicating transfer", transfer.Hash);
-            }
-        }
-
-        CurrentDownloads = claimedTransfers;
-
-        // If every missing hash is already being downloaded by another pair, keep the pair UI
-        // honest without double-counting this work in the global download overlay. The owning
-        // pair's real DownloadStartedMessage still drives the global bytes; this synthetic one
-        // is only for this pair/compact row while it waits for shared cache completion.
-        if (CurrentDownloads.Count == 0 && sharedWaits.Count > 0)
-        {
-            PublishSharedHashWaitStatus(gameObjectHandler, transferable);
-            try
-            {
-                await WaitForGlobalInflightDownloadsAsync(sharedWaits, ct).ConfigureAwait(false);
-            }
-            finally
-            {
-                Mediator.Publish(new DownloadFinishedMessage(gameObjectHandler));
-            }
-        }
-
-        return CurrentDownloads;
-
-    }
-
-    private void PublishSharedHashWaitStatus(GameObjectHandler gameObjectHandler, IReadOnlyCollection<DownloadFileTransfer> transfers)
-    {
-        if (transfers.Count == 0)
-            return;
-
-        var status = new Dictionary<string, FileDownloadStatus>(StringComparer.Ordinal)
-        {
-            ["shared-cache"] = new FileDownloadStatus
-            {
-                DownloadStatus = DownloadStatus.WaitingForQueue,
-                TotalBytes = transfers.Sum(t => Math.Max(0, t.Total)),
-                TotalFiles = transfers.Count,
-                TransferredBytes = 0,
-                TransferredFiles = 0
-            }
-        };
-
-        PublishDownloadStatus(gameObjectHandler, status, countsTowardGlobal: false);
-    }
-
-    private void MarkAllGroupsComplete()
-    {
-        foreach (var status in _downloadStatus.Values)
-        {
-            if (status == null)
-                continue;
-
-            lock (status)
-            {
-                status.DownloadStatus = DownloadStatus.Decompressing;
-                if (status.TotalBytes > 0)
-                    status.TransferredBytes = status.TotalBytes;
-                if (status.TotalFiles > 0)
-                    status.TransferredFiles = status.TotalFiles;
-            }
-        }
-    }
-
-    private void FlushAndPublishFinalDownloadStatus(GameObjectHandler downloadId)
-    {
-        foreach (var key in _groupProgress.Keys)
-        {
-            ForceFlushGroupProgress(key);
-        }
-
-        MarkAllGroupsComplete();
-        PublishDownloadStatus(downloadId);
-    }
-
-    private async Task DownloadFilesInternal(GameObjectHandler gameObjectHandler, List<FileReplacementData> fileReplacement, CancellationToken ct)
-    {
-       var downloadGroups = CurrentDownloads
-            .GroupBy(f => f.DownloadUri.Host + ":" + f.DownloadUri.Port, StringComparer.Ordinal)
-            .ToList();
-
-        foreach (var downloadGroup in downloadGroups)
-        {
-            _downloadStatus[downloadGroup.Key] = new FileDownloadStatus()
-            {
-                DownloadStatus = DownloadStatus.WaitingForQueue,
-                TotalBytes = downloadGroup.Sum(c => c.Total),
-                TotalFiles = downloadGroup.Count(),
-                TransferredBytes = 0,
-                TransferredFiles = 0
-            };
-        }
-
-        PublishDownloadStatus(gameObjectHandler);
-
-
-        var anyGroupFailure = 0;
-        var failedGroups = new ConcurrentBag<string>();
-
-        await Parallel.ForEachAsync(downloadGroups, new ParallelOptions()
-        {
-            MaxDegreeOfParallelism = GetDownloadGroupParallelism(downloadGroups.Count),
-            CancellationToken = ct,
-        },
-        async (fileGroup, token) =>
-        {
-            try
-            {
-                var cdnOk = await TryDownloadFilesFromCdnAsync(gameObjectHandler, fileGroup, fileReplacement, token).ConfigureAwait(false);
-                if (cdnOk)
-                {
-                    Logger.LogDebug("CDN fast-path: group {group} fully satisfied via CDN, skipping blk pipeline", fileGroup.Key);
-                    return;
-                }
-
-                Interlocked.Exchange(ref anyGroupFailure, 1);
-                failedGroups.Add(fileGroup.Key);
-
-                Logger.LogWarning("CDN fast-path: group {group} could not be fully satisfied via CDN; will fail overall after other groups finish",
-                    fileGroup.Key);
-            }
-            catch (OperationCanceledException)
-            {
-                throw;
-            }
-            catch (Exception ex)
-            {
-                Interlocked.Exchange(ref anyGroupFailure, 1);
-                failedGroups.Add(fileGroup.Key);
-
-                Logger.LogWarning(ex, "CDN fast-path: error for group {group}; will fail overall after other groups finish",
-                    fileGroup.Key);
-            }
-        }).ConfigureAwait(false);
-
-        if (Volatile.Read(ref anyGroupFailure) != 0)
-        {
-            Logger.LogWarning("CDN fast-path: one or more groups failed. Aborting download. Failed groups: {groups}",
-                string.Join(", ", failedGroups.Distinct(StringComparer.Ordinal)));
-
-            ClearDownload();
-            return;
-        }
-
-        FlushAndPublishFinalDownloadStatus(gameObjectHandler);
-
-        Logger.LogDebug("Download end: {id}", gameObjectHandler);
-
-        ClearDownload();
-    }
-
-
-    private async Task<List<DownloadFileDto>> FilesGetSizes(List<string> hashes, CancellationToken ct)
-    {
-        if (!_orchestrator.IsInitialized) throw new InvalidOperationException("FileTransferManager is not initialized");
-        var response = await _orchestrator.SendRequestAsync(HttpMethod.Get, MareFiles.ServerFilesGetSizesFullPath(_orchestrator.UploadCdnUri!), hashes, ct).ConfigureAwait(false);
-        return await response.Content.ReadFromJsonAsync<List<DownloadFileDto>>(cancellationToken: ct).ConfigureAwait(false) ?? [];
-    }
-
-
-    private Task PersistFileToStorageLowPri(string fileHash, string filePath, CancellationToken ct)
-    {
-        try
-        {
-            QueueCachePersistence(fileHash, filePath);
-        }
-        catch
-        {
-            // ignore and let later validation/register paths recover naturally
-        }
-
-        return Task.CompletedTask;
-    }
-
-    private void QueueCachePersistence(string fileHash, string filePath)
-    {
-        _pendingCacheEntryByPath[filePath] = fileHash;
-        EnsureCachePersistLoopStarted();
-
-        if (_pendingCacheEntryByPath.Count >= CachePersistBatchSize)
-        {
-            _ = Task.Run(() => FlushPendingCacheEntries());
-        }
-    }
-
-    private void EnsureCachePersistLoopStarted()
-    {
-        if (Volatile.Read(ref _cachePersistLoopStarted) != 0)
-            return;
-
-        if (Interlocked.CompareExchange(ref _cachePersistLoopStarted, 1, 0) != 0)
-            return;
-
-        _cachePersistLoop = Task.Run(() => CachePersistLoopAsync(_cachePersistCts.Token));
-    }
-
-    private async Task CachePersistLoopAsync(CancellationToken ct)
-    {
-        try
-        {
-            using var timer = new PeriodicTimer(CachePersistFlushInterval);
-            while (await timer.WaitForNextTickAsync(ct).ConfigureAwait(false))
-            {
-                await FlushPendingCacheEntries().ConfigureAwait(false);
-            }
-        }
-        catch (OperationCanceledException)
-        {
-            // shutdown
-        }
-        catch (Exception ex)
-        {
-            Logger.LogWarning(ex, "Cache persist loop terminated unexpectedly");
-        }
-    }
-
-    private async Task FlushPendingCacheEntries(bool allowDuringShutdown = false)
-    {
-        if (Interlocked.Exchange(ref _cachePersistFlushRunning, 1) != 0)
-            return;
-
-        try
-        {
-            while (allowDuringShutdown || !_cachePersistCts.IsCancellationRequested)
-            {
-                var pending = _pendingCacheEntryByPath.ToArray();
-                if (pending.Length == 0)
-                    break;
-
-                var processed = 0;
-                foreach (var kvp in pending)
-                {
-                    if (processed >= CachePersistBatchSize)
-                        break;
-
-                    if (!_pendingCacheEntryByPath.TryGetValue(kvp.Key, out var currentHash) || !string.Equals(currentHash, kvp.Value, StringComparison.OrdinalIgnoreCase))
-                        continue;
-
-                    if (!_pendingCacheEntryByPath.TryRemove(kvp.Key, out var fileHash))
-                        continue;
-
-                    PersistFileToStorage(fileHash, kvp.Key);
-                    processed++;
-                }
-
-                if (processed == 0)
-                    break;
-
-                if (!allowDuringShutdown && !_pendingCacheEntryByPath.IsEmpty)
-                {
-                    try
-                    {
-                        await Task.Delay(16, _cachePersistCts.Token).ConfigureAwait(false);
-                    }
-                    catch (OperationCanceledException)
-                    {
-                        break;
-                    }
-                }
-                else
-                {
-                    await Task.Yield();
-                }
-            }
-        }
-        finally
-        {
-            Volatile.Write(ref _cachePersistFlushRunning, 0);
-
-            if (!_cachePersistCts.IsCancellationRequested && !_pendingCacheEntryByPath.IsEmpty)
-            {
-                _ = Task.Run(() => FlushPendingCacheEntries());
-            }
-        }
-    }
-
-    private void PersistFileToStorage(string fileHash, string filePath)
-    {
-        var fi = new FileInfo(filePath);
-        if (!fi.Exists) return;
-
-        try
-        {
-            var nowUtc = DateTime.UtcNow;
-            if ((nowUtc - fi.LastAccessTimeUtc) >= TimeSpan.FromMinutes(30))
-            {
-                fi.LastAccessTimeUtc = nowUtc;
-            }
-        }
-        catch
-        {
-            // ignore metadata update failures; cache accounting still happens below
-        }
-
-        try
-        {
-            var entry = _fileDbManager.CreateCacheEntry(filePath);
-            if (entry != null && !string.Equals(entry.Hash, fileHash, StringComparison.OrdinalIgnoreCase))
-            {
-                Logger.LogError("Hash mismatch after extracting, got {hash}, expected {expectedHash}, deleting file", entry.Hash, fileHash);
-                File.Delete(filePath);
-                _fileDbManager.RemoveHashedFile(entry.Hash, entry.PrefixedFilePath);
-            }
-        }
-        catch (Exception ex)
-        {
-            Logger.LogWarning(ex, "Error creating cache entry");
-        }
-    }
-
-    private async Task WaitForDownloadReady(List<DownloadFileTransfer> downloadFileTransfer, Guid requestId, CancellationToken downloadCt)
-    {
-        bool alreadyCancelled = false;
-        CancellationTokenSource? localTimeoutCts = null;
-        CancellationTokenSource? composite = null;
-
-        try
-        {
-            localTimeoutCts = new();
-            localTimeoutCts.CancelAfter(TimeSpan.FromSeconds(5));
-            composite = CancellationTokenSource.CreateLinkedTokenSource(downloadCt, localTimeoutCts.Token);
-
-            while (!_orchestrator.IsDownloadReady(requestId))
-            {
-                try
-                {
-                    await Task.Delay(250, composite.Token).ConfigureAwait(false);
-                }
-                catch (TaskCanceledException)
-                {
-                    if (downloadCt.IsCancellationRequested) throw;
-
-                    // PATCH: only poke the server if orchestrator is still alive
-                    if (_orchestrator.IsInitialized)
-                    {
-                        var req = await _orchestrator.SendRequestAsync(
-                            HttpMethod.Get,
-                            MareFiles.RequestCheckQueueFullPath(_orchestrator.FilesCdnUri!, requestId),
-                            downloadFileTransfer.Select(c => c.Hash).ToList(),
-                            downloadCt
-                        ).ConfigureAwait(false);
-                        req.EnsureSuccessStatusCode();
-                    }
-
-                    localTimeoutCts.Dispose();
-                    composite.Dispose();
-                    localTimeoutCts = new();
-                    localTimeoutCts.CancelAfter(TimeSpan.FromSeconds(5));
-                    composite = CancellationTokenSource.CreateLinkedTokenSource(downloadCt, localTimeoutCts.Token);
-                }
-            }
-
-            Logger.LogDebug("Download {requestId} ready", requestId);
-        }
-        catch (TaskCanceledException)
-        {
-            try
-            {
-                if (_orchestrator.IsInitialized)
-                {
-                    await _orchestrator.SendRequestAsync(
-                        HttpMethod.Get,
-                        MareFiles.RequestCancelFullPath(_orchestrator.FilesCdnUri!, requestId)
-                    ).ConfigureAwait(false);
-                    alreadyCancelled = true;
-                }
-            }
-            catch (ObjectDisposedException)
-            {
-                // Orchestrator/HttpClient was torn downâ€”ignore.
-            }
-
-            throw;
-        }
-        finally
-        {
-            if (downloadCt.IsCancellationRequested && !alreadyCancelled)
-            {
-                try
-                {
-                    if (_orchestrator.IsInitialized)
-                    {
-                        await _orchestrator.SendRequestAsync(
-                            HttpMethod.Get,
-                            MareFiles.RequestCancelFullPath(_orchestrator.FilesCdnUri!, requestId)
-                        ).ConfigureAwait(false);
-                    }
-                }
-                catch (ObjectDisposedException)
-                {
-                    // Orchestrator/HttpClient was torn downâ€”ignore.
-                }
-            }
-
-            // clean up CTS objects reliably
-            try { localTimeoutCts?.Dispose(); } catch { }
-            try { composite?.Dispose(); } catch { }
-
-            _orchestrator.ClearDownloadRequest(requestId);
-        }
-    }
-
-    private static bool TryParseHeader(ReadOnlySpan<byte> headerBytes, bool munged, out string fileHash, out long fileLengthBytes)
-    {
-        fileHash = string.Empty;
-        fileLengthBytes = 0;
-
-        if (headerBytes.Length < 3) return false;
-
-        // Decode bytes to chars depending on munged flag
-        Span<char> chars = stackalloc char[headerBytes.Length];
-        for (int i = 0; i < headerBytes.Length; i++)
-        {
-            chars[i] = munged ? (char)(headerBytes[i] ^ 42) : (char)headerBytes[i];
-        }
-
-        if (chars[0] != '#') return false;
-
-        // Expected format: #<hash>:<length>#
-        var body = chars[1..];
-
-        var colonIndex = body.IndexOf(':');
-        if (colonIndex <= 0) return false;
-
-        var endIndex = body[(colonIndex + 1)..].IndexOf('#');
-        if (endIndex < 0) return false;
-
-        var hashSpan = body[..colonIndex];
-        var lenSpan = body.Slice(colonIndex + 1, endIndex);
-
-        if (hashSpan.Length == 0 || lenSpan.Length == 0) return false;
-
-        if (!long.TryParse(lenSpan, out fileLengthBytes)) return false;
-
-        fileHash = new string(hashSpan);
-        return true;
-    }
-
-    private static async Task<(string fileHash, long fileLengthBytes, bool munged)> ReadCdnHeaderAsync(Stream stream, CancellationToken ct)
-    {
-        var headerBytes = new List<byte>(128);
-        var one = new byte[1];
-
-        // Read byte-by-byte (header is tiny, max 256) but in an async + cancellable way.
-        while (headerBytes.Count < 256)
-        {
-            var n = await stream.ReadAsync(one.AsMemory(0, 1), ct).ConfigureAwait(false);
-            if (n <= 0) throw new EndOfStreamException("Unexpected end of stream while reading CDN header");
-            headerBytes.Add(one[0]);
-
-            // Only try parse when last interpreted char could be '#'
-            byte last = headerBytes[^1];
-            bool couldBeTerminator = (char)last == '#' || (char)(last ^ 42) == '#';
-            if (!couldBeTerminator) continue;
-
-            var span = CollectionsMarshal.AsSpan(headerBytes);
-
-            if (TryParseHeader(span, munged: false, out var hash, out var len))
-                return (hash, len, false);
-
-            if (TryParseHeader(span, munged: true, out hash, out len))
-                return (hash, len, true);
-        }
-
-        throw new InvalidDataException("CDN header too large or invalid");
-    }
-
-    private void CleanupFailedCdnDownload(string pathToDelete)
-    {
-        try
-        {
-            if (!string.IsNullOrWhiteSpace(pathToDelete) && File.Exists(pathToDelete))
-                File.Delete(pathToDelete);
-        }
-        catch
-        {
-            // ignore
-        }
-    }
-
-    private static string CreateTempDownloadPath(string finalPath)
-    {
-        var dir = Path.GetDirectoryName(finalPath);
-        if (string.IsNullOrEmpty(dir))
-            throw new InvalidOperationException($"Could not determine directory for {finalPath}");
-
-        var name = Path.GetFileName(finalPath);
-
-        // Keep temp in the same directory so the move is atomic on Windows.
-        var tmp = name + ".tmp." + Environment.ProcessId + "." + Guid.NewGuid().ToString("N");
-        return Path.Combine(dir, tmp);
-    }
-    private static bool IsFileInUse(Exception ex)
-    {
-        if (ex is UnauthorizedAccessException) return true;
-
-        if (ex is IOException ioEx)
-        {
-            if (OperatingSystem.IsWindows())
-            {
-                const int SharingViolation = unchecked((int)0x80070020);
-                const int LockViolation = unchecked((int)0x80070021);
-                return ioEx.HResult == SharingViolation || ioEx.HResult == LockViolation;
-            }
-            return true;
-        }
-        return false;
-    }
-
-
-    private static async Task<(string HashUpper, long BytesWritten)> CopyRawToFileAndHashAsync(Stream input,string destPath,long expectedRawSize,CancellationToken ct)
-    {
-        using var sha1 = IncrementalHash.CreateHash(HashAlgorithmName.SHA1);
-
-        var outOpts = new FileStreamOptions
-        {
-            Access = FileAccess.Write,
-            Mode = FileMode.Create,
-            Share = FileShare.None,
-            Options = FileOptions.Asynchronous | FileOptions.SequentialScan,
-            BufferSize = DownloadBufferSize
-        };
-
-        long total = 0;
-        long sinceYield = 0;
-        long sinceMicroPause = 0;
-        var buffer = _downloadBufferPool.Rent(CdnSmoothDecodeBufferSize);
-
-        try
-        {
-            await using var outFs = new FileStream(destPath, outOpts);
-
-            while (true)
-            {
-                var read = await input.ReadAsync(buffer.AsMemory(0, buffer.Length), ct).ConfigureAwait(false);
-                if (read <= 0)
-                    break;
-
-                sha1.AppendData(buffer, 0, read);
-                await outFs.WriteAsync(buffer.AsMemory(0, read), ct).ConfigureAwait(false);
-                total += read;
-                sinceYield += read;
-                sinceMicroPause += read;
-
-                if (expectedRawSize > 0 && total > expectedRawSize)
-                    throw new InvalidDataException($"Raw bytes exceeded expected size (expected {expectedRawSize}, got {total})");
-
-                if (sinceYield >= CdnSmoothYieldEveryBytes)
-                {
-                    var microPause = sinceMicroPause >= CdnSmoothMicroPauseEveryBytes;
-                    sinceYield = 0;
-                    if (microPause)
-                        sinceMicroPause = 0;
-
-                    await YieldForDownloadResponsivenessAsync(microPause, ct).ConfigureAwait(false);
-                }
-            }
-
-            if (expectedRawSize > 0 && total != expectedRawSize)
-                throw new InvalidDataException($"Raw bytes did not match expected size (expected {expectedRawSize}, got {total})");
-
-            return (Convert.ToHexString(sha1.GetHashAndReset()), total);
-        }
-        finally
-        {
-            _downloadBufferPool.Return(buffer);
-        }
-    }
-
-    private static async Task<long> DecompressLz4ToFileAsync(Stream input, string destPath, long expectedRawSize, CancellationToken ct)
-    {
-        var outOpts = new FileStreamOptions
-        {
-            Access = FileAccess.Write,
-            Mode = FileMode.Create,
-            Share = FileShare.None,
-            Options = FileOptions.Asynchronous | FileOptions.SequentialScan,
-            BufferSize = DownloadBufferSize
-        };
-
-        long total = 0;
-        var buffer = _downloadBufferPool.Rent(CdnSmoothDecodeBufferSize);
-        try
-        {
-            await using var outFs = new FileStream(destPath, outOpts);
-            using var fullReadInput = new FullReadStream(input);
-            await using var lz4 = new LZ4Stream(fullReadInput, LZ4StreamMode.Decompress, LZ4StreamFlags.None, Lz4BlockSize);
-
-            long sinceYield = 0;
-            long sinceMicroPause = 0;
-
-            while (true)
-            {
-                var read = await lz4.ReadAsync(buffer.AsMemory(0, buffer.Length), ct).ConfigureAwait(false);
-                if (read <= 0) break;
-
-                await outFs.WriteAsync(buffer.AsMemory(0, read), ct).ConfigureAwait(false);
-                total += read;
-                sinceYield += read;
-                sinceMicroPause += read;
-
-                if (expectedRawSize > 0 && total > expectedRawSize)
-                    throw new InvalidDataException($"Decompressed bytes exceeded expected size (expected {expectedRawSize}, got {total})");
-
-                if (sinceYield >= CdnSmoothYieldEveryBytes)
-                {
-                    var microPause = sinceMicroPause >= CdnSmoothMicroPauseEveryBytes;
-                    sinceYield = 0;
-                    if (microPause)
-                        sinceMicroPause = 0;
-
-                    await YieldForDownloadResponsivenessAsync(microPause, ct).ConfigureAwait(false);
-                }
-            }
-
-            if (expectedRawSize > 0 && total != expectedRawSize)
-                throw new InvalidDataException($"Decompressed bytes did not match expected size (expected {expectedRawSize}, got {total})");
-
-            return total;
-        }
-        finally
-        {
-            _downloadBufferPool.Return(buffer);
-        }
-    }
-
-    private static async Task<(string HashUpper, long BytesWritten)> DecompressLz4ToFileAndHashAsync(Stream input, string destPath, long expectedRawSize, CancellationToken ct)
-    {
-        using var sha1 = IncrementalHash.CreateHash(HashAlgorithmName.SHA1);
-
-        var outOpts = new FileStreamOptions
-        {
-            Access = FileAccess.Write,
-            Mode = FileMode.Create,
-            Share = FileShare.None,
-            Options = FileOptions.Asynchronous | FileOptions.SequentialScan,
-            BufferSize = DownloadBufferSize
-        };
-
-        long total = 0;
-        var buffer = _downloadBufferPool.Rent(CdnSmoothDecodeBufferSize);
-        try
-        {
-            await using var outFs = new FileStream(destPath, outOpts);
-            using var fullReadInput = new FullReadStream(input);
-            await using var lz4 = new LZ4Stream(fullReadInput, LZ4StreamMode.Decompress, LZ4StreamFlags.None, Lz4BlockSize);
-
-            long sinceYield = 0;
-            long sinceMicroPause = 0;
-
-            while (true)
-            {
-                var read = await lz4.ReadAsync(buffer.AsMemory(0, buffer.Length), ct).ConfigureAwait(false);
-                if (read <= 0) break;
-
-                sha1.AppendData(buffer, 0, read);
-                await outFs.WriteAsync(buffer.AsMemory(0, read), ct).ConfigureAwait(false);
-                total += read;
-                sinceYield += read;
-                sinceMicroPause += read;
-
-                // Safety: if server told us the raw size, never allow overflow expansions.
-                if (expectedRawSize > 0 && total > expectedRawSize)
-                    throw new InvalidDataException($"Decompressed bytes exceeded expected size (expected {expectedRawSize}, got {total})");
-
-                // Cooperative scheduling: avoid long uninterrupted CPU bursts inside the game process.
-                if (sinceYield >= CdnSmoothYieldEveryBytes)
-                {
-                    var microPause = sinceMicroPause >= CdnSmoothMicroPauseEveryBytes;
-                    sinceYield = 0;
-                    if (microPause)
-                        sinceMicroPause = 0;
-
-                    await YieldForDownloadResponsivenessAsync(microPause, ct).ConfigureAwait(false);
-                }
-            }
-
-            //await outFs.FlushAsync(ct).ConfigureAwait(false);
-
-            // Safety: if we know the exact size, enforce it.
-            if (expectedRawSize > 0 && total != expectedRawSize)
-                throw new InvalidDataException($"Decompressed bytes did not match expected size (expected {expectedRawSize}, got {total})");
-
-            return (Convert.ToHexString(sha1.GetHashAndReset()), total);
-        }
-        finally
-        {
-            _downloadBufferPool.Return(buffer);
-        }
-    }
-
-
-    private async Task<(string ComputedHash, long BytesWritten, bool UsedXorCompat)> DecodeHeaderlessSpoolWithCompatAsync(string spoolPath,string tempPath,long expectedRawSize,string expectedHash,CancellationToken ct)
-    {
-        await CdnDecodeConcurrencySemaphore.WaitAsync(ct).ConfigureAwait(false);
-        try
-        {
-            bool TryMatches((string HashUpper, long BytesWritten) res)
-                => res.BytesWritten > 0 && string.Equals(res.HashUpper, expectedHash, StringComparison.OrdinalIgnoreCase);
-
-            try
-            {
-                await using var src1 = new FileStream(spoolPath, FileMode.Open, FileAccess.Read, FileShare.Read, CdnBufferSize, FileOptions.SequentialScan | FileOptions.Asynchronous);
-                var res1 = await DecompressLz4ToFileAndHashAsync(src1, tempPath, expectedRawSize, ct).ConfigureAwait(false);
-                if (TryMatches(res1))
-                    return (res1.HashUpper, res1.BytesWritten, false);
-            }
-            catch
-            {
-                try { if (File.Exists(tempPath)) File.Delete(tempPath); } catch { }
-            }
-
-            try
-            {
-                await using var src2 = new FileStream(spoolPath, FileMode.Open, FileAccess.Read, FileShare.Read, CdnBufferSize, FileOptions.SequentialScan | FileOptions.Asynchronous);
-                using var xor2 = new LimitedXorStream(src2, src2.Length, 42);
-                var res2 = await DecompressLz4ToFileAndHashAsync(xor2, tempPath, expectedRawSize, ct).ConfigureAwait(false);
-                if (TryMatches(res2))
-                    return (res2.HashUpper, res2.BytesWritten, true);
-            }
-            catch
-            {
-                try { if (File.Exists(tempPath)) File.Delete(tempPath); } catch { }
-            }
-
-            try
-            {
-                await using var src3 = new FileStream(spoolPath, FileMode.Open, FileAccess.Read, FileShare.Read, CdnBufferSize, FileOptions.SequentialScan | FileOptions.Asynchronous);
-                var res3 = await CopyRawToFileAndHashAsync(src3, tempPath, expectedRawSize, ct).ConfigureAwait(false);
-                if (TryMatches(res3))
-                    return (res3.HashUpper, res3.BytesWritten, false);
-            }
-            catch
-            {
-                try { if (File.Exists(tempPath)) File.Delete(tempPath); } catch { }
-            }
-
-            await using var src4 = new FileStream(spoolPath, FileMode.Open, FileAccess.Read, FileShare.Read, CdnBufferSize, FileOptions.SequentialScan | FileOptions.Asynchronous);
-            using var xor4 = new LimitedXorStream(src4, src4.Length, 42);
-            var res4 = await CopyRawToFileAndHashAsync(xor4, tempPath, expectedRawSize, ct).ConfigureAwait(false);
-            return (res4.HashUpper, res4.BytesWritten, true);
-        }
-        finally
-        {
-            try { if (File.Exists(spoolPath)) File.Delete(spoolPath); } catch { }
-            CdnDecodeConcurrencySemaphore.Release();
-        }
-    }
-
-    private async Task<(string ComputedHash, long BytesWritten, bool UsedXorCompat)> DecodeHeaderlessBytesWithCompatAsync(byte[] payloadBuffer, int payloadLength, string tempPath,long expectedRawSize, string expectedHash, CancellationToken ct)
-    {
-        try
-        {
-            using (var src = new MemoryStream(payloadBuffer, 0, payloadLength, writable: false, publiclyVisible: true))
-            {
-                var (hash, bytes) = await DecompressLz4ToFileAndHashAsync(src, tempPath, expectedRawSize, ct).ConfigureAwait(false);
-                if (bytes > 0 && string.Equals(hash, expectedHash, StringComparison.OrdinalIgnoreCase))
-                    return (hash, bytes, false);
-            }
-        }
-        catch
-        {
-            try { if (File.Exists(tempPath)) File.Delete(tempPath); } catch { }
-        }
-
-        try
-        {
-            using (var src = new MemoryStream(payloadBuffer, 0, payloadLength, writable: false, publiclyVisible: true))
-            using (var xor = new LimitedXorStream(src, payloadLength, 42))
-            {
-                var (hash, bytes) = await DecompressLz4ToFileAndHashAsync(xor, tempPath, expectedRawSize, ct).ConfigureAwait(false);
-                if (bytes > 0 && string.Equals(hash, expectedHash, StringComparison.OrdinalIgnoreCase))
-                    return (hash, bytes, true);
-            }
-        }
-        catch
-        {
-            try { if (File.Exists(tempPath)) File.Delete(tempPath); } catch { }
-        }
-
-        try
-        {
-            using (var src = new MemoryStream(payloadBuffer, 0, payloadLength, writable: false, publiclyVisible: true))
-            {
-                var (hash, bytes) = await CopyRawToFileAndHashAsync(src, tempPath, expectedRawSize, ct).ConfigureAwait(false);
-                if (bytes > 0 && string.Equals(hash, expectedHash, StringComparison.OrdinalIgnoreCase))
-                    return (hash, bytes, false);
-            }
-        }
-        catch
-        {
-            try { if (File.Exists(tempPath)) File.Delete(tempPath); } catch { }
-        }
-
-        using (var src = new MemoryStream(payloadBuffer, 0, payloadLength, writable: false, publiclyVisible: true))
-        using (var xor = new LimitedXorStream(src, payloadLength, 42))
-        {
-            var (hash, bytes) = await CopyRawToFileAndHashAsync(xor, tempPath, expectedRawSize, ct).ConfigureAwait(false);
-            return (hash, bytes, true);
-        }
-    }
-
-    private async Task<(string ComputedHash, long BytesWritten)> DecodeHeaderedBytesAsync(byte[] payloadBuffer, int payloadLength, bool munged, string tempPath, long expectedRawSize, CancellationToken ct)
-    {
-        using var src = new MemoryStream(payloadBuffer, 0, payloadLength, writable: false, publiclyVisible: true);
-        Stream payloadStream = munged ? new LimitedXorStream(src, payloadLength, 42) : src;
-        using (payloadStream)
-        {
-            return await DecompressLz4ToFileAndHashAsync(payloadStream, tempPath, expectedRawSize, ct).ConfigureAwait(false);
-        }
-    }
-
-    private async Task<(byte[] Buffer, int Length)> ReadSmallPayloadToPooledBufferAsync(Stream input, long maxBytes, Action<long> progress, CancellationToken ct)
-    {
-        if (maxBytes <= 0 || maxBytes > int.MaxValue)
-            throw new InvalidDataException($"Invalid small payload size {maxBytes}");
-
-        var length = (int)maxBytes;
-        var payloadBuffer = ArrayPool<byte>.Shared.Rent(length);
-        var offset = 0;
-        long sinceYield = 0;
-        long sinceMicroPause = 0;
-
-        try
-        {
-            while (offset < length)
-            {
-                var want = Math.Min(CdnBufferSize, length - offset);
-                var read = await input.ReadAsync(payloadBuffer.AsMemory(offset, want), ct).ConfigureAwait(false);
-                if (read <= 0)
-                    throw new EndOfStreamException($"CDN payload ended early, expected {length} bytes but only received {offset}");
-
-                offset += read;
-                progress(read);
-                sinceYield += read;
-                sinceMicroPause += read;
-
-                if (sinceYield >= CdnSmoothYieldEveryBytes)
-                {
-                    var microPause = sinceMicroPause >= CdnSmoothMicroPauseEveryBytes;
-                    sinceYield = 0;
-                    if (microPause)
-                        sinceMicroPause = 0;
-
-                    await YieldForDownloadResponsivenessAsync(microPause, ct).ConfigureAwait(false);
-                }
-            }
-
-            return (payloadBuffer, length);
-        }
-        catch
-        {
-            ArrayPool<byte>.Shared.Return(payloadBuffer);
-            throw;
-        }
-    }
-    private async Task<bool> TryDownloadFilesFromCdnAsync(GameObjectHandler gameObjectHandler, IGrouping<string, DownloadFileTransfer> fileGroup, List<FileReplacementData> fileReplacement, CancellationToken ct)
-    {
-
-        var success = false;
-        List<DownloadFileTransfer>? transfers = null;
-
-        try
-        {
-            if (_orchestrator.FilesCdnUri == null) return false;
-
-            transfers = fileGroup.ToList();
-            if (transfers.Count == 0) return true;
-
-            var fileExtByHash = fileReplacement
-                .Where(f => !string.IsNullOrEmpty(f.Hash) && f.GamePaths != null && f.GamePaths.Count() > 0)
-                .GroupBy(f => f.Hash, StringComparer.OrdinalIgnoreCase)
-                .ToDictionary(g => g.Key, g =>
-                {
-                    var gp = g.First().GamePaths[0];
-                    if (string.IsNullOrEmpty(gp)) return "dat";
-
-                    var dot = gp.LastIndexOf('.');
-                    return (dot >= 0 && dot < gp.Length - 1) ? gp[(dot + 1)..] : "dat";
-                }, StringComparer.OrdinalIgnoreCase);
-
-            var configured = _mareConfigService.Current.ParallelDownloads;
-            var tinyFileHeavy = IsTinyFileHeavy(transfers);
-
-            // 0 => Auto (adaptive)
-            var cdnParallel = GetCdnParallelTarget(configured, transfers.Count);
-            if (configured <= 0 && tinyFileHeavy)
-            {
-                var tinyMax = Math.Min(GetEffectiveTinyFileParallelMax(), transfers.Count);
-                cdnParallel = Math.Clamp(Math.Max(cdnParallel, tinyMax), 1, tinyMax);
-            }
-            else
-            {
-                cdnParallel = Math.Min(cdnParallel, transfers.Count);
-            }
-
-            var anyFailure = new int[1];
-            var anyTimeoutOrBackoff = new int[1];
-            var anySlow = new int[1];
-            var downloadedStageCount = new int[1];
-
-            var spooledFiles = new ConcurrentBag<CdnSpooledFile>();
-            var results = new ConcurrentBag<CdnDownloadedFile>();
-            var inMemorySpoolBudget = new CdnInMemorySpoolBudget();
-            var decodeParallel = Math.Clamp(GetCdnDecodeParallelism(), 1, Math.Max(1, Math.Min(transfers.Count, GetCdnDecodeParallelism())));
-            // Do not let decompression throttle transfer speed. Payloads are bounded by the in-memory spool
-            // budget and otherwise live as spool files, so the fetch side can finish fast while the low-priority
-            // decode lane drains afterwards and the UI honestly reports Decompressing.
-            using var decodeQueue = new BlockingCollection<CdnSpooledFile>();
-            var groupKey = fileGroup.Key;
-
-            if (_downloadStatus.TryGetValue(groupKey, out var statusStart))
-            {
-                lock (statusStart)
-                {
-                    statusStart.DownloadStatus = DownloadStatus.Downloading;
-                }
-
-                PublishDownloadStatus(gameObjectHandler);
-            }
-
-            var decodeWorkers = new List<Task>(decodeParallel);
-
-            for (var i = 0; i < decodeParallel; i++)
-            {
-                decodeWorkers.Add(StartLowPriorityCdnDecodeWorker(
-                    decodeQueue,
-                    results,
-                    anyFailure,
-                    anySlow,
-                    ct));
-            }
-
-            var index = -1;
-            var workers = new List<Task>(cdnParallel);
-
-
-            for (int i = 0; i < cdnParallel; i++)
-            {
-                workers.Add(Task.Run(async () =>
-                {
-                    while (!ct.IsCancellationRequested && Volatile.Read(ref anyFailure[0]) == 0)
-                    {
-                        var j = Interlocked.Increment(ref index);
-                        if (j >= transfers.Count) break;
-
-                        await DownloadOneFromCdnToSpoolAsync(
-                            gameObjectHandler,
-                            groupKey,
-                            fileExtByHash,
-                            spooledFiles,
-                            decodeQueue,
-                            downloadedStageCount,
-                            results,
-                            inMemorySpoolBudget,
-                            transfers[j],
-                            anyFailure,
-                            anyTimeoutOrBackoff,
-                            anySlow,
-                            ct).ConfigureAwait(false);
-                    }
-                }, ct));
-            }
-
-            try
-            {
-                await Task.WhenAll(workers).ConfigureAwait(false);
-                ForceFlushGroupProgress(groupKey);
-            }
-            catch (OperationCanceledException)
-            {
-                Interlocked.Exchange(ref anyFailure[0], 1);
-
-                try { ForceFlushGroupProgress(groupKey); } catch { /* ignore */ }
-
-                if (ct.IsCancellationRequested)
-                {
-                    decodeQueue.CompleteAdding();
-                    try { await Task.WhenAll(decodeWorkers).ConfigureAwait(false); } catch { /* ignore */ }
-                    return false;
-                }
-            }
-            finally
-            {
-                decodeQueue.CompleteAdding();
-            }
-
-            var hadTimeout = Volatile.Read(ref anyTimeoutOrBackoff[0]) != 0;
-            var hadSlowLink = Volatile.Read(ref anySlow[0]) != 0;
-
-            if (Volatile.Read(ref anyFailure[0]) != 0 || Volatile.Read(ref downloadedStageCount[0]) != transfers.Count)
-            {
-                Logger.LogDebug("CDN staged-path: at least one file failed during download/spool, falling back to blk pipeline for group {group}", groupKey);
-                try { await Task.WhenAll(decodeWorkers).ConfigureAwait(false); } catch { /* ignore */ }
-                CleanupSpooledFiles(spooledFiles);
-                UpdateAutoCdnParallel(cdnParallel, success: false, hadTimeoutOrBackoff: hadTimeout, hadSlow: hadSlowLink);
-                return false;
-            }
-
-            if (results.Count < transfers.Count && _downloadStatus.TryGetValue(groupKey, out var statusDecode))
-            {
-                lock (statusDecode)
-                {
-                    statusDecode.DownloadStatus = DownloadStatus.Decompressing;
-                }
-
-                PublishDownloadStatus(gameObjectHandler);
-            }
-
-            try
-            {
-                await Task.WhenAll(decodeWorkers).ConfigureAwait(false);
-            }
-            catch (OperationCanceledException)
-            {
-                Interlocked.Exchange(ref anyFailure[0], 1);
-                if (ct.IsCancellationRequested)
-                {
-                    CleanupSpooledFiles(spooledFiles);
-                    return false;
-                }
-            }
-
-            if (Volatile.Read(ref anyFailure[0]) != 0 || results.Count != transfers.Count)
-            {
-                Logger.LogDebug("CDN staged-path: at least one file failed during decode/finalize, falling back to blk pipeline for group {group}", groupKey);
-                CleanupSpooledFiles(spooledFiles);
-                UpdateAutoCdnParallel(cdnParallel, success: false, hadTimeoutOrBackoff: hadTimeout, hadSlow: true);
-                return false;
-            }
-
-            try
-            {
-                RegisterAndReleaseCompletedCdnFiles(results);
-            }
-            catch
-            {
-                UpdateAutoCdnParallel(cdnParallel, success: false, hadTimeoutOrBackoff: hadTimeout, hadSlow: true);
-                return false;
-            }
-
-            if (_downloadStatus.TryGetValue(groupKey, out var status))
-            {
-                lock (status)
-                {
-                    status.DownloadStatus = DownloadStatus.Downloading;
-                }
-            }
-            PublishDownloadStatus(gameObjectHandler);
-
-            Logger.LogDebug("CDN staged-path: completed all files for group {group} via CDN", groupKey);
-            success = true;
-
-            UpdateAutoCdnParallel(cdnParallel, success: true, hadTimeoutOrBackoff: hadTimeout, hadSlow: hadSlowLink);
-            return true;
-        }
-        finally
-        {
-            if (!success && transfers != null)
-                ReleaseInflight(transfers);
-        }
-
-    }
-
-    private async Task DownloadOneFromCdnToSpoolAsync(GameObjectHandler gameObjectHandler, string groupKey, Dictionary<string, string> fileExtByHash, ConcurrentBag<CdnSpooledFile> spooledFiles, BlockingCollection<CdnSpooledFile> decodeQueue, int[] downloadedStageCount, ConcurrentBag<CdnDownloadedFile> results, CdnInMemorySpoolBudget inMemorySpoolBudget, DownloadFileTransfer transfer, int[] anyFailure, int[] anyTimeoutOrBackoff, int[] anySlow, CancellationToken ct)
-    {
-        try
-        {
-            var attempts = 0;
-            string? plannedCdnUrl = null;
-
-            while (attempts++ < MaxCdnAttemptsPerFile && !ct.IsCancellationRequested)
-            {
-                var baseCdnUrl = MareFiles
-                    .CdnGetFullPath(_orchestrator.FilesCdnUri!, transfer.Hash.ToUpperInvariant())
-                    .ToString();
-
-                if (transfer.IsRawPayload)
-                    baseCdnUrl = AppendRawV2CacheKeyQuery(baseCdnUrl);
-
-                var isCacheBusted = plannedCdnUrl != null;
-                var cdnUrl = plannedCdnUrl ?? baseCdnUrl;
-                plannedCdnUrl = null;
-
-                long attemptProgressBytes = 0;
-                long attemptProgressFiles = 0;
-                string? spoolPath = null;
-                byte[]? inMemoryPayload = null;
-                int inMemoryPayloadLength = 0;
-                long inMemoryBudgetReservation = 0;
-
-                void ReleaseInMemoryPayload()
-                {
-                    if (inMemoryPayload != null)
-                    {
-                        try { ArrayPool<byte>.Shared.Return(inMemoryPayload); } catch { }
-                        inMemoryPayload = null;
-                    }
-
-                    if (inMemoryBudgetReservation > 0)
-                    {
-                        inMemorySpoolBudget.Release(inMemoryBudgetReservation);
-                        inMemoryBudgetReservation = 0;
-                    }
-                }
-
-                void CleanupAttemptSpool()
-                {
-                    if (!string.IsNullOrWhiteSpace(spoolPath))
-                        CleanupFailedCdnDownload(spoolPath);
-
-                    ReleaseInMemoryPayload();
-                }
-
-                void AddAttemptProgress(long read)
-                {
-                    if (read <= 0)
-                        return;
-
-                    Interlocked.Add(ref attemptProgressBytes, read);
-                    AddGroupProgress(gameObjectHandler, groupKey, read, 0);
-                }
-
-                void CommitAttemptFile()
-                {
-                    Interlocked.Exchange(ref attemptProgressFiles, 1);
-                    AddGroupProgress(gameObjectHandler, groupKey, 0, 1);
-                }
-
-                void RollbackAttemptProgress()
-                {
-                    var bytes = Interlocked.Exchange(ref attemptProgressBytes, 0);
-                    if (bytes > 0)
-                        AddGroupProgress(gameObjectHandler, groupKey, -bytes, 0);
-
-                    var files = Interlocked.Exchange(ref attemptProgressFiles, 0);
-                    if (files > 0)
-                        AddGroupProgress(gameObjectHandler, groupKey, 0, -files);
-                }
-
-                Logger.LogDebug("CDN staged-path: downloading {hash} from {url} (attempt {attempt}/{max})",
-                    transfer.Hash, cdnUrl, attempts, MaxCdnAttemptsPerFile);
-
-                try
-                {
-                    using var attemptCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-                    attemptCts.CancelAfter(CdnAttemptTimeout);
-                    var attemptToken = attemptCts.Token;
-
-                    using var response = await _cdnFastClient
-                        .GetAsync(cdnUrl, HttpCompletionOption.ResponseHeadersRead, attemptToken)
-                        .ConfigureAwait(false);
-
-                    if (!response.IsSuccessStatusCode)
-                    {
-                        if (response.StatusCode == HttpStatusCode.NotFound && attempts >= MaxCdnAttemptsPerFile)
-                        {
-                            var repairAttempts = _centralFileRepairAttemptsByHash.AddOrUpdate(
-                                transfer.Hash,
-                                1,
-                                (_, current) => current + 1);
-
-                            if (repairAttempts <= MaxCentralFileRepairAttemptsPerFile)
-                            {
-                                PublishCentralFileRepairRequest(
-                                    transfer.Hash,
-                                    isCacheBusted ? "final cache-busted CDN 404" : "final CDN 404");
-
-                                Logger.LogWarning(
-                                    "Waiting {delay}s for central B2 repair upload of {hash}, then retrying CDN download. Repair attempt {attempt}/{max}",
-                                    CentralFileRepairGraceDelay.TotalSeconds,
-                                    transfer.Hash,
-                                    repairAttempts,
-                                    MaxCentralFileRepairAttemptsPerFile);
-
-                                await Task.Delay(CentralFileRepairGraceDelay, ct).ConfigureAwait(false);
-
-                                plannedCdnUrl = AppendCacheBustQuery(baseCdnUrl);
-                                attempts = 0;
-                                continue;
-                            }
-
-                            Logger.LogWarning(
-                                "Central B2 repair retry limit reached for {hash}; continuing normal CDN failure handling",
-                                transfer.Hash);
-                        }
-                        else if (response.StatusCode == HttpStatusCode.NotFound && !isCacheBusted &&
-                                                                            TryPlanCdn404SelfHeal(transfer.Hash, baseCdnUrl, response,
-                                out var cacheBustUrl, out var cfCacheStatus, out var age, out var cfRay, out var reason))
-                        {
-                            plannedCdnUrl = cacheBustUrl;
-
-                            Logger.LogDebug(
-                                "CDN staged-path: 404 for {hash} ({cfCacheStatus}, age {age}); self-heal retry via cache-bust: {url} ({reason})",
-                                transfer.Hash,
-                                cfCacheStatus ?? "n/a",
-                                age ?? "n/a",
-                                cacheBustUrl,
-                                reason);
-
-                            continue;
-                        }
-
-                        if ((int)response.StatusCode == 429)
-                        {
-                            Interlocked.Exchange(ref anyTimeoutOrBackoff[0], 1);
-
-                            var delayMs = Math.Min(2000, 250 * attempts);
-                            await Task.Delay(delayMs, attemptToken).ConfigureAwait(false);
-                            continue;
-                        }
-
-                        if (response.StatusCode == HttpStatusCode.RequestTimeout ||
-                            response.StatusCode == HttpStatusCode.BadGateway ||
-                            response.StatusCode == HttpStatusCode.ServiceUnavailable ||
-                            response.StatusCode == HttpStatusCode.GatewayTimeout)
-                        {
-                            Interlocked.Exchange(ref anyTimeoutOrBackoff[0], 1);
-                            continue;
-                        }
-
-                        response.EnsureSuccessStatusCode();
-                    }
-
-                    await using var rawStream = await response.Content.ReadAsStreamAsync(attemptToken).ConfigureAwait(false);
-
-                    var firstByteBuf = new byte[1];
-                    var read0 = await rawStream.ReadAsync(firstByteBuf.AsMemory(0, 1), attemptToken).ConfigureAwait(false);
-                    if (read0 <= 0) throw new InvalidDataException("CDN response stream was empty");
-
-                    using var respStream = new PrefixedReadStream(rawStream, firstByteBuf, read0);
-                    var b0 = firstByteBuf[0];
-                    var looksHeadered = b0 == (byte)'#' || (byte)(b0 ^ 42) == (byte)'#';
-
-                    string headerHash = transfer.Hash;
-                    long payloadLen = -1;
-                    bool munged = false;
-
-                    if (looksHeadered)
-                    {
-                        (headerHash, payloadLen, munged) = await ReadCdnHeaderAsync(respStream, attemptToken).ConfigureAwait(false);
-
-                        if (!string.Equals(headerHash, transfer.Hash, StringComparison.OrdinalIgnoreCase))
-                            throw new InvalidDataException($"CDN staged-path: header hash mismatch for {transfer.Hash}, got {headerHash}");
-
-                        if (payloadLen <= 0)
-                            throw new InvalidDataException($"CDN staged-path: invalid payload length {payloadLen} for {transfer.Hash}");
-                    }
-
-                    var ext = fileExtByHash.TryGetValue(headerHash, out var e) ? e : "dat";
-                    var finalPath = _fileDbManager.GetCacheFilePath(headerHash, ext);
-                    EnsureDirectoryForFile(finalPath);
-
-                    var tempPath = CreateTempDownloadPath(finalPath);
-                    var compressedBytes = 0L;
-
-                    if (looksHeadered && transfer.IsRawPayload)
-                    {
-                        var directSw = Stopwatch.StartNew();
-
-                        try
-                        {
-                            await using var payloadStream = new LimitedXorStream(respStream, payloadLen, munged ? (byte)42 : (byte)0);
-                            using var progressStream = new ProgressReadStream(payloadStream, read =>
-                            {
-                                AddAttemptProgress(read);
-                            });
-
-                            var expectedRaw = transfer.TotalRaw > 0 ? transfer.TotalRaw : payloadLen;
-                            var copied = await CopyRawToFileAndHashAsync(
-                                progressStream,
-                                tempPath,
-                                expectedRaw,
-                                attemptToken).ConfigureAwait(false);
-
-                            var bytesWritten = copied.BytesWritten;
-
-                            if (!string.Equals(copied.HashUpper, headerHash, StringComparison.OrdinalIgnoreCase))
-                                throw new InvalidDataException($"CDN raw-stream: raw hash mismatch for {transfer.Hash}, got {copied.HashUpper}, expected {headerHash}");
-
-                            directSw.Stop();
-
-                            if (bytesWritten <= 0)
-                                throw new InvalidDataException($"CDN raw-stream: payload was empty for {transfer.Hash}");
-
-                            if (bytesWritten >= (2 * 1024 * 1024) && directSw.Elapsed.TotalSeconds >= 1.0)
-                            {
-                                var bps = (long)(bytesWritten / directSw.Elapsed.TotalSeconds);
-                                if (bps < AutoCdnSlowBpsThreshold)
-                                    Interlocked.Exchange(ref anySlow[0], 1);
-                            }
-
-                            try
-                            {
-                                File.Move(tempPath, finalPath, overwrite: true);
-                            }
-                            catch (Exception ex)
-                            {
-                                throw new IOException($"CDN raw-stream: failed to finalize {transfer.Hash} to {finalPath}", ex);
-                            }
-
-                            results.Add(new CdnDownloadedFile(headerHash, finalPath));
-                            RegisterAndReleaseCompletedCdnFile(headerHash, finalPath);
-                            Interlocked.Increment(ref downloadedStageCount[0]);
-
-                            _cdn404State.TryRemove(headerHash, out _);
-                            _cdn404State.TryRemove(transfer.Hash, out _);
-
-                            CommitAttemptFile();
-                            return;
-                        }
-                        catch
-                        {
-                            CleanupFailedCdnDownload(tempPath);
-                            throw;
-                        }
-                    }
-
-                    var directDecodeSlotTaken = false;
-                    if (looksHeadered && payloadLen > 0 && payloadLen <= CdnDirectStreamMaxPayloadBytes)
-                        directDecodeSlotTaken = await CdnDecodeConcurrencySemaphore.WaitAsync(0, attemptToken).ConfigureAwait(false);
-
-                    if (directDecodeSlotTaken)
-                    {
-                        var directSw = Stopwatch.StartNew();
-
-                        try
-                        {
-                            await using var payloadStream = new LimitedXorStream(respStream, payloadLen, munged ? (byte)42 : (byte)0);
-                            using var progressStream = new ProgressReadStream(payloadStream, read =>
-                            {
-                                AddAttemptProgress(read);
-                            });
-
-                            var decoded = await DecompressLz4ToFileAndHashAsync(
-                                progressStream,
-                                tempPath,
-                                transfer.TotalRaw,
-                                attemptToken).ConfigureAwait(false);
-
-                            var bytesWritten = decoded.BytesWritten;
-
-                            if (!string.Equals(decoded.HashUpper, headerHash, StringComparison.OrdinalIgnoreCase))
-                                throw new InvalidDataException($"CDN direct-stream: raw hash mismatch for {transfer.Hash}, got {decoded.HashUpper}, expected {headerHash}");
-
-                            directSw.Stop();
-
-                            if (bytesWritten <= 0)
-                                throw new InvalidDataException($"CDN direct-stream: decoded payload was empty for {transfer.Hash}");
-
-                            if (bytesWritten >= (2 * 1024 * 1024) && directSw.Elapsed.TotalSeconds >= 1.0)
-                            {
-                                var bps = (long)(bytesWritten / directSw.Elapsed.TotalSeconds);
-                                if (bps < AutoCdnSlowBpsThreshold)
-                                    Interlocked.Exchange(ref anySlow[0], 1);
-                            }
-
-                            try
-                            {
-                                File.Move(tempPath, finalPath, overwrite: true);
-                            }
-                            catch (Exception ex)
-                            {
-                                throw new IOException($"CDN direct-stream: failed to finalize {transfer.Hash} to {finalPath}", ex);
-                            }
-
-                            results.Add(new CdnDownloadedFile(headerHash, finalPath));
-                            RegisterAndReleaseCompletedCdnFile(headerHash, finalPath);
-                            Interlocked.Increment(ref downloadedStageCount[0]);
-
-                            _cdn404State.TryRemove(headerHash, out _);
-                            _cdn404State.TryRemove(transfer.Hash, out _);
-
-                            CommitAttemptFile();
-                            return;
-                        }
-                        catch
-                        {
-                            CleanupFailedCdnDownload(tempPath);
-                            throw;
-                        }
-                        finally
-                        {
-                            CdnDecodeConcurrencySemaphore.Release();
-                        }
-                    }
-
-                    var canKeepPayloadInMemory = looksHeadered
-                        && payloadLen > 0
-                        && payloadLen <= GetEffectiveInMemorySpoolPayloadBudgetBytes()
-                        && inMemorySpoolBudget.TryReserve(payloadLen);
-
-                    if (canKeepPayloadInMemory)
-                    {
-                        inMemoryBudgetReservation = payloadLen;
-                        await using var payloadStream = new LimitedXorStream(respStream, payloadLen, munged ? (byte)42 : (byte)0);
-                        (inMemoryPayload, inMemoryPayloadLength) = await ReadSmallPayloadToPooledBufferAsync(payloadStream, payloadLen, read =>
-                        {
-                            AddAttemptProgress(read);
-                        }, attemptToken).ConfigureAwait(false);
-
-                        compressedBytes = inMemoryPayloadLength;
-                    }
-                    else
-                    {
-                        spoolPath = tempPath + ".spool." + Guid.NewGuid().ToString("N");
-
-                        await CdnSpoolFileWriteSemaphore.WaitAsync(attemptToken).ConfigureAwait(false);
-                        try
-                        {
-                            await using (var spoolOut = new FileStream(
-                                spoolPath,
-                                new FileStreamOptions
-                                {
-                                    Access = FileAccess.Write,
-                                    Mode = FileMode.Create,
-                                    Share = FileShare.None,
-                                    Options = FileOptions.Asynchronous | FileOptions.SequentialScan,
-                                    BufferSize = CdnBufferSize
-                                }))
-                            {
-                                if (looksHeadered)
-                                {
-                                    await using var payloadStream = new LimitedXorStream(respStream, payloadLen, munged ? (byte)42 : (byte)0);
-                                    await CopyExactlyWithProgressAsync(payloadStream, spoolOut, payloadLen, read =>
-                                    {
-                                        AddAttemptProgress(read);
-                                    }, attemptToken).ConfigureAwait(false);
-                                }
-                                else
-                                {
-                                    await CopyToWithProgressAsync(respStream, spoolOut, read =>
-                                    {
-                                        AddAttemptProgress(read);
-                                    }, attemptToken).ConfigureAwait(false);
-                                }
-                            }
-                        }
-                        finally
-                        {
-                            CdnSpoolFileWriteSemaphore.Release();
-                        }
-
-                        var fi = new FileInfo(spoolPath);
-                        if (!fi.Exists || fi.Length <= 0)
-                            throw new InvalidDataException($"CDN staged-path: spooled payload was empty for {transfer.Hash}");
-
-                        if (looksHeadered && payloadLen > 0 && fi.Length != payloadLen)
-                            throw new InvalidDataException($"CDN staged-path: spooled payload size mismatch for {transfer.Hash} (expected {payloadLen}, got {fi.Length})");
-
-                        compressedBytes = fi.Length;
-                    }
-
-                    if (compressedBytes <= 0)
-                        throw new InvalidDataException($"CDN staged-path: spooled payload was empty for {transfer.Hash}");
-
-                    var spooled = new CdnSpooledFile(
-                        transfer,
-                        headerHash,
-                        spoolPath,
-                        inMemoryPayload,
-                        inMemoryPayloadLength,
-                        inMemoryBudgetReservation,
-                        inMemorySpoolBudget,
-                        tempPath,
-                        finalPath,
-                        looksHeadered,
-                        transfer.TotalRaw,
-                        compressedBytes);
-
-                    spooledFiles.Add(spooled);
-                    decodeQueue.Add(spooled, ct);
-                    Interlocked.Increment(ref downloadedStageCount[0]);
-
-                    inMemoryPayload = null;
-                    inMemoryPayloadLength = 0;
-                    inMemoryBudgetReservation = 0;
-
-                    _cdn404State.TryRemove(headerHash, out _);
-                    _cdn404State.TryRemove(transfer.Hash, out _);
-
-                    CommitAttemptFile();
-                    return;
-                }
-                catch (OperationCanceledException oce) when (!ct.IsCancellationRequested)
-                {
-                    Interlocked.Exchange(ref anyTimeoutOrBackoff[0], 1);
-                    CleanupAttemptSpool();
-                    RollbackAttemptProgress();
-
-                    Logger.LogWarning(oce,
-                        "CDN staged-path: timeout while downloading {hash} from {url}, attempt {attempt}/{max}",
-                        transfer.Hash, cdnUrl, attempts, MaxCdnAttemptsPerFile);
-
-                    if (attempts >= MaxCdnAttemptsPerFile)
-                    {
-                        Interlocked.Exchange(ref anyFailure[0], 1);
-                        return;
-                    }
-
-                    continue;
-                }
-                catch (OperationCanceledException)
-                {
-                    CleanupAttemptSpool();
-                    RollbackAttemptProgress();
-                    Interlocked.Exchange(ref anyFailure[0], 1);
-                    throw;
-                }
-                catch (IOException ioEx)
-                {
-                    Logger.LogDebug(ioEx,
-                        "CDN staged-path: IO error for {hash} (attempt {attempt}/{max})",
-                        transfer.Hash, attempts, MaxCdnAttemptsPerFile);
-
-                    CleanupAttemptSpool();
-                    RollbackAttemptProgress();
-
-                    try
-                    {
-                        var ext2 = fileExtByHash.TryGetValue(transfer.Hash, out var e2) ? e2 : "dat";
-                        var finalPath2 = _fileDbManager.GetCacheFilePath(transfer.Hash, ext2);
-
-                        if (File.Exists(finalPath2) && ValidateDownloadedFileLowPri(finalPath2, transfer.Hash, expectedRawSize: 0, ct))
-                        {
-                            RegisterAndReleaseCompletedCdnFile(transfer.Hash, finalPath2);
-                            results.Add(new CdnDownloadedFile(transfer.Hash, finalPath2));
-                            Interlocked.Increment(ref downloadedStageCount[0]);
-
-                            _cdn404State.TryRemove(transfer.Hash, out _);
-                            AddGroupProgress(gameObjectHandler, groupKey, transfer.Total, 1);
-                            return;
-                        }
-                    }
-                    catch { /* ignore */ }
-
-                    if (attempts >= MaxCdnAttemptsPerFile)
-                    {
-                        Interlocked.Exchange(ref anyFailure[0], 1);
-                        return;
-                    }
-
-                    continue;
-                }
-                catch (Exception ex)
-                {
-                    CleanupAttemptSpool();
-                    RollbackAttemptProgress();
-
-                    if (ex is OperationCanceledException || ex.GetBaseException() is OperationCanceledException)
-                    {
-                        if (ct.IsCancellationRequested)
-                            throw;
-
-                        Interlocked.Exchange(ref anyTimeoutOrBackoff[0], 1);
-
-                        Logger.LogDebug(
-                            "CDN staged-path: cancelled while downloading {hash} from {url}, attempt {attempt}/{max}",
-                            transfer.Hash, cdnUrl, attempts, MaxCdnAttemptsPerFile);
-
-                        if (attempts >= MaxCdnAttemptsPerFile)
-                        {
-                            Interlocked.Exchange(ref anyFailure[0], 1);
-                            return;
-                        }
-
-                        continue;
-                    }
-
-                    Logger.LogWarning(ex,
-                        "CDN staged-path: error while downloading {hash} from {url}, attempt {attempt}/{max}",
-                        transfer.Hash, cdnUrl, attempts, MaxCdnAttemptsPerFile);
-
-                    if (attempts >= MaxCdnAttemptsPerFile)
-                    {
-                        if (IsLikelyCdnPayloadDecodeFailure(ex))
-                        {
-                            var root = ex.GetBaseException();
-
-                            TryPublishCentralFileRepairRequest(
-                                transfer.Hash,
-                                $"CDN payload failed during download/decode; {root.GetType().Name}: {root.Message}");
-                        }
-
-                        Interlocked.Exchange(ref anyFailure[0], 1);
-                        return;
-                    }
-                }
-            }
-
-            Interlocked.Exchange(ref anyFailure[0], 1);
-            Logger.LogWarning(
-                "CDN staged-path: all {max} attempts failed for {hash}, treating as failed for group {group}",
-                MaxCdnAttemptsPerFile,
-                transfer.Hash,
-                groupKey);
-        }
-        catch (OperationCanceledException)
-        {
-            Interlocked.Exchange(ref anyFailure[0], 1);
-            throw;
-        }
-    }
-
-    private Task StartLowPriorityCdnDecodeWorker(BlockingCollection<CdnSpooledFile> decodeQueue, ConcurrentBag<CdnDownloadedFile> results, int[] anyFailure, int[] anySlow, CancellationToken ct)
-    {
-        var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-
-        var thread = new Thread(() =>
-        {
-            try
-            {
-                EnterCdnBackgroundThreadMode("RavaSync CDN Decode");
-
-                foreach (var spooled in decodeQueue.GetConsumingEnumerable(ct))
-                {
-                    if (Volatile.Read(ref anyFailure[0]) != 0)
-                    {
-                        try { if (File.Exists(spooled.TempPath)) File.Delete(spooled.TempPath); } catch { }
-                        CleanupSpooledPayload(spooled);
-                        continue;
-                    }
-
-                    DecodeOneCdnSpoolLowImpact(spooled, results, anyFailure, anySlow, ct);
-                }
-
-                completion.TrySetResult();
-            }
-            catch (OperationCanceledException ex)
-            {
-                if (ct.IsCancellationRequested)
-                    completion.TrySetCanceled(ct);
-                else
-                {
-                    Interlocked.Exchange(ref anyFailure[0], 1);
-                    completion.TrySetException(ex);
-                }
-            }
-            catch (Exception ex)
-            {
-                Interlocked.Exchange(ref anyFailure[0], 1);
-                completion.TrySetException(ex);
-            }
-        })
-        {
-            IsBackground = true,
-            Priority = ThreadPriority.BelowNormal
-        };
-
-        thread.Start();
-        return completion.Task;
-    }
-
-    private static void EnterCdnBackgroundThreadMode(string threadName)
-    {
-        try { Thread.CurrentThread.Name = threadName; } catch { /* ignore */ }
-        try { Thread.CurrentThread.Priority = ThreadPriority.BelowNormal; } catch { /* ignore */ }
-
-        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
-            return;
-
-        try { _ = SetThreadPriority(GetCurrentThread(), NativeThreadModeBackgroundBegin); }
-        catch { /* ignore: best-effort OS scheduler hint only */ }
-    }
-
-    private static void LowImpactCpuPause(long bytesSinceLastHardPause, CancellationToken ct)
-    {
-        ct.ThrowIfCancellationRequested();
-
-        // Under Wine/Proton, Thread.Yield can be too polite to the scheduler and still allow long CPU/IO pulses.
-        // Keep Windows fast, but give Wine/Linux a real 1ms breather only at the coarse micro-pause cadence.
-        if (IsWineOrLinuxRuntime && bytesSinceLastHardPause >= CdnSmoothMicroPauseEveryBytes)
-            Thread.Sleep(1);
-        else
-            Thread.Yield();
-    }
-
-    private static (string HashUpper, long BytesWritten) CopyRawToFileAndHashLowImpact(Stream input, string destPath, long expectedRawSize, CancellationToken ct)
-    {
-        using var sha1 = IncrementalHash.CreateHash(HashAlgorithmName.SHA1);
-
-        long total = 0;
-        long sincePause = 0;
-        long sinceHardPause = 0;
-        var buffer = _downloadBufferPool.Rent(CdnSmoothDecodeBufferSize);
-
-        try
-        {
-            using var outFs = new FileStream(destPath, FileMode.Create, FileAccess.Write, FileShare.None, DownloadBufferSize, FileOptions.SequentialScan);
-
-            while (true)
-            {
-                ct.ThrowIfCancellationRequested();
-
-                var read = input.Read(buffer, 0, buffer.Length);
-                if (read <= 0)
-                    break;
-
-                sha1.AppendData(buffer, 0, read);
-                outFs.Write(buffer, 0, read);
-                total += read;
-                sincePause += read;
-                sinceHardPause += read;
-
-                if (expectedRawSize > 0 && total > expectedRawSize)
-                    throw new InvalidDataException($"Raw bytes exceeded expected size (expected {expectedRawSize}, got {total})");
-
-                if (sincePause >= CdnSmoothYieldEveryBytes)
-                {
-                    LowImpactCpuPause(sinceHardPause, ct);
-                    sincePause = 0;
-
-                    if (sinceHardPause >= CdnSmoothMicroPauseEveryBytes)
-                        sinceHardPause = 0;
-                }
-            }
-
-            if (expectedRawSize > 0 && total != expectedRawSize)
-                throw new InvalidDataException($"Raw bytes did not match expected size (expected {expectedRawSize}, got {total})");
-
-            return (Convert.ToHexString(sha1.GetHashAndReset()), total);
-        }
-        finally
-        {
-            _downloadBufferPool.Return(buffer);
-        }
-    }
-
-    private static (string HashUpper, long BytesWritten) DecompressLz4ToFileAndHashLowImpact(Stream input, string destPath, long expectedRawSize, CancellationToken ct)
-    {
-        using var sha1 = IncrementalHash.CreateHash(HashAlgorithmName.SHA1);
-
-        long total = 0;
-        long sincePause = 0;
-        long sinceHardPause = 0;
-        var buffer = _downloadBufferPool.Rent(CdnSmoothDecodeBufferSize);
-
-        try
-        {
-            using var outFs = new FileStream(destPath, FileMode.Create, FileAccess.Write, FileShare.None, DownloadBufferSize, FileOptions.SequentialScan);
-            using var fullReadInput = new FullReadStream(input);
-            using var lz4 = new LZ4Stream(fullReadInput, LZ4StreamMode.Decompress, LZ4StreamFlags.None, Lz4BlockSize);
-
-            while (true)
-            {
-                ct.ThrowIfCancellationRequested();
-
-                var read = lz4.Read(buffer, 0, buffer.Length);
-                if (read <= 0)
-                    break;
-
-                sha1.AppendData(buffer, 0, read);
-                outFs.Write(buffer, 0, read);
-                total += read;
-                sincePause += read;
-                sinceHardPause += read;
-
-                if (expectedRawSize > 0 && total > expectedRawSize)
-                    throw new InvalidDataException($"Decompressed bytes exceeded expected size (expected {expectedRawSize}, got {total})");
-
-                if (sincePause >= CdnSmoothYieldEveryBytes)
-                {
-                    LowImpactCpuPause(sinceHardPause, ct);
-                    sincePause = 0;
-
-                    if (sinceHardPause >= CdnSmoothMicroPauseEveryBytes)
-                        sinceHardPause = 0;
-                }
-            }
-
-            if (expectedRawSize > 0 && total != expectedRawSize)
-                throw new InvalidDataException($"Decompressed bytes did not match expected size (expected {expectedRawSize}, got {total})");
-
-            return (Convert.ToHexString(sha1.GetHashAndReset()), total);
-        }
-        finally
-        {
-            _downloadBufferPool.Return(buffer);
-        }
-    }
-
-    private (string ComputedHash, long BytesWritten, bool UsedXorCompat) DecodeHeaderlessSpoolWithCompatLowImpact(string spoolPath, string tempPath, long expectedRawSize, string expectedHash, CancellationToken ct)
-    {
-        CdnDecodeConcurrencySemaphore.Wait(ct);
-        try
-        {
-            bool TryMatches((string HashUpper, long BytesWritten) res)
-                => res.BytesWritten > 0 && string.Equals(res.HashUpper, expectedHash, StringComparison.OrdinalIgnoreCase);
-
-            try
-            {
-                using var src1 = new FileStream(spoolPath, FileMode.Open, FileAccess.Read, FileShare.Read, CdnBufferSize, FileOptions.SequentialScan);
-                var res1 = DecompressLz4ToFileAndHashLowImpact(src1, tempPath, expectedRawSize, ct);
-                if (TryMatches(res1))
-                    return (res1.HashUpper, res1.BytesWritten, false);
-            }
-            catch
-            {
-                try { if (File.Exists(tempPath)) File.Delete(tempPath); } catch { }
-            }
-
-            try
-            {
-                using var src2 = new FileStream(spoolPath, FileMode.Open, FileAccess.Read, FileShare.Read, CdnBufferSize, FileOptions.SequentialScan);
-                using var xor2 = new LimitedXorStream(src2, src2.Length, 42);
-                var res2 = DecompressLz4ToFileAndHashLowImpact(xor2, tempPath, expectedRawSize, ct);
-                if (TryMatches(res2))
-                    return (res2.HashUpper, res2.BytesWritten, true);
-            }
-            catch
-            {
-                try { if (File.Exists(tempPath)) File.Delete(tempPath); } catch { }
-            }
-
-            try
-            {
-                using var src3 = new FileStream(spoolPath, FileMode.Open, FileAccess.Read, FileShare.Read, CdnBufferSize, FileOptions.SequentialScan);
-                var res3 = CopyRawToFileAndHashLowImpact(src3, tempPath, expectedRawSize, ct);
-                if (TryMatches(res3))
-                    return (res3.HashUpper, res3.BytesWritten, false);
-            }
-            catch
-            {
-                try { if (File.Exists(tempPath)) File.Delete(tempPath); } catch { }
-            }
-
-            using var src4 = new FileStream(spoolPath, FileMode.Open, FileAccess.Read, FileShare.Read, CdnBufferSize, FileOptions.SequentialScan);
-            using var xor4 = new LimitedXorStream(src4, src4.Length, 42);
-            var res4 = CopyRawToFileAndHashLowImpact(xor4, tempPath, expectedRawSize, ct);
-            return (res4.HashUpper, res4.BytesWritten, true);
-        }
-        finally
-        {
-            try { if (File.Exists(spoolPath)) File.Delete(spoolPath); } catch { }
-            CdnDecodeConcurrencySemaphore.Release();
-        }
-    }
-
-    private void DecodeOneCdnSpoolLowImpact(CdnSpooledFile spooled, ConcurrentBag<CdnDownloadedFile> results, int[] anyFailure, int[] anySlow, CancellationToken ct)
-    {
-        var sw = Stopwatch.StartNew();
-
-        try
-        {
-            string computed = spooled.Hash;
-            long bytesWritten;
-            bool usedHeaderlessXorCompat = false;
-
-            if (spooled.IsHeadered)
-            {
-                CdnDecodeConcurrencySemaphore.Wait(ct);
-                try
-                {
-                    if (spooled.InMemoryPayload != null)
-                    {
-                        using var decodeSrc = new MemoryStream(spooled.InMemoryPayload, 0, spooled.InMemoryPayloadLength, writable: false, publiclyVisible: true);
-                        var decoded = DecompressLz4ToFileAndHashLowImpact(decodeSrc, spooled.TempPath, spooled.ExpectedRawSize, ct);
-                        computed = decoded.HashUpper;
-                        bytesWritten = decoded.BytesWritten;
-                    }
-                    else
-                    {
-                        using var decodeSrc = new FileStream(spooled.SpoolPath!, FileMode.Open, FileAccess.Read, FileShare.Read, CdnBufferSize, FileOptions.SequentialScan);
-                        var decoded = DecompressLz4ToFileAndHashLowImpact(decodeSrc, spooled.TempPath, spooled.ExpectedRawSize, ct);
-                        computed = decoded.HashUpper;
-                        bytesWritten = decoded.BytesWritten;
-                    }
-                }
-                finally
-                {
-                    CdnDecodeConcurrencySemaphore.Release();
-                    CleanupSpooledPayload(spooled);
-                }
-            }
-            else
-            {
-                (computed, bytesWritten, usedHeaderlessXorCompat) = DecodeHeaderlessSpoolWithCompatLowImpact(
-                    spooled.SpoolPath!,
-                    spooled.TempPath,
-                    spooled.ExpectedRawSize,
-                    spooled.Hash,
-                    ct);
-            }
-
-            sw.Stop();
-
-            if (usedHeaderlessXorCompat)
-                Logger.LogDebug("CDN staged-path: headerless XOR compat path used for {hash}", spooled.Hash);
-
-            // Decode speed is intentionally allowed to be slower than transfer speed so the game stays smooth.
-            // Do not feed local decompression throughput back into CDN auto-parallel tuning.
-            if (bytesWritten <= 0 || !string.Equals(computed, spooled.Hash, StringComparison.OrdinalIgnoreCase))
-            {
-                Logger.LogWarning(
-                    "CDN staged-path: bad decoded content for {hash} (computed={computed}, bytes={bytes}, expectedRaw={expectedRaw}, compressed={compressed}, headered={headered}); cleaning temp",
-                    spooled.Hash,
-                    computed,
-                    bytesWritten,
-                    spooled.ExpectedRawSize,
-                    spooled.CompressedBytes,
-                    spooled.IsHeadered);
-
-                TryPublishCentralFileRepairRequest(
-                    spooled.Hash,
-                    $"bad decoded CDN payload; computed={computed}; bytes={bytesWritten}; expectedRaw={spooled.ExpectedRawSize}; compressed={spooled.CompressedBytes}; headered={spooled.IsHeadered}");
-
-                CleanupFailedCdnDownload(spooled.TempPath);
-                Interlocked.Exchange(ref anyFailure[0], 1);
-                return;
-            }
-
-            try
-            {
-                File.Move(spooled.TempPath, spooled.FinalPath, overwrite: true);
-            }
-            catch (Exception ex)
-            {
-                Logger.LogWarning(ex, "CDN staged-path: failed to finalize {hash} to {path}", spooled.Hash, spooled.FinalPath);
-                CleanupFailedCdnDownload(spooled.TempPath);
-                Interlocked.Exchange(ref anyFailure[0], 1);
-                return;
-            }
-
-            results.Add(new CdnDownloadedFile(spooled.Hash, spooled.FinalPath));
-            LowImpactCpuPause(bytesWritten, ct);
-        }
-        catch (OperationCanceledException)
-        {
-            CleanupFailedCdnDownload(spooled.TempPath);
-            Interlocked.Exchange(ref anyFailure[0], 1);
-            throw;
-        }
-        catch (Exception ex)
-        {
-            Logger.LogWarning(ex, "CDN staged-path: unexpected decode/finalize error for {hash}", spooled.Hash);
-
-            if (IsLikelyCdnPayloadDecodeFailure(ex))
-            {
-                var root = ex.GetBaseException();
-
-                TryPublishCentralFileRepairRequest(
-                    spooled.Hash,
-                    $"CDN payload decode failed; {root.GetType().Name}: {root.Message}; expectedRaw={spooled.ExpectedRawSize}; compressed={spooled.CompressedBytes}; headered={spooled.IsHeadered}");
-            }
-
-            CleanupFailedCdnDownload(spooled.TempPath);
-            Interlocked.Exchange(ref anyFailure[0], 1);
-        }
-    }
-
-    private void CleanupSpooledPayload(CdnSpooledFile spooled)
-    {
-        if (!string.IsNullOrWhiteSpace(spooled.SpoolPath))
-        {
-            try { if (File.Exists(spooled.SpoolPath)) File.Delete(spooled.SpoolPath); } catch { }
-        }
-
-        if (spooled.InMemoryPayload != null)
-        {
-            try { ArrayPool<byte>.Shared.Return(spooled.InMemoryPayload); } catch { }
-
-            if (spooled.InMemoryBudgetReservation > 0)
-                spooled.InMemoryBudget?.Release(spooled.InMemoryBudgetReservation);
-        }
-    }
-
-    private void RegisterAndReleaseCompletedCdnFile(string hash, string finalPath)
-    {
-        RegisterAndReleaseCompletedCdnFiles([new CdnDownloadedFile(hash, finalPath)]);
-    }
-
-    private void RegisterAndReleaseCompletedCdnFiles(IEnumerable<CdnDownloadedFile> files)
-    {
-        var completed = files
-            .Where(f => !string.IsNullOrWhiteSpace(f.Hash) && !string.IsNullOrWhiteSpace(f.FinalPath))
-            .GroupBy(f => f.Hash, StringComparer.OrdinalIgnoreCase)
-            .Select(g => g.First())
-            .ToList();
-
-        if (completed.Count == 0)
-            return;
-
-        try
-        {
-            for (var offset = 0; offset < completed.Count; offset += CdnFinalCacheRegistrationBatchSize)
-            {
-                var batch = completed
-                    .Skip(offset)
-                    .Take(CdnFinalCacheRegistrationBatchSize)
-                    .ToList();
-
-                _fileDbManager.RegisterDownloadedCacheFiles(batch.Select(f => (f.Hash, f.FinalPath)));
-
-                foreach (var file in batch)
-                    CompleteGlobalInflightDownload(file.Hash, success: true);
-
-                if (offset + CdnFinalCacheRegistrationBatchSize < completed.Count)
-                    Thread.Yield();
-            }
-        }
-        catch (Exception ex)
-        {
-            Logger.LogWarning(ex, "CDN staged-path: failed to register completed CDN cache batch ({count} files)", completed.Count);
-            throw;
-        }
-    }
-
-    private void CleanupSpooledFiles(IEnumerable<CdnSpooledFile> spooledFiles)
-    {
-        foreach (var spooled in spooledFiles)
-        {
-            try { if (File.Exists(spooled.TempPath)) File.Delete(spooled.TempPath); } catch { }
-            CleanupSpooledPayload(spooled);
-        }
-    }
-
-    private bool ExtraContentValidation(string filePath, string hash)
-    {
-        try
-        {
-            var fi = new FileInfo(filePath);
-            if (!fi.Exists)
-            {
-                Logger.LogWarning("ExtraValidation: {file} for {hash} does not exist after download", filePath, hash);
-                return false;
-            }
-
-            try
-            {
-                _ = new MdlFile(filePath);
-                return true;
-            }
-            catch (Exception ex)
-            {
-                Logger.LogWarning(ex,
-                    "ExtraValidation: MDL header parse failed for {file} ({hash}), treating as invalid",
-                    filePath,
-                    hash);
-                return false;
-            }
-        }
-        catch (Exception ex)
-        {
-            Logger.LogWarning(ex,
-                "ExtraValidation: unexpected error while validating {file} ({hash})",
-                filePath,
-                hash);
-            return false;
-        }
-    }
-
-    private static string ComputeFileHashLowImpact(string filePath, CancellationToken ct)
-    {
-        using var sha1 = IncrementalHash.CreateHash(HashAlgorithmName.SHA1);
-        using var fs = new FileStream(
-            filePath,
-            FileMode.Open,
-            FileAccess.Read,
-            FileShare.Read,
-            CdnBufferSize,
-            FileOptions.SequentialScan);
-
-        var buffer = _downloadBufferPool.Rent(CdnSmoothDecodeBufferSize);
-        long sincePause = 0;
-        long sinceHardPause = 0;
-
-        try
-        {
-            while (true)
-            {
-                ct.ThrowIfCancellationRequested();
-
-                var read = fs.Read(buffer, 0, buffer.Length);
-                if (read <= 0)
-                    break;
-
-                sha1.AppendData(buffer, 0, read);
-                sincePause += read;
-                sinceHardPause += read;
-
-                if (sincePause >= CdnSmoothYieldEveryBytes)
-                {
-                    LowImpactCpuPause(sinceHardPause, ct);
-                    sincePause = 0;
-
-                    if (sinceHardPause >= CdnSmoothMicroPauseEveryBytes)
-                        sinceHardPause = 0;
-                }
-            }
-
-            return Convert.ToHexString(sha1.GetHashAndReset());
-        }
-        finally
-        {
-            _downloadBufferPool.Return(buffer);
-        }
-    }
-
-    private bool ValidateDownloadedFileLowPri(string fullPath, string fileHash, long expectedRawSize, CancellationToken ct)
-    {
-        try
-        {
-            const long InlineTinyValidationBytes = 64 * 1024;
-
-            long sizeHint = expectedRawSize;
-            if (sizeHint <= 0)
-            {
-                try
-                {
-                    var fi = new FileInfo(fullPath);
-                    if (fi.Exists)
-                        sizeHint = fi.Length;
-                }
-                catch
-                {
-                    // ignore and fall through to worker path
-                }
-            }
-
-            if (sizeHint > 0 && sizeHint <= InlineTinyValidationBytes)
-            {
-                return ValidateDownloadedFile(fullPath, fileHash, expectedRawSize, ct);
-            }
-
-            CdnValidationConcurrencySemaphore.Wait(ct);
-            try
-            {
-                return ValidateDownloadedFile(fullPath, fileHash, expectedRawSize, ct);
-            }
-            finally
-            {
-                CdnValidationConcurrencySemaphore.Release();
-            }
-        }
-        catch (OperationCanceledException)
-        {
-            return false;
-        }
-        catch
-        {
-            // Conservative: treat failures as invalid so we force a clean redownload.
-            return false;
-        }
-    }
-    private bool ValidateDownloadedFile(string fullPath, string fileHash, long expectedRawSize, CancellationToken ct)
-    {
-        // Conservative: IO errors should not silently "pass" validation, because that allows partial/corrupt files
-        // to persist and potentially crash-loop on apply.
-        try
-        {
-            var fi = new FileInfo(fullPath);
-
-            if (!fi.Exists)
-            {
-                Logger.LogWarning(
-                    "Validation failed for {hash}: file does not exist at {path}",
-                    fileHash, fullPath);
-                return false;
-            }
-
-            if (fi.Length == 0)
-            {
-                Logger.LogWarning(
-                    "Validation failed for {hash}: zero-length file at {path}",
-                    fileHash, fullPath);
-                return false;
-            }
-
-            if (expectedRawSize > 0 && fi.Length != expectedRawSize)
-            {
-                Logger.LogWarning(
-                    "Validation failed for {hash}: size mismatch, expected {expected} but got {actual} at {path}",
-                    fileHash, expectedRawSize, fi.Length, fullPath);
-                return false;
-            }
-
-            string computed;
-            const int MaxIoRetries = 2;
-            for (int attempt = 0; ; attempt++)
-            {
-                try
-                {
-                    computed = ComputeFileHashLowImpact(fi.FullName, ct);
-                    break;
-                }
-                catch (IOException ioEx) when (attempt < MaxIoRetries)
-                {
-                    Logger.LogDebug(ioEx, "IO error while hashing {path} (attempt {attempt}/{max})", fullPath, attempt + 1, MaxIoRetries + 1);
-                    Thread.Yield();
-                    continue;
-                }
-            }
-
-            if (!string.Equals(computed, fileHash, StringComparison.OrdinalIgnoreCase))
-            {
-                Logger.LogWarning(
-                    "Validation failed for {hash}: content hash mismatch, got {actual} for {path}",
-                    fileHash, computed, fullPath);
-                return false;
-            }
-
-            return true;
-        }
-        catch (IOException ioEx)
-        {
-            Logger.LogWarning(
-                ioEx,
-                "IO error during validation of {hash} at {path}; treating as invalid to force clean re-download",
-                fileHash, fullPath);
-            return false;
-        }
-        catch (Exception ex)
-        {
-            Logger.LogWarning(ex, "Validation threw for {hash} at {path}", fileHash, fullPath);
-            return false;
-        }
-    }
-
-
-    private int GetDownloadGroupParallelism(int groupCount)
-    {
-        var max = Math.Min(Environment.ProcessorCount, 3);
-        var configured = _mareConfigService.Current.ParallelDownloads;
-
-        if (configured > 0)
-            return Math.Clamp(Math.Min(configured, groupCount), 1, max);
-
-        if (IsWineOrLinuxRuntime)
-            return 1;
-
-        var cpu = Environment.ProcessorCount;
-        var auto =
-            cpu <= 4 ? 2 :
-            cpu <= 8 ? 2 :
-            cpu <= 16 ? 3 :
-                        3;
-
-        return Math.Clamp(Math.Min(auto, groupCount), 1, max);
-    }
-
-
-
-    private void ReleaseInflight(IEnumerable<DownloadFileTransfer> transfers)
-    {
-        foreach (var t in transfers)
-        {
-            try { CompleteGlobalInflightDownload(t.Hash, success: false); }
-            catch { /* ignore */ }
-        }
-    }
-
-
-
-    private sealed record CdnDownloadedFile(string Hash, string FinalPath);
-    private sealed record CdnSpooledFile(
-        DownloadFileTransfer Transfer,
-        string Hash,
-        string? SpoolPath,
-        byte[]? InMemoryPayload,
-        int InMemoryPayloadLength,
-        long InMemoryBudgetReservation,
-        CdnInMemorySpoolBudget? InMemoryBudget,
-        string TempPath,
-        string FinalPath,
-        bool IsHeadered,
-        long ExpectedRawSize,
-        long CompressedBytes);
-
-    sealed class LimitedXorStream : Stream
-    {
-        private readonly Stream _src;
-        private long _remaining;
-        private readonly byte _xorKey;
-
-        public LimitedXorStream(Stream src, long length, byte xorKey = 42)
-        {
-            _src = src;
-            _remaining = length;
-            _xorKey = xorKey;
-        }
-
-        public override bool CanRead => true;
-        public override bool CanSeek => false;
-        public override bool CanWrite => false;
-        public override long Length => _remaining;
-        public override long Position { get => 0; set => throw new NotSupportedException(); }
-        public override void Flush() { }
-
-        public override int Read(byte[] buffer, int offset, int count)
-        {
-            if (_remaining <= 0) return 0;
-            var toRead = (int)Math.Min(count, _remaining);
-            var read = _src.Read(buffer, offset, toRead);
-            if (read > 0)
-            {
-                if (_xorKey != 0)
-                    for (int i = 0; i < read; i++) buffer[offset + i] ^= _xorKey;
-                _remaining -= read;
-            }
-            return read;
-        }
-
-        public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken ct = default)
-        {
-            if (_remaining <= 0) return 0;
-            var toRead = (int)Math.Min(buffer.Length, _remaining);
-            var dst = buffer.Slice(0, toRead);
-            var read = await _src.ReadAsync(dst, ct).ConfigureAwait(false);
-            if (read > 0)
-            {
-                if (_xorKey != 0)
-                {
-                    var span = dst.Span.Slice(0, read);
-                    for (int i = 0; i < span.Length; i++) span[i] ^= _xorKey;
-                }
-                _remaining -= read;
-            }
-            return read;
-        }
-
-        public override long Seek(long o, SeekOrigin so) => throw new NotSupportedException();
-        public override void SetLength(long v) => throw new NotSupportedException();
-        public override void Write(byte[] b, int o, int c) => throw new NotSupportedException();
-    }
-
-    private sealed class FullReadStream : Stream
-    {
-        private readonly Stream _inner;
-
-        public FullReadStream(Stream inner)
-        {
-            _inner = inner;
-        }
-
-        public override bool CanRead => _inner.CanRead;
-        public override bool CanSeek => false;
-        public override bool CanWrite => false;
-        public override long Length => throw new NotSupportedException();
-        public override long Position
-        {
-            get => throw new NotSupportedException();
-            set => throw new NotSupportedException();
-        }
-
-        public override void Flush() => throw new NotSupportedException();
-
-        public override int Read(byte[] buffer, int offset, int count)
-        {
-            var total = 0;
-
-            while (total < count)
-            {
-                var read = _inner.Read(buffer, offset + total, count - total);
-                if (read <= 0)
-                    break;
-
-                total += read;
-            }
-
-            return total;
-        }
-
-        public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
-        {
-            var total = 0;
-
-            while (total < buffer.Length)
-            {
-                var read = await _inner.ReadAsync(buffer.Slice(total), cancellationToken).ConfigureAwait(false);
-                if (read <= 0)
-                    break;
-
-                total += read;
-            }
-
-            return total;
         }
 
         public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
@@ -3499,4 +1578,163 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
         public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
     }
 
+    private sealed class LimitedXorStream : Stream
+    {
+        private readonly Stream _inner;
+        private long _remaining;
+        private readonly byte _xorKey;
+
+        public LimitedXorStream(Stream inner, long length, byte xorKey)
+        {
+            _inner = inner;
+            _remaining = Math.Max(0, length);
+            _xorKey = xorKey;
+        }
+
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => _remaining;
+        public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
+        public override void Flush() { }
+
+        public override int Read(byte[] buffer, int offset, int count)
+        {
+            if (_remaining <= 0)
+                return 0;
+
+            var toRead = (int)Math.Min(count, _remaining);
+            var read = _inner.Read(buffer, offset, toRead);
+            if (read > 0)
+            {
+                if (_xorKey != 0)
+                {
+                    for (var i = 0; i < read; i++)
+                        buffer[offset + i] ^= _xorKey;
+                }
+
+                _remaining -= read;
+            }
+
+            return read;
+        }
+
+        public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            if (_remaining <= 0)
+                return 0;
+
+            var toRead = (int)Math.Min(buffer.Length, _remaining);
+            var slice = buffer[..toRead];
+            var read = await _inner.ReadAsync(slice, cancellationToken).ConfigureAwait(false);
+            if (read > 0)
+            {
+                if (_xorKey != 0)
+                {
+                    var span = slice.Span[..read];
+                    for (var i = 0; i < span.Length; i++)
+                        span[i] ^= _xorKey;
+                }
+
+                _remaining -= read;
+            }
+
+            return read;
+        }
+
+        public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+            => ReadAsync(buffer.AsMemory(offset, count), cancellationToken).AsTask();
+
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    }
+
+    private sealed class XorReadStream : Stream
+    {
+        private readonly Stream _inner;
+        private readonly byte _key;
+
+        public XorReadStream(Stream inner, byte key)
+        {
+            _inner = inner;
+            _key = key;
+        }
+
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => throw new NotSupportedException();
+        public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
+        public override void Flush() { }
+
+        public override int Read(byte[] buffer, int offset, int count)
+        {
+            var read = _inner.Read(buffer, offset, count);
+            for (var i = 0; i < read; i++)
+                buffer[offset + i] ^= _key;
+            return read;
+        }
+
+        public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            var read = await _inner.ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
+            var span = buffer.Span[..read];
+            for (var i = 0; i < span.Length; i++)
+                span[i] ^= _key;
+            return read;
+        }
+
+        public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+            => ReadAsync(buffer.AsMemory(offset, count), cancellationToken).AsTask();
+
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    }
+
+    private sealed class FullReadStream : Stream
+    {
+        private readonly Stream _inner;
+        public FullReadStream(Stream inner) => _inner = inner;
+        public override bool CanRead => _inner.CanRead;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => throw new NotSupportedException();
+        public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
+        public override void Flush() => throw new NotSupportedException();
+
+        public override int Read(byte[] buffer, int offset, int count)
+        {
+            var total = 0;
+            while (total < count)
+            {
+                var read = _inner.Read(buffer, offset + total, count - total);
+                if (read <= 0)
+                    break;
+                total += read;
+            }
+            return total;
+        }
+
+        public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            var total = 0;
+            while (total < buffer.Length)
+            {
+                var read = await _inner.ReadAsync(buffer[total..], cancellationToken).ConfigureAwait(false);
+                if (read <= 0)
+                    break;
+                total += read;
+            }
+            return total;
+        }
+
+        public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+            => ReadAsync(buffer.AsMemory(offset, count), cancellationToken).AsTask();
+
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    }
 }

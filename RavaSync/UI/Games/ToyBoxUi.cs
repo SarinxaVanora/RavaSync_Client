@@ -553,7 +553,23 @@ public sealed partial class ToyBoxUi : WindowMediatorSubscriberBase
     }
 
 
-    private void DrawSingleCardAt(ImDrawListPtr dl, Vector2 p, Vector2 size, byte card, bool showAsHidden)
+    private void DrawSingleCardAt(ImDrawListPtr dl, Vector2 p, Vector2 size, byte card, bool showAsHidden, float hoverGrow = 1.22f)
+    {
+        DrawSingleCardAtCore(dl, p, size, card, showAsHidden);
+
+        if (!showAsHidden && hoverGrow > 1f && ImGui.IsMouseHoveringRect(p, p + size))
+            DrawHoveredCardOverlay(p, size, card, hoverGrow);
+    }
+
+    private void DrawHoveredCardOverlay(Vector2 p, Vector2 size, byte card, float grow = 1.22f)
+    {
+        var hoverSize = size * grow;
+        var hoverPos = p + size * 0.5f - hoverSize * 0.5f;
+
+        DrawSingleCardAtCore(ImGui.GetForegroundDrawList(), hoverPos, hoverSize, card, false);
+    }
+
+    private void DrawSingleCardAtCore(ImDrawListPtr dl, Vector2 p, Vector2 size, byte card, bool showAsHidden)
     {
         dl.AddRectFilled(p + new Vector2(2, 2) * ImGuiHelpers.GlobalScale, p + size + new Vector2(2, 2) * ImGuiHelpers.GlobalScale,
             ImGui.GetColorU32(new Vector4(0f, 0f, 0f, 0.35f)), 12f);

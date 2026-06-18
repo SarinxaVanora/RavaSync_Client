@@ -11,6 +11,58 @@ namespace RavaSync.Services.Optimisation;
 internal static class NativeTexCodec
 {
 
+    public static bool TryValidateTextureFile(string path, out string reason)
+    {
+        reason = string.Empty;
+        try
+        {
+            if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
+            {
+                reason = "Texture file was missing.";
+                return false;
+            }
+
+            using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+            using var reader = new BinaryReader(stream);
+            var header = ReadHeader(reader);
+            int headerSize = Marshal.SizeOf<TexFile.TexHeader>();
+            if (header.Width == 0 || header.Height == 0)
+            {
+                reason = "Texture header contained zero width or height.";
+                return false;
+            }
+
+            if (header.MipCount == 0)
+            {
+                reason = "Texture header contained zero mip levels.";
+                return false;
+            }
+
+            uint firstOffset = GetSurfaceOffset(in header, 0);
+            if (firstOffset == 0)
+                firstOffset = (uint)headerSize;
+
+            if (firstOffset < headerSize || firstOffset >= stream.Length)
+            {
+                reason = $"Texture first surface offset was outside the file. Offset={firstOffset}, Length={stream.Length}.";
+                return false;
+            }
+
+            if (!Enum.IsDefined(typeof(TexFile.TextureFormat), header.Format))
+            {
+                reason = $"Texture header format was not recognised: {header.Format}.";
+                return false;
+            }
+
+            return true;
+        }
+        catch (Exception ex)
+        {
+            reason = ex.Message;
+            return false;
+        }
+    }
+
     public static bool TryLoadRgba32(string path, out Image<Rgba32>? image, out TexFile.TextureFormat sourceFormat, out string reason)
     {
         image = null;

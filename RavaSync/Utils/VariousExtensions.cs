@@ -113,9 +113,9 @@ public static class VariousExtensions
                             .OrderBy(g => string.IsNullOrEmpty(g.Hash) ? g.FileSwapPath : g.Hash, StringComparer.OrdinalIgnoreCase).ToList();
                         var newTail = newFileReplacements.Where(g => g.GamePaths.Any(p => p.Contains("/tail/", StringComparison.OrdinalIgnoreCase)))
                             .OrderBy(g => string.IsNullOrEmpty(g.Hash) ? g.FileSwapPath : g.Hash, StringComparer.OrdinalIgnoreCase).ToList();
-                        var existingTransients = existingFileReplacements.Where(g => g.GamePaths.Any(PairApplyUtilities.IsTransientRedrawCriticalGamePath))
+                        var existingTransients = existingFileReplacements.Where(g => g.GamePaths.Any(IsPlayerAssociatedTransientOrSupportPath))
                             .OrderBy(g => string.IsNullOrEmpty(g.Hash) ? g.FileSwapPath : g.Hash, StringComparer.OrdinalIgnoreCase).ToList();
-                        var newTransients = newFileReplacements.Where(g => g.GamePaths.Any(PairApplyUtilities.IsTransientRedrawCriticalGamePath))
+                        var newTransients = newFileReplacements.Where(g => g.GamePaths.Any(IsPlayerAssociatedTransientOrSupportPath))
                             .OrderBy(g => string.IsNullOrEmpty(g.Hash) ? g.FileSwapPath : g.Hash, StringComparer.OrdinalIgnoreCase).ToList();
                         var existingWornEquipment = SelectPlayerWornEquipmentOrAccessoryReplacements(existingFileReplacements);
                         var newWornEquipment = SelectPlayerWornEquipmentOrAccessoryReplacements(newFileReplacements);
@@ -257,6 +257,10 @@ public static class VariousExtensions
 
     private static bool IsPlayerWornEquipmentOrAccessoryGamePath(string gamePath)
         => PairApplyUtilities.IsWornEquipmentOrAccessoryGamePath(gamePath);
+
+    private static bool IsPlayerAssociatedTransientOrSupportPath(string gamePath)
+        => PairApplyUtilities.IsTransientRedrawCriticalGamePath(gamePath)
+            || PairApplyUtilities.IsVfxPropSupportGamePath(gamePath);
 
     private static bool ShouldForceOwnedObjectRedrawForFileChange(ObjectKind objectKind, List<FileReplacementData>? existingFileReplacements, List<FileReplacementData>? newFileReplacements)
     {

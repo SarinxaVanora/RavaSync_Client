@@ -1,10 +1,12 @@
 using System;
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Dalamud.Game.ClientState.Objects.Types;
 using Dalamud.Plugin;
+using Dalamud.Utility;
 using Glamourer.Api.Enums;
 using Glamourer.Api.Helpers;
 using Glamourer.Api.IpcSubscribers;
@@ -12,6 +14,7 @@ using RavaSync.MareConfiguration.Models;
 using RavaSync.PlayerData.Handlers;
 using RavaSync.Services;
 using RavaSync.Services.Mediator;
+using RavaSync.Utils;
 using Microsoft.Extensions.Logging;
 
 namespace RavaSync.Interop.Ipc;
@@ -37,9 +40,18 @@ public sealed class IpcCallerGlamourer : DisposableMediatorSubscriberBase, IIpcC
     private bool _shownGlamourerUnavailable = false;
     private readonly uint LockCode = 0x6D617265;
 
+    private static readonly bool IsWineRuntime = SafeIsWine();
     private static readonly SemaphoreSlim GlamourerFrameworkIpcGate = new(1, 1);
     private static long _nextGlamourerFrameworkIpcTick;
     private const int GlamourerFrameworkIpcSpacingMs = 16;
+
+    private static bool SafeIsWine()
+    {
+        try { return Util.IsWine(); }
+        catch { return false; }
+    }
+    private readonly ConcurrentDictionary<string, byte> _pendingNameReverts = new(StringComparer.OrdinalIgnoreCase);
+    private int _pendingNameRevertFlushQueued;
 
     public IpcCallerGlamourer(ILogger<IpcCallerGlamourer> logger, IDalamudPluginInterface pi, DalamudUtilService dalamudUtil, MareMediator mareMediator,
         RedrawManager redrawManager) : base(logger, mareMediator)
@@ -62,6 +74,11 @@ public sealed class IpcCallerGlamourer : DisposableMediatorSubscriberBase, IIpcC
 
         _glamourerStateChanged = StateChanged.Subscriber(pi, GlamourerChanged);
         _glamourerStateChanged.Enable();
+
+        Mediator.Subscribe<ZoneSwitchEndMessage>(this, _ => SchedulePendingNameRevertFlush("zone switch end"));
+        Mediator.Subscribe<DelayedFrameworkUpdateMessage>(this, _ => SchedulePendingNameRevertFlush("delayed framework update"));
+        Mediator.Subscribe<ConnectedMessage>(this, _ => SchedulePendingNameRevertFlush("connected"));
+        Mediator.Subscribe<DalamudLoginMessage>(this, _ => SchedulePendingNameRevertFlush("login"));
     }
 
     protected override void Dispose(bool disposing)
@@ -116,6 +133,8 @@ public sealed class IpcCallerGlamourer : DisposableMediatorSubscriberBase, IIpcC
     private async Task<T> RunPacedGlamourerFrameworkIpcAsync<T>(ILogger logger, string operationName, Func<T> action, CancellationToken token, int warnAfterMs = 60)
     {
         await GlamourerFrameworkIpcGate.WaitAsync(token).ConfigureAwait(false);
+        long frameworkElapsedMs = 0;
+
         try
         {
             var delayMs = Volatile.Read(ref _nextGlamourerFrameworkIpcTick) - Environment.TickCount64;
@@ -132,16 +151,19 @@ public sealed class IpcCallerGlamourer : DisposableMediatorSubscriberBase, IIpcC
                 finally
                 {
                     frameworkStopwatch.Stop();
-                    if (frameworkStopwatch.ElapsedMilliseconds >= warnAfterMs)
-                        logger.LogWarning("[Glamourer IPC HitchGuard] {operation} took {elapsed}ms on framework", operationName, frameworkStopwatch.ElapsedMilliseconds);
+                    frameworkElapsedMs = frameworkStopwatch.ElapsedMilliseconds;
+                    var effectiveWarnAfterMs = IsWineRuntime ? Math.Max(warnAfterMs, 250) : warnAfterMs;
+                    if (frameworkElapsedMs >= effectiveWarnAfterMs)
+                        logger.LogWarning("[Glamourer IPC HitchGuard] {operation} took {elapsed}ms on framework", operationName, frameworkElapsedMs);
                     else
-                        logger.LogTrace("[Glamourer IPC HitchGuard] {operation} took {elapsed}ms on framework", operationName, frameworkStopwatch.ElapsedMilliseconds);
+                        logger.LogTrace("[Glamourer IPC HitchGuard] {operation} took {elapsed}ms on framework", operationName, frameworkElapsedMs);
                 }
             }).ConfigureAwait(false);
         }
         finally
         {
-            Interlocked.Exchange(ref _nextGlamourerFrameworkIpcTick, Environment.TickCount64 + GlamourerFrameworkIpcSpacingMs);
+            var spacingMs = LinuxSmoothMode.ComputeFrameworkIpcSpacing(GlamourerFrameworkIpcSpacingMs, frameworkElapsedMs, 200);
+            Interlocked.Exchange(ref _nextGlamourerFrameworkIpcTick, Environment.TickCount64 + spacingMs);
             GlamourerFrameworkIpcGate.Release();
         }
     }
@@ -149,6 +171,8 @@ public sealed class IpcCallerGlamourer : DisposableMediatorSubscriberBase, IIpcC
     public async Task ApplyAllAsync(ILogger logger, GameObjectHandler handler, string? customization, Guid applicationId, CancellationToken token, bool fireAndForget = false, ApplyFlag? flags = null, bool waitForDrawSettle = true)
     {
         if (!APIAvailable || string.IsNullOrEmpty(customization) || _dalamudUtil.IsZoning) return;
+
+        CancelPendingNameRevertForVisibleApply(logger, handler, applicationId, "apply");
 
         async Task ApplyCoreAsync()
         {
@@ -202,6 +226,8 @@ public sealed class IpcCallerGlamourer : DisposableMediatorSubscriberBase, IIpcC
     {
         if (!APIAvailable || _dalamudUtil.IsZoning)
             return;
+
+        CancelPendingNameRevertForVisibleApply(logger, handler, applicationId, "reapply");
 
         token.ThrowIfCancellationRequested();
 
@@ -285,7 +311,13 @@ public sealed class IpcCallerGlamourer : DisposableMediatorSubscriberBase, IIpcC
 
     public async Task RevertByNameAsync(ILogger logger, string name, Guid applicationId)
     {
-        if ((!APIAvailable) || _dalamudUtil.IsZoning) return;
+        if (string.IsNullOrWhiteSpace(name) || !APIAvailable) return;
+
+        if (_dalamudUtil.IsZoning)
+        {
+            QueuePendingNameRevert(logger, name, applicationId, "zoning");
+            return;
+        }
 
         // Guard the framework-thread work with SafeIpc (timeout + errors)
         await SafeIpc.TryRun(Logger, "Glamourer.RevertByNameAsync", TimeSpan.FromSeconds(2), async ct =>
@@ -300,7 +332,13 @@ public sealed class IpcCallerGlamourer : DisposableMediatorSubscriberBase, IIpcC
 
     public void RevertByName(ILogger logger, string name, Guid applicationId)
     {
-        if ((!APIAvailable) || _dalamudUtil.IsZoning) return;
+        if (string.IsNullOrWhiteSpace(name) || !APIAvailable) return;
+
+        if (_dalamudUtil.IsZoning)
+        {
+            QueuePendingNameRevert(logger, name, applicationId, "zoning");
+            return;
+        }
 
         try
         {
@@ -313,6 +351,75 @@ public sealed class IpcCallerGlamourer : DisposableMediatorSubscriberBase, IIpcC
         {
             _logger.LogWarning(ex, "Error during Glamourer RevertByName");
         }
+    }
+
+    private void QueuePendingNameRevert(ILogger logger, string name, Guid applicationId, string reason)
+    {
+        if (string.IsNullOrWhiteSpace(name)) return;
+
+        _pendingNameReverts[name] = 0;
+        logger.LogDebug("[{appid}] Queued Glamourer name revert for {name} after {reason}", applicationId, name, reason);
+        SchedulePendingNameRevertFlush(reason);
+    }
+
+    private void SchedulePendingNameRevertFlush(string reason)
+    {
+        if (_pendingNameReverts.IsEmpty) return;
+        if (Interlocked.Exchange(ref _pendingNameRevertFlushQueued, 1) != 0) return;
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await FlushPendingNameRevertsAsync(reason).ConfigureAwait(false);
+            }
+            finally
+            {
+                Interlocked.Exchange(ref _pendingNameRevertFlushQueued, 0);
+
+                if (!_pendingNameReverts.IsEmpty && APIAvailable && !_dalamudUtil.IsZoning)
+                    SchedulePendingNameRevertFlush("pending Glamourer name revert follow-up");
+            }
+        });
+    }
+
+    private async Task FlushPendingNameRevertsAsync(string reason)
+    {
+        if (_pendingNameReverts.IsEmpty || !APIAvailable || _dalamudUtil.IsZoning) return;
+
+        var names = _pendingNameReverts.Keys.ToArray();
+        var applicationId = Guid.NewGuid();
+
+        foreach (var name in names)
+        {
+            if (_dalamudUtil.IsZoning)
+                return;
+
+            if (!_pendingNameReverts.TryRemove(name, out _))
+                continue;
+
+            try
+            {
+                _logger.LogDebug("[{appid}] Flushing queued Glamourer name revert for {name} after {reason}", applicationId, name, reason);
+                await RevertByNameAsync(_logger, name, applicationId).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _pendingNameReverts[name] = 0;
+                _logger.LogDebug(ex, "[{appid}] Failed queued Glamourer name revert for {name} after {reason}; will retry", applicationId, name, reason);
+            }
+
+            await Task.Yield();
+        }
+    }
+
+    private void CancelPendingNameRevertForVisibleApply(ILogger logger, GameObjectHandler handler, Guid applicationId, string reason)
+    {
+        var name = handler.Name;
+        if (string.IsNullOrWhiteSpace(name)) return;
+
+        if (_pendingNameReverts.TryRemove(name, out _))
+            logger.LogDebug("[{appid}] Cancelled queued Glamourer name revert for {name}; visible {reason} now owns state", applicationId, name, reason);
     }
 
     public async Task RevertByObjectIndexAsync(ILogger logger, int objectIndex, Guid applicationId)

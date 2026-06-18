@@ -1,5 +1,6 @@
-﻿using Dalamud.Bindings.ImGui;
+using Dalamud.Bindings.ImGui;
 using Dalamud.Interface;
+using Dalamud.Interface.Utility;
 using Dalamud.Interface.Utility.Raii;
 using RavaSync.PlayerData.Pairs;
 using RavaSync.UI.Handlers;
@@ -39,7 +40,8 @@ public abstract class DrawFolderBase : IDrawFolder
         using var id = ImRaii.PushId("folder_" + _id);
         var color = ImRaii.PushColor(ImGuiCol.ChildBg, ImGui.GetColorU32(ImGuiCol.FrameBgHovered), _wasHovered);
         var contentWidth = UiSharedService.GetWindowContentRegionWidth();
-        using (ImRaii.Child("folder__" + _id, new System.Numerics.Vector2(contentWidth - ImGui.GetCursorPosX(), ImGui.GetFrameHeight())))
+        var folderBottomPad = 2f * ImGuiHelpers.GlobalScale;
+        using (ImRaii.Child("folder__" + _id, new System.Numerics.Vector2(contentWidth - ImGui.GetCursorPosX(), ImGui.GetTextLineHeightWithSpacing() + folderBottomPad)))
         {
             // draw opener
             var icon = _tagHandler.IsTagOpen(_id) ? FontAwesomeIcon.CaretDown : FontAwesomeIcon.CaretRight;
@@ -67,7 +69,6 @@ public abstract class DrawFolderBase : IDrawFolder
 
         color.Dispose();
 
-        ImGui.Separator();
 
         // if opened draw content
         if (_tagHandler.IsTagOpen(_id))
@@ -85,7 +86,6 @@ public abstract class DrawFolderBase : IDrawFolder
                 ImGui.TextUnformatted(_uiSharedService.L("UI.DrawFolderBase.2a3f7724", "No users (online)"));
             }
 
-            ImGui.Separator();
         }
     }
 

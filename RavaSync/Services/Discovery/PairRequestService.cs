@@ -9,6 +9,7 @@ using RavaSync.WebAPI.SignalR.Utils;
 using Microsoft.Extensions.Logging;
 using System;
 
+using RavaSync.Services.Mesh;
 namespace RavaSync.Services.Discovery;
 
 public class PairRequestService : DisposableMediatorSubscriberBase

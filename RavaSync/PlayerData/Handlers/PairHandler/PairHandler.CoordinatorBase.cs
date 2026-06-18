@@ -42,7 +42,6 @@ public sealed partial class PairHandler
         protected MareMediator Mediator => Owner.Mediator;
         protected Pair Pair => Owner.Pair;
         protected bool IsVisible { get => Owner.IsVisible; set => Owner.IsVisible = value; }
-        protected long LastAppliedDataBytes { get => Owner.LastAppliedDataBytes; set => Owner.LastAppliedDataBytes = value; }
         protected string? PlayerName { get => Owner.PlayerName; set => Owner.PlayerName = value; }
         protected string PlayerNameHash => Owner.PlayerNameHash;
         protected nint PlayerCharacter => Owner.PlayerCharacter;
@@ -87,6 +86,8 @@ public sealed partial class PairHandler
         protected string? _lastAttemptedDataHash { get => Owner._lastAttemptedDataHash; set => Owner._lastAttemptedDataHash = value; }
         protected string? _lastAppliedTempModsFingerprint { get => Owner._lastAppliedTempModsFingerprint; set => Owner._lastAppliedTempModsFingerprint = value; }
         protected Dictionary<string, string>? _lastAppliedTempModsSnapshot { get => Owner._lastAppliedTempModsSnapshot; set => Owner._lastAppliedTempModsSnapshot = value; }
+        protected string? _lastAppliedMountMusicTempModsFingerprint { get => Owner._lastAppliedMountMusicTempModsFingerprint; set => Owner._lastAppliedMountMusicTempModsFingerprint = value; }
+        protected Dictionary<string, string>? _lastAppliedMountMusicTempModsSnapshot { get => Owner._lastAppliedMountMusicTempModsSnapshot; set => Owner._lastAppliedMountMusicTempModsSnapshot = value; }
         protected string? _activeTempFilesModName { get => Owner._activeTempFilesModName; set => Owner._activeTempFilesModName = value; }
         protected int _activeTempFilesModPriority { get => Owner._activeTempFilesModPriority; set => Owner._activeTempFilesModPriority = value; }
         protected string? _lastAppliedTransientSupportFingerprint { get => Owner._lastAppliedTransientSupportFingerprint; set => Owner._lastAppliedTransientSupportFingerprint = value; }
@@ -153,6 +154,7 @@ public sealed partial class PairHandler
         protected void MarkInitialApplyRequired(bool redrawOnNextApplication = true) => Owner.MarkInitialApplyRequired(redrawOnNextApplication);
         protected void ResetVisibleReplayReadiness() => Owner.ResetVisibleReplayReadiness();
         protected bool IsVisibleReplayReady(nint address, long nowTick) => Owner.IsVisibleReplayReady(address, nowTick);
+        protected bool IsRecentlyVisibleLifecycleReplay(long windowMs = 3000) => Owner.IsRecentlyVisibleLifecycleReplay(windowMs);
         protected void BeginVisibilityRecoveryWindow(long nowTick, bool isZoneTransition) => Owner.BeginVisibilityRecoveryWindow(nowTick, isZoneTransition);
         protected void ResetVisibilityTracking() => Owner.ResetVisibilityTracking();
         protected void ResetLiveApplicationState(bool resetRetryState = true) => Owner.ResetLiveApplicationState(resetRetryState);
@@ -174,12 +176,12 @@ public sealed partial class PairHandler
         protected Task EnsurePenumbraCollectionAsync() => Owner.EnsurePenumbraCollectionAsync();
         protected Task RemovePenumbraCollectionAsync(Guid applicationId) => Owner.RemovePenumbraCollectionAsync(applicationId);
         protected Task<PairSyncCommitResult> DownloadAndApplyCharacterAsync(Guid applicationBase, CharacterData charaData, Dictionary<ObjectKind, HashSet<PlayerChanges>> updatedData, bool updateModdedPaths, bool updateManip, bool requiresFileReadyGate, PairSyncAssetPlan assetPlan, bool forceApplyModsForThisApply, bool lifecycleApplyRequestedFromPlan, bool lifecycleRedrawRequestedFromPlan, CancellationToken downloadToken) => Owner.DownloadAndApplyCharacterAsync(applicationBase, charaData, updatedData, updateModdedPaths, updateManip, requiresFileReadyGate, assetPlan, forceApplyModsForThisApply, lifecycleApplyRequestedFromPlan, lifecycleRedrawRequestedFromPlan, downloadToken);
-        protected Task<PairSyncCommitResult> ApplyCharacterDataAsync(Guid applicationBase, CharacterData charaData, Dictionary<ObjectKind, HashSet<PlayerChanges>> updatedData, bool updateModdedPaths, bool updateManip, bool requiresFileReadyGate, Dictionary<(string GamePath, string? Hash), string> moddedPaths, PairSyncAssetPlan assetPlan, bool downloadedAny, bool forceApplyModsForThisApply, bool lifecycleApplyRequestedFromPlan, bool lifecycleRedrawRequestedFromPlan, CancellationToken token) => Owner.ApplyCharacterDataAsync(applicationBase, charaData, updatedData, updateModdedPaths, updateManip, requiresFileReadyGate, moddedPaths, assetPlan, downloadedAny, forceApplyModsForThisApply, lifecycleApplyRequestedFromPlan, lifecycleRedrawRequestedFromPlan, token);
+        protected Task<PairSyncCommitResult> ApplyCharacterDataAsync(Guid applicationBase, CharacterData charaData, Dictionary<ObjectKind, HashSet<PlayerChanges>> updatedData, bool updateModdedPaths, bool updateManip, bool requiresFileReadyGate, Dictionary<(string GamePath, string? Hash), string> moddedPaths, PairSyncAssetPlan assetPlan, bool downloadedAny, bool forceApplyModsForThisApply, bool lifecycleApplyRequestedFromPlan, bool lifecycleRedrawRequestedFromPlan, CancellationToken token, bool authoritativeCommit = true, bool suppressNonLifecycleRedraw = false) => Owner.ApplyCharacterDataAsync(applicationBase, charaData, updatedData, updateModdedPaths, updateManip, requiresFileReadyGate, moddedPaths, assetPlan, downloadedAny, forceApplyModsForThisApply, lifecycleApplyRequestedFromPlan, lifecycleRedrawRequestedFromPlan, token, authoritativeCommit, suppressNonLifecycleRedraw);
         protected bool HasAnyMissingCacheFiles(Guid applicationBase, CharacterData characterData) => Owner.HasAnyMissingCacheFiles(applicationBase, characterData);
         protected FileDownloadManager EnsureDownloadManager() => Owner.GetOrCreateDownloadManager();
         protected void DisposeDownloadManager() => Owner.DisposeDownloadManager();
         protected void BroadcastLocalOtherSyncYieldState(bool yieldToOtherSync, string owner) => Owner.BroadcastLocalOtherSyncYieldState(yieldToOtherSync, owner);
-        protected Task InitializeAsync(string name) => Owner.InitializeAsync(name);
+        protected Task InitializeAsync(string name, nint knownAddress = 0) => Owner.InitializeAsync(name, knownAddress);
         protected Task RevertCustomizationDataAsync(ObjectKind objectKind, string name, Guid applicationId, CancellationToken cancelToken, nint addressOverride = 0, IReadOnlyDictionary<ObjectKind, Guid?>? customizeIdSnapshot = null) => Owner.RevertCustomizationDataAsync(objectKind, name, applicationId, cancelToken, addressOverride, customizeIdSnapshot);
         protected void RequestManualFileRepair() => Owner.RequestManualFileRepair();
         protected Task ManualVerifyAndRepairAsync(Guid applicationBase, CharacterData charaData, CancellationToken token, bool verifyFileHashes = true, bool publishEvents = true) => Owner.ManualVerifyAndRepairAsync(applicationBase, charaData, token, verifyFileHashes, publishEvents);
@@ -188,7 +190,7 @@ public sealed partial class PairHandler
         protected void RequestPostApplyRepair(CharacterData appliedData) => Owner.RequestPostApplyRepair(appliedData);
         protected void ReclaimFromOtherSync(bool requestApplyIfPossible, bool treatAsFirstVisible) => Owner.ReclaimFromOtherSync(requestApplyIfPossible, treatAsFirstVisible);
         protected void HandleOtherSyncReleased(bool requestApplyIfPossible) => Owner.HandleOtherSyncReleased(requestApplyIfPossible);
-        protected void ResetToUninitializedState(bool revertLiveCustomizationState = true) => Owner.ResetToUninitializedState(revertLiveCustomizationState);
+        protected void GoBackToVanillaState(bool revertLiveCustomizationState = true, bool waitForCompletion = false) => Owner.GoBackToVanillaState(revertLiveCustomizationState, waitForCompletion);
         protected void ScheduleRefreshUi(bool immediate = false) => Owner.ScheduleRefreshUi(immediate);
         protected void EnterYieldedState(string owner) => Owner.EnterYieldedState(owner);
     }

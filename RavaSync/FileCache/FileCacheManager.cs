@@ -25,11 +25,11 @@ public sealed partial class FileCacheManager : IHostedService
     private readonly object _fileCachesLock = new();
 
     private readonly ConcurrentDictionary<string, FileCacheEntity> _prefixedPathIndex = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, object> _getCachesByPathLocks = new(StringComparer.OrdinalIgnoreCase);
     private readonly SemaphoreSlim _getCachesByPathsSemaphore = new(1, 1);
     private readonly ConcurrentDictionary<string, long> _missingHashProbeUntilUtcTicks = new(StringComparer.OrdinalIgnoreCase);
     private static readonly TimeSpan _missingHashProbeTtl = TimeSpan.FromSeconds(5);
-    private readonly ConcurrentDictionary<string, (FileCacheEntity? Entity, string LastModifiedTicks, long ExpiresUtcTicks)> _validatedFileCacheMemo = new(StringComparer.OrdinalIgnoreCase);
-    private static readonly TimeSpan _validatedFileCacheMemoTtl = TimeSpan.FromMilliseconds(750);
+    private readonly ConcurrentDictionary<string, (FileCacheEntity? Entity, string LastModifiedTicks, long Size)> _validatedFileCacheMemo = new(StringComparer.OrdinalIgnoreCase);
 
     private readonly object _fileWriteLock = new();
     private readonly object _startupLoadGate = new();
@@ -53,6 +53,16 @@ public sealed partial class FileCacheManager : IHostedService
     }
 
     private string CsvBakPath => _csvPath + ".bak";
+
+    private static string NormalizePathForIndex(string? path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+            return string.Empty;
+
+        return path
+            .Replace('/', '\\')
+            .Replace("\\\\", "\\", StringComparison.Ordinal);
+    }
 
     public FileCacheEntity? CreateCacheEntry(string path)
     {
@@ -429,21 +439,21 @@ public sealed partial class FileCacheManager : IHostedService
 
     private FileCacheEntity? GetFileCacheByPath(string path)
     {
-        var prefixedPath = path.Replace("/", "\\", StringComparison.OrdinalIgnoreCase);
+        var prefixedPath = NormalizePathForIndex(path);
 
-        var modDir = _ipcManager.Penumbra.ModDirectory;
+        var modDir = NormalizePathForIndex(_ipcManager.Penumbra.ModDirectory);
         if (!string.IsNullOrEmpty(modDir))
         {
             prefixedPath = prefixedPath.Replace(modDir, PenumbraPrefix + "\\", StringComparison.OrdinalIgnoreCase);
         }
 
-        var cacheDir = _configService.Current.CacheFolder;
+        var cacheDir = NormalizePathForIndex(_configService.Current.CacheFolder);
         if (!string.IsNullOrEmpty(cacheDir))
         {
             prefixedPath = prefixedPath.Replace(cacheDir, CachePrefix + "\\", StringComparison.OrdinalIgnoreCase);
         }
 
-        prefixedPath = prefixedPath.Replace("\\\\", "\\", StringComparison.Ordinal);
+        prefixedPath = NormalizePathForIndex(prefixedPath);
 
         if (_prefixedPathIndex.TryGetValue(prefixedPath, out var entry))
         {
@@ -463,18 +473,22 @@ public sealed partial class FileCacheManager : IHostedService
 
         try
         {
-            var modDir = _ipcManager.Penumbra.ModDirectory ?? string.Empty;
-            var cacheDir = _configService.Current.CacheFolder ?? string.Empty;
+            var modDir = NormalizePathForIndex(_ipcManager.Penumbra.ModDirectory);
+            var cacheDir = NormalizePathForIndex(_configService.Current.CacheFolder);
 
             var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             var result = new Dictionary<string, FileCacheEntity?>(StringComparer.OrdinalIgnoreCase);
+            var processed = 0;
 
             foreach (var original in paths)
             {
                 if (string.IsNullOrWhiteSpace(original)) continue;
                 if (!seen.Add(original)) continue;
 
-                var prefixed = original.Replace("/", "\\", StringComparison.OrdinalIgnoreCase);
+                if (++processed % 64 == 0)
+                    Thread.Yield();
+
+                var prefixed = NormalizePathForIndex(original);
 
                 if (!string.IsNullOrEmpty(modDir))
                     prefixed = prefixed.Replace(modDir, PenumbraPrefix + "\\", StringComparison.OrdinalIgnoreCase);
@@ -482,7 +496,7 @@ public sealed partial class FileCacheManager : IHostedService
                 if (!string.IsNullOrEmpty(cacheDir))
                     prefixed = prefixed.Replace(cacheDir, CachePrefix + "\\", StringComparison.OrdinalIgnoreCase);
 
-                prefixed = prefixed.Replace("\\\\", "\\", StringComparison.Ordinal);
+                prefixed = NormalizePathForIndex(prefixed);
 
                 if (_prefixedPathIndex.TryGetValue(prefixed, out var entity))
                 {
@@ -502,6 +516,140 @@ public sealed partial class FileCacheManager : IHostedService
         {
             _getCachesByPathsSemaphore.Release();
         }
+    }
+
+    public Dictionary<string, string> GetFileHashesByPaths(string[] paths)
+    {
+        var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var hashesByPrefixedPath = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var processed = 0;
+
+        foreach (var originalPath in paths)
+        {
+            if (string.IsNullOrWhiteSpace(originalPath))
+            {
+                result[originalPath] = string.Empty;
+                continue;
+            }
+
+            if (++processed % 64 == 0)
+                Thread.Yield();
+
+            var prefixedPath = ToPrefixedPathForIndex(originalPath);
+            if (string.IsNullOrWhiteSpace(prefixedPath))
+            {
+                result[originalPath] = string.Empty;
+                continue;
+            }
+
+            if (hashesByPrefixedPath.TryGetValue(prefixedPath, out var existingHash))
+            {
+                result[originalPath] = existingHash;
+                continue;
+            }
+
+            if (_prefixedPathIndex.TryGetValue(prefixedPath, out var indexedEntity))
+            {
+                var indexedHash = GetValidatedFileCache(indexedEntity)?.Hash ?? string.Empty;
+                hashesByPrefixedPath[prefixedPath] = indexedHash;
+                result[originalPath] = indexedHash;
+                continue;
+            }
+
+            var pathLock = _getCachesByPathLocks.GetOrAdd(prefixedPath, static _ => new object());
+            lock (pathLock)
+            {
+                if (_prefixedPathIndex.TryGetValue(prefixedPath, out indexedEntity))
+                {
+                    var lockedIndexedHash = GetValidatedFileCache(indexedEntity)?.Hash ?? string.Empty;
+                    hashesByPrefixedPath[prefixedPath] = lockedIndexedHash;
+                    result[originalPath] = lockedIndexedHash;
+                    continue;
+                }
+
+                FileCacheEntity? created;
+                if (prefixedPath.Contains(CachePrefix, StringComparison.OrdinalIgnoreCase))
+                {
+                    created = CreateCacheEntry(originalPath);
+                }
+                else if (prefixedPath.Contains(PenumbraPrefix, StringComparison.OrdinalIgnoreCase))
+                {
+                    created = CreateFileEntry(originalPath);
+                }
+                else
+                {
+                    created = CreateFileEntry(originalPath) ?? CreateCacheEntry(originalPath);
+                }
+
+                var createdHash = created?.Hash ?? string.Empty;
+                hashesByPrefixedPath[prefixedPath] = createdHash;
+                result[originalPath] = createdHash;
+            }
+        }
+
+        return result;
+    }
+
+    public Task<Dictionary<string, FileCacheEntity?>> RefreshFileCachesByPathsAsync(IEnumerable<string>? paths, CancellationToken ct, bool writeCsv = false)
+    {
+        var pathArray = paths?
+            .Where(p => !string.IsNullOrWhiteSpace(p))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray() ?? [];
+
+        if (pathArray.Length == 0)
+            return Task.FromResult(new Dictionary<string, FileCacheEntity?>(StringComparer.OrdinalIgnoreCase));
+
+        return Task.Factory.StartNew(() =>
+        {
+            try
+            {
+                Thread.CurrentThread.Priority = ThreadPriority.BelowNormal;
+            }
+            catch
+            {
+                // Best effort only; not every runtime allows changing thread priority.
+            }
+
+            ct.ThrowIfCancellationRequested();
+            var refreshed = RefreshFileCachesByPaths(pathArray, ct);
+
+            if (writeCsv)
+                WriteOutFullCsv();
+
+            return refreshed;
+        }, ct, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+    }
+
+    public Dictionary<string, FileCacheEntity?> RefreshFileCachesByPaths(IEnumerable<string>? paths, CancellationToken ct = default)
+    {
+        var pathArray = paths?
+            .Where(p => !string.IsNullOrWhiteSpace(p))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray() ?? [];
+
+        foreach (var path in pathArray)
+        {
+            ct.ThrowIfCancellationRequested();
+            InvalidateValidatedFileCacheMemo(ToPrefixedPathForIndex(path));
+        }
+
+        return GetFileCachesByPaths(pathArray);
+    }
+
+    private string ToPrefixedPathForIndex(string path)
+    {
+        var prefixedPath = NormalizePathForIndex(path);
+
+        var modDir = NormalizePathForIndex(_ipcManager.Penumbra.ModDirectory);
+        if (!string.IsNullOrEmpty(modDir))
+            prefixedPath = prefixedPath.Replace(modDir, PenumbraPrefix + "\\", StringComparison.OrdinalIgnoreCase);
+
+        var cacheDir = NormalizePathForIndex(_configService.Current.CacheFolder);
+        if (!string.IsNullOrEmpty(cacheDir))
+            prefixedPath = prefixedPath.Replace(cacheDir, CachePrefix + "\\", StringComparison.OrdinalIgnoreCase);
+
+        return NormalizePathForIndex(prefixedPath);
     }
 
     public void RemoveHashedFile(string hash, string prefixedFilePath)
@@ -794,25 +942,56 @@ public sealed partial class FileCacheManager : IHostedService
     {
         var resultingFileCache = ReplacePathPrefixes(fileCache);
         var prefixedPath = resultingFileCache.PrefixedFilePath;
-        var nowTicks = DateTime.UtcNow.Ticks;
+
+        FileInfo file;
+        try
+        {
+            file = new FileInfo(resultingFileCache.ResolvedFilepath);
+        }
+        catch
+        {
+            if (!string.IsNullOrWhiteSpace(prefixedPath))
+                _validatedFileCacheMemo.TryRemove(prefixedPath, out _);
+
+            RemoveHashedFile(resultingFileCache.Hash, resultingFileCache.PrefixedFilePath);
+            return null;
+        }
+
+        if (!file.Exists)
+        {
+            if (!string.IsNullOrWhiteSpace(prefixedPath))
+                _validatedFileCacheMemo.TryRemove(prefixedPath, out _);
+
+            RemoveHashedFile(resultingFileCache.Hash, resultingFileCache.PrefixedFilePath);
+            return null;
+        }
+
+        var currentLastWriteTicks = file.LastWriteTimeUtc.Ticks.ToString(CultureInfo.InvariantCulture);
+        var currentSize = file.Length;
 
         if (!string.IsNullOrWhiteSpace(prefixedPath)
             && _validatedFileCacheMemo.TryGetValue(prefixedPath, out var cached)
-            && cached.ExpiresUtcTicks > nowTicks
-            && string.Equals(cached.LastModifiedTicks, resultingFileCache.LastModifiedDateTicks, StringComparison.Ordinal))
+            && cached.Size == currentSize
+            && string.Equals(cached.LastModifiedTicks, currentLastWriteTicks, StringComparison.Ordinal)
+            && string.Equals(resultingFileCache.LastModifiedDateTicks, currentLastWriteTicks, StringComparison.Ordinal))
         {
             return cached.Entity;
         }
 
-        var validated = Validate(resultingFileCache);
+        FileCacheEntity? validated;
+        if (!string.Equals(currentLastWriteTicks, resultingFileCache.LastModifiedDateTicks, StringComparison.Ordinal)
+            || (resultingFileCache.Size.HasValue && resultingFileCache.Size.Value >= 0 && resultingFileCache.Size.Value != currentSize))
+        {
+            UpdateHashedFile(resultingFileCache);
+            validated = resultingFileCache;
+        }
+        else
+        {
+            validated = resultingFileCache;
+        }
 
         if (!string.IsNullOrWhiteSpace(prefixedPath))
-        {
-            _validatedFileCacheMemo[prefixedPath] = (
-                validated,
-                resultingFileCache.LastModifiedDateTicks,
-                DateTime.UtcNow.Add(_validatedFileCacheMemoTtl).Ticks);
-        }
+            _validatedFileCacheMemo[prefixedPath] = (validated, currentLastWriteTicks, currentSize);
 
         return validated;
     }

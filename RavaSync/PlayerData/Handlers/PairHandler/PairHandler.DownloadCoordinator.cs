@@ -32,6 +32,7 @@ public sealed partial class PairHandler
         private const int PairUploadWaitLogMs = 1000;
         private const int PairUploadWaitUiRefreshMs = 250;
         private const string PairUploadWaitStatusKey = "__pair_upload_wait";
+        private const int PairDownloadAttemptLimit = 3;
 
         public DownloadCoordinator(PairHandler owner) : base(owner)
         {
@@ -43,7 +44,7 @@ public sealed partial class PairHandler
                 if (initialBlock != null)
                     return initialBlock;
 
-                var prepareResult = await PrepareRequiredFilesForPairSyncAsync(applicationBase, charaData, requiresFileReadyGate, assetPlan, lifecycleRedrawRequestedFromPlan, downloadToken).ConfigureAwait(false);
+                var prepareResult = await PrepareRequiredFilesForPairSyncAsync(applicationBase, charaData, updatedData, updateModdedPaths, updateManip, requiresFileReadyGate, assetPlan, forceApplyModsForThisApply, lifecycleApplyRequestedFromPlan, lifecycleRedrawRequestedFromPlan, downloadToken).ConfigureAwait(false);
 
                     if (prepareResult.Failure != null)
                         return prepareResult.Failure;
@@ -65,26 +66,31 @@ public sealed partial class PairHandler
                 return commitStart;
             }
 
-            private async Task<(PairSyncCommitResult? Failure, Dictionary<(string GamePath, string? Hash), string> ModdedPaths, PairSyncAssetPlan AssetPlan, bool DownloadedAny)> PrepareRequiredFilesForPairSyncAsync(Guid applicationBase, CharacterData charaData, bool requiresFileReadyGate, PairSyncAssetPlan assetPlan, bool lifecycleRedrawRequestedFromPlan, CancellationToken downloadToken)
+            private async Task<(PairSyncCommitResult? Failure, Dictionary<(string GamePath, string? Hash), string> ModdedPaths, PairSyncAssetPlan AssetPlan, bool DownloadedAny)> PrepareRequiredFilesForPairSyncAsync(Guid applicationBase, CharacterData charaData, Dictionary<ObjectKind, HashSet<PlayerChanges>> updatedData, bool updateModdedPaths, bool updateManip, bool requiresFileReadyGate, PairSyncAssetPlan assetPlan, bool forceApplyModsForThisApply, bool lifecycleApplyRequestedFromPlan, bool lifecycleRedrawRequestedFromPlan, CancellationToken downloadToken)
             {
                 var moddedPaths = assetPlan.ModdedPaths.Count > 0
                     ? new Dictionary<(string GamePath, string? Hash), string>(assetPlan.ModdedPaths)
                     : [];
 
                 var downloadedAny = false;
+                FileDownloadManager? activeDownloadManager = null;
 
                 if (!requiresFileReadyGate)
                     return (null, moddedPaths, PairSyncAssetPlan.Empty, downloadedAny);
 
                 List<FileReplacementData> RecalculateMissing()
-                    => _modPathResolver.Calculate(applicationBase, charaData, out moddedPaths, downloadToken);
+                {
+                    var recalculated = _modPathResolver.Calculate(applicationBase, charaData, out moddedPaths, downloadToken, Pair.EffectiveScreenShakeEnabled);
+                    return DropSessionFailedMissingFiles(recalculated, applicationBase, "recalculate");
+                }
 
                 var toDownloadReplacements = assetPlan.HasAssets || assetPlan.HasMissingFiles
-                    ? assetPlan.MissingFiles.ToList()
+                    ? DropSessionFailedMissingFiles(assetPlan.MissingFiles.ToList(), applicationBase, "initial asset plan")
                     : RecalculateMissing();
                 var previousMissingCount = toDownloadReplacements.Count;
+                var appearancePreviewApplied = false;
 
-                for (var attempts = 1; attempts <= 10 && toDownloadReplacements.Count > 0 && !downloadToken.IsCancellationRequested; attempts++)
+                for (var attempts = 1; attempts <= PairDownloadAttemptLimit && toDownloadReplacements.Count > 0 && !downloadToken.IsCancellationRequested; attempts++)
                 {
                     var block = GetPairSyncExecutionBlockReason($"download attempt {attempts}");
                     if (block != null)
@@ -114,7 +120,14 @@ public sealed partial class PairHandler
 
                     toDownloadReplacements = PairApplyUtilities.DeduplicateReplacementsByHash(toDownloadReplacements);
 
-                    var uploadWaitBlock = await WaitForPairUploadsToFinishBeforeDownloadAsync(applicationBase, toDownloadReplacements, downloadToken).ConfigureAwait(false);
+                    // Download the pair's currently-applicable payload as one unit.
+                    // The old appearance-first staging could apply one small payload, then publish/apply
+                    // one or two follow-up payloads a moment later, which made single-pair room entry feel
+                    // like the character was loading in pieces.
+                    var replacementsThisAttempt = toDownloadReplacements;
+                    var appearanceFirstStage = false;
+
+                    var uploadWaitBlock = await WaitForPairUploadsToFinishBeforeDownloadAsync(applicationBase, replacementsThisAttempt, charaData.DataHash.Value, downloadToken).ConfigureAwait(false);
                     if (uploadWaitBlock != null)
                         return (uploadWaitBlock, moddedPaths, assetPlan, downloadedAny);
 
@@ -139,13 +152,16 @@ public sealed partial class PairHandler
                             Pair.UserData,
                             nameof(PairHandler),
                             EventSeverity.Informational,
-                            $"Starting download for {toDownloadReplacements.Count} files (attempt {attempts}/10)")));
+                            appearanceFirstStage
+                                ? $"Starting appearance-first download for {replacementsThisAttempt.Count}/{toDownloadReplacements.Count} files (attempt {attempts}/{PairDownloadAttemptLimit})"
+                                : $"Starting download for {toDownloadReplacements.Count} files (attempt {attempts}/{PairDownloadAttemptLimit})")));
 
                         var downloadManager = EnsureDownloadManager();
+                        activeDownloadManager = downloadManager;
                         downloadManager.ConfigureFileRepairContext(Pair.UserData.UID, Pair.Ident, charaData.DataHash.Value);
 
                         var toDownloadFiles = await downloadManager
-                            .InitiateDownloadList(_charaHandler!, toDownloadReplacements, downloadToken)
+                            .InitiateDownloadList(_charaHandler!, replacementsThisAttempt, downloadToken)
                             .ConfigureAwait(false);
 
                         if (toDownloadFiles != null && toDownloadFiles.Count > 0)
@@ -154,9 +170,15 @@ public sealed partial class PairHandler
                         if (toDownloadFiles == null || toDownloadFiles.Count == 0)
                         {
                             var recalculatedMissing = RecalculateMissing();
+                            recalculatedMissing = DropCentralRepairFailedMissingFiles(activeDownloadManager, recalculatedMissing, applicationBase);
 
                             if (recalculatedMissing.Count == 0)
+                            {
+                                _downloadManager?.ClearDownload();
+                                _pairDownloadTask = null;
+                                ClearPairSyncDownloadStatus();
                                 break;
+                            }
 
                             _downloadManager?.ClearDownload();
                             _pairDownloadTask = null;
@@ -166,6 +188,15 @@ public sealed partial class PairHandler
                                 downloadLane.Release();
                                 downloadLaneAcquired = false;
                                 SyncStorm.RegisterDownloadFinished();
+                            }
+
+                            if (appearanceFirstStage && !appearancePreviewApplied)
+                            {
+                                toDownloadReplacements = recalculatedMissing;
+                                var appliedPreview = await TryApplyAppearanceFirstPreviewAsync(applicationBase, charaData, updatedData, updateModdedPaths, updateManip, requiresFileReadyGate, moddedPaths, toDownloadReplacements, forceApplyModsForThisApply, lifecycleApplyRequestedFromPlan, lifecycleRedrawRequestedFromPlan, downloadToken).ConfigureAwait(false);
+                                appearancePreviewApplied |= appliedPreview;
+                                previousMissingCount = toDownloadReplacements.Count;
+                                continue;
                             }
 
                             var delayMs = Math.Min(4000, 500 * attempts);
@@ -192,7 +223,7 @@ public sealed partial class PairHandler
                             return (downloadBlock, moddedPaths, BuildPairSyncAssetPlanFromResolvedPaths(moddedPaths, toDownloadReplacements, charaData), downloadedAny);
                         }
 
-                        _pairDownloadTask = downloadManager.DownloadFiles(_charaHandler!, toDownloadReplacements, downloadToken);
+                        _pairDownloadTask = downloadManager.DownloadFiles(_charaHandler!, replacementsThisAttempt, downloadToken);
 
                         try
                         {
@@ -206,8 +237,8 @@ public sealed partial class PairHandler
                         }
                         catch (Exception ex)
                         {
-                            Logger.LogWarning(ex, "[BASE-{appBase}] Download task failed on attempt {attempt}/10 for {player}",
-                                applicationBase, attempts, PlayerName);
+                            Logger.LogWarning(ex, "[BASE-{appBase}] Download task failed on attempt {attempt}/{maxAttempts} for {player}",
+                                applicationBase, attempts, PairDownloadAttemptLimit, PlayerName);
 
                             ClearPairSyncDownloadStatus();
 
@@ -225,6 +256,7 @@ public sealed partial class PairHandler
                             await Task.Delay(delayMs, downloadToken).ConfigureAwait(false);
 
                             toDownloadReplacements = RecalculateMissing();
+                            toDownloadReplacements = DropCentralRepairFailedMissingFiles(activeDownloadManager, toDownloadReplacements, applicationBase);
                             previousMissingCount = toDownloadReplacements.Count;
                             continue;
                         }
@@ -232,11 +264,27 @@ public sealed partial class PairHandler
                         downloadToken.ThrowIfCancellationRequested();
 
                         toDownloadReplacements = RecalculateMissing();
+                        toDownloadReplacements = DropCentralRepairFailedMissingFiles(activeDownloadManager, toDownloadReplacements, applicationBase);
+
+                        if (appearanceFirstStage && !appearancePreviewApplied)
+                        {
+                            if (downloadLaneAcquired)
+                            {
+                                downloadLane.Release();
+                                downloadLaneAcquired = false;
+                                SyncStorm.RegisterDownloadFinished();
+                            }
+
+                            var appliedPreview = await TryApplyAppearanceFirstPreviewAsync(applicationBase, charaData, updatedData, updateModdedPaths, updateManip, requiresFileReadyGate, moddedPaths, toDownloadReplacements, forceApplyModsForThisApply, lifecycleApplyRequestedFromPlan, lifecycleRedrawRequestedFromPlan, downloadToken).ConfigureAwait(false);
+                            appearancePreviewApplied |= appliedPreview;
+                            previousMissingCount = toDownloadReplacements.Count;
+                            continue;
+                        }
 
                         if (toDownloadReplacements.Count > 0 && toDownloadReplacements.Count == previousMissingCount && Logger.IsEnabled(LogLevel.Debug))
                         {
-                            Logger.LogDebug("[BASE-{appBase}] Missing count unchanged after download attempt {attempt}/10 for {player}: still {count}",
-                                applicationBase, attempts, PlayerName, toDownloadReplacements.Count);
+                            Logger.LogDebug("[BASE-{appBase}] Missing count unchanged after download attempt {attempt}/{maxAttempts} for {player}: still {count}",
+                                applicationBase, attempts, PairDownloadAttemptLimit, PlayerName, toDownloadReplacements.Count);
                         }
 
                         previousMissingCount = toDownloadReplacements.Count;
@@ -259,12 +307,33 @@ public sealed partial class PairHandler
 
                 if (toDownloadReplacements.Count > 0)
                 {
+                    var exhaustedHashes = toDownloadReplacements
+                        .Select(static f => f.Hash)
+                        .Where(static h => !string.IsNullOrWhiteSpace(h))
+                        .Distinct(StringComparer.OrdinalIgnoreCase)
+                        .ToList();
+
+                    Logger.LogWarning(
+                        "[BASE-{appBase}] Download attempts exhausted for {player}; keeping {count} unresolved hash(es) retryable instead of session-skipping them: {hashes}",
+                        applicationBase,
+                        PlayerName,
+                        exhaustedHashes.Count,
+                        string.Join(", ", exhaustedHashes.Take(20)));
+                }
+
+                toDownloadReplacements = DropSessionFailedMissingFiles(toDownloadReplacements, applicationBase, "post-exhaustion");
+                toDownloadReplacements = DropCentralRepairFailedMissingFiles(activeDownloadManager ?? _downloadManager, toDownloadReplacements, applicationBase);
+
+                if (toDownloadReplacements.Count > 0)
+                {
                     Mediator.Publish(new EventMessage(new Event(
                         PlayerName,
                         Pair.UserData,
                         nameof(PairHandler),
                         EventSeverity.Warning,
-                        $"RavaSync: {toDownloadReplacements.Count} files could not be downloaded; not applying partial appearance.")));
+                        appearancePreviewApplied
+                            ? $"RavaSync: {toDownloadReplacements.Count} non-appearance file(s) could not be downloaded; keeping the appearance-first preview pending retry."
+                            : $"RavaSync: {toDownloadReplacements.Count} files could not be downloaded; not applying partial appearance.")));
 
                     var retryImmediately = lifecycleRedrawRequestedFromPlan || !_hasRetriedAfterMissingDownload;
                     if (!_hasRetriedAfterMissingDownload)
@@ -272,7 +341,7 @@ public sealed partial class PairHandler
                         _hasRetriedAfterMissingDownload = true;
 
                         Logger.LogInformation(
-                            "[BASE-{appBase}] Self-heal: requesting worker retry for {name} after missing-files detected",
+                            "[BASE-{appBase}] Self-heal: requesting sync retry for {name} after missing-files detected",
                             applicationBase,
                             PlayerName);
                     }
@@ -299,14 +368,202 @@ public sealed partial class PairHandler
             return (null, moddedPaths, BuildPairSyncAssetPlanFromResolvedPaths(moddedPaths, [], charaData), downloadedAny);
         }
 
-        private async Task<PairSyncCommitResult?> WaitForPairUploadsToFinishBeforeDownloadAsync(Guid applicationBase, IReadOnlyCollection<FileReplacementData> toDownloadReplacements, CancellationToken downloadToken)
+        private List<FileReplacementData> DropSessionFailedMissingFiles(List<FileReplacementData> missingFiles, Guid applicationBase, string phase)
+        {
+            if (missingFiles.Count == 0)
+                return missingFiles;
+
+            var kept = new List<FileReplacementData>(missingFiles.Count);
+            var dropped = new List<string>();
+
+            foreach (var missing in missingFiles)
+            {
+                var hash = missing.Hash;
+                if (!string.IsNullOrWhiteSpace(hash) && FileDownloadManager.HasSessionDownloadFailedHash(hash))
+                {
+                    dropped.Add(hash);
+                    continue;
+                }
+
+                kept.Add(missing);
+            }
+
+            if (dropped.Count == 0)
+                return missingFiles;
+
+            Logger.LogDebug(
+                "[BASE-{appBase}] Skipping {count} hash(es) already exhausted earlier this session during {phase} for {player}: {hashes}",
+                applicationBase,
+                dropped.Distinct(StringComparer.OrdinalIgnoreCase).Count(),
+                phase,
+                PlayerName,
+                string.Join(", ", dropped.Distinct(StringComparer.OrdinalIgnoreCase).Take(20)));
+
+            return kept;
+        }
+
+        private List<FileReplacementData> DropCentralRepairFailedMissingFiles(FileDownloadManager? downloadManager, List<FileReplacementData> missingFiles, Guid applicationBase)
+        {
+            if (downloadManager == null || missingFiles.Count == 0)
+                return missingFiles;
+
+            var exhausted = missingFiles
+                .Select(static f => f.Hash)
+                .Where(h => !string.IsNullOrWhiteSpace(h) && downloadManager.HasCentralFileRepairFailedHash(h))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            if (exhausted.Count > 0)
+            {
+                Logger.LogWarning(
+                    "[BASE-{appBase}] Central B2 repair is exhausted for {count} file(s) for {player}; keeping them in the missing set so partial appearance is not applied: {hashes}",
+                    applicationBase,
+                    exhausted.Count,
+                    PlayerName,
+                    string.Join(", ", exhausted.Take(20)));
+            }
+
+            return missingFiles;
+        }
+
+        private async Task<bool> TryApplyAppearanceFirstPreviewAsync(Guid applicationBase, CharacterData charaData, Dictionary<ObjectKind, HashSet<PlayerChanges>> updatedData, bool updateModdedPaths, bool updateManip, bool requiresFileReadyGate, Dictionary<(string GamePath, string? Hash), string> moddedPaths, List<FileReplacementData> stillMissing, bool forceApplyModsForThisApply, bool lifecycleApplyRequestedFromPlan, bool lifecycleRedrawRequestedFromPlan, CancellationToken downloadToken)
+        {
+            if (moddedPaths.Count == 0)
+                return false;
+
+            var previewPlan = BuildPairSyncAssetPlanFromResolvedPaths(moddedPaths, stillMissing, charaData);
+            if (!previewPlan.Entries.Any(IsAppearanceFirstAssetEntry))
+                return false;
+
+            var waitFailure = await WaitForApplicationCommitSlotAsync(applicationBase, downloadToken).ConfigureAwait(false);
+            if (waitFailure != null)
+            {
+                Logger.LogTrace("[BASE-{appBase}] Appearance-first preview apply for {player} skipped: {reason}", applicationBase, PlayerName, waitFailure.Reason);
+                return false;
+            }
+
+            Logger.LogDebug("[BASE-{appBase}] Applying appearance-first preview for {player}: {readyFiles} ready file(s), {missingFiles} remaining", applicationBase, PlayerName, previewPlan.Entries.Count, stillMissing.Count);
+
+            await PaceRoomEntryCommitHandoffAsync(applicationBase, true, lifecycleApplyRequestedFromPlan, lifecycleRedrawRequestedFromPlan, downloadToken).ConfigureAwait(false);
+
+            var previewLifecycleRedraw = lifecycleRedrawRequestedFromPlan || lifecycleApplyRequestedFromPlan;
+
+            var previewResult = await ApplyCharacterDataAsync(
+                applicationBase,
+                charaData,
+                updatedData,
+                updateModdedPaths,
+                updateManip,
+                requiresFileReadyGate,
+                moddedPaths,
+                previewPlan,
+                true,
+                forceApplyModsForThisApply,
+                lifecycleApplyRequestedFromPlan,
+                previewLifecycleRedraw,
+                downloadToken,
+                authoritativeCommit: false,
+                suppressNonLifecycleRedraw: !previewLifecycleRedraw).ConfigureAwait(false);
+
+            if (!previewResult.Success)
+            {
+                Logger.LogTrace("[BASE-{appBase}] Appearance-first preview apply for {player} did not commit: {reason}", applicationBase, PlayerName, previewResult.Reason);
+                return false;
+            }
+
+            return true;
+        }
+
+        private static List<FileReplacementData> SelectAppearanceFirstReplacements(List<FileReplacementData> replacements)
+        {
+            // Disabled deliberately: the appearance-first preview can only be safe if every
+            // appearance-critical piece is already present before the preview apply happens
+            // (face/ears/tail/skeleton/gear plus Glamourer/Customize+/Honorific/manipulations).
+            // If even one critical file or metadata payload is still pending, the receiver can
+            // briefly show broken actors with missing body parts.  Until that can be proven
+            // end-to-end, download the full required set first and only then apply.
+            return [];
+        }
+
+        private static bool IsAppearanceFirstReplacement(FileReplacementData replacement)
+        {
+            if (replacement.GamePaths == null)
+                return false;
+
+            foreach (var gamePath in replacement.GamePaths)
+            {
+                if (IsAppearanceFirstGamePath(gamePath))
+                    return true;
+            }
+
+            return false;
+        }
+
+        private static bool IsAppearanceFirstAssetEntry(PairSyncAssetEntry entry)
+            => entry.Criticality == PairSyncAssetCriticality.AppearanceCritical
+               || entry.Kind is PairSyncAssetKind.Skeleton or PairSyncAssetKind.Physics
+               || IsAppearanceFirstGamePath(entry.GamePath);
+
+        private static bool IsAppearanceFirstGamePath(string? gamePath)
+        {
+            if (string.IsNullOrWhiteSpace(gamePath))
+                return false;
+
+            var normalized = gamePath.Replace('\\', '/').Trim();
+            var ext = Path.GetExtension(normalized).ToLowerInvariant();
+
+            if (ext is ".mdl" or ".mtrl" or ".tex" or ".sklb" or ".atch" or ".phyb" or ".pbd" or ".imc" or ".eqp" or ".eqdp" or ".est" or ".cmp" or ".gmp")
+                return true;
+
+            if (ext == ".shpk" && normalized.StartsWith("chara/", StringComparison.OrdinalIgnoreCase))
+                return true;
+
+            if (ext is ".pap" or ".tmb" or ".tmb2" or ".avfx" or ".atex" or ".scd" or ".shpk" or ".eid" or ".skp")
+                return false;
+
+            return normalized.Contains("/face/", StringComparison.OrdinalIgnoreCase)
+                   || normalized.Contains("/hair/", StringComparison.OrdinalIgnoreCase)
+                   || normalized.Contains("/tail/", StringComparison.OrdinalIgnoreCase)
+                   || normalized.Contains("/ear/", StringComparison.OrdinalIgnoreCase)
+                   || normalized.Contains("/body/", StringComparison.OrdinalIgnoreCase)
+                   || normalized.Contains("/skin/", StringComparison.OrdinalIgnoreCase)
+                   || normalized.Contains("/attachoffset/", StringComparison.OrdinalIgnoreCase)
+                   || normalized.Contains("/material/", StringComparison.OrdinalIgnoreCase)
+                   || normalized.Contains("/equipment/", StringComparison.OrdinalIgnoreCase)
+                   || normalized.Contains("/accessory/", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private async Task<PairSyncCommitResult?> WaitForPairUploadsToFinishBeforeDownloadAsync(Guid applicationBase, IReadOnlyCollection<FileReplacementData> toDownloadReplacements, string dataHash, CancellationToken downloadToken)
         {
             if (!Pair.IsUploadingRecently)
                 return null;
 
+            if (MissingFileMeshService.HasRecentMeshReadyForCharacterData(Pair.UserData?.UID, dataHash))
+            {
+                ClearPairSyncDownloadStatus();
+                Logger.LogDebug(
+                    "[BASE-{appBase}] Pair upload flag is active for {player}, but Mesh ready was received for {hash}; continuing download/apply",
+                    applicationBase,
+                    PlayerName,
+                    dataHash);
+                return null;
+            }
+
+            if (AreRequiredDownloadHashesAvailableLocally(toDownloadReplacements))
+            {
+                ClearPairSyncDownloadStatus();
+                Logger.LogDebug(
+                    "[BASE-{appBase}] Pair upload flag is active for {player}, but all required hash(es) are already local; continuing apply",
+                    applicationBase,
+                    PlayerName);
+                return null;
+            }
+
             var startedTick = Environment.TickCount64;
             var lastLogTick = 0L;
             var lastUiTick = 0L;
+            var lastLocalAvailabilityCheckTick = 0L;
+            var localAvailabilityPollMs = IsWineRuntime ? 500 : PairUploadWaitPollMs;
             var fileCount = Math.Max(1, toDownloadReplacements?.Count ?? 0);
 
             PublishPairUploadWaitStatus(fileCount);
@@ -329,6 +586,31 @@ public sealed partial class PairHandler
                 }
 
                 var nowTick = Environment.TickCount64;
+                if (unchecked(nowTick - lastLocalAvailabilityCheckTick) >= localAvailabilityPollMs
+                    && AreRequiredDownloadHashesAvailableLocally(toDownloadReplacements))
+                {
+                    lastLocalAvailabilityCheckTick = nowTick;
+                    ClearPairSyncDownloadStatus();
+                    Logger.LogDebug(
+                        "[BASE-{appBase}] Pair upload flag is still active for {player}, but all required hash(es) became local after {elapsed}ms; continuing apply",
+                        applicationBase,
+                        PlayerName,
+                        unchecked(nowTick - startedTick));
+                    return null;
+                }
+
+                if (MissingFileMeshService.HasRecentMeshReadyForCharacterData(Pair.UserData?.UID, dataHash))
+                {
+                    ClearPairSyncDownloadStatus();
+                    Logger.LogDebug(
+                        "[BASE-{appBase}] Pair upload flag is still active for {player}, but Mesh ready arrived after {elapsed}ms for {hash}; continuing download/apply",
+                        applicationBase,
+                        PlayerName,
+                        unchecked(Environment.TickCount64 - startedTick),
+                        dataHash);
+                    return null;
+                }
+
 
                 if (unchecked(nowTick - lastLogTick) >= PairUploadWaitLogMs)
                 {
@@ -363,6 +645,29 @@ public sealed partial class PairHandler
                 unchecked(Environment.TickCount64 - startedTick));
 
             return null;
+        }
+
+        private bool AreRequiredDownloadHashesAvailableLocally(IReadOnlyCollection<FileReplacementData>? replacements)
+        {
+            if (replacements == null || replacements.Count == 0)
+                return false;
+
+            var checkedHashes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var sawHash = false;
+
+            foreach (var replacement in replacements)
+            {
+                var hash = replacement?.Hash;
+                if (string.IsNullOrWhiteSpace(hash) || !checkedHashes.Add(hash))
+                    continue;
+
+                sawHash = true;
+                var cache = _fileDbManager.GetFileCacheByHash(hash);
+                if (cache == null || string.IsNullOrWhiteSpace(cache.ResolvedFilepath) || !File.Exists(cache.ResolvedFilepath))
+                    return false;
+            }
+
+            return sawHash;
         }
 
         private void PublishPairUploadWaitStatus(int fileCount)
@@ -424,7 +729,10 @@ public sealed partial class PairHandler
                             applicationBase, PlayerName);
                     }
 
-                    await Task.Delay(15, downloadToken).ConfigureAwait(false);
+                    var pollDelayMs = IsWineRuntime
+                        ? LinuxSmoothMode.ComputeMaintenancePollDelay(30, 100)
+                        : 15;
+                    await Task.Delay(pollDelayMs, downloadToken).ConfigureAwait(false);
 
                     try
                     {
@@ -445,6 +753,48 @@ public sealed partial class PairHandler
                 return null;
             }
 
+        private async Task PaceRoomEntryCommitHandoffAsync(Guid applicationBase, bool downloadedAny, bool lifecycleApplyRequestedFromPlan, bool lifecycleRedrawRequestedFromPlan, CancellationToken token)
+        {
+            var visibleLifecycleEntry = lifecycleApplyRequestedFromPlan || lifecycleRedrawRequestedFromPlan || IsRecentlyVisibleLifecycleReplay();
+            if (!downloadedAny && !visibleLifecycleEntry)
+                return;
+
+            var jitterSeed = Math.Abs(PlayerNameHash?.GetHashCode(StringComparison.Ordinal) ?? applicationBase.GetHashCode());
+            var smoothDelayMs = downloadedAny
+                ? (SyncStorm.IsActive ? 25 + (jitterSeed % 35) : 8 + (jitterSeed % 15))
+                : 0;
+
+            if (visibleLifecycleEntry)
+            {
+                var backlog = SyncStorm.TotalBacklog;
+                int lifecycleDelayMs;
+
+                if (SyncStorm.IsActive && backlog >= 24)
+                    lifecycleDelayMs = 180 + (jitterSeed % 220);
+                else if (SyncStorm.IsActive && backlog >= 12)
+                    lifecycleDelayMs = 120 + (jitterSeed % 140);
+                else if (SyncStorm.IsActive)
+                    lifecycleDelayMs = 65 + (jitterSeed % 90);
+                else
+                    lifecycleDelayMs = 18 + (jitterSeed % 28);
+
+                if (IsWineRuntime)
+                {
+                    if (SyncStorm.IsActive && backlog >= 24)
+                        lifecycleDelayMs += 120;
+                    else if (SyncStorm.IsActive && backlog >= 12)
+                        lifecycleDelayMs += 80;
+                    else
+                        lifecycleDelayMs += SyncStorm.IsActive ? 45 : 12;
+                }
+
+                smoothDelayMs = Math.Max(smoothDelayMs, lifecycleDelayMs);
+            }
+
+            if (smoothDelayMs > 0)
+                await Task.Delay(smoothDelayMs, token).ConfigureAwait(false);
+        }
+
         private async Task<PairSyncCommitResult> StartPairSyncApplicationCommitAsync(
             Guid applicationBase,
             CharacterData charaData,
@@ -460,12 +810,7 @@ public sealed partial class PairHandler
             bool lifecycleRedrawRequestedFromPlan,
             CancellationToken downloadToken)
         {
-                if (downloadedAny)
-                {
-                    var jitterSeed = Math.Abs(PlayerNameHash?.GetHashCode(StringComparison.Ordinal) ?? applicationBase.GetHashCode());
-                    var smoothDelayMs = SyncStorm.IsActive ? 20 + (jitterSeed % 25) : 8 + (jitterSeed % 15);
-                    await Task.Delay(smoothDelayMs, downloadToken).ConfigureAwait(false);
-                }
+                await PaceRoomEntryCommitHandoffAsync(applicationBase, downloadedAny, lifecycleApplyRequestedFromPlan, lifecycleRedrawRequestedFromPlan, downloadToken).ConfigureAwait(false);
 
                 var block = GetPairSyncExecutionBlockReason("application commit handoff");
                 if (block != null)
@@ -520,9 +865,6 @@ public sealed partial class PairHandler
 
                 if (Pair.AutoPausedByOtherSync && !Pair.EffectiveOverrideOtherSync)
                     return PairSyncCommitResult.YieldedToOtherSync($"yielded to OtherSync during {phase}");
-
-                if (_localOtherSyncDecisionYield && !Pair.EffectiveOverrideOtherSync)
-                    return PairSyncCommitResult.YieldedToOtherSync($"local OtherSync gate yielded during {phase}");
 
                 if (_charaHandler == null || _charaHandler.Address == nint.Zero)
                     return PairSyncCommitResult.Hidden($"no visible actor handler during {phase}");

@@ -1,0 +1,121 @@
+import store_default from "../../../npm/hybrids/src/store.js";
+import router_default from "../../../npm/hybrids/src/router.js";
+import { html } from "../../../npm/hybrids/src/template/index.js";
+import Options, { MODE_DEFAULT } from "../../../store/options.js";
+import { lang } from "../../../ui/labels.js";
+import { TERMS_AND_CONDITIONS_URL } from "../../../utils/urls.js";
+import lottie_mode_zap_default from "../../../ui/assets/lottie-mode-zap.json.js";
+import success_default from "./success.js";
+import lottie_mode_default_default from "../../../ui/assets/lottie-mode-default.json.js";
+//#region src/pages/onboarding/views/modes.js
+/**
+* Ghostery Browser Extension
+* https://www.ghostery.com/
+*
+* Copyright 2017-present Ghostery GmbH. All rights reserved.
+*
+* This Source Code Form is subject to the terms of the Mozilla Public
+* License, v. 2.0. If a copy of the MPL was not distributed with this
+* file, You can obtain one at http://mozilla.org/MPL/2.0
+*/
+function selectMode(mode) {
+	return (host, event) => {
+		router_default.resolve(event, store_default.set(Options, { mode }));
+	};
+}
+var modes_default = {
+	[router_default.connect]: { stack: [success_default] },
+	render: () => html`
+    <template layout="column gap:2 width:full::800px">
+      <ui-card
+        layout="contents gap:2"
+        layout@390px="gap:3"
+        layout@768px="column"
+        data-qa="view:filtering-mode"
+      >
+        <section layout="block:center column gap" layout@390px="margin:2:0:1">
+          <ui-text type="display-m" mobile-type="display-xs"> Select filtering mode </ui-text>
+          <ui-text type="body-m" mobile-type="body-s">
+            Because no two people surf alike, we're giving you the power to pick how you want to
+            experience the web.
+          </ui-text>
+        </section>
+        <div layout="column gap" layout@768px="grid:2">
+          <ui-action>
+            <a
+              href="${router_default.url(success_default)}"
+              onclick="${selectMode(MODE_DEFAULT)}"
+              layout="grid"
+              data-qa="button:filtering-mode:ghostery"
+            >
+              <ui-mode-radio checked>
+                <input type="radio" name="filtering-mode" checked />
+                <ui-lottie
+                  src="${lottie_mode_default_default}"
+                  layout="ratio:83/45 width:220px"
+                  layout@768px="width:100%"
+                  autoplay
+                ></ui-lottie>
+                <ui-icon
+                  name="logo-in-box"
+                  layout="width:83px"
+                  layout@768px="width:138px"
+                ></ui-icon>
+                <ui-text>
+                  We block it all for you - ads, trackers, distractions. Always on when you browse.
+                </ui-text>
+                <ui-text type="label-s" slot="footer">
+                  Best for full coverage and privacy enthusiasts.
+                </ui-text>
+              </ui-mode-radio>
+            </a>
+          </ui-action>
+          <ui-text
+            type="display-2xs"
+            uppercase
+            layout="block:center margin:0.5:0"
+            layout@768px="hidden"
+          >
+            <!-- Ghostery mode "or" ZAP mode -->
+            or
+          </ui-text>
+          <ui-action>
+            <a
+              href="${router_default.url(success_default)}"
+              onclick="${selectMode("zap")}"
+              layout="grid"
+              data-qa="button:filtering-mode:zap"
+            >
+              <ui-mode-radio>
+                <ui-lottie
+                  src="${lottie_mode_zap_default}"
+                  layout="ratio:83/45 width:220px"
+                  layout@768px="width:100%"
+                  autoplay
+                ></ui-lottie>
+                <ui-icon name="logo-zap" layout="width:83px" layout@768px="width:116px"></ui-icon>
+                ${lang === "en" ? html`
+                      <div translate="no">
+                        <ui-text> You zap ads away on the sites you use. </ui-text>
+                        <ui-text> Zap once. They stay ad-free every time you visit. </ui-text>
+                      </div>
+                    ` : html`<ui-text balance>
+                      You block ads on the sites you use. Block once. They stay ad-free every time
+                      you visit.
+                    </ui-text>`}
+                <ui-text type="label-s" slot="footer">
+                  Best for beginners or sharing with family.
+                </ui-text>
+              </ui-mode-radio>
+            </a>
+          </ui-action>
+        </div>
+      </ui-card>
+      <ui-button type="transparent" layout="self:center">
+        <a href="${TERMS_AND_CONDITIONS_URL}" target="_blank"> Terms & Conditions </a>
+      </ui-button>
+    </template>
+  `
+};
+//#endregion
+export { modes_default as default };

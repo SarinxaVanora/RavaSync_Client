@@ -27,8 +27,12 @@ public static class PairApplyUtilities
         gamePath = NormalizeGamePath(gamePath);
         if (string.IsNullOrEmpty(gamePath)) return false;
 
+        // Sound banks are required transient support, but changing/publishing an SCD
+        // should not force a character redraw. Redraws do not make an already-started
+        // sound event restart correctly, and treating SCD as redraw-critical can make
+        // minion or dance support payloads redraw the visible character unnecessarily.
         if (gamePath.EndsWith(".scd", StringComparison.OrdinalIgnoreCase))
-            return true;
+            return false;
 
         if (gamePath.EndsWith(".avfx", StringComparison.OrdinalIgnoreCase)
             || gamePath.EndsWith(".atex", StringComparison.OrdinalIgnoreCase)
@@ -52,8 +56,11 @@ public static class PairApplyUtilities
         gamePath = NormalizeGamePath(gamePath);
         if (string.IsNullOrEmpty(gamePath)) return false;
 
-        if (gamePath.EndsWith(".sklb", StringComparison.OrdinalIgnoreCase))
+        if (gamePath.EndsWith(".sklb", StringComparison.OrdinalIgnoreCase)
+            || gamePath.EndsWith(".atch", StringComparison.OrdinalIgnoreCase))
+        {
             return true;
+        }
 
         if (!gamePath.EndsWith(".phy", StringComparison.OrdinalIgnoreCase)
             && !gamePath.EndsWith(".phyb", StringComparison.OrdinalIgnoreCase)
@@ -266,16 +273,40 @@ public static class PairApplyUtilities
         if (charaData == null)
             return "NULL";
 
-        using var sha1 = SHA1.Create();
+        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA1);
 
         void Append(string? value)
         {
             value ??= string.Empty;
-            var bytes = Encoding.UTF8.GetBytes(value);
-            if (bytes.Length > 0)
-                sha1.TransformBlock(bytes, 0, bytes.Length, null, 0);
 
-            sha1.TransformBlock(new[] { (byte)'\n' }, 0, 1, null, 0);
+            if (value.Length > 0)
+            {
+                var maxByteCount = Encoding.UTF8.GetMaxByteCount(value.Length);
+                byte[]? rented = null;
+
+                try
+                {
+                    Span<byte> buffer = maxByteCount <= 1024 ? stackalloc byte[maxByteCount] : default;
+                    if (maxByteCount > 1024)
+                    {
+                        rented = ArrayPool<byte>.Shared.Rent(maxByteCount);
+                        buffer = rented;
+                    }
+
+                    var written = Encoding.UTF8.GetBytes(value.AsSpan(), buffer);
+                    if (written > 0)
+                        hash.AppendData(buffer[..written]);
+                }
+                finally
+                {
+                    if (rented != null)
+                        ArrayPool<byte>.Shared.Return(rented);
+                }
+            }
+
+            Span<byte> separator = stackalloc byte[1];
+            separator[0] = (byte)'\n';
+            hash.AppendData(separator);
         }
 
         Append("HASH");
@@ -331,19 +362,40 @@ public static class PairApplyUtilities
         Append("PETNAMES");
         Append(charaData.PetNamesData);
 
-        sha1.TransformFinalBlock(Array.Empty<byte>(), 0, 0);
-        return Convert.ToHexString(sha1.Hash!);
+        return Convert.ToHexString(hash.GetHashAndReset());
+    }
+
+    public static bool IsMountMusicGamePath(string gamePath)
+    {
+        gamePath = NormalizeGamePath(gamePath);
+        if (string.IsNullOrEmpty(gamePath)) return false;
+        if (!gamePath.EndsWith(".scd", StringComparison.OrdinalIgnoreCase)) return false;
+
+        return gamePath.StartsWith("music/", StringComparison.OrdinalIgnoreCase)
+            || gamePath.StartsWith("bgm/", StringComparison.OrdinalIgnoreCase)
+            || gamePath.Contains("/bgm_ride", StringComparison.OrdinalIgnoreCase)
+            || gamePath.Contains("bgm_ride", StringComparison.OrdinalIgnoreCase);
     }
 
     public static Dictionary<string, string> BuildPenumbraTempMods(Dictionary<(string GamePath, string? Hash), string> moddedPaths, Action<string,string,string>? logConflict = null)
+        => BuildPenumbraTempModsCore(moddedPaths, static _ => true, logConflict);
+
+    public static Dictionary<string, string> BuildNonMountMusicPenumbraTempMods(Dictionary<(string GamePath, string? Hash), string> moddedPaths, Action<string,string,string>? logConflict = null)
+        => BuildPenumbraTempModsCore(moddedPaths, static gamePath => !IsMountMusicGamePath(gamePath), logConflict);
+
+    public static Dictionary<string, string> BuildMountMusicPenumbraTempMods(Dictionary<(string GamePath, string? Hash), string> moddedPaths, Action<string,string,string>? logConflict = null)
+        => BuildPenumbraTempModsCore(moddedPaths, IsMountMusicGamePath, logConflict);
+
+    private static Dictionary<string, string> BuildPenumbraTempModsCore(Dictionary<(string GamePath, string? Hash), string> moddedPaths, Func<string, bool> includeGamePath, Action<string,string,string>? logConflict = null)
     {
         var output = new Dictionary<string, string>(moddedPaths.Count, StringComparer.OrdinalIgnoreCase);
         var winnerHashes = new Dictionary<string, string?>(moddedPaths.Count, StringComparer.OrdinalIgnoreCase);
 
         foreach (var kvp in moddedPaths)
         {
-            var gamePath = kvp.Key.GamePath?.Replace('\\', '/').Trim();
+            var gamePath = NormalizeGamePath(kvp.Key.GamePath ?? string.Empty);
             if (string.IsNullOrWhiteSpace(gamePath)) continue;
+            if (!includeGamePath(gamePath)) continue;
 
             var path = kvp.Value;
             if (string.IsNullOrWhiteSpace(path)) continue;

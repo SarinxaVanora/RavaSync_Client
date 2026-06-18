@@ -80,6 +80,8 @@ public sealed partial class PairHandler : DisposableMediatorSubscriberBase
     private DateTime _lastAssignedCollectionAssignUtc = DateTime.MinValue;
     private DateTime _nextTempCollectionRetryNotBeforeUtc = DateTime.MinValue;
     private long _lastApplyCompletedTick;
+    private long _nextActiveSyncIndicatorValidationTick;
+    private Task? _activeSyncIndicatorValidationTask;
     private static readonly bool IsWineRuntime = SafeIsWine();
 
     private static bool SafeIsWine()
@@ -88,12 +90,48 @@ public sealed partial class PairHandler : DisposableMediatorSubscriberBase
         catch { return false; }
     }
 
+    private void ClearPairSyncTransferStatus()
+    {
+        Pair.SetCurrentDownloadStatus(null);
+        Pair.SetCurrentDownloadSummary(Pair.DownloadProgressSummary.None);
+        Pair.SetVisibleTransferStatus(Pair.VisibleTransferIndicator.None);
+    }
+
+    private void PublishPairSyncLoadingFilesStatus(int fileCount)
+    {
+        var totalFiles = Math.Max(1, fileCount);
+
+        Pair.SetVisibleTransferStatus(Pair.VisibleTransferIndicator.LoadingFiles);
+        Pair.SetCurrentDownloadSummary(new Pair.DownloadProgressSummary(
+            HasAny: true,
+            AnyDownloading: false,
+            AnyLoading: true,
+            TotalBytes: 0,
+            TransferredBytes: 0,
+            TotalFiles: totalFiles,
+            TransferredFiles: totalFiles));
+
+        Pair.SetCurrentDownloadStatus(new Dictionary<string, FileDownloadStatus>(StringComparer.Ordinal)
+        {
+            ["__pair_loading_files"] = new()
+            {
+                DownloadStatus = DownloadStatus.Decompressing,
+                TotalFiles = totalFiles,
+                TransferredFiles = totalFiles,
+                TotalBytes = 0,
+                TransferredBytes = 0,
+            }
+        });
+
+        Mediator.Publish(new RefreshUiMessage());
+    }
+
     private static int ComputeNormalApplyConcurrency()
     {
         var logical = Environment.ProcessorCount;
 
         if (IsWineRuntime)
-            return logical <= 8 ? 1 : 2;
+            return 1;
 
         if (logical <= 8) return 2;
         if (logical <= 16) return 4;
@@ -103,7 +141,6 @@ public sealed partial class PairHandler : DisposableMediatorSubscriberBase
     private static int ComputeNormalDownloadConcurrency()
     {
         var logical = Environment.ProcessorCount;
-        if (IsWineRuntime) return logical <= 8 ? 1 : 2;
         if (logical <= 8) return 2;
         if (logical <= 16) return 3;
         return 4;
@@ -113,16 +150,15 @@ public sealed partial class PairHandler : DisposableMediatorSubscriberBase
     {
         var logical = Environment.ProcessorCount;
         if (IsWineRuntime) return 1;
-        if (logical <= 8) return 1;
-        if (logical <= 16) return 2;
+        if (logical <= 8) return 2;
         return 3;
     }
 
     private static int ComputeStormDownloadConcurrency()
     {
         var logical = Environment.ProcessorCount;
-        if (IsWineRuntime) return 1;
-        return logical <= 8 ? 1 : 2;
+        if (logical <= 8) return 2;
+        return 3;
     }
 
     private static readonly int NormalApplyConcurrency = ComputeNormalApplyConcurrency();
@@ -135,20 +171,44 @@ public sealed partial class PairHandler : DisposableMediatorSubscriberBase
     private static readonly SemaphoreSlim NormalDownloadSemaphore = new(NormalDownloadConcurrency, NormalDownloadConcurrency);
     private static readonly SemaphoreSlim StormDownloadSemaphore = new(StormDownloadConcurrency, StormDownloadConcurrency);
 
-    // Smooth redraw spikes globally (room-entry bursts) without hard-stalling the entire room.
-    // Per-actor redraw coalescing still prevents duplicate redraws for the same object.
-    private static readonly int GlobalRedrawConcurrency = IsWineRuntime ? 1 : 2;
+    // Smooth redraw spikes globally (room-entry/reconnect bursts). Penumbra redraw is one of the
+    // most hitch-prone IPC paths, so keep it strictly one-by-one and add a tiny dispatch gap.
+    private const int GlobalRedrawConcurrency = 1;
+    private static int CriticalGlobalRedrawSpacingMs => LinuxSmoothMode.ComputeDispatchSpacing(175, 600);
+    private static int NonCriticalGlobalRedrawSpacingMs => LinuxSmoothMode.ComputeDispatchSpacing(75, 325);
+    private static long _lastGlobalRedrawDispatchTick;
     private static readonly SemaphoreSlim GlobalRedrawSemaphore = new(GlobalRedrawConcurrency, GlobalRedrawConcurrency);
     private static readonly ConcurrentDictionary<int, byte> RedrawObjectIndicesInFlight = new();
 
-    private static readonly SemaphoreSlim GlobalPostApplyRepairSemaphore = new(2, 2);
+    private static int LifecycleApplyDispatchSpacingMs => LinuxSmoothMode.ComputeDispatchSpacing(125, 525);
+    private static int ReceiverApplyDispatchSpacingMs(bool lifecycleApply) => LinuxSmoothMode.ComputeReceiverApplyDispatchSpacing(lifecycleApply);
+    private static long _lastLifecycleApplyDispatchTick;
+    private static long _lastReceiverApplyDispatchTick;
+    private static readonly SemaphoreSlim GlobalLifecycleApplySemaphore = new(1, 1);
+
+    private static readonly int GlobalPostApplyRepairConcurrency = IsWineRuntime ? 1 : 2;
+    private static readonly SemaphoreSlim GlobalPostApplyRepairSemaphore = new(GlobalPostApplyRepairConcurrency, GlobalPostApplyRepairConcurrency);
+
+    private const int MountMusicTempModPriority = 100;
+
+    private static int WineIncomingDataCoalesceDelayMs => LinuxSmoothMode.ComputeIncomingCoalesceDelay();
+    private static readonly int WineApplyPhaseWarnMs = IsWineRuntime ? 350 : 1200;
+    private static readonly int WineApplyTotalWarnMs = IsWineRuntime ? 1200 : 5000;
     private string? _lastAttemptedDataHash;
     private string? _lastAppliedTempModsFingerprint;
     private Dictionary<string, string>? _lastAppliedTempModsSnapshot;
+    private string? _lastAppliedMountMusicTempModsFingerprint;
+    private Dictionary<string, string>? _lastAppliedMountMusicTempModsSnapshot;
     private string? _activeTempFilesModName;
     private int _activeTempFilesModPriority;
     private CancellationTokenSource? _deferredTempFilesModCleanupCts;
     private volatile bool _disposeRestoreAlreadyQueued;
+    private int _vanillaTeardownInProgress;
+    private int _visibilityLifecycleGeneration;
+    private Task? _vanillaTeardownTask;
+    private string? _lastVanillaTeardownPlayerName;
+    private int? _lastVanillaTeardownObjectIndex;
+    private nint _lastVanillaTeardownPlayerAddress;
     private string? _lastAppliedTransientSupportFingerprint;
     private string? _lastAppliedManipulationFingerprint = null;
     private readonly ConcurrentDictionary<Guid, byte> _lifecycleRedrawApplications = new();
@@ -158,6 +218,7 @@ public sealed partial class PairHandler : DisposableMediatorSubscriberBase
     private long _visibleReplayCandidateSinceTick = -1;
     private int _visibleReplayStableFrames = 0;
     private long _lastInitialApplyDispatchTick = -1;
+    private long _lastVisibleLifecycleReplayTick = -1;
     private const int VisibleReplayStableFramesRequired = 3;
     private const int VisibleReplaySettleMs = 175;
     private const int VisibleReplayDispatchCooldownMs = 500;
@@ -193,7 +254,7 @@ public sealed partial class PairHandler : DisposableMediatorSubscriberBase
     private const int VisibilityLossGraceMs = 900;
     private const int ZoneVisibilityLossGraceMs = 1400;
     private const int IdentityDriftGraceMs = 900;
-    private const int StableVisibilityUpdateIntervalMs = 125;
+    private const int StableVisibilityUpdateIntervalMs = 250;
     private const int ActiveVisibilityUpdateIntervalMs = 33;
     private bool _initialApplyPending;
     private long _otherSyncPollTick;
@@ -239,8 +300,6 @@ public sealed partial class PairHandler : DisposableMediatorSubscriberBase
         _syncWorker = new PairSyncWorker(this);
         _penumbraCollection = Guid.Empty;
         _penumbraCollectionTask = null;
-        LastAppliedDataBytes = -1;
-
         SubscribeMediatorEvents();
     }
 
@@ -270,7 +329,6 @@ public sealed partial class PairHandler : DisposableMediatorSubscriberBase
         }
     }
 
-    public long LastAppliedDataBytes { get; private set; }
     public Pair Pair { get; private set; }
 
     private nint ResolveStablePlayerAddress(nint fallbackAddress = 0)
@@ -286,7 +344,7 @@ public sealed partial class PairHandler : DisposableMediatorSubscriberBase
 
         if (_lastAssignedPlayerAddress != nint.Zero
             && _lastAssignedPlayerAddress != liveAddress
-            && _dalamudUtil.AddressMatchesPlayerIdent(Pair.Ident, _lastAssignedPlayerAddress))
+            && _dalamudUtil.AddressMatchesPlayerIdentCached(Pair.Ident, _lastAssignedPlayerAddress))
         {
             return _lastAssignedPlayerAddress;
         }
@@ -322,7 +380,7 @@ public sealed partial class PairHandler : DisposableMediatorSubscriberBase
             return false;
         }
 
-        return _dalamudUtil.AddressMatchesPlayerIdent(Pair.Ident, address);
+        return _dalamudUtil.AddressMatchesPlayerIdentCached(Pair.Ident, address);
     }
 
 
@@ -364,6 +422,9 @@ public sealed partial class PairHandler : DisposableMediatorSubscriberBase
         : ((FFXIVClientStructs.FFXIV.Client.Game.Object.GameObject*)PlayerCharacter)->EntityId;
     public string? PlayerName { get; private set; }
     public string PlayerNameHash => Pair.Ident;
+    internal string LastKnownVanillaTeardownPlayerName => !string.IsNullOrWhiteSpace(PlayerName)
+        ? PlayerName!
+        : _lastVanillaTeardownPlayerName ?? string.Empty;
 
     internal bool IsObjectKindActive(ObjectKind kind)
     {
@@ -400,16 +461,17 @@ public sealed partial class PairHandler : DisposableMediatorSubscriberBase
     private void SubscribeMediatorEvents()
     {
         Mediator.Subscribe<FrameworkUpdateMessage>(this, (_) => FrameworkUpdate());
+        Mediator.Subscribe<OtherSyncCurrentStateChangedMessage>(this, (_) => WakeOtherSyncOwnershipCheck());
         Mediator.Subscribe<ZoneSwitchStartMessage>(this, (_) =>
         {
-            Logger.LogDebug("Zone switch start: tearing down live RavaSync state for {pair}", Pair.UserData.AliasOrUID);
-            ResetToUninitializedState(revertLiveCustomizationState: false);
+            Logger.LogDebug("Zone switch start: treating {pair} as visibility lost; running targeted vanilla teardown", Pair.UserData.AliasOrUID);
+            GoBackToVanillaState(revertLiveCustomizationState: true);
         });
 
         Mediator.Subscribe<ZoneSwitchEndMessage>(this, (_) =>
         {
-            Logger.LogDebug("Zone switch end: ensuring live RavaSync state is torn down for {pair}", Pair.UserData.AliasOrUID);
-            ResetToUninitializedState(revertLiveCustomizationState: false);
+            Logger.LogDebug("Zone switch end: waking visibility/replay lifecycle for {pair} without resetting local state", Pair.UserData.AliasOrUID);
+            HandleZoneSwitchEnd();
         });
 
         Mediator.Subscribe<PenumbraInitializedMessage>(this, (_) =>
@@ -421,7 +483,7 @@ public sealed partial class PairHandler : DisposableMediatorSubscriberBase
             ResetCollectionBindingState();
             ResetOwnedObjectRetryState();
 
-            if (!IsVisible && _charaHandler != null)
+            if (!IsVisible && _charaHandler != null && Volatile.Read(ref _vanillaTeardownInProgress) == 0)
             {
                 PlayerName = string.Empty;
                 _charaHandler.Dispose();
@@ -467,9 +529,14 @@ public sealed partial class PairHandler : DisposableMediatorSubscriberBase
             if (_charaHandler == null || msg.DownloadId != _charaHandler)
                 return;
 
-            Pair.SetCurrentDownloadSummary(Pair.DownloadProgressSummary.None);
-            Pair.SetCurrentDownloadStatus(null);
-            Pair.SetVisibleTransferStatus(Pair.VisibleTransferIndicator.None);
+            var activePairDownload = _pairDownloadTask;
+            if (activePairDownload != null && !activePairDownload.IsCompleted)
+            {
+                PublishPairSyncLoadingFilesStatus(1);
+                return;
+            }
+
+            ClearPairSyncTransferStatus();
         });
 
         Mediator.Subscribe<CombatOrPerformanceEndMessage>(this, _ =>
@@ -508,17 +575,295 @@ public sealed partial class PairHandler : DisposableMediatorSubscriberBase
             Logger.LogTrace("Reapplying Pet Names data for {this}", this);
             await _ipcManager.PetNames.SetPlayerData(PlayerCharacter, _cachedData.PetNamesData).ConfigureAwait(false);
         });
+
+        Mediator.Subscribe<PenumbraResourceLoadMessage>(this, HandlePenumbraResourceLoadForCompactIndicators);
+    }
+
+    private void HandlePenumbraResourceLoadForCompactIndicators(PenumbraResourceLoadMessage msg)
+    {
+        if (!_dalamudUtil.IsOnFrameworkThread)
+        {
+            _ = _dalamudUtil.RunOnFrameworkThread(() => HandlePenumbraResourceLoadForCompactIndicators(msg));
+            return;
+        }
+
+        if (!IsVisible || Pair.IsPaused)
+            return;
+
+        var gamePath = NormalizeLiveIndicatorGamePath(msg.GamePath);
+        var filePath = NormalizeLiveIndicatorGamePath(msg.FilePath);
+        var soundPath = IsLiveSoundIndicatorPath(gamePath) ? gamePath : IsLiveSoundIndicatorPath(filePath) ? filePath : string.Empty;
+        if (string.IsNullOrWhiteSpace(soundPath))
+            return;
+
+        var isPairActorLoad = msg.GameObject != IntPtr.Zero && IsPairResourceLoadAddress((nint)msg.GameObject);
+        var isAppliedMountMusicLoad = IsAppliedMountMusicTempModPath(gamePath)
+            || IsAppliedMountMusicTempModPath(filePath)
+            || IsAppliedMountMusicTempModPath(soundPath);
+
+        // Normal actor-bound SCDs still have to belong to this pair. Default-collection mount music
+        // can arrive without a useful pair actor pointer, so allow it only when it matches this pair's
+        // currently applied mount-music temp-mod snapshot. The lifetime is still the known-good
+        // incoming user-data boundary: observed SCD keeps the icon; next payload clears it unless
+        // another relevant SCD was observed for this pair.
+        if (!isPairActorLoad && !isAppliedMountMusicLoad)
+            return;
+
+        var longLived = IsLongLivedLiveIndicatorPath(gamePath)
+            || IsLongLivedLiveIndicatorPath(filePath)
+            || isAppliedMountMusicLoad;
+
+        Pair.MarkActiveSyncResource(vfx: false, sound: true, longLived, soundPath, isPairActorLoad ? (nint)msg.GameObject : nint.Zero);
+    }
+
+    private bool IsCurrentAppliedRavaSyncResourceLoad(string? gamePath, string? resolvedFilePath)
+    {
+        var normalizedGamePath = NormalizeLiveIndicatorGamePath(gamePath);
+        if (string.IsNullOrWhiteSpace(normalizedGamePath))
+            return false;
+
+        // Penumbra's resource-load callback is authoritative that a replacement is being loaded,
+        // but the resolved file path it reports is not stable enough to exact-match against our
+        // temp-mod cache path on every machine/redirect style. For the UI indicator we only need
+        // to know that the live game path belongs to this pair's currently applied RavaSync payload.
+        // Validation below then keeps it alive while Penumbra still reports the resource on the object.
+        if (AppliedTempModGamePathMatches(_lastAppliedTempModsSnapshot, normalizedGamePath))
+            return true;
+
+        if (AppliedTempModGamePathMatches(_lastAppliedMountMusicTempModsSnapshot, normalizedGamePath))
+            return true;
+
+        return false;
+    }
+
+    private static bool AppliedTempModGamePathMatches(IReadOnlyDictionary<string, string>? appliedTempMods, string normalizedGamePath)
+    {
+        if (appliedTempMods == null || appliedTempMods.Count == 0)
+            return false;
+
+        if (appliedTempMods.ContainsKey(normalizedGamePath))
+            return true;
+
+        // Defensive: most snapshots are already normalized, but older/current call sites can keep
+        // original slash/case formatting. Do the cheap precise check first, then fall back here.
+        return appliedTempMods.Keys.Any(path => string.Equals(NormalizeLiveIndicatorGamePath(path), normalizedGamePath, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private bool IsAppliedMountMusicTempModPath(string? path)
+        => AppliedTempModKeyOrValueMatches(_lastAppliedMountMusicTempModsSnapshot, path);
+
+    private static bool AppliedTempModKeyOrValueMatches(IReadOnlyDictionary<string, string>? appliedTempMods, string? path)
+    {
+        if (appliedTempMods == null || appliedTempMods.Count == 0 || string.IsNullOrWhiteSpace(path))
+            return false;
+
+        var normalizedGamePath = NormalizeLiveIndicatorGamePath(path);
+        var normalizedPhysicalPath = NormalizePhysicalLiveIndicatorPath(path);
+
+        foreach (var kvp in appliedTempMods)
+        {
+            if (!string.IsNullOrWhiteSpace(normalizedGamePath)
+                && string.Equals(NormalizeLiveIndicatorGamePath(kvp.Key), normalizedGamePath, StringComparison.OrdinalIgnoreCase))
+                return true;
+
+            if (!string.IsNullOrWhiteSpace(normalizedGamePath)
+                && string.Equals(NormalizeLiveIndicatorGamePath(kvp.Value), normalizedGamePath, StringComparison.OrdinalIgnoreCase))
+                return true;
+
+            if (!string.IsNullOrWhiteSpace(normalizedPhysicalPath)
+                && string.Equals(NormalizePhysicalLiveIndicatorPath(kvp.Value), normalizedPhysicalPath, StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+
+        return false;
+    }
+
+    private static string NormalizePhysicalLiveIndicatorPath(string? path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+            return string.Empty;
+
+        var trimmed = path.Trim();
+        if (!Path.IsPathRooted(trimmed))
+            return string.Empty;
+
+        return NormalizeLiveIndicatorFilePath(trimmed).ToLowerInvariant();
+    }
+
+    private static string NormalizeLiveIndicatorGamePath(string? path)
+    {
+        return (path ?? string.Empty)
+            .Replace('\\', '/')
+            .Trim()
+            .TrimStart('/')
+            .ToLowerInvariant();
+    }
+
+    private static string NormalizeLiveIndicatorFilePath(string? path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+            return string.Empty;
+
+        try
+        {
+            return Path.GetFullPath(path).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar).Replace('\\', '/');
+        }
+        catch
+        {
+            return path.Trim().TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar).Replace('\\', '/');
+        }
+    }
+
+    private static bool IsLiveSoundIndicatorPath(string? path)
+    {
+        return string.Equals(Path.GetExtension(NormalizeLiveIndicatorGamePath(path)), ".scd", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsLiveVfxIndicatorPath(string? path)
+    {
+        return string.Equals(Path.GetExtension(NormalizeLiveIndicatorGamePath(path)), ".avfx", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsLongLivedLiveIndicatorPath(string? path)
+    {
+        var normalized = NormalizeLiveIndicatorGamePath(path);
+        if (string.IsNullOrWhiteSpace(normalized))
+            return false;
+
+        return PairApplyUtilities.IsMountMusicGamePath(normalized)
+            || normalized.Contains("loop", StringComparison.OrdinalIgnoreCase)
+            || normalized.Contains("bgm_ride", StringComparison.OrdinalIgnoreCase)
+            || normalized.StartsWith("music/", StringComparison.OrdinalIgnoreCase)
+            || normalized.Contains("/music/", StringComparison.OrdinalIgnoreCase)
+            || normalized.StartsWith("bgm/", StringComparison.OrdinalIgnoreCase)
+            || normalized.Contains("/bgm/", StringComparison.OrdinalIgnoreCase)
+            || normalized.StartsWith("sound/bgm/", StringComparison.OrdinalIgnoreCase)
+            || normalized.Contains("/sound/bgm/", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private bool IsPairResourceLoadAddress(nint address)
+    {
+        if (address == nint.Zero)
+            return false;
+
+        if (_charaHandler?.Address == address || _lastAssignedPlayerAddress == address)
+            return true;
+
+        if (!_dalamudUtil.IsOnFrameworkThread)
+            return false;
+
+        var playerAddress = ResolveStablePlayerAddress();
+        if (playerAddress == nint.Zero)
+            return false;
+
+        if (address == playerAddress)
+            return true;
+
+        return _dalamudUtil.GetCompanionPtr(playerAddress) == address
+            || _dalamudUtil.GetPetPtr(playerAddress) == address
+            || _dalamudUtil.GetMinionOrMountPtr(playerAddress) == address;
+    }
+
+    private void ValidateActiveSyncIndicators()
+    {
+        Pair.PruneExpiredActiveSyncIndicators();
+
+        var activeIndicators = Pair.SnapshotActiveSyncResourceIndicators();
+        if (activeIndicators.Count == 0 || !IsVisible || Pair.IsPaused)
+            return;
+
+        var now = Environment.TickCount64;
+        if (unchecked(_nextActiveSyncIndicatorValidationTick - now) > 0)
+            return;
+
+        if (_activeSyncIndicatorValidationTask != null && !_activeSyncIndicatorValidationTask.IsCompleted)
+            return;
+
+        var validationIntervalMs = IsWineRuntime
+            ? LinuxSmoothMode.ComputeActiveIndicatorValidationInterval(1000)
+            : 1000;
+        _nextActiveSyncIndicatorValidationTick = unchecked(now + validationIntervalMs);
+        _activeSyncIndicatorValidationTask = ValidateActiveSyncIndicatorsAsync(activeIndicators);
+    }
+
+    private async Task ValidateActiveSyncIndicatorsAsync(IReadOnlyList<Pair.ActiveSyncResourceIndicator> activeIndicators)
+    {
+        try
+        {
+            foreach (var group in activeIndicators.Where(i => i.Address != nint.Zero).GroupBy(i => i.Address).ToArray())
+            {
+                var currentResources = await _ipcManager.Penumbra.GetGameObjectResourcePathsAsync(Logger, group.Key).ConfigureAwait(false);
+                var liveGamePaths = currentResources == null
+                    ? new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+                    : FlattenLiveIndicatorGamePaths(currentResources);
+
+                Pair.ReconcileActiveSyncResourcesForAddress(group.Key, liveGamePaths);
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.LogTrace(ex, "Failed to validate active sync indicators for {pair}", Pair.UserData.AliasOrUID);
+        }
+    }
+
+    private static HashSet<string> FlattenLiveIndicatorGamePaths(Dictionary<string, HashSet<string>> resources)
+    {
+        var output = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var item in resources)
+        {
+            var keyPath = NormalizeLiveIndicatorGamePath(item.Key);
+            if (!string.IsNullOrWhiteSpace(keyPath))
+                output.Add(keyPath);
+
+            var paths = item.Value;
+            if (paths == null)
+                continue;
+
+            foreach (var path in paths)
+            {
+                var normalized = NormalizeLiveIndicatorGamePath(path);
+                if (!string.IsNullOrWhiteSpace(normalized))
+                    output.Add(normalized);
+            }
+        }
+
+        return output;
     }
 
     private void FrameworkUpdate()
     {
+        LinuxSmoothMode.RecordFrameworkTick();
         FlushScheduledRefreshUi();
+        ValidateActiveSyncIndicators();
         _visibilityCoordinator.FrameworkUpdate();
     }
 
-    private Task InitializeAsync(string name) => _visibilityCoordinator.InitializeAsync(name);
+    private Task InitializeAsync(string name, nint knownAddress = 0) => _visibilityCoordinator.InitializeAsync(name, knownAddress);
+
+    private void HandleZoneSwitchEnd() => _visibilityCoordinator.HandleZoneSwitchEnd();
 
     private void ResetToUninitializedState(bool revertLiveCustomizationState = true) => _visibilityCoordinator.ResetToUninitializedState(revertLiveCustomizationState);
+
+    public void GoBackToVanillaState(bool revertLiveCustomizationState = true, bool waitForCompletion = false)
+    {
+        CancelPairSyncWork();
+        ResetToUninitializedState(revertLiveCustomizationState);
+
+        if (!waitForCompletion || _dalamudUtil.IsOnFrameworkThread)
+            return;
+
+        try
+        {
+            _vanillaTeardownTask?.Wait(TimeSpan.FromSeconds(4));
+        }
+        catch (Exception ex)
+        {
+            Logger.LogDebug(ex, "Timed out or failed while waiting for vanilla teardown for {pair}", Pair.UserData.AliasOrUID);
+        }
+    }
+
+    private void WakeOtherSyncOwnershipCheck()
+        => _visibilityCoordinator.WakeOtherSyncOwnershipCheck();
 
     private Task<(bool Bound, bool Reassigned)> EnsurePenumbraCollectionBindingAsync(Guid applicationId)
         => _penumbraCoordinator.EnsurePenumbraCollectionBindingAsync(applicationId);
@@ -535,89 +880,6 @@ public sealed partial class PairHandler : DisposableMediatorSubscriberBase
 
     public void ReclaimFromOtherSync(bool requestApplyIfPossible, bool treatAsFirstVisible)
         => _otherSyncCoordinator.ReclaimFromOtherSync(requestApplyIfPossible, treatAsFirstVisible);
-
-    public void EnterPausedVanillaState()
-    {
-        CancelPairSyncWork();
-
-        var applicationId = Guid.NewGuid();
-        var name = PlayerName;
-        var playerAddress = ResolveStablePlayerAddress(_charaHandler?.Address ?? nint.Zero);
-        var objectKinds = (_cachedData == null
-            ? Enumerable.Empty<ObjectKind>()
-            : (_cachedData.FileReplacements?.Keys ?? Enumerable.Empty<ObjectKind>())
-                .Concat(_cachedData.GlamourerData?.Keys ?? Enumerable.Empty<ObjectKind>())
-                .Concat(_cachedData.CustomizePlusData?.Keys ?? Enumerable.Empty<ObjectKind>()))
-            .Distinct()
-            .ToArray();
-
-        ResetCollectionBindingState();
-        ResetAppliedModTrackingState();
-        ResetOwnedObjectRetryState();
-        ResetReapplyTrackingState();
-        ResetVisibilityTracking();
-
-        _initialApplyPending = false;
-        _forceApplyMods = true;
-        _redrawOnNextApplication = true;
-
-        Pair.SetVisibleTransferStatus(Pair.VisibleTransferIndicator.None);
-        Pair.SetCurrentDownloadStatus(null);
-        Pair.SetCurrentDownloadSummary(Pair.DownloadProgressSummary.None);
-        Pair.ClearDisplayedPerformanceMetrics();
-        ScheduleRefreshUi(immediate: true);
-
-        if (_lifetime.ApplicationStopping.IsCancellationRequested)
-            return;
-
-        if (_dalamudUtil.IsZoning || _dalamudUtil.IsInCutscene)
-            return;
-
-        if (_charaHandler == null || string.IsNullOrEmpty(name))
-            return;
-
-        _disposeRestoreAlreadyQueued = true;
-
-        _ = Task.Run(async () =>
-        {
-            try
-            {
-                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
-
-                await RemovePenumbraCollectionAsync(applicationId).ConfigureAwait(false);
-
-                foreach (var objectKind in objectKinds)
-                {
-                    try
-                    {
-                        await RevertCustomizationDataAsync(objectKind, name, applicationId, cts.Token, playerAddress).ConfigureAwait(false);
-                    }
-                    catch (OperationCanceledException)
-                    {
-                        throw;
-                    }
-                    catch (InvalidOperationException ex)
-                    {
-                        Logger.LogDebug(ex, "[{applicationId}] Pause revert skipped for {pair} {objectKind}; actor no longer matched",
-                            applicationId, Pair.UserData.AliasOrUID, objectKind);
-                    }
-                    catch (Exception ex)
-                    {
-                        Logger.LogWarning(ex, "[{applicationId}] Pause revert failed for {pair} {objectKind}",
-                            applicationId, Pair.UserData.AliasOrUID, objectKind);
-                    }
-                }
-            }
-            catch (OperationCanceledException)
-            {
-                Logger.LogDebug("[{applicationId}] Pause revert timed out for {pair}", applicationId, Pair.UserData.AliasOrUID);
-            }
-            catch (Exception ex)
-            {
-                Logger.LogWarning(ex, "[{applicationId}] Failed entering paused vanilla state for {pair}", applicationId, Pair.UserData.AliasOrUID);
-            }
-        });
-    }
 
     private void HandleOtherSyncReleased(bool requestApplyIfPossible)
         => _otherSyncCoordinator.HandleOtherSyncReleased(requestApplyIfPossible);
@@ -661,11 +923,11 @@ public sealed partial class PairHandler : DisposableMediatorSubscriberBase
     private Task RevertCustomizationDataAsync(ObjectKind objectKind, string name, Guid applicationId, CancellationToken cancelToken, nint addressOverride = 0, IReadOnlyDictionary<ObjectKind, Guid?>? customizeIdSnapshot = null)
         => _customizationCoordinator.RevertCustomizationDataAsync(objectKind, name, applicationId, cancelToken, addressOverride, customizeIdSnapshot);
 
-    private bool IsPairSyncBusyForPayload(string payloadFingerprint) => _syncWorker?.IsBusyForPayload(payloadFingerprint) == true;
+    internal bool IsPairSyncBusyForPayload(string payloadFingerprint) => _syncWorker?.IsBusyForPayload(payloadFingerprint) == true;
 
     private void CancelPairSyncWork(bool clearDesired = false) => _syncWorker?.CancelActiveWork(clearDesired);
     private void ResetPairSyncPipelineState() => _syncWorker?.ResetPipelineState();
 
-    private Task<PairSyncCommitResult> ApplyCharacterDataAsync(Guid applicationBase, CharacterData charaData, Dictionary<ObjectKind, HashSet<PlayerChanges>> updatedData, bool updateModdedPaths, bool updateManip, bool requiresFileReadyGate, Dictionary<(string GamePath, string? Hash), string> moddedPaths, PairSyncAssetPlan assetPlan, bool downloadedAny, bool forceApplyModsForThisApply, bool lifecycleApplyRequestedFromPlan, bool lifecycleRedrawRequestedFromPlan, CancellationToken token)
-        => _applyExecutionCoordinator.ApplyCharacterDataAsync(applicationBase, charaData, updatedData, updateModdedPaths, updateManip, requiresFileReadyGate, moddedPaths, assetPlan, downloadedAny, forceApplyModsForThisApply, lifecycleApplyRequestedFromPlan, lifecycleRedrawRequestedFromPlan, token);
+    private Task<PairSyncCommitResult> ApplyCharacterDataAsync(Guid applicationBase, CharacterData charaData, Dictionary<ObjectKind, HashSet<PlayerChanges>> updatedData, bool updateModdedPaths, bool updateManip, bool requiresFileReadyGate, Dictionary<(string GamePath, string? Hash), string> moddedPaths, PairSyncAssetPlan assetPlan, bool downloadedAny, bool forceApplyModsForThisApply, bool lifecycleApplyRequestedFromPlan, bool lifecycleRedrawRequestedFromPlan, CancellationToken token, bool authoritativeCommit = true, bool suppressNonLifecycleRedraw = false)
+        => _applyExecutionCoordinator.ApplyCharacterDataAsync(applicationBase, charaData, updatedData, updateModdedPaths, updateManip, requiresFileReadyGate, moddedPaths, assetPlan, downloadedAny, forceApplyModsForThisApply, lifecycleApplyRequestedFromPlan, lifecycleRedrawRequestedFromPlan, token, authoritativeCommit, suppressNonLifecycleRedraw);
 }

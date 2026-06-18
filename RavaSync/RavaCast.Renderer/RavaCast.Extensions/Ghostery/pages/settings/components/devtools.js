@@ -1,0 +1,240 @@
+import { dispatch } from "../../../npm/hybrids/src/utils.js";
+import store_default from "../../../npm/hybrids/src/store.js";
+import { html } from "../../../npm/hybrids/src/template/index.js";
+import Notification from "../../../store/notification.js";
+import Options from "../../../store/options.js";
+import { longDateFormatter } from "../../../ui/labels.js";
+import { ACTION_DISABLE_ANTITRACKING_MODIFICATION, ACTION_DISABLE_AUTOCONSENT, ACTION_DISABLE_GPC, ACTION_PAUSE_ASSISTANT } from "../../../npm/@ghostery/config/dist/esm/actions.js";
+import { FLAGS } from "../../../npm/@ghostery/config/dist/esm/flags.js";
+import Config from "../../../store/config.js";
+import Resources from "../../../store/resources.js";
+import { asyncAction } from "../utils/actions.js";
+import { getStorage } from "../../../utils/telemetry.js";
+//#region src/pages/settings/components/devtools.js
+/**
+* Ghostery Browser Extension
+* https://www.ghostery.com/
+*
+* Copyright 2017-present Ghostery GmbH. All rights reserved.
+*
+* This Source Code Form is subject to the terms of the Mozilla Public
+* License, v. 2.0. If a copy of the MPL was not distributed with this
+* file, You can obtain one at http://mozilla.org/MPL/2.0
+*/
+var VERSION = chrome.runtime.getManifest().version;
+function clearStorage(host, event) {
+	asyncAction(event, chrome.runtime.sendMessage({ action: "clearStorage" }));
+}
+async function setConfig(values) {
+	await chrome.runtime.sendMessage({
+		action: "devtools:config",
+		values
+	});
+}
+async function forceConfigSync(host, event) {
+	await asyncAction(event, setConfig({ updatedAt: 0 }));
+}
+async function testConfigDomain() {
+	const domain = window.prompt("Enter domain to test:", "example.com");
+	if (!domain) return;
+	const actions = window.prompt("Enter actions to test:", [
+		ACTION_DISABLE_AUTOCONSENT,
+		ACTION_DISABLE_ANTITRACKING_MODIFICATION,
+		ACTION_DISABLE_GPC,
+		ACTION_PAUSE_ASSISTANT
+	].join(", "));
+	if (!actions) return;
+	await setConfig({ domains: { [domain]: { actions: actions.split(",").map((a) => a.trim()) } } });
+}
+function toggleFlag(name) {
+	return async (host, event) => {
+		await setConfig({ flags: { [name]: event.target.checked ? {
+			percentage: 0,
+			enabled: event.target.checked
+		} : null } });
+	};
+}
+function createClearConfigDomain(name) {
+	return async () => {
+		setConfig({ domains: { [name]: null } });
+	};
+}
+function refresh(host) {
+	host.counter += 1;
+	if (host.counter > 5) {
+		host.visible = true;
+		dispatch(host, "shown");
+	}
+}
+var devtools_default = {
+	visible: false,
+	counter: 0,
+	options: store_default(Options),
+	config: store_default(Config),
+	notifications: store_default([Notification]),
+	resources: store_default(Resources),
+	render: ({ visible, counter, options, config, notifications, resources }) => html`
+    <template layout="column gap:3 margin:top:2">
+      ${(visible || counter > 5) && html`
+        <section layout="column gap:4" translate="no">
+          <div layout="column gap:3" translate="no">
+            <ui-text type="headline-m">Developer tools</ui-text>
+            <div layout="column gap">
+              <settings-toggle value="${config.enabled}" onchange="${html.set(config, "enabled")}">
+                Remote Configuration
+                <ui-text type="body-s" color="tertiary" slot="footer">
+                  Updated at: ${longDateFormatter.format(new Date(config.updatedAt))}
+                </ui-text>
+                ${config.enabled && html`
+                  <div layout="column gap:3" slot="card-footer" translate="no">
+                    <div layout="column gap">
+                      <ui-text type="label-m">Flags</ui-text>
+                      <div layout="row:wrap gap:2:1">
+                        ${FLAGS.map((name) => html`
+                            <label layout="row items:center gap">
+                              <ui-input>
+                                <input
+                                  type="checkbox"
+                                  checked="${config.hasFlag(name)}"
+                                  onchange="${toggleFlag(name)}"
+                                />
+                              </ui-input>
+                              <ui-text type="body-xs" color="tertiary"> ${name} </ui-text>
+                            </label>
+                          `)}
+                      </div>
+                    </div>
+                    <div layout="column gap">
+                      <ui-text type="label-m">Domains</ui-text>
+                      <div layout="row:wrap gap">
+                        ${Object.entries(config.domains).filter(([, d]) => d.actions.length).map(([name, d]) => html`<ui-text
+                                color="secondary"
+                                onclick="${createClearConfigDomain(name)}"
+                                style="cursor: pointer;"
+                              >
+                                ${name} (${d.actions.join(", ")})
+                              </ui-text>`) || "none"}
+                      </div>
+                    </div>
+                    <div layout="row gap">
+                      <ui-button
+                        onclick="${forceConfigSync}"
+                        layout="shrink:0 self:start"
+                        size="s"
+                        slot="footer"
+                      >
+                        <button>
+                          <ui-icon name="refresh" layout="size:2"></ui-icon>
+                          Force sync
+                        </button>
+                      </ui-button>
+                      <ui-button
+                        layout="shrink:0 self:start"
+                        onclick="${testConfigDomain}"
+                        size="s"
+                      >
+                        <button>Add domain</button>
+                      </ui-button>
+                    </div>
+                  </div>
+                `}
+              </settings-toggle>
+              <settings-toggle
+                value="${options.fixesFilters}"
+                onchange="${html.set(options, "fixesFilters")}"
+                data-qa="toggle:fixes-filters"
+              >
+                Ghostery specific fixes
+              </settings-toggle>
+            </div>
+            <settings-card static layout="column gap:3">
+              ${store_default.ready(notifications) && html`
+                <div layout="column gap items:start" translate="no">
+                  <ui-text type="headline-s">Notifications</ui-text>
+                  <div layout="row:wrap gap">
+                    ${notifications.length === 0 && html`
+                      <ui-text type="body-m" color="secondary" translate="no">
+                        No notifications shown yet
+                      </ui-text>
+                    `}
+                    ${notifications.map(({ id, shown, lastShownAt }) => html`
+                        <ui-text type="body-m" color="secondary">
+                          <ui-text type="label-m">${id}:</ui-text>
+                          ${shown}
+                          ${!!lastShownAt && `(${longDateFormatter.format(new Date(lastShownAt))})`}
+                        </ui-text>
+                      `)}
+                  </div>
+                </div>
+              `}
+              ${html.resolve(getStorage().then((storage) => html`
+                    <div layout="column gap items:start" translate="no">
+                      <ui-text type="headline-s">Attribution</ui-text>
+                      <div layout="column gap:0.5">
+                        <ui-text type="body-m" color="secondary">
+                          <ui-text type="label-m">Install date:</ui-text>
+                          <span data-qa="text:install-date">${storage.installDate || "N/A"}</span>
+                        </ui-text>
+                        <ui-text type="body-m" color="secondary">
+                          <ui-text type="label-m">Source:</ui-text>
+                          <span data-qa="text:utm-source">${storage.utm_source || "N/A"}</span>
+                        </ui-text>
+                        <ui-text type="body-m" color="secondary">
+                          <ui-text type="label-m">Campaign:</ui-text>
+                          <span data-qa="text:utm-campaign">${storage.utm_campaign || "N/A"}</span>
+                        </ui-text>
+                      </div>
+                    </div>
+                  `))}
+              ${html`
+                <div layout="column gap items:start" translate="no">
+                  <ui-text type="headline-s">Enabled DNR rulesets</ui-text>
+                  <ui-text type="body-xs" color="tertiary">
+                    The below list is not reactive to changes made in the extension - use refresh
+                    button
+                  </ui-text>
+                  <div layout="block:left">
+                    ${html.resolve(chrome.declarativeNetRequest.getEnabledRulesets().then((rules) => html`${rules.join(", ") || "No rulesets enabled..."}`))}
+                  </div>
+                  <ui-button onclick="${refresh}" layout="shrink:0" size="s">
+                    <button>Refresh</button>
+                  </ui-button>
+                </div>
+              `}
+              ${store_default.ready(resources) && html`
+                <div layout="column gap" translate="no">
+                  <ui-text type="headline-s">Resource Checksums</ui-text>
+                  <div>
+                    ${Object.entries(resources.checksums).map(([key, value]) => html`
+                        <ui-text type="body-m" color="secondary" style="word-break: break-all;">
+                          ${key}: ${value}
+                        </ui-text>
+                      `)}
+                  </div>
+                </div>
+              `}
+            </settings-card>
+            <settings-card static layout="column gap:2">
+              <ui-text type="headline-s">Actions</ui-text>
+              <div layout="row gap items:start">
+                <ui-button onclick="${clearStorage}" layout="shrink:0" size="s">
+                  <button>
+                    <ui-icon name="trash" layout="size:2"></ui-icon>
+                    Clear storage
+                  </button>
+                </ui-button>
+              </div>
+            </settings-card>
+          </div>
+        </section>
+      `}
+      <div layout="column" translate="no">
+        <div onclick="${refresh}">
+          <ui-text type="body-m" color="tertiary" style="user-select: none;"> v${VERSION} </ui-text>
+        </div>
+      </div>
+    </template>
+  `
+};
+//#endregion
+export { devtools_default as default };

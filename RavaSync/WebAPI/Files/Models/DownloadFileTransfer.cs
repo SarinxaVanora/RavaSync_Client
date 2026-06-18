@@ -16,7 +16,8 @@ public class DownloadFileTransfer : FileTransfer
     {
         set
         {
-            // nothing to set
+            if (value > 0)
+                Dto.Size = value;
         }
         get
         {

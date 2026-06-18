@@ -106,8 +106,11 @@ public sealed partial class PairHandler
             _refreshUiPending = false;
             _refreshUiPublishTick = 0;
         }
-        var name = PlayerName;
+        var name = string.IsNullOrEmpty(PlayerName) ? _lastVanillaTeardownPlayerName : PlayerName;
         var skipHeavyRestore = _disposeRestoreAlreadyQueued;
+        var preserveQueuedTeardownIdentity = skipHeavyRestore && Volatile.Read(ref _vanillaTeardownInProgress) != 0;
+        var queuedTeardownIdx = _lastVanillaTeardownObjectIndex;
+        var queuedTeardownAddress = _lastVanillaTeardownPlayerAddress;
         Logger.LogDebug("Disposing {name} ({user})", name, Pair);
         try
         {
@@ -131,7 +134,11 @@ public sealed partial class PairHandler
 
                 if (skipHeavyRestore)
                 {
-                    Logger.LogDebug("[{applicationId}] Skipping synchronous dispose restore for {name}; paused/disconnect cleanup was already queued", applicationId, name);
+                    // A hard vanilla teardown has already been queued from the visibility/offline path.
+                    // Do not run synchronous IPC from Dispose: disconnect can dispose many pair handlers at once,
+                    // and blocking Penumbra/Glamourer IPC here can hang the game. The queued teardown owns the
+                    // actual vanilla cleanup; Dispose only releases local handler state.
+                    Logger.LogDebug("[{applicationId}] Skipping synchronous dispose restore for {name}; hard vanilla teardown is already queued", applicationId, name);
                 }
                 else if (_dalamudUtil is { IsZoning: false, IsInCutscene: false } && !string.IsNullOrEmpty(name))
                 {
@@ -182,7 +189,14 @@ public sealed partial class PairHandler
         }
         finally
         {
-            PlayerName = null;
+            if (!preserveQueuedTeardownIdentity)
+            {
+                PlayerName = null;
+                _lastVanillaTeardownPlayerName = null;
+                _lastVanillaTeardownObjectIndex = null;
+                _lastVanillaTeardownPlayerAddress = nint.Zero;
+            }
+
             _cachedData = null;
             ResetAppliedModTrackingState();
             Logger.LogDebug("Disposing {name} complete", name);
@@ -203,6 +217,9 @@ public sealed partial class PairHandler
 
     private void FlushScheduledRefreshUi()
     {
+        if (!Volatile.Read(ref _refreshUiPending))
+            return;
+
         var publish = false;
         lock (_refreshUiGate)
         {
@@ -241,6 +258,7 @@ public sealed partial class PairHandler
             switch (s.DownloadStatus)
             {
                 case DownloadStatus.Downloading:
+                case DownloadStatus.Repairing:
                 case DownloadStatus.WaitingForQueue:
                 case DownloadStatus.WaitingForSlot:
                     anyDownloading = true;

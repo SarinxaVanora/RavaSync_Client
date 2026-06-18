@@ -27,11 +27,11 @@ public sealed class CharaDataCharacterHandler : DisposableMediatorSubscriberBase
         _gameObjectHandlerFactory = gameObjectHandlerFactory;
         _dalamudUtilService = dalamudUtilService;
         _ipcManager = ipcManager;
-        mediator.Subscribe<GposeEndMessage>(this, (_) =>
+        mediator.Subscribe<GposeEndMessage>(this, (f) =>
         {
-            foreach (var chara in _handledCharaData)
+            foreach (var chara in _handledCharaData.ToList())
             {
-                RevertHandledChara(chara);
+                _ = RevertHandledChara(chara);
             }
         });
 
@@ -53,7 +53,7 @@ public sealed class CharaDataCharacterHandler : DisposableMediatorSubscriberBase
             {
                 try
                 {
-                    await RevertChara(entry.Name, entry.CustomizePlus).ConfigureAwait(false);
+                    await RevertChara(entry).ConfigureAwait(false);
                 }
                 catch (Exception ex)
                 {
@@ -70,25 +70,71 @@ public sealed class CharaDataCharacterHandler : DisposableMediatorSubscriberBase
     protected override void Dispose(bool disposing)
     {
         base.Dispose(disposing);
-        foreach (var chara in _handledCharaData)
+        foreach (var chara in _handledCharaData.ToList())
         {
-            RevertHandledChara(chara);
+            _ = RevertHandledChara(chara);
         }
     }
 
-    public async Task RevertChara(string name, Guid? cPlusId)
+    public Task RevertChara(string name, Guid? cPlusId)
+        => RevertChara(new HandledCharaDataEntry(name, false, cPlusId, null!, null));
+
+    public async Task RevertChara(HandledCharaDataEntry handled)
     {
         Guid applicationId = Guid.NewGuid();
-        await _ipcManager.Glamourer.RevertByNameAsync(Logger, name, applicationId).ConfigureAwait(false);
-        if (cPlusId != null)
+        await _ipcManager.Glamourer.RevertByNameAsync(Logger, handled.Name, applicationId).ConfigureAwait(false);
+        if (handled.CustomizePlus != null)
         {
-            await _ipcManager.CustomizePlus.RevertByIdAsync(cPlusId).ConfigureAwait(false);
+            await _ipcManager.CustomizePlus.RevertByIdAsync(handled.CustomizePlus).ConfigureAwait(false);
         }
+
         using var handler = await _gameObjectHandlerFactory.Create(ObjectKind.Player,
-            () => _dalamudUtilService.GetGposeCharacterFromObjectTableByName(name, _dalamudUtilService.IsInGpose)?.Address ?? IntPtr.Zero, false)
+            () => _dalamudUtilService.GetGposeCharacterFromObjectTableByName(handled.Name, _dalamudUtilService.IsInGpose)?.Address ?? IntPtr.Zero, false)
             .ConfigureAwait(false);
-        if (handler.Address != nint.Zero)
-            await _ipcManager.Penumbra.RedrawAsync(Logger, handler, applicationId, CancellationToken.None).ConfigureAwait(false);
+
+        bool hadLiveHandler = handler.Address != nint.Zero;
+        if (hadLiveHandler)
+        {
+            var (idx, addr) = await _dalamudUtilService.RunOnFrameworkThread(() =>
+            {
+                var obj = handler.GetGameObject();
+                return (obj?.ObjectIndex ?? -1, obj?.Address ?? nint.Zero);
+            }).ConfigureAwait(false);
+
+            if (idx >= 0)
+            {
+                await ClearPenumbraTemporarySlotAsync(handled, idx, addr, applicationId).ConfigureAwait(false);
+                await _ipcManager.Penumbra.RedrawAsync(Logger, handler, applicationId, CancellationToken.None).ConfigureAwait(false);
+            }
+        }
+        else if (handled.IsSelf)
+        {
+            var (idx, addr) = await _dalamudUtilService.RunOnFrameworkThread(() =>
+            {
+                var player = _dalamudUtilService.GetPlayerCharacter();
+                return (player?.ObjectIndex ?? -1, player?.Address ?? nint.Zero);
+            }).ConfigureAwait(false);
+
+            if (idx >= 0)
+                await ClearPenumbraTemporarySlotAsync(handled, idx, addr, applicationId).ConfigureAwait(false);
+        }
+
+        if (handled.PenumbraCollection is { } collection && collection != Guid.Empty)
+            await _ipcManager.Penumbra.RemoveTemporaryCollectionAsync(Logger, applicationId, collection).ConfigureAwait(false);
+    }
+
+    private async Task ClearPenumbraTemporarySlotAsync(HandledCharaDataEntry handled, int idx, nint address, Guid applicationId)
+    {
+        if (handled.PenumbraCollection is not { } collection || collection == Guid.Empty || idx < 0)
+            return;
+
+        if (handled.IsSelf)
+        {
+            await _ipcManager.Penumbra.AssignEmptyCollectionToSelfAsync(Logger, idx, address, handled.Name).ConfigureAwait(false);
+            return;
+        }
+
+        await _ipcManager.Penumbra.AssignEmptyCollectionToVerifiedCharacterAsync(Logger, idx, string.Empty, address, handled.Name).ConfigureAwait(false);
     }
 
     public async Task<bool> RevertHandledChara(string name)
@@ -96,15 +142,15 @@ public sealed class CharaDataCharacterHandler : DisposableMediatorSubscriberBase
         var handled = _handledCharaData.FirstOrDefault(f => string.Equals(f.Name, name, StringComparison.Ordinal));
         if (handled == null) return false;
         _handledCharaData.Remove(handled);
-        await _dalamudUtilService.RunOnFrameworkThread(() => RevertChara(handled.Name, handled.CustomizePlus)).ConfigureAwait(false);
+        await RevertChara(handled).ConfigureAwait(false);
         return true;
     }
 
-    public Task RevertHandledChara(HandledCharaDataEntry? handled)
+    public async Task RevertHandledChara(HandledCharaDataEntry? handled)
     {
-        if (handled == null) return Task.CompletedTask;
+        if (handled == null) return;
         _handledCharaData.Remove(handled);
-        return _dalamudUtilService.RunOnFrameworkThread(() => RevertChara(handled.Name, handled.CustomizePlus));
+        await RevertChara(handled).ConfigureAwait(false);
     }
 
     internal void AddHandledChara(HandledCharaDataEntry handledCharaDataEntry)

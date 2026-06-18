@@ -1,5 +1,6 @@
 using Dalamud.Game.ClientState.Objects.SubKinds;
 using Dalamud.Plugin;
+using Dalamud.Utility;
 using RavaSync.MareConfiguration.Models;
 using RavaSync.PlayerData.Handlers;
 using RavaSync.Services;
@@ -12,11 +13,14 @@ using System.Collections.Concurrent;
 using Dalamud.Game.ClientState.Objects.Types;
 using System.Diagnostics;
 using RavaSync.Services.Optimisation;
+using RavaSync.Utils;
 
 namespace RavaSync.Interop.Ipc;
 
 public sealed class IpcCallerPenumbra : DisposableMediatorSubscriberBase, IIpcCaller
 {
+    public const string MountMusicTemporaryModName = "RavaSync - Mount music";
+
     private readonly IDalamudPluginInterface _pi;
     private readonly DalamudUtilService _dalamudUtil;
     private readonly MareMediator _mareMediator;
@@ -48,10 +52,19 @@ public sealed class IpcCallerPenumbra : DisposableMediatorSubscriberBase, IIpcCa
 
     private readonly ConcurrentDictionary<nint, RedrawGate> _redrawGates = new();
     private readonly ConcurrentDictionary<Guid, PendingRedrawAck> _pendingRedrawAcks = new();
+    private static readonly bool IsWineRuntime = SafeIsWine();
     private static readonly SemaphoreSlim PenumbraFrameworkIpcGate = new(1, 1);
+    private static readonly SemaphoreSlim RavaSyncGlobalTemporaryCollectionWipeGate = new(1, 1);
     private static long _nextPenumbraFrameworkIpcTick;
-    // Keep Penumbra framework IPC serialized and paced so room-entry applies do not stack on one frame.
+    // Keep Penumbra framework IPC serialized so room-entry applies do not stack on one frame.
+    // Windows keeps its original fixed spacing. Linux/Wine adapts only after an IPC call proves expensive.
     private const int PenumbraFrameworkIpcSpacingMs = 24;
+
+    private static bool SafeIsWine()
+    {
+        try { return Util.IsWine(); }
+        catch { return false; }
+    }
 
     public string? ModDirectory
     {
@@ -186,6 +199,51 @@ public sealed class IpcCallerPenumbra : DisposableMediatorSubscriberBase, IIpcCa
         return result;
     }
 
+    public async Task<PenumbraCollectionModSettings?> GetCollectionModSettingsAsync(ILogger logger, Guid collectionId, string collectionName)
+    {
+        if (!APIAvailable || collectionId == Guid.Empty) return null;
+
+        PenumbraCollectionModSettings? result = null;
+
+        await SafeIpc.TryRun(Logger, "Penumbra.GetCollectionModSettings", TimeSpan.FromSeconds(2), async ct =>
+        {
+            var (ec, settings) = await _dalamudUtil.RunOnFrameworkThread(() =>
+            {
+                return _penumbraGetAllModSettings.Invoke(collectionId);
+            }).ConfigureAwait(false);
+
+            if (ec != PenumbraApiEc.Success || settings == null)
+            {
+                logger.LogDebug("[Penumbra] GetAllModSettings failed for collection {collection} ({ec})", collectionId, ec);
+                return;
+            }
+
+            var mapped = new Dictionary<string, PenumbraModSettingState>(StringComparer.OrdinalIgnoreCase);
+            foreach (var kv in settings)
+            {
+                mapped[kv.Key] = new PenumbraModSettingState(
+                    kv.Value.Item1,
+                    kv.Value.Item2,
+                    kv.Value.Item3 ?? new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase),
+                    kv.Value.Item4,
+                    kv.Value.Item5);
+            }
+
+            result = new PenumbraCollectionModSettings(collectionId, collectionName ?? string.Empty, mapped);
+        }).ConfigureAwait(false);
+
+        return result;
+    }
+
+    public async Task<PenumbraCollectionModSettings?> GetDefaultCollectionModSettingsAsync(ILogger logger)
+    {
+        var defaultCollection = await GetCollectionAsync(logger, ApiCollectionType.Default).ConfigureAwait(false);
+        if (!defaultCollection.HasValue || defaultCollection.Value.Id == Guid.Empty)
+            return null;
+
+        return await GetCollectionModSettingsAsync(logger, defaultCollection.Value.Id, defaultCollection.Value.Name ?? string.Empty).ConfigureAwait(false);
+    }
+
     public async Task<PenumbraCollectionModSettings?> GetLocalPlayerCollectionModSettingsAsync(ILogger logger, int gameObjectIndex)
     {
         if (!APIAvailable || gameObjectIndex < 0) return null;
@@ -311,6 +369,7 @@ public sealed class IpcCallerPenumbra : DisposableMediatorSubscriberBase, IIpcCa
     private async Task<T> RunPacedPenumbraFrameworkIpcAsync<T>(ILogger logger, string operationName, Func<T> action, CancellationToken token, int warnAfterMs = 60)
     {
         await PenumbraFrameworkIpcGate.WaitAsync(token).ConfigureAwait(false);
+        long frameworkElapsedMs = 0;
 
         try
         {
@@ -328,16 +387,19 @@ public sealed class IpcCallerPenumbra : DisposableMediatorSubscriberBase, IIpcCa
                 finally
                 {
                     sw.Stop();
-                    if (sw.ElapsedMilliseconds >= warnAfterMs)
-                        logger.LogWarning("[Penumbra IPC HitchGuard] {operation} took {elapsed}ms on framework", operationName, sw.ElapsedMilliseconds);
+                    frameworkElapsedMs = sw.ElapsedMilliseconds;
+                    var effectiveWarnAfterMs = IsWineRuntime ? Math.Max(warnAfterMs, 250) : warnAfterMs;
+                    if (frameworkElapsedMs >= effectiveWarnAfterMs)
+                        logger.LogWarning("[Penumbra IPC HitchGuard] {operation} took {elapsed}ms on framework", operationName, frameworkElapsedMs);
                     else
-                        logger.LogTrace("[Penumbra IPC HitchGuard] {operation} took {elapsed}ms on framework", operationName, sw.ElapsedMilliseconds);
+                        logger.LogTrace("[Penumbra IPC HitchGuard] {operation} took {elapsed}ms on framework", operationName, frameworkElapsedMs);
                 }
             }).ConfigureAwait(false);
         }
         finally
         {
-            Interlocked.Exchange(ref _nextPenumbraFrameworkIpcTick, Environment.TickCount64 + PenumbraFrameworkIpcSpacingMs);
+            var spacingMs = LinuxSmoothMode.ComputeFrameworkIpcSpacing(PenumbraFrameworkIpcSpacingMs, frameworkElapsedMs, 240);
+            Interlocked.Exchange(ref _nextPenumbraFrameworkIpcTick, Environment.TickCount64 + spacingMs);
             PenumbraFrameworkIpcGate.Release();
         }
     }
@@ -349,10 +411,223 @@ public sealed class IpcCallerPenumbra : DisposableMediatorSubscriberBase, IIpcCa
             return true;
         }, token, warnAfterMs);
 
-    public Task<bool> AssignEmptyCollectionAsync(ILogger logger, int idx)
+
+    public async Task<bool> AssignEmptyCollectionToVerifiedCharacterAsync(ILogger logger, int idx, string expectedIdent, nint expectedAddress, string? expectedDisplayName = null)
     {
-        logger.LogWarning("Blocked legacy empty-collection assignment for object index {idx}. RavaSync no longer clears actor slots by object index because the slot may have been reused by the local player or an unrelated actor.", idx);
-        return Task.FromResult(false);
+        if (!APIAvailable) return false;
+        if (idx < 0) return false;
+
+        bool assigned = false;
+
+        await SafeIpc.TryRun(Logger, "Penumbra.AssignEmptyCollectionVerified", TimeSpan.FromSeconds(10), async ct =>
+        {
+            assigned = await RunPacedPenumbraFrameworkIpcAsync(logger, "Penumbra.AssignEmptyCollectionVerified(force)", () =>
+            {
+                if (!ValidateTemporaryCollectionClearTargetOnFramework(logger, idx, expectedIdent, expectedAddress, expectedDisplayName))
+                    return false;
+
+                var ecForce = _penumbraAssignTemporaryCollection.Invoke(Guid.Empty, idx, forceAssignment: true);
+                if (ecForce == PenumbraApiEc.Success)
+                {
+                    logger.LogTrace("[Penumbra] Cleared temporary collection assignment for verified idx {idx} ({name}/{ident})", idx, expectedDisplayName ?? string.Empty, expectedIdent ?? string.Empty);
+                    return true;
+                }
+
+                logger.LogDebug("[Penumbra] Failed to clear temporary collection assignment for idx {idx} ({name}/{ident}), ret={ret}", idx, expectedDisplayName ?? string.Empty, expectedIdent ?? string.Empty, ecForce);
+                return false;
+            }, ct).ConfigureAwait(false);
+        }).ConfigureAwait(false);
+
+        return assigned;
+    }
+
+    public async Task<bool> AssignEmptyCollectionIfAssignedCollectionMatchesAsync(ILogger logger, Guid applicationId, int idx, Guid expectedCollectionId, string? expectedDisplayName = null)
+    {
+        if (!APIAvailable) return false;
+        if (idx < 0 || expectedCollectionId == Guid.Empty) return false;
+
+        bool assigned = false;
+
+        await SafeIpc.TryRun(Logger, "Penumbra.AssignEmptyCollectionIfCollectionMatches", TimeSpan.FromSeconds(10), async ct =>
+        {
+            assigned = await RunPacedPenumbraFrameworkIpcAsync(logger, "Penumbra.AssignEmptyCollectionIfCollectionMatches(force)", () =>
+            {
+                if (!_ravaSyncTemporaryCollections.ContainsKey(expectedCollectionId))
+                    logger.LogDebug("[{applicationId}] Collection-match clear is using unregistered/stale collection {collection} at idx {idx}; continuing because teardown must remove captured receiver state", applicationId, expectedCollectionId, idx);
+
+                if (IsProtectedUserCollectionOnFramework(expectedCollectionId, out var protectedReason))
+                {
+                    logger.LogWarning("[{applicationId}] Blocked collection-match clear for protected collection {collection} at idx {idx} ({reason})", applicationId, expectedCollectionId, idx, protectedReason);
+                    return false;
+                }
+
+                ICharacter? target = null;
+                try
+                {
+                    target = _dalamudUtil.GetCharacterFromObjectTableByIndex(idx);
+                }
+                catch
+                {
+                    target = null;
+                }
+
+                var targetAddress = target?.Address ?? nint.Zero;
+                if (targetAddress != nint.Zero)
+                {
+                    var localPlayerAddress = _dalamudUtil.GetPlayerPtr();
+                    if (localPlayerAddress != nint.Zero && targetAddress == localPlayerAddress)
+                    {
+                        logger.LogWarning("[{applicationId}] Blocked collection-match clear on local player at idx {idx}; expected remote {name}", applicationId, idx, expectedDisplayName ?? string.Empty);
+                        return false;
+                    }
+
+                    var collectionInfo = _penumbraGetCollectionForObject.Invoke(idx);
+                    if (!collectionInfo.ObjectValid || collectionInfo.EffectiveCollection.Id != expectedCollectionId)
+                    {
+                        logger.LogTrace("[{applicationId}] Collection-match clear skipped for idx {idx}; effective collection is {actual}, expected {expected}", applicationId, idx, collectionInfo.EffectiveCollection.Id, expectedCollectionId);
+                        return false;
+                    }
+                }
+                else
+                {
+                    logger.LogDebug("[{applicationId}] Clearing former RavaSync slot idx {idx} ({name}) even though no live object is present; this prevents stale assignment from reattaching on re-entry", applicationId, idx, expectedDisplayName ?? string.Empty);
+                }
+
+                var ecForce = _penumbraAssignTemporaryCollection.Invoke(Guid.Empty, idx, forceAssignment: true);
+                if (ecForce == PenumbraApiEc.Success)
+                {
+                    logger.LogDebug("[{applicationId}] Cleared RavaSync temp collection {collection} from idx {idx} ({name}) by collection match", applicationId, expectedCollectionId, idx, expectedDisplayName ?? string.Empty);
+                    return true;
+                }
+
+                logger.LogDebug("[{applicationId}] Failed collection-match clear of temp collection {collection} from idx {idx} ({name}), ret={ret}", applicationId, expectedCollectionId, idx, expectedDisplayName ?? string.Empty, ecForce);
+                return false;
+            }, ct).ConfigureAwait(false);
+        }).ConfigureAwait(false);
+
+        return assigned;
+    }
+
+
+    public async Task<bool> AssignEmptyCollectionToSelfAsync(ILogger logger, int idx, nint expectedAddress, string? expectedDisplayName = null)
+    {
+        if (!APIAvailable) return false;
+        if (idx < 0) return false;
+
+        bool assigned = false;
+
+        await SafeIpc.TryRun(Logger, "Penumbra.AssignEmptyCollectionSelf", TimeSpan.FromSeconds(10), async ct =>
+        {
+            assigned = await RunPacedPenumbraFrameworkIpcAsync(logger, "Penumbra.AssignEmptyCollectionSelf(force)", () =>
+            {
+                if (!ValidateTemporaryCollectionSelfClearTargetOnFramework(logger, idx, expectedAddress, expectedDisplayName))
+                    return false;
+
+                var ecForce = _penumbraAssignTemporaryCollection.Invoke(Guid.Empty, idx, forceAssignment: true);
+                if (ecForce == PenumbraApiEc.Success)
+                {
+                    logger.LogTrace("[Penumbra] Cleared temporary collection assignment for self idx {idx} ({name})", idx, expectedDisplayName ?? string.Empty);
+                    return true;
+                }
+
+                logger.LogDebug("[Penumbra] Failed to clear temporary collection assignment for self idx {idx} ({name}), ret={ret}", idx, expectedDisplayName ?? string.Empty, ecForce);
+                return false;
+            }, ct).ConfigureAwait(false);
+        }).ConfigureAwait(false);
+
+        return assigned;
+    }
+
+    private bool ValidateTemporaryCollectionSelfClearTargetOnFramework(ILogger logger, int idx, nint expectedAddress, string? expectedDisplayName)
+    {
+        try
+        {
+            var target = _dalamudUtil.GetCharacterFromObjectTableByIndex(idx);
+            var targetAddress = target?.Address ?? nint.Zero;
+
+            if (targetAddress == nint.Zero)
+            {
+                logger.LogDebug("Skipped self temporary collection clear for {name}: idx {idx} no longer points at a valid player", expectedDisplayName ?? string.Empty, idx);
+                return false;
+            }
+
+            var localPlayerAddress = _dalamudUtil.GetPlayerPtr();
+            var localPlayer = _dalamudUtil.GetPlayerCharacter();
+            var localName = localPlayer?.Name.TextValue ?? string.Empty;
+            var expectedName = string.IsNullOrWhiteSpace(expectedDisplayName) ? localName : expectedDisplayName;
+            var targetName = target?.Name.TextValue ?? string.Empty;
+
+            var isLocalPlayer = localPlayerAddress != nint.Zero && targetAddress == localPlayerAddress;
+            var nameMatchesSelf = !string.IsNullOrWhiteSpace(expectedName) && string.Equals(targetName, expectedName, StringComparison.Ordinal);
+
+            if (!isLocalPlayer && !nameMatchesSelf)
+            {
+                logger.LogWarning("Blocked self temporary collection clear at idx {idx}: target {targetName}/{addr:X} does not match local/self name {expectedName}", idx, targetName, targetAddress, expectedName);
+                return false;
+            }
+
+            if (expectedAddress != nint.Zero && targetAddress != expectedAddress && !isLocalPlayer)
+            {
+                logger.LogTrace("Self temporary collection clear target for {name} moved from {oldAddr:X} to {newAddr:X}; accepting because this is the named GPose/local self", expectedName, expectedAddress, targetAddress);
+            }
+
+            return true;
+        }
+        catch (Exception ex)
+        {
+            logger.LogDebug(ex, "Blocked self temporary collection clear for idx {idx}; target validation failed", idx);
+            return false;
+        }
+    }
+
+    private bool ValidateTemporaryCollectionClearTargetOnFramework(ILogger logger, int idx, string? expectedIdent, nint expectedAddress, string? expectedDisplayName)
+    {
+        try
+        {
+            var localPlayerAddress = _dalamudUtil.GetPlayerPtr();
+            var target = _dalamudUtil.GetCharacterFromObjectTableByIndex(idx);
+            var targetAddress = target?.Address ?? nint.Zero;
+
+            if (targetAddress == nint.Zero)
+            {
+                logger.LogDebug("Skipped RavaSync receiver temporary collection clear for {name}/{ident}: idx {idx} no longer points at a valid player", expectedDisplayName ?? string.Empty, expectedIdent ?? string.Empty, idx);
+                return false;
+            }
+
+            if (localPlayerAddress != nint.Zero && targetAddress == localPlayerAddress)
+            {
+                logger.LogWarning("Blocked RavaSync receiver temporary collection clear on the local player at idx {idx}; expected remote {name}/{ident}", idx, expectedDisplayName ?? string.Empty, expectedIdent ?? string.Empty);
+                return false;
+            }
+
+            var targetName = target?.Name.TextValue ?? string.Empty;
+            var expectedName = expectedDisplayName ?? string.Empty;
+            var nameMatches = !string.IsNullOrWhiteSpace(expectedName)
+                && string.Equals(targetName, expectedName, StringComparison.OrdinalIgnoreCase);
+
+            if (!string.IsNullOrWhiteSpace(expectedIdent) && !_dalamudUtil.AddressMatchesPlayerIdent(expectedIdent, targetAddress))
+            {
+                if (!nameMatches)
+                {
+                    logger.LogDebug("Skipped RavaSync receiver temporary collection clear for idx {idx}: target {targetName}/{addr:X} no longer matches expected {name}/{ident}", idx, targetName, targetAddress, expectedName, expectedIdent);
+                    return false;
+                }
+
+                logger.LogDebug("Allowing RavaSync receiver temporary collection clear for idx {idx}: ident cache no longer matches {ident}, but live target name still matches {name}", idx, expectedIdent, expectedName);
+            }
+
+            if (expectedAddress != nint.Zero && targetAddress != expectedAddress)
+            {
+                logger.LogTrace("RavaSync receiver temporary collection clear target for {name}/{ident} moved from {oldAddr:X} to {newAddr:X}; accepting because ident still matches", expectedDisplayName ?? string.Empty, expectedIdent ?? string.Empty, expectedAddress, targetAddress);
+            }
+
+            return true;
+        }
+        catch (Exception ex)
+        {
+            logger.LogDebug(ex, "Blocked RavaSync receiver temporary collection clear for idx {idx}; target validation failed", idx);
+            return false;
+        }
     }
 
     public Task<bool> AssignTemporaryCollectionAsync(ILogger logger, Guid collName, int idx)
@@ -521,6 +796,40 @@ public sealed class IpcCallerPenumbra : DisposableMediatorSubscriberBase, IIpcCa
         }
 
         return false;
+    }
+
+    private static bool IsRavaSyncTemporaryCollectionName(string? collectionName)
+        => !string.IsNullOrWhiteSpace(collectionName)
+            && collectionName.StartsWith("RavaSync", StringComparison.OrdinalIgnoreCase);
+
+    private bool IsRavaSyncOwnedTemporaryCollectionOnFramework(Guid collectionId, string? collectionName)
+    {
+        if (collectionId == Guid.Empty)
+            return false;
+
+        if (_ravaSyncTemporaryCollections.ContainsKey(collectionId))
+            return true;
+
+        return IsRavaSyncTemporaryCollectionName(collectionName);
+    }
+
+    private bool DoesPlayerMatchTeardownTargetOnFramework((int ObjectIndex, nint Address, string Name) player, string? expectedIdent, string? expectedDisplayName, nint expectedAddress)
+    {
+        if (player.ObjectIndex < 0 || player.Address == nint.Zero)
+            return false;
+
+        var localPlayerAddress = _dalamudUtil.GetPlayerPtr();
+        if (localPlayerAddress != nint.Zero && player.Address == localPlayerAddress)
+            return false;
+
+        if (expectedAddress != nint.Zero && player.Address == expectedAddress)
+            return true;
+
+        if (!string.IsNullOrWhiteSpace(expectedIdent) && _dalamudUtil.AddressMatchesPlayerIdent(expectedIdent, player.Address))
+            return true;
+
+        return !string.IsNullOrWhiteSpace(expectedDisplayName)
+            && string.Equals(player.Name, expectedDisplayName, StringComparison.OrdinalIgnoreCase);
     }
 
     public async Task ConvertTextureFiles(ILogger logger, Dictionary<string, string[]> textures, IProgress<(string, int)> progress, CancellationToken token)
@@ -712,6 +1021,51 @@ public sealed class IpcCallerPenumbra : DisposableMediatorSubscriberBase, IIpcCa
         return result;
     }
 
+    public async Task<Dictionary<string, HashSet<string>>?> GetGameObjectResourcePathsAsync(ILogger logger, nint gameObjectAddress)
+    {
+        if (!APIAvailable || gameObjectAddress == nint.Zero) return null;
+
+        Dictionary<string, HashSet<string>>? result = null;
+
+        await SafeIpc.TryRun(Logger, "Penumbra.GetGameObjectResourcePathsByAddress", TimeSpan.FromSeconds(2), async ct =>
+        {
+            result = await _dalamudUtil.RunOnFrameworkThread(() =>
+            {
+                try
+                {
+                    logger.LogTrace("Calling On IPC: Penumbra.GetGameObjectResourcePathsByAddress {address:X}", gameObjectAddress);
+                    var gameObj = _dalamudUtil.CreateGameObject((IntPtr)gameObjectAddress);
+                    var idx = gameObj?.ObjectIndex;
+                    if (idx == null) return null;
+
+                    var resourcePathSets = _penumbraResourcePaths.Invoke(idx.Value);
+                    if (resourcePathSets == null)
+                        return null;
+
+                    try
+                    {
+                        return resourcePathSets[0];
+                    }
+                    catch (ArgumentOutOfRangeException)
+                    {
+                        return null;
+                    }
+                    catch (IndexOutOfRangeException)
+                    {
+                        return null;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    logger.LogTrace(ex, "Failed to get Penumbra resource paths for game object {address:X}", gameObjectAddress);
+                    return null;
+                }
+            }).ConfigureAwait(false);
+        }).ConfigureAwait(false);
+
+        return result;
+    }
+
     public async Task<Dictionary<ushort, Dictionary<string, HashSet<string>>>?> GetPlayerResourcePathsAsync(ILogger logger)
     {
         if (!APIAvailable) return null;
@@ -807,7 +1161,7 @@ public sealed class IpcCallerPenumbra : DisposableMediatorSubscriberBase, IIpcCa
                     finally
                     {
                         frameworkStopwatch.Stop();
-                        if (frameworkStopwatch.ElapsedMilliseconds >= 60)
+                        if (frameworkStopwatch.ElapsedMilliseconds >= (IsWineRuntime ? 250 : 60))
                         {
                             logger.LogWarning("[{appid}] PenumbraRedraw for {name} took {elapsed}ms on framework", applicationId, handler.Name, frameworkStopwatch.ElapsedMilliseconds);
                         }
@@ -867,7 +1221,7 @@ public sealed class IpcCallerPenumbra : DisposableMediatorSubscriberBase, IIpcCa
             finally
             {
                 frameworkStopwatch.Stop();
-                if (frameworkStopwatch.ElapsedMilliseconds >= 60)
+                if (frameworkStopwatch.ElapsedMilliseconds >= (IsWineRuntime ? 250 : 60))
                 {
                     logger.LogWarning("[{appid}] PenumbraRedrawDirect for {name} took {elapsed}ms on framework", applicationId, handler.Name, frameworkStopwatch.ElapsedMilliseconds);
                 }
@@ -919,7 +1273,7 @@ public sealed class IpcCallerPenumbra : DisposableMediatorSubscriberBase, IIpcCa
             finally
             {
                 frameworkStopwatch.Stop();
-                if (frameworkStopwatch.ElapsedMilliseconds >= 60)
+                if (frameworkStopwatch.ElapsedMilliseconds >= (IsWineRuntime ? 250 : 60))
                 {
                     logger.LogWarning("[{appid}] PenumbraRedrawDirectConfirmed for {name} took {elapsed}ms on framework", applicationId, handler.Name, frameworkStopwatch.ElapsedMilliseconds);
                 }
@@ -1020,18 +1374,26 @@ public sealed class IpcCallerPenumbra : DisposableMediatorSubscriberBase, IIpcCa
     {
         if (!APIAvailable) return;
 
-        await SafeIpc.TryRun(Logger, "Penumbra.RemoveTemporaryMod(Meta)", TimeSpan.FromSeconds(10), async ct =>
+        await SafeIpc.TryRun(Logger, "Penumbra.ClearManipulationData", TimeSpan.FromSeconds(10), async ct =>
         {
-            if (await _dalamudUtil.RunOnFrameworkThread(() => ShouldBlockRavaSyncTemporaryCollectionMutationOnFramework(logger, applicationId, collId, "Penumbra.RemoveTemporaryMod(Meta)", "MareChara_Meta")).ConfigureAwait(false))
+            if (await _dalamudUtil.RunOnFrameworkThread(() => ShouldBlockRavaSyncTemporaryCollectionMutationOnFramework(logger, applicationId, collId, "Penumbra.ClearManipulationData", "MareChara_Meta")).ConfigureAwait(false))
                 return;
 
-            await RunPacedPenumbraFrameworkIpcAsync(logger, "Penumbra.RemoveTemporaryMod(Meta)", () =>
+            await RunPacedPenumbraFrameworkIpcAsync(logger, "Penumbra.ClearManipulationData", () =>
             {
-                if (ShouldBlockRavaSyncTemporaryCollectionMutationOnFramework(logger, applicationId, collId, "Penumbra.RemoveTemporaryMod(Meta)", "MareChara_Meta"))
+                if (ShouldBlockRavaSyncTemporaryCollectionMutationOnFramework(logger, applicationId, collId, "Penumbra.ClearManipulationData", "MareChara_Meta"))
                     return;
 
-                var retRem = _penumbraRemoveTemporaryMod.Invoke("MareChara_Meta", collId, 0);
-                logger.LogTrace("[{applicationId}] Cleared meta (height) from temp collection {collId}, ret={ret}", applicationId, collId, retRem);
+                var emptyPaths = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                var retAdd = _penumbraAddTemporaryMod.Invoke("MareChara_Meta", collId, emptyPaths, string.Empty, 0);
+                if (retAdd != PenumbraApiEc.Success)
+                {
+                    var retRemove = _penumbraRemoveTemporaryMod.Invoke("MareChara_Meta", collId, 0);
+                    logger.LogTrace("[{applicationId}] Clear meta fallback: removed temp meta mod from {collId}, ret={ret}", applicationId, collId, retRemove);
+                    retAdd = _penumbraAddTemporaryMod.Invoke("MareChara_Meta", collId, emptyPaths, string.Empty, 0);
+                }
+
+                logger.LogTrace("[{applicationId}] Cleared meta by overwriting temp collection {collId} with empty manipulation, ret={ret}", applicationId, collId, retAdd);
             }, ct).ConfigureAwait(false);
         }).ConfigureAwait(false);
     }
@@ -1106,6 +1468,502 @@ public sealed class IpcCallerPenumbra : DisposableMediatorSubscriberBase, IIpcCa
         return ipcOk && applied;
     }
 
+
+
+
+    public async Task<bool> SetMountMusicTemporaryModOnDefaultCollectionAsync(ILogger logger, Guid applicationId, Dictionary<string, string> modPaths, int priority)
+    {
+        if (!APIAvailable) return false;
+        if (modPaths == null || modPaths.Count == 0) return false;
+
+        var defaultCollection = await GetCollectionAsync(logger, ApiCollectionType.Default).ConfigureAwait(false);
+        if (!defaultCollection.HasValue || defaultCollection.Value.Id == Guid.Empty)
+        {
+            logger.LogDebug("[{applicationId}] Could not resolve Default collection for receiver mount music temp mod", applicationId);
+            return false;
+        }
+
+        var collId = defaultCollection.Value.Id;
+        var applied = false;
+
+        var ipcOk = await SafeIpc.TryRun(Logger, "Penumbra.SetMountMusicTemporaryModOnDefaultCollection", TimeSpan.FromSeconds(10), async ct =>
+        {
+            if (logger.IsEnabled(LogLevel.Trace))
+            {
+                foreach (var mod in modPaths)
+                    logger.LogTrace("[{applicationId}] {tempModName}: {from} => {to}", applicationId, MountMusicTemporaryModName, mod.Key, mod.Value);
+            }
+
+            var retAdd = await RunPacedPenumbraFrameworkIpcAsync(logger, $"Penumbra.AddTemporaryMod({MountMusicTemporaryModName})", () =>
+            {
+                var ret = _penumbraAddTemporaryMod.Invoke(MountMusicTemporaryModName, collId, modPaths, string.Empty, priority);
+                logger.LogTrace("[{applicationId}] Setting mount music temp mod {tempModName} on Default collection {collId} at priority {priority}, Success: {ret}", applicationId, MountMusicTemporaryModName, collId, priority, ret);
+                return ret;
+            }, ct).ConfigureAwait(false);
+
+            if (retAdd != PenumbraApiEc.Success)
+            {
+                await RunPacedPenumbraFrameworkIpcAsync(logger, $"Penumbra.RemoveTemporaryMod({MountMusicTemporaryModName})", () =>
+                {
+                    var retRemove = _penumbraRemoveTemporaryMod.Invoke(MountMusicTemporaryModName, collId, priority);
+                    logger.LogTrace("[{applicationId}] Replace fallback: removing mount music temp mod {tempModName} from Default collection {collId} at priority {priority}, Success: {ret}", applicationId, MountMusicTemporaryModName, collId, priority, retRemove);
+                }, ct).ConfigureAwait(false);
+
+                retAdd = await RunPacedPenumbraFrameworkIpcAsync(logger, $"Penumbra.AddTemporaryMod({MountMusicTemporaryModName})Fallback", () =>
+                {
+                    var ret = _penumbraAddTemporaryMod.Invoke(MountMusicTemporaryModName, collId, modPaths, string.Empty, priority);
+                    logger.LogTrace("[{applicationId}] Replace fallback: setting mount music temp mod {tempModName} on Default collection {collId} at priority {priority}, Success: {ret}", applicationId, MountMusicTemporaryModName, collId, priority, ret);
+                    return ret;
+                }, ct).ConfigureAwait(false);
+            }
+
+            applied = retAdd == PenumbraApiEc.Success;
+        }).ConfigureAwait(false);
+
+        return ipcOk && applied;
+    }
+
+    public async Task ClearMountMusicTemporaryModOnDefaultCollectionAsync(ILogger logger, Guid applicationId, int priority)
+    {
+        if (!APIAvailable) return;
+
+        var defaultCollection = await GetCollectionAsync(logger, ApiCollectionType.Default).ConfigureAwait(false);
+        if (!defaultCollection.HasValue || defaultCollection.Value.Id == Guid.Empty)
+            return;
+
+        var collId = defaultCollection.Value.Id;
+
+        await SafeIpc.TryRun(Logger, "Penumbra.ClearMountMusicTemporaryModOnDefaultCollection", TimeSpan.FromSeconds(10), async ct =>
+        {
+            await RunPacedPenumbraFrameworkIpcAsync(logger, $"Penumbra.ClearTemporaryMods({MountMusicTemporaryModName}@{priority})", () =>
+            {
+                var emptyPaths = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                var retAdd = _penumbraAddTemporaryMod.Invoke(MountMusicTemporaryModName, collId, emptyPaths, string.Empty, priority);
+                if (retAdd != PenumbraApiEc.Success)
+                {
+                    var retRemove = _penumbraRemoveTemporaryMod.Invoke(MountMusicTemporaryModName, collId, priority);
+                    logger.LogTrace("[{applicationId}] Clear mount music fallback: removed {tempModName}@{priority} from Default collection {collId}, ret={ret}", applicationId, MountMusicTemporaryModName, priority, collId, retRemove);
+                    retAdd = _penumbraAddTemporaryMod.Invoke(MountMusicTemporaryModName, collId, emptyPaths, string.Empty, priority);
+                }
+
+                logger.LogTrace("[{applicationId}] Cleared mount music temp mod {tempModName}@{priority} on Default collection {collId} by overwriting with empty redirects, ret={ret}", applicationId, MountMusicTemporaryModName, priority, collId, retAdd);
+            }, ct).ConfigureAwait(false);
+        }).ConfigureAwait(false);
+    }
+
+
+
+    private static readonly (string Name, int Priority)[] RavaSyncReceiverTempFileMods =
+    [
+        ("MareChara_Files", 100),
+        ("MareChara_Files", 0),
+        ("MareChara_Files_A", 100),
+        ("MareChara_Files_A", 0),
+        ("MareChara_Files_B", 100),
+        ("MareChara_Files_B", 0),
+    ];
+
+    private void ForceRavaSyncTemporaryCollectionVanillaOnFramework(ILogger logger, Guid applicationId, Guid collId, string reason)
+    {
+        if (collId == Guid.Empty)
+            return;
+
+        if (IsProtectedUserCollectionOnFramework(collId, out var protectedReason))
+        {
+            logger.LogWarning("[{applicationId}] Blocked {reason} vanilla overwrite for protected collection {collection} ({protectedReason})", applicationId, reason, collId, protectedReason);
+            return;
+        }
+
+        var emptyPaths = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var (name, priority) in RavaSyncReceiverTempFileMods)
+        {
+            try
+            {
+                var retAdd = _penumbraAddTemporaryMod.Invoke(name, collId, emptyPaths, string.Empty, priority);
+                if (retAdd != PenumbraApiEc.Success)
+                {
+                    var retRemove = _penumbraRemoveTemporaryMod.Invoke(name, collId, priority);
+                    logger.LogTrace("[{applicationId}] {reason}: fallback removed temp files mod {tempModName}@{priority} from {collId}, ret={ret}", applicationId, reason, name, priority, collId, retRemove);
+                    retAdd = _penumbraAddTemporaryMod.Invoke(name, collId, emptyPaths, string.Empty, priority);
+                }
+
+                logger.LogTrace("[{applicationId}] {reason}: overwrote temp files mod {tempModName}@{priority} on {collId} with empty redirects, ret={ret}", applicationId, reason, name, priority, collId, retAdd);
+            }
+            catch (Exception ex)
+            {
+                logger.LogDebug(ex, "[{applicationId}] {reason}: failed vanilla overwrite for temp files mod {tempModName}@{priority} on {collId}", applicationId, reason, name, priority, collId);
+            }
+        }
+
+        try
+        {
+            var retMeta = _penumbraAddTemporaryMod.Invoke("MareChara_Meta", collId, emptyPaths, string.Empty, 0);
+            if (retMeta != PenumbraApiEc.Success)
+            {
+                var retRemoveMeta = _penumbraRemoveTemporaryMod.Invoke("MareChara_Meta", collId, 0);
+                logger.LogTrace("[{applicationId}] {reason}: fallback removed temp meta mod from {collId}, ret={ret}", applicationId, reason, collId, retRemoveMeta);
+                retMeta = _penumbraAddTemporaryMod.Invoke("MareChara_Meta", collId, emptyPaths, string.Empty, 0);
+            }
+
+            logger.LogTrace("[{applicationId}] {reason}: overwrote temp meta mod on {collId} with empty manipulation, ret={ret}", applicationId, reason, collId, retMeta);
+        }
+        catch (Exception ex)
+        {
+            logger.LogDebug(ex, "[{applicationId}] {reason}: failed vanilla overwrite for temp meta mod on {collId}", applicationId, reason, collId);
+        }
+
+        foreach (var priority in new[] { 100, 0 })
+        {
+            try
+            {
+                var retSupport = _penumbraRemoveTemporaryMod.Invoke("RavaSync_AsyncLoadSupport", collId, priority);
+                logger.LogTrace("[{applicationId}] {reason}: removed async support temp mod @{priority} from {collId}, ret={ret}", applicationId, reason, priority, collId, retSupport);
+            }
+            catch (Exception ex)
+            {
+                logger.LogDebug(ex, "[{applicationId}] {reason}: failed removing async support temp mod @{priority} from {collId}", applicationId, reason, priority, collId);
+            }
+        }
+
+        logger.LogDebug("[{applicationId}] {reason}: forced RavaSync temp collection {collId} to vanilla contents", applicationId, reason, collId);
+    }
+
+    public async Task ClearRavaSyncTemporaryModsFastAsync(ILogger logger, Guid applicationId, Guid collId)
+    {
+        if (!APIAvailable) return;
+        if (collId == Guid.Empty) return;
+
+        await SafeIpc.TryRun(Logger, "Penumbra.ForceRavaSyncTemporaryModsVanilla", TimeSpan.FromSeconds(5), async ct =>
+        {
+            await RunPacedPenumbraFrameworkIpcAsync(logger, "Penumbra.ForceRavaSyncTemporaryModsVanilla", () =>
+            {
+                ForceRavaSyncTemporaryCollectionVanillaOnFramework(logger, applicationId, collId, "teardown");
+            }, ct, warnAfterMs: 100).ConfigureAwait(false);
+        }).ConfigureAwait(false);
+    }
+
+    public async Task ClearRavaSyncTemporaryCollectionForPlayerAsync(ILogger logger, Guid applicationId, string expectedIdent, string? expectedDisplayName, nint expectedAddress, int? lastObjectIndex, Guid capturedCollection, CancellationToken token = default)
+    {
+        if (!APIAvailable) return;
+
+        await SafeIpc.TryRun(Logger, "Penumbra.RestoreRavaSyncTargetTemporaryCollectionToVanilla", TimeSpan.FromSeconds(5), async ct =>
+        {
+            await RunPacedPenumbraFrameworkIpcAsync(logger, "Penumbra.RestoreRavaSyncTargetTemporaryCollectionToVanilla", () =>
+            {
+                // Critical: make the collection itself vanilla first. Penumbra can keep rendering a
+                // previously-assigned temp collection through despawn/re-entry; deleting or clearing the
+                // object slot alone is not enough if the collection contents still contain redirects.
+                if (capturedCollection != Guid.Empty)
+                    ForceRavaSyncTemporaryCollectionVanillaOnFramework(logger, applicationId, capturedCollection, "targeted teardown captured collection");
+
+                var vanillaCollectionsApplied = new HashSet<Guid>();
+
+                void TryRestoreIndex(int idx, string source, bool allowNoLiveObject)
+                {
+                    if (idx < 0)
+                        return;
+
+                    try
+                    {
+                        var localPlayerAddress = _dalamudUtil.GetPlayerPtr();
+                        var live = _dalamudUtil.GetCharacterFromObjectTableByIndex(idx);
+                        var liveAddress = live?.Address ?? nint.Zero;
+
+                        if (liveAddress != nint.Zero && localPlayerAddress != nint.Zero && liveAddress == localPlayerAddress)
+                        {
+                            logger.LogWarning("[{applicationId}] Targeted vanilla teardown blocked at idx {idx}; target is local player", applicationId, idx);
+                            return;
+                        }
+
+                        if (liveAddress == nint.Zero && !allowNoLiveObject)
+                            return;
+
+                        Guid effectiveId = Guid.Empty;
+                        string effectiveName = string.Empty;
+                        var objectValid = false;
+
+                        try
+                        {
+                            var collectionInfo = _penumbraGetCollectionForObject.Invoke(idx);
+                            objectValid = collectionInfo.ObjectValid;
+                            if (objectValid)
+                            {
+                                effectiveId = collectionInfo.EffectiveCollection.Id;
+                                effectiveName = collectionInfo.EffectiveCollection.Name ?? string.Empty;
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            logger.LogDebug(ex, "[{applicationId}] Targeted vanilla teardown could not read Penumbra collection for idx {idx} ({source})", applicationId, idx, source);
+                        }
+
+                        var matchesCapturedCollection = capturedCollection != Guid.Empty && effectiveId == capturedCollection;
+                        var matchesRavaCollection = IsRavaSyncOwnedTemporaryCollectionOnFramework(effectiveId, effectiveName);
+
+                        if (objectValid && !matchesCapturedCollection && !matchesRavaCollection)
+                            return;
+
+                        var vanillaCollection = effectiveId != Guid.Empty && (matchesCapturedCollection || matchesRavaCollection)
+                            ? effectiveId
+                            : capturedCollection;
+
+                        if (vanillaCollection == Guid.Empty)
+                            return;
+
+                        if (vanillaCollectionsApplied.Add(vanillaCollection))
+                            ForceRavaSyncTemporaryCollectionVanillaOnFramework(logger, applicationId, vanillaCollection, $"targeted teardown {source}");
+
+                        // Assign the now-empty owned collection back to the actor/index and redraw. This actively
+                        // replaces rendered redirects with an empty owned collection instead of hoping
+                        // Guid.Empty/deletion invalidates Penumbra's rendered state in time.
+                        var retAssign = _penumbraAssignTemporaryCollection.Invoke(vanillaCollection, idx, forceAssignment: true);
+                        logger.LogDebug("[{applicationId}] Targeted vanilla teardown assigned empty RavaSync collection {collection} to idx={idx} source={source}, previous={previous}/{name}, ret={ret}", applicationId, vanillaCollection, idx, source, effectiveId, effectiveName, retAssign);
+
+                        try
+                        {
+                            _penumbraRedraw.Invoke(idx, RedrawType.Redraw);
+                        }
+                        catch (Exception redrawEx)
+                        {
+                            logger.LogDebug(redrawEx, "[{applicationId}] Targeted vanilla teardown redraw failed for idx {idx}", applicationId, idx);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        logger.LogDebug(ex, "[{applicationId}] Targeted vanilla teardown failed restoring idx {idx} ({source})", applicationId, idx, source);
+                    }
+                }
+
+                if (lastObjectIndex.HasValue)
+                    TryRestoreIndex(lastObjectIndex.Value, "last assigned", allowNoLiveObject: true);
+
+                foreach (var player in _dalamudUtil.GetPlayerCharacterSnapshotsFromObjectTable())
+                {
+                    if (!DoesPlayerMatchTeardownTargetOnFramework(player, expectedIdent, expectedDisplayName, expectedAddress))
+                        continue;
+
+                    TryRestoreIndex(player.ObjectIndex, "live target", allowNoLiveObject: false);
+                }
+            }, ct, warnAfterMs: 100).ConfigureAwait(false);
+        }).ConfigureAwait(false);
+    }
+
+    public void QueueRavaSyncGlobalTemporaryCollectionWipe(ILogger logger, string reason)
+    {
+        if (!APIAvailable)
+            return;
+
+        var applicationId = Guid.NewGuid();
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                // Keep global wipes single-pass. Visibility/zone re-entry is generation-guarded
+                // at the PairHandler level; a delayed global follow-up has no pair generation guard
+                // and can wipe a freshly-applied actor after it becomes visible again.
+                await WipeAllRavaSyncTemporaryCollectionsAsync(logger, applicationId, reason, CancellationToken.None, deleteCollections: true).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                logger.LogDebug(ex, "[{applicationId}] Global RavaSync temporary collection wipe task failed for {reason}", applicationId, reason);
+            }
+        });
+    }
+
+    public async Task WipeAllRavaSyncTemporaryCollectionsAsync(ILogger logger, Guid applicationId, string reason, CancellationToken token = default, bool deleteCollections = false)
+    {
+        if (!APIAvailable)
+            return;
+
+        if (!await RavaSyncGlobalTemporaryCollectionWipeGate.WaitAsync(0, token).ConfigureAwait(false))
+        {
+            logger.LogDebug("[{applicationId}] Skipping duplicate global RavaSync temporary collection wipe for {reason}; another wipe is already running", applicationId, reason);
+            return;
+        }
+
+        try
+        {
+            var initiallyTrackedCollections = _ravaSyncTemporaryCollections.Keys
+                .Where(c => c != Guid.Empty)
+                .Distinct()
+                .ToArray();
+
+            var collectionSet = initiallyTrackedCollections.ToHashSet();
+            var liveAssignments = new List<(int Index, nint Address, string Name, Guid Collection)>();
+            var discoveredCollections = new List<Guid>();
+
+            await SafeIpc.TryRun(Logger, "Penumbra.ScanRavaSyncTemporaryCollections", TimeSpan.FromSeconds(5), async ct =>
+            {
+                var scanResult = await RunPacedPenumbraFrameworkIpcAsync(logger, "Penumbra.ScanRavaSyncTemporaryCollections", () =>
+                {
+                    var assignments = new List<(int Index, nint Address, string Name, Guid Collection)>();
+                    var discovered = new List<Guid>();
+                    var localPlayerAddress = _dalamudUtil.GetPlayerPtr();
+                    var players = _dalamudUtil.GetPlayerCharacterSnapshotsFromObjectTable();
+
+                    foreach (var player in players)
+                    {
+                        if (player.ObjectIndex < 0 || player.Address == nint.Zero)
+                            continue;
+
+                        if (localPlayerAddress != nint.Zero && player.Address == localPlayerAddress)
+                            continue;
+
+                        try
+                        {
+                            var collectionInfo = _penumbraGetCollectionForObject.Invoke(player.ObjectIndex);
+                            if (!collectionInfo.ObjectValid)
+                                continue;
+
+                            var effectiveCollectionId = collectionInfo.EffectiveCollection.Id;
+                            var effectiveCollectionName = collectionInfo.EffectiveCollection.Name ?? string.Empty;
+                            if (!IsRavaSyncOwnedTemporaryCollectionOnFramework(effectiveCollectionId, effectiveCollectionName))
+                                continue;
+
+                            assignments.Add((player.ObjectIndex, player.Address, player.Name, effectiveCollectionId));
+                            if (effectiveCollectionId != Guid.Empty)
+                                discovered.Add(effectiveCollectionId);
+                        }
+                        catch (Exception ex)
+                        {
+                            logger.LogDebug(ex, "[{applicationId}] Failed checking Penumbra collection for object index {idx} during global wipe", applicationId, player.ObjectIndex);
+                        }
+                    }
+
+                    return (Assignments: assignments, Discovered: discovered.Distinct().ToArray());
+                }, ct, warnAfterMs: 80).ConfigureAwait(false);
+
+                liveAssignments = scanResult.Assignments;
+                discoveredCollections = scanResult.Discovered.ToList();
+            }).ConfigureAwait(false);
+
+            foreach (var discovered in discoveredCollections)
+            {
+                if (discovered != Guid.Empty)
+                    collectionSet.Add(discovered);
+            }
+
+            var collections = collectionSet
+                .Where(c => c != Guid.Empty)
+                .Distinct()
+                .ToArray();
+
+            if (collections.Length == 0 && liveAssignments.Count == 0)
+            {
+                logger.LogTrace("[{applicationId}] Global RavaSync temporary collection wipe for {reason}: no tracked or live RavaSync collections", applicationId, reason);
+                return;
+            }
+
+            logger.LogDebug("[{applicationId}] Global RavaSync temporary collection wipe for {reason}: tracked={trackedCount}, discovered={discoveredCount}, collections={collectionCount}, liveAssignments={assignmentCount}, deleteCollections={deleteCollections}", applicationId, reason, initiallyTrackedCollections.Length, discoveredCollections.Count, collections.Length, liveAssignments.Count, deleteCollections);
+
+            foreach (var collectionId in collections)
+            {
+                token.ThrowIfCancellationRequested();
+
+                await SafeIpc.TryRun(Logger, "Penumbra.ForceGlobalRavaSyncTemporaryCollectionVanilla", TimeSpan.FromSeconds(5), async ct =>
+                {
+                    await RunPacedPenumbraFrameworkIpcAsync(logger, "Penumbra.ForceGlobalRavaSyncTemporaryCollectionVanilla", () =>
+                    {
+                        ForceRavaSyncTemporaryCollectionVanillaOnFramework(logger, applicationId, collectionId, $"global wipe {reason}");
+                    }, ct, warnAfterMs: 100).ConfigureAwait(false);
+                }).ConfigureAwait(false);
+            }
+
+            const int liveAssignmentBatchSize = 1;
+            for (var start = 0; start < liveAssignments.Count; start += liveAssignmentBatchSize)
+            {
+                token.ThrowIfCancellationRequested();
+
+                var batch = liveAssignments.Skip(start).Take(liveAssignmentBatchSize).ToArray();
+                await SafeIpc.TryRun(Logger, "Penumbra.ClearRavaSyncTemporaryCollectionAssignments", TimeSpan.FromSeconds(5), async ct =>
+                {
+                    await RunPacedPenumbraFrameworkIpcAsync(logger, "Penumbra.ClearRavaSyncTemporaryCollectionAssignments", () =>
+                    {
+                        foreach (var item in batch)
+                        {
+                            try
+                            {
+                                var current = _penumbraGetCollectionForObject.Invoke(item.Index);
+                                if (!current.ObjectValid)
+                                    continue;
+
+                                var effectiveCollectionId = current.EffectiveCollection.Id;
+                                var effectiveCollectionName = current.EffectiveCollection.Name ?? string.Empty;
+                                if (!IsRavaSyncOwnedTemporaryCollectionOnFramework(effectiveCollectionId, effectiveCollectionName))
+                                    continue;
+
+                                ForceRavaSyncTemporaryCollectionVanillaOnFramework(logger, applicationId, effectiveCollectionId, $"global live assignment {reason}");
+                                var clearResult = _penumbraAssignTemporaryCollection.Invoke(effectiveCollectionId, item.Index, forceAssignment: true);
+                                logger.LogDebug("[{applicationId}] Global wipe assigned empty RavaSync temp collection {collection}/{collectionName} to idx {idx} ({name}), ret={ret}", applicationId, effectiveCollectionId, effectiveCollectionName, item.Index, item.Name, clearResult);
+
+                                if (clearResult == PenumbraApiEc.Success)
+                                {
+                                    collectionSet.Add(effectiveCollectionId);
+                                    try
+                                    {
+                                        _penumbraRedraw.Invoke(item.Index, RedrawType.Redraw);
+                                    }
+                                    catch (Exception redrawEx)
+                                    {
+                                        logger.LogDebug(redrawEx, "[{applicationId}] Global wipe redraw failed for idx {idx} ({name})", applicationId, item.Index, item.Name);
+                                    }
+                                }
+                            }
+                            catch (Exception ex)
+                            {
+                                logger.LogDebug(ex, "[{applicationId}] Failed clearing RavaSync temp collection assignment for idx {idx} ({name})", applicationId, item.Index, item.Name);
+                            }
+                        }
+                    }, ct, warnAfterMs: 100).ConfigureAwait(false);
+                }).ConfigureAwait(false);
+            }
+
+            collections = collectionSet
+                .Where(c => c != Guid.Empty)
+                .Distinct()
+                .ToArray();
+
+            if (deleteCollections)
+            {
+                foreach (var collectionId in collections)
+                {
+                    token.ThrowIfCancellationRequested();
+
+                    await SafeIpc.TryRun(Logger, "Penumbra.DeleteRavaSyncTemporaryCollection", TimeSpan.FromSeconds(5), async ct =>
+                    {
+                        await RunPacedPenumbraFrameworkIpcAsync(logger, "Penumbra.DeleteRavaSyncTemporaryCollection", () =>
+                        {
+                            if (IsProtectedUserCollectionOnFramework(collectionId, out var protectedReason))
+                            {
+                                logger.LogWarning("[{applicationId}] Global wipe blocked protected collection deletion for {collection} ({reason})", applicationId, collectionId, protectedReason);
+                                return;
+                            }
+
+                            var result = _penumbraRemoveTemporaryCollection.Invoke(collectionId);
+                            if (result == PenumbraApiEc.Success)
+                                _ravaSyncTemporaryCollections.TryRemove(collectionId, out _);
+
+                            logger.LogDebug("[{applicationId}] Global wipe deleted RavaSync temporary collection {collection}, ret={ret}", applicationId, collectionId, result);
+                        }, ct, warnAfterMs: 100).ConfigureAwait(false);
+                    }).ConfigureAwait(false);
+                }
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            logger.LogDebug("[{applicationId}] Global RavaSync temporary collection wipe cancelled for {reason}", applicationId, reason);
+        }
+        catch (Exception ex)
+        {
+            logger.LogDebug(ex, "[{applicationId}] Global RavaSync temporary collection wipe failed for {reason}", applicationId, reason);
+        }
+        finally
+        {
+            RavaSyncGlobalTemporaryCollectionWipeGate.Release();
+        }
+    }
+
     public async Task ClearNamedTemporaryModsAsync(ILogger logger, Guid applicationId, Guid collId, string tempModName, int priority = 0)
     {
         if (!APIAvailable) return;
@@ -1121,8 +1979,16 @@ public sealed class IpcCallerPenumbra : DisposableMediatorSubscriberBase, IIpcCa
                 if (ShouldBlockRavaSyncTemporaryCollectionMutationOnFramework(logger, applicationId, collId, "Penumbra.ClearTemporaryMods", tempModName))
                     return;
 
-                var retRemove = _penumbraRemoveTemporaryMod.Invoke(tempModName, collId, priority);
-                logger.LogTrace("[{applicationId}] Clearing temp files mod {tempModName} for {collId} at priority {priority}, Success: {ret}", applicationId, tempModName, collId, priority, retRemove);
+                var emptyPaths = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                var retAdd = _penumbraAddTemporaryMod.Invoke(tempModName, collId, emptyPaths, string.Empty, priority);
+                if (retAdd != PenumbraApiEc.Success)
+                {
+                    var retRemove = _penumbraRemoveTemporaryMod.Invoke(tempModName, collId, priority);
+                    logger.LogTrace("[{applicationId}] Clear temp files fallback: removed {tempModName}@{priority} from {collId}, ret={ret}", applicationId, tempModName, priority, collId, retRemove);
+                    retAdd = _penumbraAddTemporaryMod.Invoke(tempModName, collId, emptyPaths, string.Empty, priority);
+                }
+
+                logger.LogTrace("[{applicationId}] Cleared temp files mod {tempModName}@{priority} for {collId} by overwriting with empty redirects, ret={ret}", applicationId, tempModName, priority, collId, retAdd);
             }, ct).ConfigureAwait(false);
         }).ConfigureAwait(false);
     }

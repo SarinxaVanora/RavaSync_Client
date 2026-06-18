@@ -1,6 +1,8 @@
-using Microsoft.Extensions.Logging;
+﻿using Microsoft.Extensions.Logging;
 using RavaSync.API.Data;
 using RavaSync.FileCache;
+using RavaSync.MareConfiguration;
+using RavaSync.Services.Optimisation;
 using RavaSync.WebAPI.Files.Models;
 using System.Collections.Concurrent;
 using System.Collections.Immutable;
@@ -30,19 +32,23 @@ public sealed class ModPathResolver
 
     private readonly FileCacheManager _fileDbManager;
     private readonly ILogger<ModPathResolver> _logger;
+    private readonly MareConfigService _configService;
+    private readonly ScreenShakeSanitisationService _screenShakeSanitisationService;
 
-    public ModPathResolver(ILogger<ModPathResolver> logger, FileCacheManager fileDbManager)
+    public ModPathResolver(ILogger<ModPathResolver> logger, FileCacheManager fileDbManager, MareConfigService configService, ScreenShakeSanitisationService screenShakeSanitisationService)
     {
         _logger = logger;
         _fileDbManager = fileDbManager;
+        _configService = configService;
+        _screenShakeSanitisationService = screenShakeSanitisationService;
     }
 
-    public List<FileReplacementData> Calculate(Guid applicationBase, CharacterData charaData, out Dictionary<(string GamePath, string? Hash), string> moddedDictionary, CancellationToken token)
+    public List<FileReplacementData> Calculate(Guid applicationBase, CharacterData charaData, out Dictionary<(string GamePath, string? Hash), string> moddedDictionary, CancellationToken token, bool? allowScreenShake = null)
     {
         GlobalResolveSemaphore.Wait(token);
         try
         {
-            return CalculateCore(applicationBase, charaData, out moddedDictionary, token);
+            return CalculateCore(applicationBase, charaData, out moddedDictionary, token, allowScreenShake ?? _configService.Current.GlobalSyncScreenShake);
         }
         finally
         {
@@ -85,7 +91,7 @@ public sealed class ModPathResolver
         return ReplacementPlanCache.GetOrAdd(cacheKey, _ => BuildReplacementPlan(charaData));
     }
 
-    private List<FileReplacementData> CalculateCore(Guid applicationBase, CharacterData charaData, out Dictionary<(string GamePath, string? Hash), string> moddedDictionary, CancellationToken token)
+    private List<FileReplacementData> CalculateCore(Guid applicationBase, CharacterData charaData, out Dictionary<(string GamePath, string? Hash), string> moddedDictionary, CancellationToken token, bool allowScreenShake)
     {
         var st = Stopwatch.StartNew();
 
@@ -107,7 +113,7 @@ public sealed class ModPathResolver
             for (int i = 0; i < noSwap.Length; i++)
             {
                 token.ThrowIfCancellationRequested();
-                ProcessNoSwapReplacement(applicationBase, noSwap[i], missingFiles, outputDict, fileCacheMemo, migrationLock, MarkMigrationChanged, token);
+                ProcessNoSwapReplacement(applicationBase, noSwap[i], missingFiles, outputDict, fileCacheMemo, migrationLock, MarkMigrationChanged, token, allowScreenShake);
             }
 
             for (int i = 0; i < swaps.Length; i++)
@@ -127,6 +133,7 @@ public sealed class ModPathResolver
                 {
                     if (string.IsNullOrWhiteSpace(gp)) continue;
                     if (string.Equals(gp, swap, StringComparison.OrdinalIgnoreCase)) continue;
+                    if (!ShouldApplyGlobalSyncGamePath(gp, swap)) continue;
                     outputDict[(gp, null)] = swap;
                 }
             }
@@ -156,7 +163,7 @@ public sealed class ModPathResolver
         return missingFiles.ToList();
     }
 
-    private void ProcessNoSwapReplacement(Guid applicationBase, FileReplacementData item, List<FileReplacementData> missingFiles, Dictionary<(string GamePath, string? Hash), string> outputDict, ConcurrentDictionary<string, FileCacheEntity?> fileCacheMemo, object migrationLock, Action markMigrationChanged, CancellationToken token)
+    private void ProcessNoSwapReplacement(Guid applicationBase, FileReplacementData item, List<FileReplacementData> missingFiles, Dictionary<(string GamePath, string? Hash), string> outputDict, ConcurrentDictionary<string, FileCacheEntity?> fileCacheMemo, object migrationLock, Action markMigrationChanged, CancellationToken token, bool allowScreenShake)
     {
         token.ThrowIfCancellationRequested();
 
@@ -171,20 +178,26 @@ public sealed class ModPathResolver
         if (gamePathsObj == null)
             return;
 
-        object gamePathsStable = gamePathsObj is IList<string> ? gamePathsObj : (object)gamePathsObj.ToList();
+        var gamePathsStable = gamePathsObj is IList<string> list ? list.Where(static p => !string.IsNullOrWhiteSpace(p)).ToList() : gamePathsObj.Where(static p => !string.IsNullOrWhiteSpace(p)).ToList();
+        if (gamePathsStable.Count == 0)
+            return;
 
-        static bool TryGetFirstNonEmptyGamePath(object gamePathsObj, out string first)
+        var effectiveGamePaths = gamePathsStable
+            .Where(path => ShouldApplyGlobalSyncGamePath(path, null))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        if (effectiveGamePaths.Length == 0)
+            return;
+
+        static bool TryGetFirstNonEmptyGamePath(IEnumerable<string> gamePaths, out string first)
         {
             first = string.Empty;
-            if (gamePathsObj is IEnumerable<string> enumerable)
+            foreach (var s in gamePaths)
             {
-                foreach (var s in enumerable)
+                if (!string.IsNullOrWhiteSpace(s))
                 {
-                    if (!string.IsNullOrWhiteSpace(s))
-                    {
-                        first = s;
-                        return true;
-                    }
+                    first = s;
+                    return true;
                 }
             }
             return false;
@@ -200,7 +213,7 @@ public sealed class ModPathResolver
         var fileCache = GetCachedFileEntry(hash);
         if (fileCache == null || string.IsNullOrWhiteSpace(fileCache.ResolvedFilepath))
         {
-            missingFiles.Add(item);
+            missingFiles.Add(CloneReplacementWithGamePaths(item, effectiveGamePaths));
             return;
         }
 
@@ -211,7 +224,7 @@ public sealed class ModPathResolver
             fi = new FileInfo(resolved);
             if (!fi.Exists || (fi.Length == 0 && (DateTime.UtcNow - fi.LastWriteTimeUtc) >= TimeSpan.FromSeconds(10)))
             {
-                missingFiles.Add(item);
+                missingFiles.Add(CloneReplacementWithGamePaths(item, effectiveGamePaths));
                 return;
             }
         }
@@ -220,7 +233,7 @@ public sealed class ModPathResolver
             fi = new FileInfo(resolved);
         }
 
-        if (string.IsNullOrEmpty(fi.Extension) && TryGetFirstNonEmptyGamePath(gamePathsStable, out var firstGp))
+        if (string.IsNullOrEmpty(fi.Extension) && TryGetFirstNonEmptyGamePath(effectiveGamePaths, out var firstGp))
         {
             var targetExt = GetExtensionOrDat(firstGp);
             lock (migrationLock)
@@ -244,10 +257,58 @@ public sealed class ModPathResolver
             }
         }
 
-        foreach (var gp in (IEnumerable<string>)gamePathsStable)
+        foreach (var gp in effectiveGamePaths)
         {
-            if (string.IsNullOrWhiteSpace(gp)) continue;
-            outputDict[(gp, hash)] = resolved;
+            if (string.IsNullOrWhiteSpace(gp))
+                continue;
+
+            var effectiveResolved = resolved;
+            if (!allowScreenShake
+                && ScreenShakeSanitisationService.IsAvfxCandidate(gp, resolved)
+                && _screenShakeSanitisationService.TryGetScreenShakeSafePath(gp, resolved, hash, out var safePath)
+                && !string.IsNullOrWhiteSpace(safePath))
+            {
+                effectiveResolved = safePath;
+            }
+
+            outputDict[(gp, hash)] = effectiveResolved;
         }
     }
+
+    private static FileReplacementData CloneReplacementWithGamePaths(FileReplacementData source, string[] gamePaths)
+    {
+        return new FileReplacementData
+        {
+            GamePaths = gamePaths,
+            Hash = source.Hash,
+            FileSwapPath = source.FileSwapPath,
+        };
+    }
+
+    private bool ShouldApplyGlobalSyncGamePath(string? gamePath, string? fileSwapPath)
+    {
+        var pathForKind = string.IsNullOrWhiteSpace(fileSwapPath) ? gamePath : fileSwapPath;
+        var normalized = NormalizeGamePath(pathForKind);
+        if (string.IsNullOrWhiteSpace(normalized))
+            return false;
+
+        var ext = Path.GetExtension(normalized).ToLowerInvariant();
+        if (!_configService.Current.GlobalSyncSounds && ext == ".scd")
+            return false;
+
+        if (!_configService.Current.GlobalSyncAnimations && (ext == ".pap" || ext == ".tmb" || ext == ".tmb2"))
+            return false;
+
+        if (!_configService.Current.GlobalSyncVfx && IsVfxGamePathExtension(ext))
+            return false;
+
+        return true;
+    }
+
+    private static bool IsVfxGamePathExtension(string extension)
+        => extension is ".avfx" or ".atex" or ".shpk" or ".eid" or ".skp";
+
+    private static string NormalizeGamePath(string? value)
+        => string.IsNullOrWhiteSpace(value) ? string.Empty : value.Replace('\\', '/').Trim();
+
 }

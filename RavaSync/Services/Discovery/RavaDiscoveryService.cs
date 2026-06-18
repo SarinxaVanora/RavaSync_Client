@@ -1,4 +1,4 @@
-﻿using Dalamud.Game.ClientState;
+using Dalamud.Game.ClientState;
 using Dalamud.Game.ClientState.Objects;
 using Dalamud.Game.ClientState.Objects.SubKinds;
 using Dalamud.Plugin.Services;
@@ -15,6 +15,7 @@ using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 
+using RavaSync.Services.Mesh;
 namespace RavaSync.Services.Discovery;
 
 public sealed class RavaDiscoveryService : DisposableMediatorSubscriberBase, IHostedService
@@ -49,17 +50,6 @@ public sealed class RavaDiscoveryService : DisposableMediatorSubscriberBase, IHo
     private int _roundRobinStartIndex = 0;
     private bool _isMeshListening = false;
 
-    private readonly object _yieldBroadcastGate = new();
-    private sealed record LocalYieldStateEntry(bool Yield, string Owner);
-    private sealed record YieldBroadcastStateEntry(bool Yield, string Owner);
-    private readonly ConcurrentDictionary<string, LocalYieldStateEntry> _localYieldStatesByUid = new(StringComparer.Ordinal);
-    private readonly ConcurrentDictionary<string, YieldBroadcastStateEntry> _lastYieldBroadcastByUid = new(StringComparer.Ordinal);
-
-    private sealed record RemoteYieldCacheEntry(bool Yield, string Owner, DateTime LastSeenUtc);
-    private readonly ConcurrentDictionary<string, RemoteYieldCacheEntry> _lastRemoteYieldByUid = new(StringComparer.Ordinal);
-    private static readonly TimeSpan RemoteYieldDedupWindow = TimeSpan.FromSeconds(6);
-
-
     private sealed record ObjectSessionCacheEntry(string SessionId,DateTime LastSeenUtc);
 
     private readonly ConcurrentDictionary<nint, ObjectSessionCacheEntry> _objectSessionCache = new();
@@ -71,7 +61,6 @@ public sealed class RavaDiscoveryService : DisposableMediatorSubscriberBase, IHo
     private const int MaxGameMeshMessagesPerTick = 8;
 
     public sealed record RavaPeerInfo(string SessionId,byte[] PeerKey,DateTime FirstSeenUtc,DateTime LastSeenUtc);
-    public sealed record RavaYieldByIdentReceivedMessage(string FromIdent, bool YieldToOtherSync, string Owner, TimeSpan Ttl);
 
     public RavaDiscoveryService(ILogger<RavaDiscoveryService> logger,IObjectTable objectTable,
         IClientState clientState,IRavaMesh mesh,MareMediator mediator,DalamudUtilService dalamudUtil,ApiController api,MareConfigService configService) : base(logger, mediator)
@@ -107,19 +96,6 @@ public sealed class RavaDiscoveryService : DisposableMediatorSubscriberBase, IHo
             ResetMeshListener();
         });
 
-        _mediator.Subscribe<LocalOtherSyncYieldStateChangedMessage>(this, msg =>
-        {
-            var affectedUid = msg.AffectedUid ?? string.Empty;
-            if (string.IsNullOrWhiteSpace(affectedUid))
-                return;
-
-            var yield = msg.YieldToOtherSync;
-            var owner = yield ? (msg.Owner ?? string.Empty) : string.Empty;
-
-            _localYieldStatesByUid[affectedUid] = new LocalYieldStateEntry(yield, owner);
-
-            BroadcastLocalOtherSyncState(affectedUid, yield, owner);
-        });
     }
 
     private void ResetMeshListener()
@@ -141,8 +117,6 @@ public sealed class RavaDiscoveryService : DisposableMediatorSubscriberBase, IHo
         _lastHelloSentUtc.Clear();
         _objectSessionCache.Clear();
 
-        _lastYieldBroadcastByUid.Clear();
-        _lastRemoteYieldByUid.Clear();
     }
 
     public Task StartAsync(CancellationToken cancellationToken)
@@ -209,8 +183,6 @@ public sealed class RavaDiscoveryService : DisposableMediatorSubscriberBase, IHo
                 _mesh.Listen(_mySessionId, OnMeshMessageAsync);
                 _isMeshListening = true;
 
-                // Re-broadcast current local yield states on mesh start (reconnect case)
-                BroadcastAllLocalOtherSyncStates();
             }
             catch (Exception ex)
             {
@@ -309,9 +281,6 @@ public sealed class RavaDiscoveryService : DisposableMediatorSubscriberBase, IHo
                 case RavaHelloAck a:
                     TouchPeer(a.FromSessionId, a.FromPeerKey);
                     break;
-                case RavaYield y:
-                    TouchPeer(y.FromSessionId, peerKey: null);
-                    break;
                 case RavaGame g:
                     TouchPeer(g.FromSessionId, peerKey: null);
                     break;
@@ -322,49 +291,6 @@ public sealed class RavaDiscoveryService : DisposableMediatorSubscriberBase, IHo
 
             switch (message)
             {
-                case RavaYield y:
-                    {
-                        var now = DateTime.UtcNow;
-
-                        var targetUid = y.AffectedUid ?? string.Empty;
-                        if (string.IsNullOrWhiteSpace(targetUid))
-                            break;
-
-                        var ownUid = _ownUser?.UID ?? string.Empty;
-                        if (string.IsNullOrWhiteSpace(ownUid) || !string.Equals(targetUid, ownUid, StringComparison.Ordinal))
-                            break;
-
-                        var fromUid = y.FromUid ?? string.Empty;
-                        if (string.IsNullOrWhiteSpace(fromUid))
-                            break;
-
-                        var owner = y.Owner ?? string.Empty;
-                        if (!y.YieldToOtherSync)
-                            owner = string.Empty;
-
-                        var cacheKey = fromUid;
-                        var incoming = new RemoteYieldCacheEntry(y.YieldToOtherSync, owner, now);
-
-                        if (_lastRemoteYieldByUid.TryGetValue(cacheKey, out var last))
-                        {
-                            var same =
-                                last.Yield == incoming.Yield
-                                && string.Equals(last.Owner, incoming.Owner, StringComparison.OrdinalIgnoreCase);
-
-                            if (same && (now - last.LastSeenUtc) < RemoteYieldDedupWindow)
-                            {
-                                _lastRemoteYieldByUid[cacheKey] = last with { LastSeenUtc = now };
-                                break;
-                            }
-                        }
-
-                        _lastRemoteYieldByUid[cacheKey] = incoming;
-
-                        _mediator.Publish(new RemoteOtherSyncYieldMessage( FromUid: fromUid,YieldToOtherSync: incoming.Yield,Owner: incoming.Owner,Ttl: TimeSpan.FromSeconds(12)));
-
-                        break;
-                    }
-
                 case RavaGame game:
                     _pendingGameMeshMessages.Enqueue(new SyncshellGameMeshMessage(sessionId, game.FromSessionId, game.Payload));
                     break;
@@ -450,7 +376,6 @@ public sealed class RavaDiscoveryService : DisposableMediatorSubscriberBase, IHo
 
         _knownPeers.AddOrUpdate(from, info, (_, existing) => existing with { LastSeenUtc = now });
 
-        BroadcastLocalOtherSyncStatesToPeer(from);
 
         var ack = new RavaHelloAck(_mySessionId, _myPeerKey);
         _ = _mesh.SendAsync(from, ack);
@@ -472,7 +397,6 @@ public sealed class RavaDiscoveryService : DisposableMediatorSubscriberBase, IHo
 
         _knownPeers.AddOrUpdate(from, info, (_, existing) => existing with { LastSeenUtc = now });
 
-        BroadcastLocalOtherSyncStatesToPeer(from);
     }
 
     private void HandlePairRequest(string localSessionId, RavaPairRequest pr)
@@ -512,7 +436,6 @@ public sealed class RavaDiscoveryService : DisposableMediatorSubscriberBase, IHo
 
         _mySessionId = null;
 
-        _lastYieldBroadcastByUid.Clear();
 
         if (!string.IsNullOrEmpty(oldSession))
         {
@@ -606,76 +529,6 @@ public sealed class RavaDiscoveryService : DisposableMediatorSubscriberBase, IHo
                 _knownPeers.TryRemove(kvp.Key, out _);
                 _lastHelloSentUtc.TryRemove(kvp.Key, out _);
             }
-        }
-    }
-
-    private void BroadcastLocalOtherSyncStatesToPeer(string sessionId)
-    {
-        if (!_api.IsConnected) return;
-        if (!_isMeshListening) return;
-        if (_mySessionId == null) return;
-        if (string.IsNullOrWhiteSpace(sessionId)) return;
-
-        foreach (var kvp in _localYieldStatesByUid)
-        {
-            var msg = new RavaYield(
-                FromSessionId: _mySessionId,
-                FromUid: _ownUser?.UID ?? string.Empty,
-                AffectedUid: kvp.Key,
-                YieldToOtherSync: kvp.Value.Yield,
-                Owner: kvp.Value.Yield ? (kvp.Value.Owner ?? string.Empty) : string.Empty);
-
-            _ = _mesh.SendAsync(sessionId, msg);
-        }
-    }
-
-    private void BroadcastAllLocalOtherSyncStates()
-    {
-        if (!_api.IsConnected) return;
-        if (!_isMeshListening) return;
-        if (_mySessionId == null) return;
-
-        foreach (var kvp in _localYieldStatesByUid)
-        {
-            BroadcastLocalOtherSyncState(kvp.Key,kvp.Value.Yield,kvp.Value.Yield ? kvp.Value.Owner : string.Empty);
-        }
-    }
-
-    public void BroadcastLocalOtherSyncState(string affectedUid, bool yieldToOtherSync, string owner)
-    {
-        if (!_api.IsConnected) return;
-        if (!_isMeshListening) return;
-        if (_mySessionId == null) return;
-        if (string.IsNullOrWhiteSpace(affectedUid)) return;
-
-        owner ??= string.Empty;
-
-        if (!yieldToOtherSync)
-            owner = string.Empty;
-
-        var outgoing = new YieldBroadcastStateEntry(yieldToOtherSync, owner);
-        if (_lastYieldBroadcastByUid.TryGetValue(affectedUid, out var last)
-            && last.Yield == outgoing.Yield
-            && string.Equals(last.Owner, outgoing.Owner, StringComparison.OrdinalIgnoreCase))
-        {
-            return;
-        }
-
-        _lastYieldBroadcastByUid[affectedUid] = outgoing;
-
-        var peers = _knownPeers.Keys.ToArray();
-        if (peers.Length == 0) return;
-
-        var msg = new RavaYield(
-            FromSessionId: _mySessionId,
-            FromUid: _ownUser?.UID ?? string.Empty,
-            AffectedUid: affectedUid,
-            YieldToOtherSync: yieldToOtherSync,
-            Owner: owner);
-
-        for (int i = 0; i < peers.Length; i++)
-        {
-            _ = _mesh.SendAsync(peers[i], msg);
         }
     }
 

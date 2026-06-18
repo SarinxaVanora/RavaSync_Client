@@ -1,0 +1,122 @@
+import router_default from "../../../npm/hybrids/src/router.js";
+import { html } from "../../../npm/hybrids/src/template/index.js";
+//#region src/pages/panel/components/dialog.js
+/**
+* Ghostery Browser Extension
+* https://www.ghostery.com/
+*
+* Copyright 2017-present Ghostery GmbH. All rights reserved.
+*
+* This Source Code Form is subject to the terms of the Mozilla Public
+* License, v. 2.0. If a copy of the MPL was not distributed with this
+* file, You can obtain one at http://mozilla.org/MPL/2.0
+*/
+function close(host) {
+	host.shadowRoot.querySelector("a").click();
+}
+function animateOnClose(host, event) {
+	router_default.resolve(event, new Promise((resolve) => {
+		host.shadowRoot.querySelector("#dialog").addEventListener("transitionend", resolve, { once: true });
+		host.open = false;
+	}));
+}
+var dialog_default = {
+	open: {
+		value: false,
+		reflect: true,
+		connect(host, key) {
+			const timeout = setTimeout(() => {
+				host[key] = true;
+			});
+			return () => clearTimeout(timeout);
+		}
+	},
+	header: {
+		value: false,
+		reflect: true
+	},
+	footer: {
+		value: false,
+		reflect: true
+	},
+	render: () => html`
+    <template layout="block fixed inset layer:400">
+      <div id="backdrop" layout="fixed inset:0" onclick="${close}"></div>
+      <div
+        id="dialog"
+        layout="
+          grid::max|1
+          width:full::full height:auto::94dvh
+          margin:0 padding:0
+          fixed inset bottom top:auto
+        "
+      >
+        <section id="header" layout="grid:24px|1|24px items:center padding:1.5:2 gap">
+          <div layout="block:center column items:center area:2/3">
+            <slot name="header" onslotchange="${html.set("header", true)}"></slot>
+          </div>
+          <ui-action>
+            <a onclick="${animateOnClose}" href="${router_default.backUrl()}" layout="padding:2 margin:-2">
+              <div layout="row center size:3">
+                <ui-icon name="close" layout="size:2"></ui-icon>
+              </div>
+            </a>
+          </ui-action>
+        </section>
+        <section id="content" layout="column overflow:y:auto overflow:x:hidden gap:2 padding:1.5">
+          <slot></slot>
+        </section>
+        <section id="footer" layout="padding:1.5:2">
+          <slot name="footer" onslotchange="${html.set("footer", true)}"></slot>
+        </section>
+      </div>
+    </template>
+  `.css`
+    #dialog {
+      border: none;
+      border-radius: 12px 12px 0 0;
+      background: var(--background-primary);
+      overscroll-behavior: contain;
+      transform: translateY(100%);
+      transition: transform 500ms cubic-bezier(0.4, 0.15, 0, 1);
+    }
+
+    #backdrop {
+      background: var(--component-custom-token-overlay);
+      opacity: 0;
+      transition: all 300ms ease-out;
+    }
+
+    :host([open]) #dialog {
+      transform: translateY(0);
+    }
+
+    :host([open]) #backdrop {
+      opacity: 1;
+    }
+
+    :host(:not([header])) #header {
+      display: none;
+    }
+
+    #header {
+      border-bottom: 1px solid var(--border-primary);
+    }
+
+    :host(:not([footer])) #footer {
+      display: none;
+    }
+
+    #footer {
+      border-top: 1px solid var(--border-primary);
+    }
+
+    a > div {
+      color: var(--color-secondary);
+      background: var(--border-primary);
+      border-radius: 50%;
+    }
+  `
+};
+//#endregion
+export { dialog_default as default };

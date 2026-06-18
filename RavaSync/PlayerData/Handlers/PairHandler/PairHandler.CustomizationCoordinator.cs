@@ -36,6 +36,7 @@ public sealed partial class PairHandler
             private const int OwnedObjectRetryInitialDelayMs = 35;
             private const int OwnedObjectRetryPollDelayMs = 75;
             private const int OwnedObjectRetryBackoffMs = 150;
+            private const int ShortLivedPetRedrawSettleMs = 140;
 
             public void QueueOwnedObjectCustomizationRetry(ObjectKind objectKind)
             {
@@ -178,6 +179,52 @@ public sealed partial class PairHandler
                 return true;
             }
 
+            private static bool ShouldDeferFileBackedOwnedObjectApplyUntilDrawSettled(ObjectKind objectKind)
+                => objectKind == ObjectKind.Pet;
+
+            private async Task<bool> IsOwnedObjectReadyForFileBackedApplyAsync(Guid applicationId, GameObjectHandler handler, ObjectKind objectKind, CancellationToken token)
+            {
+                if (objectKind == ObjectKind.Player)
+                    return true;
+
+                if (!ShouldDeferFileBackedOwnedObjectApplyUntilDrawSettled(objectKind))
+                {
+                    if (handler.CurrentDrawCondition != GameObjectHandler.DrawCondition.None)
+                    {
+                        Logger.LogTrace("[{applicationId}] Applying file-backed owned-object state without waiting for draw settle for {handler}; draw state={draw}", applicationId, handler, handler.CurrentDrawCondition);
+                    }
+
+                    return true;
+                }
+
+                await handler.RefreshStateOnFrameworkAsync().ConfigureAwait(false);
+                token.ThrowIfCancellationRequested();
+
+                if (handler.Address == nint.Zero)
+                    return false;
+
+                if (handler.CurrentDrawCondition != GameObjectHandler.DrawCondition.None)
+                {
+                    Logger.LogTrace("[{applicationId}] Deferring file-backed {objectKind} apply until summon draw settles for {handler}; draw state={draw}", applicationId, objectKind, handler, handler.CurrentDrawCondition);
+                    return false;
+                }
+
+                await Task.Delay(ShortLivedPetRedrawSettleMs, token).ConfigureAwait(false);
+                await handler.RefreshStateOnFrameworkAsync().ConfigureAwait(false);
+                token.ThrowIfCancellationRequested();
+
+                if (handler.Address == nint.Zero)
+                    return false;
+
+                if (handler.CurrentDrawCondition != GameObjectHandler.DrawCondition.None)
+                {
+                    Logger.LogTrace("[{applicationId}] Deferring file-backed {objectKind} apply after settle check for {handler}; draw state={draw}", applicationId, objectKind, handler, handler.CurrentDrawCondition);
+                    return false;
+                }
+
+                return true;
+            }
+
             public async Task<bool> ApplyCustomizationDataAsync(Guid applicationId, KeyValuePair<ObjectKind, HashSet<PlayerChanges>> changes, CharacterData charaData, bool allowPlayerRedraw, bool forceLightweightMetadataReapply, bool awaitPlayerGlamourerApply, bool waitForPlayerGlamourerDrawSettle, ApplyFlag glamourerApplyFlags, CancellationToken token)
             {
                 if (PlayerCharacter == nint.Zero) return false;
@@ -202,24 +249,27 @@ public sealed partial class PairHandler
                         return false;
                     }
 
-                    if (changes.Key != ObjectKind.Player)
-                        _pendingOwnedObjectCustomizationRetry.Remove(changes.Key);
-
                     Logger.LogDebug("[{applicationId}] Applying Customization Data for {handler}", applicationId, handler);
                     var isFileBackedOwnedObjectApply = changes.Key != ObjectKind.Player
                         && (changes.Value.Contains(PlayerChanges.ModFiles) || changes.Value.Contains(PlayerChanges.ForcedRedraw));
                     if (changes.Key != ObjectKind.Player)
                     {
-                        if (!isFileBackedOwnedObjectApply)
+                        if (isFileBackedOwnedObjectApply)
                         {
-                            var ownedObjectDrawWaitMs = SyncStorm.IsActive ? 500 : 1500;
+                            if (!await IsOwnedObjectReadyForFileBackedApplyAsync(applicationId, handler, changes.Key, token).ConfigureAwait(false))
+                            {
+                                QueueOwnedObjectCustomizationRetry(changes.Key);
+                                return false;
+                            }
+                        }
+                        else
+                        {
+                            var ownedObjectDrawWaitMs = IsWineRuntime ? 700 : (SyncStorm.IsActive ? 500 : 1500);
                             await _dalamudUtil.WaitWhileCharacterIsDrawing(Logger, handler, applicationId, ownedObjectDrawWaitMs, token).ConfigureAwait(false);
                             token.ThrowIfCancellationRequested();
                         }
-                        else if (handler.CurrentDrawCondition != GameObjectHandler.DrawCondition.None)
-                        {
-                            Logger.LogTrace("[{applicationId}] Applying file-backed owned-object state without waiting for draw settle for {handler}; draw state={draw}", applicationId, handler, handler.CurrentDrawCondition);
-                        }
+
+                        _pendingOwnedObjectCustomizationRetry.Remove(changes.Key);
                     }
 
                     // Coalesce redraws for this handler into a single call at the end.
@@ -281,6 +331,8 @@ public sealed partial class PairHandler
                                 {
                                     var waitForThisGlamourerApply = awaitPlayerGlamourerApply && changes.Key == ObjectKind.Player;
                                     await _ipcManager.Glamourer.ApplyAllAsync(Logger, handler, glamourerData, applicationId, token, fireAndForget: !waitForThisGlamourerApply, flags: glamourerApplyFlags, waitForDrawSettle: waitForThisGlamourerApply && waitForPlayerGlamourerDrawSettle).ConfigureAwait(false);
+                                    if (IsWineRuntime && changes.Key == ObjectKind.Player)
+                                        await Task.Delay(120, token).ConfigureAwait(false);
                                 }
                                 break;
 
@@ -396,6 +448,7 @@ public sealed partial class PairHandler
                     await _ipcManager.Heels.RestoreOffsetForPlayerAsync(address).ConfigureAwait(false);
                     tempHandler.CompareNameAndThrow(name);
                     Logger.LogDebug("[{applicationId}] Restoring C+ for {alias}/{name}", applicationId, Pair.UserData.AliasOrUID, name);
+                    await _ipcManager.CustomizePlus.RevertAsync(address).ConfigureAwait(false);
                     if (customizeId.HasValue)
                         await _ipcManager.CustomizePlus.RevertByIdAsync(customizeId.Value).ConfigureAwait(false);
                     tempHandler.CompareNameAndThrow(name);

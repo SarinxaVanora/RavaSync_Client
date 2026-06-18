@@ -1,3 +1,4 @@
+using System.Threading;
 
 using Microsoft.Extensions.Logging;
 using RavaSync.API.Data.Enum;
@@ -31,6 +32,16 @@ public sealed partial class PairHandler
 
     private void ResetCollectionBindingState()
     {
+        // Keep the last known Penumbra binding identity for any later hard-vanilla teardown.
+        // Clearing these too early loses the only object-index handle Penumbra may still have,
+        // which lets stale temp collection assignments reattach when the actor appears again.
+        if (_lastAssignedObjectIndex.HasValue)
+            _lastVanillaTeardownObjectIndex = _lastAssignedObjectIndex;
+        if (_lastAssignedPlayerAddress != nint.Zero)
+            _lastVanillaTeardownPlayerAddress = _lastAssignedPlayerAddress;
+        if (!string.IsNullOrWhiteSpace(PlayerName))
+            _lastVanillaTeardownPlayerName = PlayerName;
+
         _lastAssignedObjectIndex = null;
         _lastAssignedPlayerAddress = nint.Zero;
         _lastAssignedCollectionAssignUtc = DateTime.MinValue;
@@ -41,8 +52,11 @@ public sealed partial class PairHandler
     {
         _lastAppliedTempModsFingerprint = null;
         _lastAppliedTempModsSnapshot = null;
+        _lastAppliedMountMusicTempModsFingerprint = null;
+        _lastAppliedMountMusicTempModsSnapshot = null;
         _lastAppliedTransientSupportFingerprint = null;
         _lastAppliedManipulationFingerprint = null;
+        Pair.ClearActiveSyncIndicators();
         ClearAppliedLightweightState();
     }
 
@@ -90,6 +104,12 @@ public sealed partial class PairHandler
         _lastInitialApplyDispatchTick = -1;
     }
 
+    private bool IsRecentlyVisibleLifecycleReplay(long windowMs = 3000)
+    {
+        var tick = _lastVisibleLifecycleReplayTick;
+        return tick >= 0 && unchecked(Environment.TickCount64 - tick) <= windowMs;
+    }
+
 
     private void BeginVisibleLifecycleReplay(nint address, string reason)
     {
@@ -115,6 +135,9 @@ public sealed partial class PairHandler
         ResetOwnedObjectRetryState();
         ResetReapplyTrackingState();
         ResetVisibleReplayReadiness();
+        _visibilityCoordinator.ResetVisibleSupportReapplyTracking();
+        _lastVisibleLifecycleReplayTick = Environment.TickCount64;
+        Interlocked.Increment(ref _visibilityLifecycleGeneration);
 
         _customizeIds.Clear();
 
@@ -170,6 +193,7 @@ public sealed partial class PairHandler
         _zoneRecoveryUntilTick = -1;
         _identityDriftSinceTick = -1;
         ResetVisibleReplayReadiness();
+        _visibilityCoordinator.ResetVisibleSupportReapplyTracking();
         _nextVisibilityWorkTick = 0;
     }
 

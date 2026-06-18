@@ -1,0 +1,142 @@
+import { addListener } from "../utils/options-observer.js";
+import AutoSyncingMap from "../utils/map.js";
+import { CUSTOM_FILTERS_ID_RANGE, EXCEPTIONS_RULE_PRIORITY, FIXES_ID_RANGE, MAX_RULE_PRIORITY, REDIRECT_PROTECTION_EXCEPTIONS_ID_RANGE, REDIRECT_PROTECTION_ID_RANGE, REDIRECT_PROTECTION_SESSION_OFFSET, getDynamicRulesIds, getRedirectProtectionRules } from "../utils/dnr.js";
+//#region src/background/redirect-protection.js
+/**
+* Ghostery Browser Extension
+* https://www.ghostery.com/
+*
+* Copyright 2017-present Ghostery GmbH. All rights reserved.
+*
+* This Source Code Form is subject to the terms of the Mozilla Public
+* License, v. 2.0. If a copy of the MPL was not distributed with this
+* file, You can obtain one at http://mozilla.org/MPL/2.0
+*/
+var REDIRECT_PROTECTION_PAGE_URL = chrome.runtime.getURL("pages/redirect-protection/index.html");
+async function updateRedirectProtectionRules(options) {
+	if (options.redirectProtection.enabled) {
+		const rules = (await chrome.declarativeNetRequest.getDynamicRules()).filter((rule) => rule.id >= CUSTOM_FILTERS_ID_RANGE.start && rule.id < CUSTOM_FILTERS_ID_RANGE.end || rule.id >= FIXES_ID_RANGE.start && rule.id < FIXES_ID_RANGE.end);
+		const addRules = getRedirectProtectionRules(rules).map((rule, index) => ({
+			...rule,
+			id: REDIRECT_PROTECTION_ID_RANGE.start + index
+		}));
+		await chrome.declarativeNetRequest.updateDynamicRules({
+			removeRuleIds: await getDynamicRulesIds(REDIRECT_PROTECTION_ID_RANGE),
+			addRules
+		});
+		console.info(`[redirect-protection] Updated redirect protection rules for custom filters and fixes: ${addRules.length}/${rules.length}`);
+	}
+}
+async function updateRedirectProtectionExceptions(options) {
+	if (options.redirectProtection.enabled) {
+		const hostnames = Object.keys(options.redirectProtection.exceptions);
+		await chrome.declarativeNetRequest.updateDynamicRules({
+			removeRuleIds: await getDynamicRulesIds(REDIRECT_PROTECTION_EXCEPTIONS_ID_RANGE),
+			addRules: hostnames.map((hostname, index) => ({
+				id: REDIRECT_PROTECTION_EXCEPTIONS_ID_RANGE.start + index,
+				priority: EXCEPTIONS_RULE_PRIORITY,
+				action: { type: "allow" },
+				condition: {
+					urlFilter: `||${hostname}^`,
+					resourceTypes: ["main_frame"]
+				}
+			}))
+		});
+		console.info("[redirect-protection] Updated exception rules for disabled domains");
+	} else {
+		await chrome.declarativeNetRequest.updateDynamicRules({
+			removeRuleIds: await getDynamicRulesIds(REDIRECT_PROTECTION_EXCEPTIONS_ID_RANGE),
+			addRules: [{
+				id: REDIRECT_PROTECTION_EXCEPTIONS_ID_RANGE.start,
+				priority: MAX_RULE_PRIORITY,
+				action: { type: "allow" },
+				condition: {
+					urlFilter: "*",
+					resourceTypes: ["main_frame"]
+				}
+			}]
+		});
+		console.info("[redirect-protection] Removed all exception rules as protection was disabled");
+	}
+}
+var redirectUrlMap = new AutoSyncingMap({
+	storageKey: "redirectUrls:v1",
+	ttlInMs: 300 * 1e3
+});
+chrome.webNavigation.onBeforeNavigate.addListener((details) => {
+	if (details.frameId === 0 && details.url && !details.url.startsWith(REDIRECT_PROTECTION_PAGE_URL)) redirectUrlMap.set(details.tabId, details.url);
+}, { url: [{ schemes: ["http", "https"] }] });
+chrome.webRequest?.onBeforeRedirect.addListener((details) => {
+	if (!details.redirectUrl.startsWith(REDIRECT_PROTECTION_PAGE_URL)) redirectUrlMap.set(details.tabId, details.redirectUrl);
+}, { urls: ["<all_urls>"] });
+chrome.tabs.onRemoved.addListener((tabId) => {
+	redirectUrlMap.delete(tabId);
+});
+addListener("redirectProtection", async function redirectProtectionExceptions(redirectProtection, lastRedirectProtection) {
+	if (!lastRedirectProtection) return;
+	await updateRedirectProtectionExceptions({ redirectProtection });
+	if (!redirectProtection.enabled) {
+		const ruleIds = await getDynamicRulesIds(REDIRECT_PROTECTION_ID_RANGE);
+		if (ruleIds.length) {
+			await chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds: ruleIds });
+			console.info(`[redirect-protection] Removed all redirect protection rules: ${ruleIds.length}`);
+		}
+	} else if (!lastRedirectProtection.enabled) await updateRedirectProtectionRules({ redirectProtection });
+});
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+	if (message.action === "getRedirectUrl") {
+		sendResponse({ url: sender.tab && sender.tab.id ? redirectUrlMap.get(sender.tab.id) || null : null });
+		return false;
+	}
+	if (message.action === "allowRedirect") {
+		if (!message.url) {
+			sendResponse({
+				success: false,
+				error: "Missing URL"
+			});
+			return false;
+		}
+		if (!sender.tab || !sender.tab.id) {
+			console.error("[redirect-protection] Missing tab in allowRedirect");
+			sendResponse({
+				success: false,
+				error: "Missing tab"
+			});
+			return false;
+		}
+		const tabId = sender.tab.id;
+		const url = message.url;
+		(async () => {
+			try {
+				const urlObj = new URL(url);
+				const urlPattern = `||${urlObj.host}${urlObj.pathname}${urlObj.search}${urlObj.hash}`;
+				const id = REDIRECT_PROTECTION_SESSION_OFFSET + tabId;
+				await chrome.declarativeNetRequest.updateSessionRules({
+					addRules: [{
+						id,
+						priority: EXCEPTIONS_RULE_PRIORITY,
+						action: { type: "allow" },
+						condition: {
+							urlFilter: urlPattern,
+							resourceTypes: ["main_frame"],
+							tabIds: [tabId]
+						}
+					}],
+					removeRuleIds: [id]
+				});
+				redirectUrlMap.delete(tabId);
+				sendResponse({ success: true });
+			} catch (error) {
+				console.error("[redirect-protection] Error creating session rule:", error);
+				sendResponse({
+					success: false,
+					error: error.message
+				});
+			}
+		})();
+		return true;
+	}
+	return false;
+});
+//#endregion
+export { updateRedirectProtectionRules };

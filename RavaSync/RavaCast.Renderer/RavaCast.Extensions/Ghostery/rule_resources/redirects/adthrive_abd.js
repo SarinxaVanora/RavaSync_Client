@@ -1,0 +1,1 @@
+(()=>{const e=new Date(Date.now()+3e4);document.cookie=`__adblocker=false; expires=${e.toUTCString()}; path=/`})();

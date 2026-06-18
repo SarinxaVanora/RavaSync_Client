@@ -1,6 +1,7 @@
 ﻿using System;
 using Dalamud.Interface.Windowing;
 using Microsoft.Extensions.Logging;
+using RavaSync.UI;
 
 namespace RavaSync.Services.Mediator;
 
@@ -36,10 +37,11 @@ public abstract class WindowMediatorSubscriberBase : Window, IMediatorSubscriber
 
     public override void Draw()
     {
-        // open a theme scope if a derived class provides one
-        var scope = BeginThemeScope();
+        var themeScope = BeginThemeScope();
         try
         {
+            using var ravaChrome = RavaUiChrome.BeginScope();
+
             if (_performanceCollectorService.Enabled)
                 _performanceCollectorService.LogPerformance(this, $"Draw", DrawInternal);
             else
@@ -47,7 +49,7 @@ public abstract class WindowMediatorSubscriberBase : Window, IMediatorSubscriber
         }
         finally
         {
-            scope?.Dispose();
+            themeScope?.Dispose();
         }
     }
 

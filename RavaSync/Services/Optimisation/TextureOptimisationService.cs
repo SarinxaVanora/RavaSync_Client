@@ -100,6 +100,15 @@ public sealed class TextureOptimisationService
             string temporaryOutput = CreateTemporaryPath(item.PrimaryPath, item.TargetName);
             try
             {
+                var profile = TextureContentProfile.Analyze(item.PrimaryPath);
+                if (ShouldUseAuthoritativePenumbraConversion(profile))
+                {
+                    callerLogger.LogInformation("Texture optimisation routing semantically sensitive texture through Penumbra for {primary}. Target={target}.", item.PrimaryPath, item.TargetName);
+                    AddToPlan(fallbackPlan, item.TargetTextureType, item.PrimaryPath, item.AlternatePaths.ToArray());
+                    penumbraFallbacks++;
+                    continue;
+                }
+
                 string compressionSource = item.PrimaryPath;
                 string? temporaryResizeSource = null;
                 try
@@ -110,7 +119,6 @@ public sealed class TextureOptimisationService
                     if (prepared.PreparedPathKind == PreparedPathKind.GpuTemporary)
                         temporaryResizeSource = prepared.PreparedPath;
 
-                    var profile = TextureContentProfile.Analyze(item.PrimaryPath);
                     bool gpuCompressed = await _d3d11TextureCompressionService.TryCompressTextureAsync(compressionSource, temporaryOutput, item.TargetTexFormat, profile.IsStrictNormalMap, token).ConfigureAwait(false);
                     if (!gpuCompressed)
                     {
@@ -120,7 +128,14 @@ public sealed class TextureOptimisationService
                         continue;
                     }
 
-                    ReplacePrimaryAndAlternates(temporaryOutput, item.PrimaryPath, item.AlternatePaths);
+                    if (!TryInstallOptimisedTexture(callerLogger, temporaryOutput, item.PrimaryPath, item.AlternatePaths, out var installReason))
+                    {
+                        callerLogger.LogWarning("Texture optimisation local output for {primary} was rejected before overwrite. Target={target}. Reason={reason}. Routing to Penumbra.", item.PrimaryPath, item.TargetName, installReason);
+                        AddToPlan(fallbackPlan, item.TargetTextureType, item.PrimaryPath, item.AlternatePaths.ToArray());
+                        penumbraFallbacks++;
+                        continue;
+                    }
+
                     directGpuCompleted++;
                     callerLogger.LogInformation("Texture optimisation completed locally through D3D11 for {primary}. Target={target}.", item.PrimaryPath, item.TargetName);
                 }
@@ -255,8 +270,10 @@ public sealed class TextureOptimisationService
         reason = string.Empty;
         bool changed = false;
 
-        if (!profile.IsStrictNormalMap && !profile.IsMaterialMask)
+        if (CanScrubTransparentPixels(profile))
             changed |= ScrubTransparentPixels(image, profile);
+        else if (profile.IsAlphaSensitive || profile.IsCharacterTexture || profile.IsEquipmentTexture)
+            reason = "Transparent-pixel cleanup skipped to preserve texture semantics.";
 
         if (CanApplyUvAwareCleanup(profile) && item.RelatedModelPaths.Count > 0 && TryBuildBestUvCoverage(item.RelatedModelPaths, out var coverage, out var hadWrappedModels))
         {
@@ -396,9 +413,25 @@ public sealed class TextureOptimisationService
         return string.Join("|", modelPaths.Select(static p => p.ToLowerInvariant()));
     }
 
+    private static bool CanScrubTransparentPixels(TextureContentProfile profile)
+    {
+        return !profile.IsStrictNormalMap
+            && !profile.IsMaterialMask
+            && !profile.IsAlphaSensitive
+            && !profile.IsCharacterTexture
+            && !profile.IsEquipmentTexture
+            && profile.IsDefinitelyOpaqueDiffuse;
+    }
+
     private static bool CanApplyUvAwareCleanup(TextureContentProfile profile)
     {
         return !profile.IsUiOrOverlaySensitive
+            && !profile.IsFaceOrEyeSensitive
+            && !profile.IsHairOrFurSensitive
+            && !profile.IsSkinOrBody
+            && !profile.IsAlphaSensitive
+            && !profile.IsCharacterTexture
+            && !profile.IsEquipmentTexture
             && !profile.IsStrictNormalMap
             && !profile.IsMaterialMask;
     }
@@ -921,18 +954,51 @@ public sealed class TextureOptimisationService
         bucket[preparedPath] = duplicateTargets;
     }
 
-    private static void ReplacePrimaryAndAlternates(string temporaryOutput, string primaryPath, IReadOnlyList<string> alternatePaths)
+    private static bool TryInstallOptimisedTexture(ILogger callerLogger, string temporaryOutput, string primaryPath, IReadOnlyList<string> alternatePaths, out string reason)
     {
-        Directory.CreateDirectory(Path.GetDirectoryName(primaryPath)!);
-        File.Copy(temporaryOutput, primaryPath, overwrite: true);
+        reason = string.Empty;
+        if (string.IsNullOrWhiteSpace(temporaryOutput) || !File.Exists(temporaryOutput))
+        {
+            reason = "temporary output was missing";
+            return false;
+        }
+
+        if (!NativeTexCodec.TryValidateTextureFile(temporaryOutput, out reason))
+            return false;
+
+        foreach (var target in EnumerateTextureTargets(primaryPath, alternatePaths))
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(target)!);
+            File.Copy(temporaryOutput, target, overwrite: true);
+        }
+
+        return true;
+    }
+
+    private static IEnumerable<string> EnumerateTextureTargets(string primaryPath, IReadOnlyList<string> alternatePaths)
+    {
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (!string.IsNullOrWhiteSpace(primaryPath) && seen.Add(primaryPath))
+            yield return primaryPath;
+
+        if (alternatePaths == null)
+            yield break;
+
         foreach (var duplicate in alternatePaths)
         {
-            if (string.IsNullOrWhiteSpace(duplicate))
-                continue;
-
-            Directory.CreateDirectory(Path.GetDirectoryName(duplicate)!);
-            File.Copy(temporaryOutput, duplicate, overwrite: true);
+            if (!string.IsNullOrWhiteSpace(duplicate) && seen.Add(duplicate))
+                yield return duplicate;
         }
+    }
+
+    private static bool ShouldUseAuthoritativePenumbraConversion(TextureContentProfile profile)
+    {
+        return profile.IsUiOrOverlaySensitive
+            || profile.IsFaceOrEyeSensitive
+            || profile.IsHairOrFurSensitive
+            || profile.IsSkinOrBody
+            || profile.IsAlphaSensitive
+            || profile.PreserveHighDetail;
     }
 
     private static void TryDeleteQuietly(ILogger callerLogger, string path)
@@ -982,6 +1048,8 @@ public sealed class TextureOptimisationService
             return 0;
 
         var profile = TextureContentProfile.Analyze(primaryPath);
+        if (profile.PreserveHighDetail || profile.IsAlphaSensitive || profile.IsCharacterTexture || profile.IsEquipmentTexture)
+            return 0;
         if (profile.PreferredMaxDimension > 0)
             return profile.PreferredMaxDimension;
 

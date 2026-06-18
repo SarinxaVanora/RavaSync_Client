@@ -42,6 +42,7 @@ public sealed class PairManager : DisposableMediatorSubscriberBase
     private readonly ConcurrentDictionary<string, Pair> _pairsByUid = new(StringComparer.Ordinal);
     private readonly object _refreshUiGate = new();
     private long _lastOtherSyncCleanupTick;
+    private string _ownUid = string.Empty;
     private bool _refreshUiPending;
     private long _refreshUiPublishTick;
     private Lazy<List<Pair>> _directPairsInternal;
@@ -60,54 +61,35 @@ public sealed class PairManager : DisposableMediatorSubscriberBase
         _characterRavaSidecarUtility = characterRavaSidecarUtility;
         _playerPerformanceService = playerPerformanceService;
         
-        Mediator.Subscribe<DisconnectedMessage>(this, (_) => ClearPairs());
+        Mediator.Subscribe<ConnectedMessage>(this, msg =>
+        {
+            _ownUid = msg.Connection.User?.UID ?? string.Empty;
+        });
+        Mediator.Subscribe<DisconnectedMessage>(this, (_) =>
+        {
+            _ownUid = string.Empty;
+            ClearPairs();
+        });
+        Mediator.Subscribe<ZoneSwitchStartMessage>(this, (_) =>
+        {
+            // Zone start is handled by each live PairHandler through the same targeted
+            // IsVisible=false teardown path used for ordinary visibility loss. Do not
+            // run a manager-level global wipe here: it has no pair lifecycle generation
+            // guard, so if it executes late it can wipe freshly-applied actors in the
+            // destination zone.
+            Logger.LogDebug("Zone switch start: pair handlers own targeted vanilla teardown");
+        });
+        Mediator.Subscribe<ZoneSwitchEndMessage>(this, (_) =>
+        {
+            // Zone end is a recovery/replay point, not a second teardown. Running a second
+            // wipe/reset here races Glamourer/Penumbra reapply and leaves pairs stuck vanilla.
+            Logger.LogDebug("Zone switch end: no global vanilla wipe; visible pair handlers will re-enter apply lifecycle");
+        });
         Mediator.Subscribe<CutsceneEndMessage>(this, (_) => ReapplyPairData());
         Mediator.Subscribe<DelayedFrameworkUpdateMessage>(this, _ =>
         {
             PeriodicOtherSyncCleanup();
             FlushScheduledRefreshUi();
-        });
-        Mediator.Subscribe<RemoteOtherSyncConnectedMessage>(this, msg =>
-        {
-            HandleRemoteOtherSyncConnected(msg.Owner ?? "OtherSync");
-        });
-
-        Mediator.Subscribe<RemoteOtherSyncDisconnectedMessage>(this, msg =>
-        {
-            HandleRemoteOtherSyncDisconnected(msg.Owner ?? "OtherSync");
-        });
-        Mediator.Subscribe<RemoteOtherSyncYieldMessage>(this, msg =>
-        {
-            var uid = msg.FromUid;
-            var owner = msg.YieldToOtherSync ? NormalizeOtherSyncOwner(msg.Owner) : string.Empty;
-
-            if (!CanTrackRemoteOtherSyncLatch(msg.YieldToOtherSync, owner))
-            {
-                _pendingOtherSyncLatchByUid.TryRemove(uid, out _);
-
-                var unavailablePair = GetPairByUID(uid);
-                if (unavailablePair != null && unavailablePair.RemoteOtherSyncOverrideActive && MatchesOtherSyncOwner(unavailablePair.RemoteOtherSyncOwner, owner))
-                {
-                    var wasYielded = unavailablePair.AutoPausedByOtherSync;
-
-                    unavailablePair.ExpireRemoteOtherSyncOverride(requestApplyIfPossible: true);
-
-                    if (wasYielded && !unavailablePair.AutoPausedByOtherSync)
-                        Mediator.Publish(new LocalOtherSyncYieldStateChangedMessage(unavailablePair.UserData.UID, false, string.Empty));
-
-                    ScheduleRefreshUi();
-                }
-
-                return;
-            }
-
-            _pendingOtherSyncLatchByUid[uid] = new PendingOtherSyncLatch(msg.YieldToOtherSync, owner);
-
-            var pair = GetPairByUID(uid);
-            if (pair == null) return;
-
-            ApplyPendingOtherSyncLatchIfAny(pair);
-            ScheduleRefreshUi();
         });
         _directPairsInternal = DirectPairsLazy();
         _groupPairsInternal = GroupPairsLazy();
@@ -157,8 +139,17 @@ public sealed class PairManager : DisposableMediatorSubscriberBase
 
     private void CleanupExpiredOtherSyncLatches()
     {
-        // OtherSync ownership is now fully flag-driven and remains latched until an
-        // explicit remote change or disconnect says otherwise. No TTL/periodic expiry.
+        // Remote OtherSync claims now arrive as pair-targeted current state inside
+        // normal character userdata. Keep a received true claim pending until our
+        // local IPC can verify the same owner for that pair; false/no-claim userdata
+        // clears the pending state immediately.
+        if (_pendingOtherSyncLatchByUid.IsEmpty)
+            return;
+
+        _ipcManager.OtherSync.ShouldPollOwnership();
+
+        foreach (var pair in _allClientPairs.Values.ToArray())
+            ApplyPendingOtherSyncLatchIfAny(pair);
     }
 
     private static bool SyncRelevantPermissionsChanged(RavaSync.API.Data.Enum.UserPermissions previousPermissions, RavaSync.API.Data.Enum.UserPermissions nextPermissions)
@@ -204,12 +195,21 @@ public sealed class PairManager : DisposableMediatorSubscriberBase
             && !string.Equals(normalizedOwner, "Other", StringComparison.OrdinalIgnoreCase);
     }
 
-    private static bool CanTrackRemoteOtherSyncLatch(bool yieldToOtherSync, string? owner)
+    private static bool CanStoreRemoteOtherSyncLatch(bool yieldToOtherSync, string? owner)
     {
         if (!yieldToOtherSync)
             return true;
 
         return CanTrackRemoteOtherSyncOwner(owner);
+    }
+
+    private bool CanApplyRemoteOtherSyncLatch(bool yieldToOtherSync, string? owner)
+    {
+        if (!yieldToOtherSync)
+            return true;
+
+        return CanTrackRemoteOtherSyncOwner(owner)
+            && _ipcManager.OtherSync.IsOwnerAvailable(owner);
     }
 
     private static bool MatchesOtherSyncOwner(string currentOwner, string targetOwner)
@@ -221,21 +221,46 @@ public sealed class PairManager : DisposableMediatorSubscriberBase
         if (!_pendingOtherSyncLatchByUid.TryGetValue(uid, out var pending))
             return;
 
-        if (!CanTrackRemoteOtherSyncLatch(pending.YieldToOtherSync, pending.Owner))
+        if (!CanStoreRemoteOtherSyncLatch(pending.YieldToOtherSync, pending.Owner))
+        {
+            _pendingOtherSyncLatchByUid.TryRemove(uid, out _);
+
+            pair.ExpireRemoteOtherSyncOverride(requestApplyIfPossible: true);
+            return;
+        }
+
+        if (!CanApplyRemoteOtherSyncLatch(pending.YieldToOtherSync, pending.Owner))
+            return;
+
+        pair.ApplyRemoteOtherSyncOverride(pending.YieldToOtherSync, pending.Owner);
+    }
+
+    private void ApplyIncomingOtherSyncSidecar(Pair pair, string uid, bool hasOtherSync, CharacterRavaSidecarUtility.OtherSyncPayload? payload)
+    {
+        if (string.IsNullOrWhiteSpace(uid))
+            return;
+
+        var active = hasOtherSync && payload?.a == true;
+        var owner = active ? NormalizeOtherSyncOwner(payload?.o) : string.Empty;
+
+        if (active && !CanTrackRemoteOtherSyncOwner(owner))
+            active = false;
+
+        if (!active)
         {
             _pendingOtherSyncLatchByUid.TryRemove(uid, out _);
 
             var wasYielded = pair.AutoPausedByOtherSync;
-
             pair.ExpireRemoteOtherSyncOverride(requestApplyIfPossible: true);
 
             if (wasYielded && !pair.AutoPausedByOtherSync)
-                Mediator.Publish(new LocalOtherSyncYieldStateChangedMessage(pair.UserData.UID, false, string.Empty));
+                ScheduleRefreshUi();
 
             return;
         }
 
-        pair.ApplyRemoteOtherSyncOverride(pending.YieldToOtherSync, pending.Owner);
+        _pendingOtherSyncLatchByUid[uid] = new PendingOtherSyncLatch(true, owner);
+        ApplyPendingOtherSyncLatchIfAny(pair);
     }
 
     private void IndexPair(Pair pair)
@@ -303,17 +328,11 @@ public sealed class PairManager : DisposableMediatorSubscriberBase
 
         var pairs = _allClientPairs.Values.ToArray();
 
-        Parallel.ForEach(pairs, pair =>
-        {
-            try
-            {
-                pair.EnterPausedVanillaState();
-            }
-            catch (Exception ex)
-            {
-                Logger.LogTrace(ex, "Fast vanilla restore failed while clearing pair {uid}", pair.UserData.UID);
-            }
-        });
+        // Disconnect must be a slate-wipe, not a per-pair/index guessing game.
+        // Queue one global Penumbra wipe first so every live RavaSync temporary collection is
+        // unassigned/deleted without blocking the disconnect path or hitching the framework.
+        QueueGlobalPenumbraVanillaWipe("disconnect");
+        QueueGlobalLiveCustomizationVanillaWipe(pairs, "disconnect");
 
         DisposePairs(pairs);
         _allClientPairs.Clear();
@@ -321,6 +340,128 @@ public sealed class PairManager : DisposableMediatorSubscriberBase
         _allGroups.Clear();
         _pendingOtherSyncLatchByUid.Clear();
         RecreateLazy();
+    }
+
+
+    private void QueueGlobalPenumbraVanillaWipe(string reason)
+    {
+        try
+        {
+            _ipcManager.Penumbra.QueueRavaSyncGlobalTemporaryCollectionWipe(Logger, reason);
+        }
+        catch (Exception ex)
+        {
+            Logger.LogDebug(ex, "Failed queueing global Penumbra vanilla wipe for {reason}", reason);
+        }
+    }
+
+
+    private void QueueGlobalLiveCustomizationVanillaWipe(IEnumerable<Pair> pairs, string reason)
+    {
+        var names = pairs
+            .SelectMany(p => new[] { p.PlayerName ?? string.Empty, p.LastKnownPlayerName })
+            .Where(n => !string.IsNullOrWhiteSpace(n))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+        var applicationId = Guid.NewGuid();
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                Logger.LogDebug("[{applicationId}] Queueing global vanilla IPC-state wipe for {reason}: pairNames={count}", applicationId, reason, names.Length);
+
+                foreach (var name in names)
+                {
+                    try
+                    {
+                        await _ipcManager.Glamourer.RevertByNameAsync(Logger, name!, applicationId).ConfigureAwait(false);
+                    }
+                    catch (Exception ex)
+                    {
+                        Logger.LogDebug(ex, "[{applicationId}] Ignoring global Glamourer name revert failure for {name} during {reason}", applicationId, name, reason);
+                    }
+
+                    await Task.Yield();
+                }
+
+                var livePlayers = await _dalamudUtil.RunOnFrameworkThread(() =>
+                {
+                    var localPlayerAddress = _dalamudUtil.GetPlayerPtr();
+                    return _dalamudUtil.GetPlayerCharacterSnapshotsFromObjectTable()
+                        .Where(p => p.ObjectIndex >= 0 && p.Address != nint.Zero && (localPlayerAddress == nint.Zero || p.Address != localPlayerAddress))
+                        .ToArray();
+                }).ConfigureAwait(false);
+
+                foreach (var player in livePlayers)
+                {
+                    try
+                    {
+                        await _ipcManager.Glamourer.RevertByObjectIndexAsync(Logger, player.ObjectIndex, applicationId).ConfigureAwait(false);
+                    }
+                    catch (Exception ex)
+                    {
+                        Logger.LogDebug(ex, "[{applicationId}] Ignoring global Glamourer object-index revert failure for idx {idx} during {reason}", applicationId, player.ObjectIndex, reason);
+                    }
+
+                    if (player.ObjectIndex <= ushort.MaxValue)
+                    {
+                        try
+                        {
+                            await _ipcManager.CustomizePlus.RevertByObjectIndexAsync((ushort)player.ObjectIndex).ConfigureAwait(false);
+                        }
+                        catch (Exception ex)
+                        {
+                            Logger.LogDebug(ex, "[{applicationId}] Ignoring global Customize+ object-index revert failure for idx {idx} during {reason}", applicationId, player.ObjectIndex, reason);
+                        }
+
+                        try
+                        {
+                            await _ipcManager.Honorific.ClearTitleByObjectIndexAsync(player.ObjectIndex).ConfigureAwait(false);
+                        }
+                        catch (Exception ex)
+                        {
+                            Logger.LogDebug(ex, "[{applicationId}] Ignoring global Honorific object-index clear failure for idx {idx} during {reason}", applicationId, player.ObjectIndex, reason);
+                        }
+
+                        try
+                        {
+                            await _ipcManager.PetNames.ClearPlayerDataByObjectIndexAsync(player.ObjectIndex).ConfigureAwait(false);
+                        }
+                        catch (Exception ex)
+                        {
+                            Logger.LogDebug(ex, "[{applicationId}] Ignoring global PetNames object-index clear failure for idx {idx} during {reason}", applicationId, player.ObjectIndex, reason);
+                        }
+                    }
+
+                    try
+                    {
+                        await _ipcManager.Heels.RestoreOffsetForPlayerAsync(player.Address).ConfigureAwait(false);
+                    }
+                    catch (Exception ex)
+                    {
+                        Logger.LogDebug(ex, "[{applicationId}] Ignoring global Heels revert failure for {name}/{addr:X} during {reason}", applicationId, player.Name, player.Address, reason);
+                    }
+
+                    try
+                    {
+                        await _ipcManager.Moodles.RevertStatusAsync(player.Address).ConfigureAwait(false);
+                    }
+                    catch (Exception ex)
+                    {
+                        Logger.LogDebug(ex, "[{applicationId}] Ignoring global Moodles revert failure for {name}/{addr:X} during {reason}", applicationId, player.Name, player.Address, reason);
+                    }
+
+                    await Task.Yield();
+                }
+
+                Logger.LogDebug("[{applicationId}] Global vanilla IPC-state wipe queued for {reason}: livePlayers={count}", applicationId, reason, livePlayers.Length);
+            }
+            catch (Exception ex)
+            {
+                Logger.LogDebug(ex, "[{applicationId}] Global vanilla IPC-state wipe failed for {reason}", applicationId, reason);
+            }
+        });
     }
 
     public List<Pair> GetOnlineUserPairs()
@@ -497,9 +638,15 @@ public sealed class PairManager : DisposableMediatorSubscriberBase
         var previousManifestFingerprint = pair.LastReceivedSyncManifest?.mf ?? string.Empty;
         var hasSyncManifest = _characterRavaSidecarUtility.TryExtractSyncManifest(dto.CharaData, out var syncManifest);
         var hasPerformance = _characterRavaSidecarUtility.TryExtractPerformance(dto.CharaData, out var sidecarVramBytes, out var sidecarTriangles);
+        var hasOtherSync = _characterRavaSidecarUtility.TryExtractOtherSync(dto.CharaData, _ownUid, out var otherSync);
+        var hasActiveSoundIndicator = _characterRavaSidecarUtility.TryExtractActiveSoundIndicator(dto.CharaData, out var activeSoundIndicator);
 
         if (hasPerformance)
             _playerPerformanceService.HandleIncomingPerformanceMetrics(pair, dto.CharaData?.DataHash.Value, sidecarVramBytes, sidecarTriangles);
+
+        ApplyIncomingOtherSyncSidecar(pair, dto.User.UID, hasOtherSync, otherSync);
+        if (hasActiveSoundIndicator)
+            pair.ApplyRemoteActiveSoundIndicator(activeSoundIndicator);
 
         var merged = 0;
         if (hasSyncManifest)
@@ -517,9 +664,10 @@ public sealed class PairManager : DisposableMediatorSubscriberBase
             if (Logger.IsEnabled(LogLevel.Trace))
             {
                 Logger.LogTrace(
-                    "Ignoring duplicate/sidecar-only character data for {uid}; perf={perf}, manifest={manifest}, merged={merged}, clearedUpload={clearedUpload}",
+                    "Ignoring duplicate/sidecar-only character data for {uid}; perf={perf}, sound={sound}, manifest={manifest}, merged={merged}, clearedUpload={clearedUpload}",
                     dto.User.UID,
                     hasPerformance,
+                    hasActiveSoundIndicator,
                     currentManifestFingerprint,
                     merged,
                     clearedUpload);
@@ -667,7 +815,7 @@ public sealed class PairManager : DisposableMediatorSubscriberBase
 
         if (dto.Permissions.IsPaused())
         {
-            pair.EnterPausedVanillaState();
+            pair.GoBackToVanillaState();
         }
 
         Logger.LogTrace("Paused: {paused}, Anims: {anims}, Sounds: {sounds}, VFX: {vfx}",
@@ -788,10 +936,18 @@ public sealed class PairManager : DisposableMediatorSubscriberBase
     private void DisposePairs(IEnumerable<Pair> pairs)
     {
         Logger.LogDebug("Disposing all Pairs");
-        Parallel.ForEach(pairs, pair =>
+
+        foreach (var pair in pairs)
         {
-            pair.MarkOffline(wait: true);
-        });
+            try
+            {
+                pair.MarkOffline(wait: false, queuePerPairTeardown: false);
+            }
+            catch (Exception ex)
+            {
+                Logger.LogDebug(ex, "Failed disposing pair {pair} during global pair clear", pair.UserData.AliasOrUID);
+            }
+        }
 
         RecreateLazy();
     }
@@ -885,6 +1041,16 @@ public sealed class PairManager : DisposableMediatorSubscriberBase
             Mediator.Publish(new RefreshUiMessage());
     }
 
+    public void ReapplyAllPairData() => ReapplyPairData();
+
+    public void ForceManipulationReapplyForAllPairs()
+    {
+        foreach (var pair in _allClientPairs.Select(k => k.Value))
+        {
+            pair.ForceManipulationReapply();
+        }
+    }
+
     private void ReapplyPairData()
     {
         foreach (var pair in _allClientPairs.Select(k => k.Value))
@@ -911,40 +1077,9 @@ public sealed class PairManager : DisposableMediatorSubscriberBase
         return false;
     }
 
-    private void HandleRemoteOtherSyncDisconnected(string owner)
-    {
-        Logger.LogDebug("Remote other-sync disconnected: {owner}. Clearing matching per-UID latch state.", owner);
-
-        foreach (var kvp in _pendingOtherSyncLatchByUid.ToArray())
-        {
-            if (!string.Equals(kvp.Value.Owner, owner, StringComparison.OrdinalIgnoreCase))
-                continue;
-
-            _pendingOtherSyncLatchByUid.TryRemove(kvp.Key, out _);
-
-            if (_pairsByUid.TryGetValue(kvp.Key, out var pair))
-            {
-                var wasYielded = pair.AutoPausedByOtherSync;
-
-                pair.ExpireRemoteOtherSyncOverride(requestApplyIfPossible: true);
-
-                if (wasYielded && !pair.AutoPausedByOtherSync)
-                    Mediator.Publish(new LocalOtherSyncYieldStateChangedMessage(pair.UserData.UID, false, string.Empty));
-            }
-        }
-
-        ScheduleRefreshUi();
-    }
-
-    private void HandleRemoteOtherSyncConnected(string owner)
-    {
-        Logger.LogDebug("Remote other-sync connected: {owner}. Keeping per-UID latch state unchanged.", owner);
-        ScheduleRefreshUi();
-    }
-
     private void PeriodicOtherSyncCleanup()
     {
-        // Intentionally no-op. OtherSync state is explicit/latching now.
+        CleanupExpiredOtherSyncLatches();
     }
 
     private void RecreateLazy()

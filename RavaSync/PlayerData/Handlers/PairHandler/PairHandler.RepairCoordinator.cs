@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
@@ -28,6 +28,10 @@ public sealed partial class PairHandler
 {
     private sealed class RepairCoordinator : CoordinatorBase
     {
+        private const int MissingCheckRecheckDelayMs = 750;
+        private const int MissingCheckFreshMs = 5000;
+        private const int WineMissingCheckFreshMs = 15000;
+
         public RepairCoordinator(PairHandler owner) : base(owner)
         {
         }
@@ -51,6 +55,9 @@ public sealed partial class PairHandler
 
                                 var hash = item.Hash;
                                 if (string.IsNullOrWhiteSpace(hash))
+                                    continue;
+
+                                if (FileDownloadManager.HasSessionDownloadFailedHash(hash))
                                     continue;
 
                                 if (!seenHashes.Add(hash))
@@ -196,7 +203,7 @@ public sealed partial class PairHandler
                     }
 
                     Dictionary<(string GamePath, string? Hash), string> moddedPaths;
-                    var missing = _modPathResolver.Calculate(applicationBase, charaData, out moddedPaths, token);
+                    var missing = _modPathResolver.Calculate(applicationBase, charaData, out moddedPaths, token, Pair.EffectiveScreenShakeEnabled);
 
                     var invalidHashes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                     var pathByHash = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
@@ -265,12 +272,41 @@ public sealed partial class PairHandler
 
                     }
 
+                    var sessionSkippedInvalidHashes = invalidHashes
+                        .Where(FileDownloadManager.HasSessionDownloadFailedHash)
+                        .ToList();
+
+                    foreach (var skippedHash in sessionSkippedInvalidHashes)
+                        invalidHashes.Remove(skippedHash);
+
+                    if (sessionSkippedInvalidHashes.Count > 0)
+                    {
+                        Logger.LogInformation(
+                            "[BASE-{appBase}] Manual/background repair is skipping {count} hash(es) already exhausted earlier this session for {pair}: {hashes}",
+                            applicationBase,
+                            sessionSkippedInvalidHashes.Count,
+                            Pair.UserData.AliasOrUID,
+                            string.Join(", ", sessionSkippedInvalidHashes.Take(20)));
+
+                        if (publishEvents && invalidHashes.Count == 0)
+                        {
+                            Mediator.Publish(new EventMessage(new Event(
+                                PlayerName,
+                                Pair.UserData,
+                                nameof(PairHandler),
+                                EventSeverity.Warning,
+                                $"RavaSync: {sessionSkippedInvalidHashes.Count} file(s) already failed this session; skipping repair retry so sync updates can continue.")));
+                        }
+                    }
+
                     if (invalidHashes.Count == 0)
                     {
                         if (publishEvents)
                         {
                             Logger.LogInformation(
-                                "[BASE-{appBase}] No missing or corrupt files detected for {pair}",
+                                sessionSkippedInvalidHashes.Count > 0
+                                    ? "[BASE-{appBase}] No retryable missing/corrupt files detected for {pair}; session-skipped hashes remain omitted"
+                                    : "[BASE-{appBase}] No missing or corrupt files detected for {pair}",
                                 applicationBase, Pair.UserData.AliasOrUID);
                         }
                         else
@@ -287,7 +323,9 @@ public sealed partial class PairHandler
                                 Pair.UserData,
                                 nameof(PairHandler),
                                 EventSeverity.Informational,
-                                "RavaSync: File verification complete — no issues detected for this user.")));
+                                sessionSkippedInvalidHashes.Count > 0
+                                    ? "RavaSync: File verification complete — failed-session files remain skipped for this user."
+                                    : "RavaSync: File verification complete — no issues detected for this user.")));
                         }
 
                         return;
@@ -375,9 +413,9 @@ public sealed partial class PairHandler
             {
                     lock (_missingCheckGate)
                     {
-                        // treat as fresh for 5 seconds
+                        var freshWindowMs = IsWineRuntime ? WineMissingCheckFreshMs : MissingCheckFreshMs;
                         if (string.Equals(_lastMissingCheckedHash, dataHash, StringComparison.Ordinal)
-                            && (Environment.TickCount64 - _lastMissingCheckedTick) < 5000)
+                            && (Environment.TickCount64 - _lastMissingCheckedTick) < freshWindowMs)
                         {
                             hadMissing = _lastMissingCheckHadMissing;
                             return true;
@@ -407,7 +445,7 @@ public sealed partial class PairHandler
                         return;
                     }
 
-                    _ = Task.Run(() =>
+                    _ = Task.Run(async () =>
                     {
                         try
                         {
@@ -430,18 +468,40 @@ public sealed partial class PairHandler
 
                                     if (missing)
                                     {
-                                        var applyCopy = currentData.DeepClone();
-                                        _ = Task.Run(() =>
+                                        var recheckDelayMs = IsWineRuntime
+                                            ? LinuxSmoothMode.ComputeMaintenancePollDelay(MissingCheckRecheckDelayMs, 2000)
+                                            : MissingCheckRecheckDelayMs;
+                                        await Task.Delay(recheckDelayMs).ConfigureAwait(false);
+                                        missing = HasAnyMissingCacheFiles(currentBase, currentData);
+
+                                        lock (_missingCheckGate)
                                         {
-                                            try
+                                            _lastMissingCheckedHash = currentHash;
+                                            _lastMissingCheckedTick = Environment.TickCount64;
+                                            _lastMissingCheckHadMissing = missing;
+                                        }
+
+                                        if (missing)
+                                        {
+                                            var applyCopy = currentData.DeepClone();
+                                            _ = Task.Run(() =>
                                             {
-                                                Owner.ApplyCharacterData(Guid.NewGuid(), applyCopy, forceApplyCustomization: true);
-                                            }
-                                            catch (Exception ex)
-                                            {
-                                                Logger.LogTrace(ex, "[BASE-{appBase}] Deferred missing-check reapply failed for hash {hash}", currentBase, currentHash);
-                                            }
-                                        });
+                                                try
+                                                {
+                                                    Owner.ApplyCharacterData(Guid.NewGuid(), applyCopy, forceApplyCustomization: true);
+                                                }
+                                                catch (Exception ex)
+                                                {
+                                                    Logger.LogTrace(ex, "[BASE-{appBase}] Deferred missing-check reapply failed for hash {hash}", currentBase, currentHash);
+                                                }
+                                            });
+                                        }
+                                    }
+
+                                    if (!missing)
+                                    {
+                                        Logger.LogTrace("[BASE-{appBase}] Missing-check passed for hash {hash}; waking pair sync worker", currentBase, currentHash);
+                                        Owner._syncWorker?.Signal(PairSyncReason.IncomingData);
                                     }
                                 }
                                 catch (Exception ex)
@@ -531,7 +591,8 @@ public sealed partial class PairHandler
 
                                 try
                                 {
-                                    await Task.Delay(1500, cts.Token).ConfigureAwait(false);
+                                    var repairDelayMs = LinuxSmoothMode.ComputeBackgroundRepairDelay(1500);
+                                    await Task.Delay(repairDelayMs, cts.Token).ConfigureAwait(false);
 
                                     await GlobalPostApplyRepairSemaphore.WaitAsync(cts.Token).ConfigureAwait(false);
                                     acquired = true;

@@ -54,6 +54,8 @@ public class DownloadUi : WindowMediatorSubscriberBase
         public long AccTransferredBytes;
         public int AccTotalFiles;
         public int AccTransferredFiles;
+        public long FixedTotalBytes;
+        public int FixedTotalFiles;
 
         public DateTime LastUpdateUtc;
         public bool Finished;
@@ -111,6 +113,8 @@ public class DownloadUi : WindowMediatorSubscriberBase
                     return new DownloadAggregate
                     {
                         Status = snap,
+                        FixedTotalBytes = snap.Values.Sum(s => Math.Max(0, s.TotalBytes)),
+                        FixedTotalFiles = snap.Values.Sum(s => Math.Max(0, s.TotalFiles)),
                         LastUpdateUtc = now,
                         Finished = false
                     };
@@ -144,6 +148,19 @@ public class DownloadUi : WindowMediatorSubscriberBase
                         }
                     }
 
+                    var snapTotalBytes = snap.Values.Sum(s => Math.Max(0, s.TotalBytes));
+                    var snapTotalFiles = snap.Values.Sum(s => Math.Max(0, s.TotalFiles));
+
+                    if (existing.Finished && (now - existing.LastUpdateUtc) <= DownloadUiHoldWindow)
+                    {
+                        existing.FixedTotalBytes = snapTotalBytes;
+                        existing.FixedTotalFiles = snapTotalFiles;
+                    }
+                    else
+                    {
+                        existing.FixedTotalBytes = Math.Max(existing.FixedTotalBytes, snapTotalBytes);
+                        existing.FixedTotalFiles = Math.Max(existing.FixedTotalFiles, snapTotalFiles);
+                    }
                     existing.Status = snap;
                     existing.LastUpdateUtc = now;
                     existing.Finished = false;
@@ -202,7 +219,7 @@ public class DownloadUi : WindowMediatorSubscriberBase
                     UiSharedService.DrawOutlinedFont($"▲", ImGuiColors.DalamudWhite, new Vector4(0, 0, 0, 255), 1);
                     ImGui.SameLine();
                     var xDistance = ImGui.GetCursorPosX();
-                    UiSharedService.DrawOutlinedFont($"Compressing+Uploading {doneUploads}/{totalUploads}",
+                    UiSharedService.DrawOutlinedFont($"Sending files {doneUploads}/{totalUploads}",
                         ImGuiColors.DalamudWhite, new Vector4(0, 0, 0, 255), 1);
                     ImGui.NewLine();
                     ImGui.SameLine(xDistance);
@@ -226,6 +243,7 @@ public class DownloadUi : WindowMediatorSubscriberBase
 
                     var dlQueue = 0;
                     var dlProg = 0;
+                    var dlRepair = 0;
                     var dlDecomp = 0;
 
                     foreach (var s in statuses)
@@ -244,6 +262,10 @@ public class DownloadUi : WindowMediatorSubscriberBase
 
                             case DownloadStatus.Downloading:
                                 dlProg += remaining;
+                                break;
+
+                            case DownloadStatus.Repairing:
+                                dlRepair += Math.Max(1, remaining);
                                 break;
 
                             case DownloadStatus.Decompressing:
@@ -269,7 +291,7 @@ public class DownloadUi : WindowMediatorSubscriberBase
                     UiSharedService.DrawOutlinedFont($"▼", ImGuiColors.DalamudWhite, new Vector4(0, 0, 0, 255), 1);
                     ImGui.SameLine();
                     var xDistance = ImGui.GetCursorPosX();
-                    var phase = DownloadProgressHints.GetPrimaryPhase(0, dlQueue, dlProg, dlDecomp);
+                    var phase = DownloadProgressHints.GetPrimaryPhase(0, dlQueue, dlProg, dlDecomp, dlRepair);
                     var phaseLabel = DownloadProgressHints.GetPhaseLabel(phase);
                     var headerText = string.IsNullOrWhiteSpace(phaseLabel) ? item.Key.Name : $"{item.Key.Name} - {phaseLabel}";
                     UiSharedService.DrawOutlinedFont(headerText, ImGuiColors.DalamudWhite, new Vector4(0, 0, 0, 255), 1);
@@ -338,11 +360,13 @@ public class DownloadUi : WindowMediatorSubscriberBase
                     var hasQueue = statuses.Any(s => s.DownloadStatus == DownloadStatus.WaitingForQueue
                                                      || s.DownloadStatus == DownloadStatus.WaitingForSlot);
                     var hasProg = statuses.Any(s => s.DownloadStatus == DownloadStatus.Downloading);
+                    var hasRepair = statuses.Any(s => s.DownloadStatus == DownloadStatus.Repairing);
                     var hasDecomp = statuses.Any(s => s.DownloadStatus == DownloadStatus.Decompressing);
 
                     var sInit = 0;
                     var sQueue = 0;
                     var sProg = 0;
+                    var sRepair = 0;
                     var sDecomp = 0;
 
                     foreach (var s in statuses)
@@ -367,20 +391,24 @@ public class DownloadUi : WindowMediatorSubscriberBase
                                 sProg += remaining;
                                 break;
 
+                            case DownloadStatus.Repairing:
+                                sRepair += Math.Max(1, remaining);
+                                break;
+
                             case DownloadStatus.Decompressing:
                                 sDecomp += Math.Max(1, remaining);
                                 break;
                         }
                     }
 
-                    var isWaiting = hasQueue && !hasProg && !hasDecomp;
-                    var isInitializing = hasInit && !hasProg && !hasDecomp;
+                    var isWaiting = hasQueue && !hasProg && !hasRepair && !hasDecomp;
+                    var isInitializing = hasInit && !hasProg && !hasRepair && !hasDecomp;
                     var shouldPulse = isWaiting || isInitializing;
 
                     double dlProgressPercent;
                     string downloadText;
 
-                    var downloadPhase = DownloadProgressHints.GetPrimaryPhase(sInit, sQueue, sProg, sDecomp);
+                    var downloadPhase = DownloadProgressHints.GetPrimaryPhase(sInit, sQueue, sProg, sDecomp, sRepair);
 
                     if (isWaiting || isInitializing)
                     {
@@ -473,7 +501,7 @@ public class DownloadUi : WindowMediatorSubscriberBase
                     try
                     {
                         using var _ = _uiShared.UidFont.Push();
-                        var uploadText = "Uploading";
+                        var uploadText = "Sending files";
                         var textSize = ImGui.CalcTextSize(uploadText);
 
                         var drawList = ImGui.GetBackgroundDrawList();
@@ -1018,7 +1046,7 @@ public class DownloadUi : WindowMediatorSubscriberBase
         int dlTotalFiles = 0;
         int dlTransferredFiles = 0;
 
-        int dlInit = 0, dlQueue = 0, dlProg = 0, dlDecomp = 0;
+        int dlInit = 0, dlQueue = 0, dlProg = 0, dlRepair = 0, dlDecomp = 0;
         bool dlAllPreparing = true;
 
         if (_configService.Current.ShowGlobalTransferBars && haveDownloads)
@@ -1027,9 +1055,8 @@ public class DownloadUi : WindowMediatorSubscriberBase
             {
                 var statuses = entry.Value.Status.Values;
 
-                var entryTotalBytes = entry.Value.AccTotalBytes;
-                foreach (var s in statuses)
-                    entryTotalBytes += s.TotalBytes;
+                var currentTotalBytes = statuses.Sum(s => Math.Max(0, s.TotalBytes));
+                var entryTotalBytes = entry.Value.AccTotalBytes + Math.Max(entry.Value.FixedTotalBytes, currentTotalBytes);
 
                 if (entryTotalBytes <= 0 || entryTotalBytes < MinVisibleDownloadBytes)
                     continue;
@@ -1058,6 +1085,9 @@ public class DownloadUi : WindowMediatorSubscriberBase
                         case DownloadStatus.Downloading:
                             dlProg += count;
                             break;
+                        case DownloadStatus.Repairing:
+                            dlRepair += Math.Max(1, count);
+                            break;
                         case DownloadStatus.Decompressing:
                             dlDecomp += Math.Max(1, count);
                             break;
@@ -1067,7 +1097,8 @@ public class DownloadUi : WindowMediatorSubscriberBase
                 dlTotalBytes += entryTotalBytes;
                 dlTransferredBytes += entry.Value.AccTransferredBytes + statuses.Sum(s => s.TransferredBytes);
 
-                dlTotalFiles += entry.Value.AccTotalFiles + statuses.Sum(s => s.TotalFiles);
+                var currentTotalFiles = statuses.Sum(s => Math.Max(0, s.TotalFiles));
+                dlTotalFiles += entry.Value.AccTotalFiles + Math.Max(entry.Value.FixedTotalFiles, currentTotalFiles);
                 dlTransferredFiles += entry.Value.AccTransferredFiles + statuses.Sum(s => s.TransferredFiles);
 
                 var thisPreparing = statuses.All(s =>
@@ -1083,7 +1114,7 @@ public class DownloadUi : WindowMediatorSubscriberBase
         var dlPct = (dlTotalBytes <= 0) ? 0f : (float)(dlTransferredBytes / (double)dlTotalBytes);
         dlPct = Math.Clamp(dlPct, 0f, 1f);
 
-        var dlPhase = DownloadProgressHints.GetPrimaryPhase(dlInit, dlQueue, dlProg, dlDecomp);
+        var dlPhase = DownloadProgressHints.GetPrimaryPhase(dlInit, dlQueue, dlProg, dlDecomp, dlRepair);
         var dlPhaseLabel = DownloadProgressHints.GetPhaseLabel(dlPhase);
         if (string.IsNullOrWhiteSpace(dlPhaseLabel))
             dlPhaseLabel = "Downloading";
@@ -1113,7 +1144,7 @@ public class DownloadUi : WindowMediatorSubscriberBase
         var ulPct = (ulTotalToUpload <= 0) ? 0f : (float)(ulTotalUploaded / (double)ulTotalToUpload);
         ulPct = Math.Clamp(ulPct, 0f, 1f);
 
-        var ulText = $"Uploading  {ulDoneUploads}/{ulTotalUploads}  ({UiSharedService.ByteToString(ulTotalUploaded, addSuffix: false)}/{UiSharedService.ByteToString(ulTotalToUpload)})";
+        var ulText = $"Sending files  {ulDoneUploads}/{ulTotalUploads}  ({UiSharedService.ByteToString(ulTotalUploaded, addSuffix: false)}/{UiSharedService.ByteToString(ulTotalToUpload)})";
 
         // ===== Draw bars (stacked vs row) =====
         void DrawDownloadBar()
@@ -1143,7 +1174,7 @@ public class DownloadUi : WindowMediatorSubscriberBase
 
             ImGui.Dummy(new Vector2(barW, barH));
 
-            string? hint = DownloadProgressHints.BuildPhaseList(dlInit, dlQueue, dlProg, dlDecomp);
+            string? hint = DownloadProgressHints.BuildPhaseList(dlInit, dlQueue, dlProg, dlDecomp, dlRepair);
 
             if (string.IsNullOrWhiteSpace(hint) && dlAllPreparing)
                 hint = dlPhaseLabel;
@@ -1260,6 +1291,7 @@ public class DownloadUi : WindowMediatorSubscriberBase
 
                 var sQueue = 0;
                 var sProg = 0;
+                var sRepair = 0;
                 var sDecomp = 0;
                 var sInit = 0;
 
@@ -1289,6 +1321,10 @@ public class DownloadUi : WindowMediatorSubscriberBase
                             sProg += count;
                             break;
 
+                        case DownloadStatus.Repairing:
+                            sRepair += Math.Max(1, count);
+                            break;
+
                         case DownloadStatus.Decompressing:
                             sDecomp += Math.Max(1, count);
                             break;
@@ -1299,7 +1335,7 @@ public class DownloadUi : WindowMediatorSubscriberBase
                 var pct = (totalBytes <= 0) ? 0f : (float)(transferredBytes / (double)totalBytes);
                 pct = Math.Clamp(pct, 0f, 1f);
 
-                var listPhase = DownloadProgressHints.GetPrimaryPhase(sInit, sQueue, sProg, sDecomp);
+                var listPhase = DownloadProgressHints.GetPrimaryPhase(sInit, sQueue, sProg, sDecomp, sRepair);
                 var listPhaseLabel = DownloadProgressHints.GetPhaseLabel(listPhase);
                 var headerText = string.IsNullOrWhiteSpace(listPhaseLabel) ? kv.Key.Name : $"{kv.Key.Name} - {listPhaseLabel}";
                 ImGui.TextUnformatted(headerText);

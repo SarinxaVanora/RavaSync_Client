@@ -1,0 +1,221 @@
+import logger_default from "./logger.js";
+import { clamp, parseUntrustedJSON, randBetween } from "./utils.js";
+import SelfCheck from "./self-check.js";
+//#region node_modules/@whotracksme/reporting/reporting/src/patterns-updater.js
+/**
+* WhoTracks.Me
+* https://whotracks.me/
+*
+* Copyright 2017-present Ghostery GmbH. All rights reserved.
+*
+* This Source Code Form is subject to the terms of the Mozilla Public
+* License, v. 2.0. If a copy of the MPL was not distributed with this
+* file, You can obtain one at http://mozilla.org/MPL/2.0
+*/
+var SECOND = 1e3;
+var MINUTE = 60 * SECOND;
+var HOUR = 60 * MINUTE;
+/**
+* If you need to introduce incompatible changes to the the state
+* persistence, you can bump this number to clear the persisted cache.
+* It will be as if you start with a fresh installation of the extension.
+*
+* (If you are not sure whether the change is incompatible, it is
+* a good idea to be conservative and bump this number anyway; it will
+* only introduce little overhead.)
+*/
+var DB_VERSION = 1;
+/**
+* Responsible for keeping the patterns up-to-date by polling
+* the backend for changes. By design, it supports situations where
+* the extension is frequently restarted; in other words, it is
+* designed to work in an empheral service worker model and
+* does not required a persistent background.
+*
+* The current implementation assumes that the "update" function
+* gets triggered frequently enough to check for new patterns
+* within the configured intervals.
+*/
+var PatternsUpdater = class {
+	constructor({ config, patterns, storage, storageKey }) {
+		this.patterns = patterns;
+		this.storage = storage;
+		this.storageKey = storageKey;
+		this.patternUpdateUrl = config.PATTERNS_URL;
+		if (!this.patternUpdateUrl) logger_default.warn("PATTERNS_URL is not configured. Pattern updates will be skipped and empty patterns will be used instead.");
+		this.defaultUpdateInterval = {
+			min: 8 * HOUR,
+			max: 24 * HOUR
+		};
+		this.fastUpdateInterval = {
+			min: 30 * MINUTE,
+			max: 2 * HOUR
+		};
+		this._initEmptyCache();
+	}
+	_initEmptyCache() {
+		this._persistedState = {
+			patterns: null,
+			skipAttemptsUntil: 0,
+			lastFetchAttempt: 0,
+			lastConfirmedModification: 0,
+			failedAttemptsInARow: 0,
+			dbVersion: DB_VERSION
+		};
+	}
+	async _savePersistedState() {
+		return this.storage.set(this.storageKey, this._persistedState);
+	}
+	async init({ now = Date.now() } = {}) {
+		let force = false;
+		try {
+			let persistedState = await this.storage.get(this.storageKey);
+			if (persistedState && persistedState.dbVersion !== DB_VERSION) {
+				logger_default.info("DB_VERSION changed. Discarding the cache...");
+				persistedState = null;
+			}
+			if (persistedState && !this._timestampsLookValid(persistedState, now)) {
+				logger_default.warn("The timestamps in the pattern cache show indications that the system clock was off. Discarding the cache:", persistedState);
+				persistedState = null;
+			}
+			if (persistedState) {
+				if (persistedState.patterns) this.patterns.updatePatterns(JSON.parse(persistedState.patterns));
+				this._persistedState = persistedState;
+			} else {
+				logger_default.info("Pattern cache does not exist. This should only happen on the first time the extension is started.");
+				force = true;
+			}
+		} catch (e) {
+			logger_default.warn("Failed to load cached patterns from disk. Forcing an update.");
+			force = true;
+		}
+		try {
+			await this.update({
+				force,
+				now
+			});
+		} catch (e) {
+			logger_default.warn("Failed to fetch patterns", e);
+		}
+	}
+	/**
+	* Poll for pattern updates. It will block until the update operation
+	* is finished.
+	*
+	* Cooldowns:
+	* ----------
+	* To make this function easier to use, the caller is not responsible
+	* for throttling updates. In fact, it is better if the update function
+	* is called as often as possible.
+	*
+	* Error handling:
+	* ---------------
+	* It is not the responsibility of the caller to schedule retry attemps,
+	* but only to guarantee that the "update" function is called regurarily.
+	* As it is generally not useful to learn about failure, the returned
+	* promise will always resolve. But if you want to know whether it really
+	* succeeded or not - for logging or debugging purposes - you can overwrite
+	* the default by passing the "ignoreError" flag.
+	*/
+	async update({ force = false, ignoreErrors = true, now = Date.now() } = {}) {
+		try {
+			await this._update({
+				force,
+				now
+			});
+		} catch (e) {
+			if (!ignoreErrors) throw e;
+			logger_default.debug("Failed to update patterns. It is safe to continue.");
+		}
+	}
+	async _update({ force = false, now = Date.now() } = {}) {
+		const url = this.patternUpdateUrl;
+		if (!url) {
+			logger_default.debug("Pattern updates skipped (update URL not configured)");
+			return;
+		}
+		if (!force && now < this._persistedState.skipAttemptsUntil) {
+			logger_default.debug("Cooldown not reached yet. Need to wait until", this._persistedState.skipAttemptsUntil, "before updating patterns again.");
+			if (this._persistedState.failedAttemptsInARow > 0) throw new Error("Unable to fetch patterns. Need to wait for the cooldown to finish before retrying...");
+			return;
+		}
+		const otherUpdate = this._pendingUpdate;
+		if (otherUpdate) {
+			logger_default.debug("Pattern update already in progress...");
+			await otherUpdate;
+			return;
+		}
+		let done;
+		this._pendingUpdate = new Promise((resolve) => {
+			done = resolve;
+		});
+		try {
+			this._persistedState.lastFetchAttempt = now;
+			const response = await fetch(url, {
+				method: "GET",
+				cache: "no-cache",
+				credentials: "omit"
+			});
+			if (!response.ok) throw new Error(`Failed to fetch patterns (${response.statusText}) from url=${url}`);
+			const newPatterns = await response.text();
+			const rules = parseUntrustedJSON(newPatterns, { maxSize: 1024 * 1024 });
+			const oldPatterns = this._persistedState.patterns;
+			this._persistedState.patterns = newPatterns;
+			const detectedModification = oldPatterns && oldPatterns !== newPatterns;
+			if (detectedModification) {
+				logger_default.info("The server released new patterns:", rules);
+				this._persistedState.lastConfirmedModification = now;
+			}
+			this._persistedState.failedAttemptsInARow = 0;
+			const { min, max } = detectedModification ? this.fastUpdateInterval : this.defaultUpdateInterval;
+			this._persistedState.skipAttemptsUntil = now + randBetween(min, max);
+			if (!oldPatterns || detectedModification) this.patterns.updatePatterns(rules);
+		} catch (e) {
+			this._persistedState.failedAttemptsInARow += 1;
+			const avgCooldown = this._persistedState.failedAttemptsInARow * (10 * SECOND);
+			const finalCooldown = clamp({
+				value: randBetween(avgCooldown / 1.5, 1.5 * avgCooldown),
+				min: 3 * SECOND,
+				max: 8 * HOUR
+			});
+			this._persistedState.skipAttemptsUntil = now + finalCooldown;
+			logger_default.warn("Failed to fetch pattern. Cooldown until:", new Date(this._persistedState.skipAttemptsUntil), e);
+			throw e;
+		} finally {
+			try {
+				await this._savePersistedState();
+			} catch (e) {
+				logger_default.warn("Failed to update patterns cache.", e);
+			}
+			this._pendingUpdate = null;
+			done();
+		}
+	}
+	/**
+	* Run some sanity checks on the timestamps. If any of the timestamps
+	* were produced from a clock that was in the future, updates will
+	* stop working. If we detect such a case, we should purge the cache
+	* and start from scratch.
+	*
+	* Staying forever on outdated patterns would also increase the risk
+	* of sticking out from the crowd.
+	*/
+	_timestampsLookValid(persistedState, now = Date.now()) {
+		const maxCooldown = Math.max(this.defaultUpdateInterval.min, this.defaultUpdateInterval.max, this.fastUpdateInterval.min, this.fastUpdateInterval.max);
+		const allowedDrift = 5 * MINUTE;
+		const isOK = (ts) => ts < now + allowedDrift;
+		return isOK(persistedState.skipAttemptsUntil - maxCooldown) && isOK(persistedState.lastConfirmedModification) && isOK(persistedState.lastFetchAttempt);
+	}
+	async selfChecks(check = new SelfCheck()) {
+		if (this._persistedState.failedAttemptsInARow > 0) check.warn("unable to update patterns", { errorsInARow: this._persistedState.failedAttemptsInARow });
+		const patternAge = Date.now() - this._persistedState.lastFetchAttempt;
+		if (patternAge > this.defaultUpdateInterval.max) check.fail("patterns are outdated", {
+			ageInHours: patternAge / HOUR,
+			maxAgeInHours: this.defaultUpdateInterval.max / HOUR
+		});
+		else check.pass("patterns are up to date", { lastUpdated: `${patternAge / HOUR} hours ago` });
+		return check;
+	}
+};
+//#endregion
+export { PatternsUpdater as default };

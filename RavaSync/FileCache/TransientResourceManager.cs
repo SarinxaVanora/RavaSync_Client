@@ -18,7 +18,7 @@ namespace RavaSync.FileCache;
 
 public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
 {
-    private static readonly string[] _manifestGamePathRoots = ["chara/", "vfx/", "bgcommon/", "sound/", "ui/", "shader/"];
+    private static readonly string[] _manifestGamePathRoots = ["chara/", "vfx/", "bgcommon/", "sound/", "music/", "bgm/", "game_script/", "ui/", "shader/"];
     private static readonly JsonDocumentOptions _manifestJsonOptions = new()
     {
         AllowTrailingCommas = true,
@@ -76,8 +76,9 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
     private readonly object _playerRelatedPointersLock = new();
     private readonly object _semiTransientResourcesLock = new();
     private readonly object _transientResourcesLock = new();
-    private readonly object _recordedTransientsLock = new();
+
     private readonly object _sendTransientLock = new();
+    private readonly FileCacheManager _fileCacheManager;
     private readonly object _playerConfigIdentityLock = new();
     private readonly object _playerOwnedResourceBaselineLock = new();
     private readonly object _targetedManifestRefreshLock = new();
@@ -89,23 +90,24 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
     private readonly object _modelCharaObjectKindIndexLock = new();
     private ModelCharaObjectKindIndex? _modelCharaObjectKindIndex;
 
-    private readonly string[] _handledFileTypes = ["tmb", "tmb2", "pap", "avfx", "atex", "sklb", "eid", "phy", "phyb", "pbd", "scd", "skp", "shpk", "kdb"];
+    private static readonly string[] _manifestPrimaryTransientFileTypes = ["tmb", "tmb2", "pap", "avfx", "atex", "sklb", "eid", "phy", "phyb", "pbd", "scd", "skp", "shpk", "kdb"];
+    private readonly string[] _handledFileTypes = _manifestPrimaryTransientFileTypes;
     private readonly string[] _handledRecordingFileTypes = ["tex", "mdl", "mtrl"];
     private static readonly string[] _manifestSupportFileTypes = ["mdl", "mtrl", "tex"];
     private readonly string[] _autoRecordTriggerFileTypes = ["tmb", "tmb2", "pap", "avfx", "atex", "scd"];
-    private const string StartupPrimeManifestRuleVersion = "startup-manifest-prime-v17-explicit-inactive-options";
+    private const string StartupPrimeManifestRuleVersion = "startup-manifest-prime-v27-mount-music-object-scope";
     private static readonly TimeSpan _autoRecordQuietWindow = TimeSpan.FromMilliseconds(300);
     private static readonly TimeSpan _autoRecordMaximumWindow = TimeSpan.FromMilliseconds(1700);
     private static readonly TimeSpan _autoRecordRecentBaselineLifetime = TimeSpan.FromMilliseconds(2500);
     private static readonly TimeSpan _autoRecordSnapshotProbeDelay = TimeSpan.FromMilliseconds(150);
     private const int AutoRecordSnapshotProbeCount = 6;
-    private static readonly TimeSpan _playerOwnedResourceBaselineRefreshInterval = TimeSpan.FromMilliseconds(500);
+
     private static readonly TimeSpan _appearanceChangeAutoRecordSuppressWindow = TimeSpan.FromMilliseconds(2500);
     private const int StartupPrimeApplyBatchSize = 96;
     private const int StartupPrimeManifestYieldEvery = 6;
     private static readonly TimeSpan StartupPrimeModYieldDelay = TimeSpan.FromMilliseconds(20);
     private static readonly TimeSpan StartupPrimeBatchYieldDelay = TimeSpan.FromMilliseconds(35);
-    private static readonly TimeSpan TargetedManifestRefreshSettleDelay = TimeSpan.FromMilliseconds(750);
+    private static readonly TimeSpan TargetedManifestRefreshSettleDelay = TimeSpan.FromMilliseconds(75);
 
     private readonly HashSet<string> _cachedHandledPaths = new(StringComparer.Ordinal);
     private readonly HashSet<GameObjectHandler> _playerRelatedPointers = [];
@@ -115,14 +117,12 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
     private readonly ConcurrentDictionary<ObjectKind, HashSet<string>> _transientResources = new();
     private readonly ConcurrentDictionary<ObjectKind, HashSet<string>> _pendingAutoRecordedSupportResources = new();
     private readonly ConcurrentDictionary<nint, ConcurrentDictionary<string, long>> _recentOwnedResourceLoadsByAddress = new();
-    private readonly ConcurrentDictionary<string, string> _transientHashByGamePath = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, string> _transientFilePathByGamePath = new(StringComparer.OrdinalIgnoreCase);
     private Dictionary<string, string> _cachedPlayerOwnedResourceFileByGamePath = new(StringComparer.OrdinalIgnoreCase);
     private string _cachedPlayerPersistentDataKey = string.Empty;
+    private string _luminaObjectScopeMigrationCompletedForPlayerKey = string.Empty;
 
     private CancellationTokenSource _sendTransientCts = new();
-    private int _playerOwnedResourceBaselineRefreshRunning;
-    private long _nextPlayerOwnedResourceBaselineRefreshTick;
     private long _suppressAutoRecordUntilTick;
     private volatile ConcurrentBag<TransientRecord> _recordedTransients = new();
     private readonly object _autoRecordLock = new();
@@ -139,8 +139,13 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
     private int _isTransientRecording;
     private int _startupTransientPrimeQueued;
     private int _startupTransientPrimeCompleted;
+    private int _startupTransientPrimeRequeueRequested;
+    private Guid _lastStartupManifestPrimeCollectionId = Guid.Empty;
+    private int _transientManifestDirtyForNextBuild;
+    private readonly SemaphoreSlim _startupManifestPrimeSemaphore = new(1, 1);
     private CancellationTokenSource _startupTransientPrimeCts = new();
     private CancellationTokenSource _targetedManifestRefreshCts = new();
+    private CancellationTokenSource _activeCollectionDirtyCheckCts = new();
     private readonly Dictionary<string, PenumbraModSettingChangedMessage> _pendingTargetedManifestRefreshes = new(StringComparer.OrdinalIgnoreCase);
     private volatile TransientManifestPrimeProgressSnapshot _manifestPrimeProgress = TransientManifestPrimeProgressSnapshot.Idle;
     private int _manifestPrimeImportedPathCount;
@@ -148,6 +153,7 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
 
     public TransientManifestPrimeProgressSnapshot ManifestPrimeProgress => _manifestPrimeProgress;
     public bool IsTransientRecording => Volatile.Read(ref _isTransientRecording) != 0;
+    public bool HasDirtyTransientManifestForNextBuild => Volatile.Read(ref _transientManifestDirtyForNextBuild) != 0;
     public ValueProgress<TimeSpan> RecordTimeRemaining { get; } = new();
     public IReadOnlyCollection<TransientRecord> RecordedTransients => _recordedTransients;
 
@@ -156,6 +162,7 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
     {
         _configurationService = configurationService;
         _dalamudUtil = dalamudUtil;
+        _fileCacheManager = fileCacheManager;
         _ipcManager = ipcManager;
         _gameData = gameData;
 
@@ -165,6 +172,13 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
         Mediator.Subscribe<PenumbraModSettingChangedMessage>(this, (msg) =>
         {
             SuppressAutoRecordingForAppearanceChange("PenumbraModSettingChanged");
+
+            if (IsLikelyActiveCollectionTransientRefreshSignal(msg))
+            {
+                QueueActiveCollectionTransientDirtyCheck(msg);
+                return;
+            }
+
             QueueTargetedTransientManifestRefresh(msg);
         });
         Mediator.Subscribe<ClassJobChangedMessage>(this, (_) => SuppressAutoRecordingForAppearanceChange("ClassJobChanged"));
@@ -265,6 +279,7 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
                 if (!string.Equals(_cachedPlayerPersistentDataKey, nextKey, StringComparison.Ordinal))
                 {
                     _cachedPlayerPersistentDataKey = nextKey;
+                    _luminaObjectScopeMigrationCompletedForPlayerKey = string.Empty;
                     changed = true;
                 }
             }
@@ -280,17 +295,6 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
         catch (Exception ex)
         {
             Logger.LogTrace(ex, "Failed to refresh transient player config identity");
-        }
-    }
-
-    private ConcurrentDictionary<ObjectKind, HashSet<string>> SemiTransientResources
-    {
-        get
-        {
-            lock (_semiTransientResourcesLock)
-            {
-                return EnsureSemiTransientResourcesUnsafe();
-            }
         }
     }
 
@@ -358,6 +362,46 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
             PersistTransientResources(objectKind);
 
         return GetActiveTransientResources(objectKind);
+    }
+
+    public async Task EnsureTransientManifestStateForCurrentBuildAsync(ObjectKind objectKind, string? reason, CancellationToken token)
+    {
+        if (objectKind != ObjectKind.Player || Volatile.Read(ref _transientManifestDirtyForNextBuild) == 0)
+            return;
+
+        await _startupManifestPrimeSemaphore.WaitAsync(token).ConfigureAwait(false);
+        try
+        {
+            if (Volatile.Read(ref _transientManifestDirtyForNextBuild) == 0)
+                return;
+
+            var buildReason = string.IsNullOrWhiteSpace(reason) ? "CharacterBuild" : reason;
+            Logger.LogDebug("Refreshing dirty transient manifest state just-in-time for local player build, reason={reason}", buildReason);
+
+            var completed = await TryPrimeStartupTransientManifestAsync(
+                $"{buildReason}:TransientManifestDirtyBuildRefresh",
+                token,
+                publishRefresh: false,
+                requestRedraw: false).ConfigureAwait(false);
+
+            if (completed)
+            {
+                Volatile.Write(ref _startupTransientPrimeCompleted, 1);
+                Volatile.Write(ref _transientManifestDirtyForNextBuild, 0);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            Logger.LogDebug(ex, "Failed to refresh dirty transient manifest state during local player build; the next build will retry");
+        }
+        finally
+        {
+            _startupManifestPrimeSemaphore.Release();
+        }
     }
 
     public void PersistTransientResources(ObjectKind objectKind)
@@ -449,7 +493,10 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
             return;
 
         foreach (var path in missingGamePaths)
+        {
             PlayerConfig.RemovePath(path, objectKind);
+            RemoveKnownResolvedFilePathForGamePath(path);
+        }
 
         SaveTransientConfigNow(nameof(CleanUpSemiTransientResources));
     }
@@ -481,6 +528,7 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
             return;
 
         PlayerConfig.RemovePath(normalizedPath, objectKind);
+        RemoveKnownResolvedFilePathForGamePath(normalizedPath);
         SaveTransientConfigNow(nameof(RemoveTransientResource));
     }
 
@@ -571,6 +619,66 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
         return _transientFilePathByGamePath.TryGetValue(normalizedGamePath, out var value) ? value : null;
     }
 
+    private void RemoveRuntimeTransientPath(ObjectKind objectKind, string gamePath)
+    {
+        var normalizedGamePath = NormalizePath(gamePath);
+        if (string.IsNullOrWhiteSpace(normalizedGamePath))
+            return;
+
+        lock (_semiTransientResourcesLock)
+        {
+            var semiTransientResources = EnsureSemiTransientResourcesUnsafe();
+            if (semiTransientResources.TryGetValue(objectKind, out var semiTransient))
+                semiTransient.RemoveWhere(path => string.Equals(path, normalizedGamePath, StringComparison.OrdinalIgnoreCase));
+        }
+
+        lock (_transientResourcesLock)
+        {
+            if (_transientResources.TryGetValue(objectKind, out var transient))
+                transient.RemoveWhere(path => string.Equals(path, normalizedGamePath, StringComparison.OrdinalIgnoreCase));
+
+            if (_pendingAutoRecordedSupportResources.TryGetValue(objectKind, out var pendingSupport))
+                pendingSupport.RemoveWhere(path => string.Equals(path, normalizedGamePath, StringComparison.OrdinalIgnoreCase));
+        }
+    }
+
+    private void RemoveKnownResolvedFilePathForGamePath(string gamePath)
+    {
+        var normalizedGamePath = NormalizePath(gamePath);
+        if (string.IsNullOrWhiteSpace(normalizedGamePath))
+            return;
+
+        _transientFilePathByGamePath.TryRemove(normalizedGamePath, out _);
+
+        var playerConfig = PlayerConfig;
+        lock (playerConfig)
+        {
+            playerConfig.PersistentResolvedFilePathByGamePath.Remove(normalizedGamePath);
+        }
+    }
+
+    private void RemoveKnownResolvedFilePathForResolvedPath(string resolvedPath)
+    {
+        var normalizedResolvedPath = NormalizeResolvedFilePath(resolvedPath);
+        if (string.IsNullOrWhiteSpace(normalizedResolvedPath))
+            return;
+
+        foreach (var kvp in _transientFilePathByGamePath.Where(kvp => string.Equals(NormalizeResolvedFilePath(kvp.Value), normalizedResolvedPath, StringComparison.OrdinalIgnoreCase)).ToArray())
+            _transientFilePathByGamePath.TryRemove(kvp.Key, out _);
+
+        var playerConfig = PlayerConfig;
+        lock (playerConfig)
+        {
+            foreach (var key in playerConfig.PersistentResolvedFilePathByGamePath
+                         .Where(kvp => string.Equals(NormalizeResolvedFilePath(kvp.Value), normalizedResolvedPath, StringComparison.OrdinalIgnoreCase))
+                         .Select(kvp => kvp.Key)
+                         .ToArray())
+            {
+                playerConfig.PersistentResolvedFilePathByGamePath.Remove(key);
+            }
+        }
+    }
+
     private void BeginManifestPrimeProgress(bool targeted, int totalMods, string reason)
     {
         Interlocked.Exchange(ref _manifestPrimeImportedPathCount, 0);
@@ -613,7 +721,7 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
         return normalized.Length <= 96 ? normalized : "…" + normalized[^95..];
     }
 
-    public Dictionary<string, string> GetKnownResolvedFilePaths(ObjectKind objectKind, IEnumerable<string>? gamePaths = null)
+    public Dictionary<string, string> GetKnownResolvedFilePaths(ObjectKind objectKind, IEnumerable<string>? gamePaths = null, bool validateExists = true)
     {
         var requested = gamePaths?
             .Select(NormalizePath)
@@ -641,7 +749,7 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
             var normalizedResolvedPath = NormalizeResolvedFilePath(resolvedPath);
             if (string.IsNullOrWhiteSpace(normalizedResolvedPath)
                 || string.Equals(normalizedResolvedPath, normalizedGamePath, StringComparison.OrdinalIgnoreCase)
-                || !File.Exists(normalizedResolvedPath))
+                || (validateExists && !File.Exists(normalizedResolvedPath)))
             {
                 continue;
             }
@@ -655,11 +763,24 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
 
     private void QueueStartupTransientManifestPrime(string reason)
     {
-        if (Volatile.Read(ref _startupTransientPrimeCompleted) != 0)
+        var forceReprime = ShouldForceStartupManifestReprime(reason);
+        if (forceReprime)
+        {
+            Volatile.Write(ref _startupTransientPrimeCompleted, 0);
+            ClearStartupManifestPrimeFingerprint();
+        }
+        else if (Volatile.Read(ref _startupTransientPrimeCompleted) != 0)
+        {
             return;
+        }
 
         if (Interlocked.CompareExchange(ref _startupTransientPrimeQueued, 1, 0) != 0)
+        {
+            if (forceReprime)
+                Interlocked.Exchange(ref _startupTransientPrimeRequeueRequested, 1);
+
             return;
+        }
 
         CancellationToken token;
         lock (_sendTransientLock)
@@ -685,10 +806,19 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
                 {
                     await Task.Delay(attempt == 0 ? TimeSpan.FromSeconds(2) : TimeSpan.FromSeconds(5), token).ConfigureAwait(false);
 
-                    if (await TryPrimeStartupTransientManifestAsync(reason, token).ConfigureAwait(false))
+                    await _startupManifestPrimeSemaphore.WaitAsync(token).ConfigureAwait(false);
+                    try
                     {
-                        Volatile.Write(ref _startupTransientPrimeCompleted, 1);
-                        return;
+                        if (await TryPrimeStartupTransientManifestAsync(reason, token).ConfigureAwait(false))
+                        {
+                            Volatile.Write(ref _startupTransientPrimeCompleted, 1);
+                            Volatile.Write(ref _transientManifestDirtyForNextBuild, 0);
+                            return;
+                        }
+                    }
+                    finally
+                    {
+                        _startupManifestPrimeSemaphore.Release();
                     }
                 }
 
@@ -708,6 +838,116 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
             finally
             {
                 Volatile.Write(ref _startupTransientPrimeQueued, 0);
+
+                if (Interlocked.Exchange(ref _startupTransientPrimeRequeueRequested, 0) != 0
+                    && !token.IsCancellationRequested)
+                {
+                    QueueStartupTransientManifestPrime(reason);
+                }
+            }
+        }, token);
+    }
+
+    private static bool ShouldForceStartupManifestReprime(string reason)
+    {
+        return string.Equals(reason, "PenumbraDirectoryChanged", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(reason, "PenumbraInitialized", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsLikelyActiveCollectionTransientRefreshSignal(PenumbraModSettingChangedMessage msg)
+    {
+        if (string.IsNullOrWhiteSpace(msg.ModName))
+            return true;
+
+        var change = NormalizeManifestSelectionKey(msg.Change ?? string.Empty);
+        if (string.IsNullOrWhiteSpace(change))
+            return false;
+
+        return change.Contains("collection", StringComparison.OrdinalIgnoreCase)
+            && (change.Contains("change", StringComparison.OrdinalIgnoreCase)
+                || change.Contains("active", StringComparison.OrdinalIgnoreCase)
+                || change.Contains("assign", StringComparison.OrdinalIgnoreCase)
+                || change.Contains("inherit", StringComparison.OrdinalIgnoreCase));
+    }
+
+    private void QueueActiveCollectionTransientDirtyCheck(PenumbraModSettingChangedMessage msg)
+    {
+        CancellationToken token;
+        lock (_targetedManifestRefreshLock)
+        {
+            try
+            {
+                _activeCollectionDirtyCheckCts.Cancel();
+                _activeCollectionDirtyCheckCts.Dispose();
+            }
+            catch (ObjectDisposedException)
+            {
+                // shutdown/dispose race
+            }
+
+            _activeCollectionDirtyCheckCts = new CancellationTokenSource();
+            token = _activeCollectionDirtyCheckCts.Token;
+        }
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await Task.Delay(TargetedManifestRefreshSettleDelay, token).ConfigureAwait(false);
+
+                if (!_ipcManager.Penumbra.APIAvailable)
+                    return;
+
+                var localPlayer = await _dalamudUtil.RunOnFrameworkThread(() =>
+                {
+                    RefreshPlayerPersistentDataKeyFromFramework();
+
+                    var ptr = _dalamudUtil.GetPlayerPtr();
+                    if (ptr == nint.Zero)
+                        return (Address: nint.Zero, ObjectIndex: -1);
+
+                    var obj = _dalamudUtil.CreateGameObject(ptr);
+                    return (Address: ptr, ObjectIndex: obj?.ObjectIndex ?? -1);
+                }).ConfigureAwait(false);
+
+                if (token.IsCancellationRequested || localPlayer.Address == nint.Zero || localPlayer.ObjectIndex < 0)
+                    return;
+
+                var collectionState = await _ipcManager.Penumbra.GetLocalPlayerCollectionModSettingsAsync(Logger, localPlayer.ObjectIndex).ConfigureAwait(false);
+                if (collectionState == null || collectionState.CollectionId == Guid.Empty)
+                    return;
+
+                var lastCollectionId = _lastStartupManifestPrimeCollectionId;
+                if (lastCollectionId == Guid.Empty)
+                {
+                    Logger.LogTrace("Ignoring active-collection transient dirty signal with no completed local collection baseline yet; startup prime will seed it");
+                    return;
+                }
+
+                if (lastCollectionId == collectionState.CollectionId)
+                {
+                    Logger.LogTrace("Ignoring Penumbra collection signal for transient manifests; local player effective collection is still {collectionId}", collectionState.CollectionId);
+                    return;
+                }
+
+                if (msg.CollectionId != Guid.Empty && msg.CollectionId != collectionState.CollectionId)
+                {
+                    Logger.LogTrace("Penumbra collection signal referenced {signalledCollectionId}, but local player effective collection settled on {localCollectionId}; using local effective collection change check only",
+                        msg.CollectionId, collectionState.CollectionId);
+                }
+
+                Logger.LogDebug("Local player effective Penumbra collection changed from {oldCollectionId} to {newCollectionId}; marking transient manifest state dirty for the next local player build",
+                    lastCollectionId, collectionState.CollectionId);
+                MarkTransientManifestDirtyForNextBuild("LocalPlayerPenumbraCollectionChanged");
+                PublishLocalPlayerTransientManifestRefresh("LocalPlayerPenumbraCollectionChanged:TransientManifestDirty");
+            }
+            catch (OperationCanceledException)
+            {
+                // a newer collection signal replaced this check
+            }
+            catch (Exception ex)
+            {
+                Logger.LogDebug(ex, "Active collection transient dirty check failed; leaving transient state unchanged");
             }
         }, token);
     }
@@ -797,6 +1037,15 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
         if (collectionState == null)
             return;
 
+        if (ShouldReprimeStartupManifestForActiveCollectionChange(collectionState.CollectionId, requests))
+        {
+            Logger.LogDebug("Penumbra active collection changed from {oldCollectionId} to {newCollectionId}; marking transient manifest state dirty for the next local player build",
+                _lastStartupManifestPrimeCollectionId, collectionState.CollectionId);
+            MarkTransientManifestDirtyForNextBuild("PenumbraActiveCollectionChanged");
+            PublishLocalPlayerTransientManifestRefresh("PenumbraActiveCollectionChanged:TransientManifestDirty");
+            return;
+        }
+
         var effectiveRequests = requests
             .Where(request => IsPenumbraModSettingRequestRelevantToLocalCollection(request, collectionState.Mods, collectionState.CollectionId))
             .ToList();
@@ -804,16 +1053,16 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
         if (effectiveRequests.Count == 0)
             return;
 
-        var useFullEffectiveCollectionRefresh = effectiveRequests.Any(IsLikelyWholeModStateRefreshRequest)
-            || effectiveRequests.Any(request => !TryResolveCollectionModForTargetedManifestRefresh(collectionState.Mods, request.ModName, out _, out _));
-        var targetedMods = BuildTargetedManifestRefreshModList(collectionState.Mods, effectiveRequests, useFullEffectiveCollectionRefresh);
+        var targetedMods = BuildTargetedManifestRefreshModList(collectionState.Mods, effectiveRequests);
         if (targetedMods.Count == 0)
             return;
 
-        BeginManifestPrimeProgress(targeted: true, totalMods: targetedMods.Count, reason: useFullEffectiveCollectionRefresh ? "Penumbra mod enable/disable" : "Penumbra mod setting change");
+        var includesPriorityOrStateChange = effectiveRequests.Any(IsLikelyWholeModStateRefreshRequest);
+        BeginManifestPrimeProgress(targeted: true, totalMods: targetedMods.Count, reason: includesPriorityOrStateChange ? "Penumbra transient priority/state change" : "Penumbra mod setting change");
 
         var knownGamePaths = BuildStartupPrimeKnownGamePathsSnapshot();
         var importBatch = new List<ManifestTransientImportEntry>(StartupPrimeApplyBatchSize * 2);
+        var selectedDeltaEntries = new List<ManifestTransientImportEntry>(StartupPrimeApplyBatchSize * 2);
         var manifestIndex = new StartupManifestPrimeSelectionIndex();
         var appliedManifestPriorityByGamePath = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
         var importedAny = false;
@@ -822,7 +1071,7 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
         foreach (var mod in targetedMods)
         {
             token.ThrowIfCancellationRequested();
-            UpdateManifestPrimeProgress(targeted: true, useFullEffectiveCollectionRefresh ? "Refreshing effective collection" : "Scanning changed mod", mod.ModKey, scannedMods, targetedMods.Count);
+            UpdateManifestPrimeProgress(targeted: true, "Scanning changed mod", mod.ModKey, scannedMods, targetedMods.Count);
 
             var modPath = ResolveModDirectory(modDirectory, mod.ModKey);
             if (!Directory.Exists(modPath))
@@ -837,13 +1086,17 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
             var settings = mod.ModState?.Settings ?? new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
             var priority = mod.ModState?.Priority ?? 0;
 
+            var beforeImportCount = importBatch.Count;
             await ImportManifestEntriesAsync(modPath, settings, priority, importSelectedEntries, importBatch, knownGamePaths, manifestIndex, token).ConfigureAwait(false);
+            if (importBatch.Count > beforeImportCount)
+                selectedDeltaEntries.AddRange(importBatch.Skip(beforeImportCount));
+
             scannedMods++;
-            UpdateManifestPrimeProgress(targeted: true, useFullEffectiveCollectionRefresh ? "Refreshing effective collection" : "Scanning changed mod", mod.ModKey, scannedMods, targetedMods.Count);
+            UpdateManifestPrimeProgress(targeted: true, "Scanning changed mod", mod.ModKey, scannedMods, targetedMods.Count);
 
             if (importBatch.Count >= StartupPrimeApplyBatchSize)
             {
-                if (ApplyStartupManifestEntriesToTransientConfig(importBatch, useFullEffectiveCollectionRefresh ? "PenumbraModToggle:EffectiveCollectionManifest" : "PenumbraModSettingChanged:TargetedManifest", knownGamePaths, appliedManifestPriorityByGamePath))
+                if (ApplyStartupManifestEntriesToTransientConfig(importBatch, "PenumbraModSettingChanged:TargetedManifest", knownGamePaths, appliedManifestPriorityByGamePath))
                     importedAny = true;
 
                 importBatch.Clear();
@@ -853,12 +1106,13 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
 
         if (importBatch.Count > 0)
         {
-            if (ApplyStartupManifestEntriesToTransientConfig(importBatch, useFullEffectiveCollectionRefresh ? "PenumbraModToggle:EffectiveCollectionManifest" : "PenumbraModSettingChanged:TargetedManifest", knownGamePaths, appliedManifestPriorityByGamePath))
+            if (ApplyStartupManifestEntriesToTransientConfig(importBatch, "PenumbraModSettingChanged:TargetedManifest", knownGamePaths, appliedManifestPriorityByGamePath))
                 importedAny = true;
         }
 
+        var liveWinnerChanged = await ReconcileTargetedTransientManifestLiveWinnersAsync(manifestIndex, selectedDeltaEntries, token).ConfigureAwait(false);
         var prunedExistingManifestEntries = PruneInvalidStartupManifestPaths(manifestIndex);
-        if (!importedAny && !prunedExistingManifestEntries)
+        if (!importedAny && !liveWinnerChanged && !prunedExistingManifestEntries)
         {
             FinishManifestPrimeProgress(targeted: true, "No selected transient changes", string.Empty, scannedMods, targetedMods.Count);
             Logger.LogTrace("Targeted transient manifest refresh found no selected transient changes across {count} changed Penumbra mod(s)", scannedMods);
@@ -867,13 +1121,250 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
 
         ClearStartupManifestPrimeFingerprint();
         SaveTransientConfigNow(nameof(TryRefreshTargetedTransientManifestPacksAsync));
-        PublishLocalPlayerTransientManifestRefresh("PenumbraModSettingChanged:TransientManifest");
+        if (!await TryPublishLocalPlayerTransientManifestDeltaAsync(selectedDeltaEntries, manifestIndex, "PenumbraModSettingChanged:TransientManifestDelta", token).ConfigureAwait(false))
+            PublishLocalPlayerTransientManifestRefresh("PenumbraModSettingChanged:TransientManifest");
         FinishManifestPrimeProgress(targeted: true, "Completed", string.Empty, scannedMods, targetedMods.Count);
 
-        Logger.LogDebug("Targeted transient manifest refresh completed for {count} changed Penumbra mod(s); imported={imported}, pruned={pruned}",
+        Logger.LogDebug("Targeted transient manifest refresh completed for {count} changed Penumbra mod(s); imported={imported}, liveWinnerChanged={liveWinnerChanged}, pruned={pruned}",
             scannedMods,
             importedAny,
+            liveWinnerChanged,
             prunedExistingManifestEntries);
+    }
+
+    private async Task<bool> ReconcileTargetedTransientManifestLiveWinnersAsync(StartupManifestPrimeSelectionIndex manifestIndex, List<ManifestTransientImportEntry> selectedDeltaEntries, CancellationToken token)
+    {
+        if (manifestIndex.ManifestGamePaths.Count == 0 || !_ipcManager.Penumbra.APIAvailable)
+            return false;
+
+        var gamePaths = manifestIndex.ManifestGamePaths
+            .Select(NormalizePath)
+            .Where(path => !string.IsNullOrWhiteSpace(path))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+        if (gamePaths.Length == 0)
+            return false;
+
+        var changed = false;
+        var (resolvedPaths, _) = await _ipcManager.Penumbra.ResolvePathsAsync(gamePaths, []).ConfigureAwait(false);
+        token.ThrowIfCancellationRequested();
+
+        for (var i = 0; i < gamePaths.Length && i < resolvedPaths.Length; i++)
+        {
+            var gamePath = NormalizePath(gamePaths[i]);
+            var resolvedPath = NormalizeResolvedFilePath(resolvedPaths[i]);
+            if (string.IsNullOrWhiteSpace(gamePath)
+                || string.IsNullOrWhiteSpace(resolvedPath)
+                || resolvedPath.StartsWith("fileswap|", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(resolvedPath, gamePath, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            manifestIndex.SelectedGamePaths.Add(gamePath);
+            manifestIndex.SelectedResolvedFilePaths.Add(resolvedPath);
+
+            if (!selectedDeltaEntries.Any(entry => string.Equals(entry.GamePath, gamePath, StringComparison.OrdinalIgnoreCase)
+                    && string.Equals(entry.ResolvedFilePath, resolvedPath, StringComparison.OrdinalIgnoreCase)))
+            {
+                selectedDeltaEntries.Add(new ManifestTransientImportEntry(gamePath, resolvedPath, resolvedPath, int.MaxValue, []));
+            }
+
+            changed |= RegisterKnownTransientFilePath(gamePath, resolvedPath);
+            var playerConfig = PlayerConfig;
+            lock (playerConfig)
+            {
+                changed |= playerConfig.RegisterPersistentResolvedFilePath(gamePath, resolvedPath);
+            }
+        }
+
+        if (changed)
+            Logger.LogDebug("Updated live transient winner map for {count} targeted Penumbra manifest path(s)", gamePaths.Length);
+
+        return changed;
+    }
+
+    private async Task<bool> TryPublishLocalPlayerTransientManifestDeltaAsync(IReadOnlyCollection<ManifestTransientImportEntry> selectedEntries, StartupManifestPrimeSelectionIndex manifestIndex, string reason, CancellationToken token)
+    {
+        var touchedGamePaths = new HashSet<string>(manifestIndex.ManifestGamePaths, StringComparer.OrdinalIgnoreCase);
+        foreach (var selectedPath in manifestIndex.SelectedGamePaths)
+            touchedGamePaths.Add(selectedPath);
+
+        if (touchedGamePaths.Count == 0 && (selectedEntries == null || selectedEntries.Count == 0))
+            return false;
+
+        var addOrUpdateByKind = await BuildTransientManifestDeltaReplacementsAsync(touchedGamePaths, selectedEntries ?? Array.Empty<ManifestTransientImportEntry>(), token).ConfigureAwait(false);
+        Mediator.Publish(new TransientManifestDeltaPublishMessage(addOrUpdateByKind, touchedGamePaths, reason));
+        return true;
+    }
+
+    private async Task<Dictionary<ObjectKind, IReadOnlyCollection<FileReplacement>>> BuildTransientManifestDeltaReplacementsAsync(HashSet<string> touchedGamePaths, IReadOnlyCollection<ManifestTransientImportEntry> selectedEntries, CancellationToken token)
+    {
+        var replacementsByKind = new Dictionary<ObjectKind, List<FileReplacement>>();
+        var gamePathsByKindAndResolvedPath = new Dictionary<ObjectKind, Dictionary<string, HashSet<string>>>();
+        var liveResolvedGamePaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var forwardPaths = touchedGamePaths
+            .Select(NormalizePath)
+            .Where(path => !string.IsNullOrWhiteSpace(path))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+        if (forwardPaths.Length > 0 && _ipcManager.Penumbra.APIAvailable)
+        {
+            var (resolvedPaths, _) = await _ipcManager.Penumbra.ResolvePathsAsync(forwardPaths, []).ConfigureAwait(false);
+            token.ThrowIfCancellationRequested();
+
+            for (var i = 0; i < forwardPaths.Length && i < resolvedPaths.Length; i++)
+            {
+                var gamePath = NormalizePath(forwardPaths[i]);
+                var resolvedPath = NormalizeResolvedFilePath(resolvedPaths[i]);
+                if (!IsUsableTransientManifestDeltaResolvedPath(gamePath, resolvedPath))
+                    continue;
+
+                var objectKind = InferDeltaObjectKindForGamePath(gamePath, selectedEntries);
+                AddTransientManifestDeltaResolvedPath(gamePathsByKindAndResolvedPath, objectKind, resolvedPath, gamePath);
+                liveResolvedGamePaths.Add(gamePath);
+            }
+        }
+
+        var effectiveSelectedEntries = selectedEntries.Count == 0
+            ? new List<ManifestTransientImportEntry>()
+            : BuildEffectivePriorityManifestEntries(selectedEntries, new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase));
+        var manifestFallbackGamePaths = 0;
+        foreach (var entryGroup in effectiveSelectedEntries.GroupBy(entry => NormalizePath(entry.GamePath), StringComparer.OrdinalIgnoreCase))
+        {
+            var gamePath = NormalizePath(entryGroup.Key);
+            if (string.IsNullOrWhiteSpace(gamePath) || liveResolvedGamePaths.Contains(gamePath))
+                continue;
+
+            var usableEntries = entryGroup
+                .Where(entry =>
+                {
+                    var resolvedPath = NormalizeResolvedFilePath(entry.ResolvedFilePath);
+                    return IsUsableTransientManifestDeltaResolvedPath(gamePath, resolvedPath) && File.Exists(resolvedPath);
+                })
+                .ToList();
+
+            if (usableEntries.Count == 0)
+                continue;
+
+            var distinctResolvedPathCount = usableEntries
+                .Select(entry => NormalizeResolvedFilePath(entry.ResolvedFilePath))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .Count();
+            if (distinctResolvedPathCount > 1)
+            {
+                // Penumbra can have multiple selected groups writing the same game path.
+                // Live resolution would only ever give us the effective winner, so when
+                // live resolution is unavailable use the latest selected manifest entry
+                // as the closest match instead of emitting competing replacements for
+                // the same path. This matters for packs such as Kamehameha where the
+                // voice option overrides the base SCD path.
+                usableEntries = new List<ManifestTransientImportEntry> { usableEntries[usableEntries.Count - 1] };
+            }
+
+            var objectKind = InferManifestEntryPersistentObjectKind(usableEntries);
+            foreach (var entry in usableEntries)
+            {
+                var resolvedPath = NormalizeResolvedFilePath(entry.ResolvedFilePath);
+                AddTransientManifestDeltaResolvedPath(gamePathsByKindAndResolvedPath, objectKind, resolvedPath, gamePath);
+            }
+
+            manifestFallbackGamePaths++;
+        }
+
+        if (manifestFallbackGamePaths > 0)
+            Logger.LogDebug("Added {count} manifest-resolved transient delta path(s) without waiting for Penumbra live resolution", manifestFallbackGamePaths);
+
+        var pathsToHash = gamePathsByKindAndResolvedPath.Values
+            .SelectMany(map => map.Keys)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+        var hashesByPath = pathsToHash.Length == 0
+            ? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            : _fileCacheManager.GetFileHashesByPaths(pathsToHash);
+
+        foreach (var kindEntry in gamePathsByKindAndResolvedPath)
+        {
+            foreach (var pathEntry in kindEntry.Value)
+            {
+                if (!hashesByPath.TryGetValue(pathEntry.Key, out var hash) || string.IsNullOrWhiteSpace(hash))
+                    continue;
+
+                var replacement = new FileReplacement(pathEntry.Value.ToArray(), pathEntry.Key) { Hash = hash };
+                if (!replacement.HasFileReplacement)
+                    continue;
+
+                if (!replacementsByKind.TryGetValue(kindEntry.Key, out var replacements))
+                {
+                    replacements = [];
+                    replacementsByKind[kindEntry.Key] = replacements;
+                }
+
+                replacements.Add(replacement);
+            }
+        }
+
+        return replacementsByKind.ToDictionary(kvp => kvp.Key, kvp => (IReadOnlyCollection<FileReplacement>)kvp.Value);
+    }
+
+    private static bool IsUsableTransientManifestDeltaResolvedPath(string gamePath, string resolvedPath)
+    {
+        return !string.IsNullOrWhiteSpace(gamePath)
+            && !string.IsNullOrWhiteSpace(resolvedPath)
+            && !resolvedPath.StartsWith("fileswap|", StringComparison.OrdinalIgnoreCase)
+            && !string.Equals(resolvedPath, gamePath, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static void AddTransientManifestDeltaResolvedPath(Dictionary<ObjectKind, Dictionary<string, HashSet<string>>> gamePathsByKindAndResolvedPath, ObjectKind objectKind, string resolvedPath, string gamePath)
+    {
+        if (!gamePathsByKindAndResolvedPath.TryGetValue(objectKind, out var byResolvedPath))
+        {
+            byResolvedPath = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
+            gamePathsByKindAndResolvedPath[objectKind] = byResolvedPath;
+        }
+
+        if (!byResolvedPath.TryGetValue(resolvedPath, out var gamePaths))
+        {
+            gamePaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            byResolvedPath[resolvedPath] = gamePaths;
+        }
+
+        gamePaths.Add(gamePath);
+    }
+
+    private ObjectKind InferDeltaObjectKindForGamePath(string gamePath, IReadOnlyCollection<ManifestTransientImportEntry> selectedEntries)
+    {
+        var matchingEntries = selectedEntries
+            .Where(entry => string.Equals(entry.GamePath, gamePath, StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+
+        if (matchingEntries.Length > 0)
+            return InferManifestEntryPersistentObjectKind(matchingEntries);
+
+        if (TryInferLuminaPersistentObjectKind(gamePath, out var luminaObjectKind))
+            return luminaObjectKind;
+
+        if (IsLikelyMinionOrMountPersistentPath(gamePath))
+            return ObjectKind.MinionOrMount;
+
+        if (IsLikelyCompanionPersistentPath(gamePath))
+            return ObjectKind.Companion;
+
+        return ObjectKind.Player;
+    }
+
+    private bool ShouldReprimeStartupManifestForActiveCollectionChange(Guid effectiveCollectionId, IReadOnlyCollection<PenumbraModSettingChangedMessage> requests)
+    {
+        if (effectiveCollectionId == Guid.Empty)
+            return false;
+
+        var lastCollectionId = _lastStartupManifestPrimeCollectionId;
+        return lastCollectionId != Guid.Empty
+            && lastCollectionId != effectiveCollectionId
+            && requests.Any(IsLikelyActiveCollectionTransientRefreshSignal);
     }
 
     private static bool IsPenumbraModSettingRequestRelevantToLocalCollection(
@@ -881,9 +1372,21 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
         Dictionary<string, IpcCallerPenumbra.PenumbraModSettingState> localEffectiveMods,
         Guid localEffectiveCollectionId)
     {
-        if (request.CollectionId == Guid.Empty || request.CollectionId == localEffectiveCollectionId || request.Inherited)
+        // Only the effective local-player collection, or a mod that exists in that effective
+        // collection, may refresh outbound transient manifests. Penumbra can broadcast
+        // inherited/global-looking setting changes for other collections; treating those as
+        // local made inactive collection priorities and animation/VFX manifests bleed into
+        // what we send to other users.
+        if (localEffectiveCollectionId != Guid.Empty && request.CollectionId == localEffectiveCollectionId)
             return true;
-        return TryResolveCollectionModForTargetedManifestRefresh(localEffectiveMods, request.ModName, out _, out _);
+
+        if (TryResolveCollectionModForTargetedManifestRefresh(localEffectiveMods, request.ModName, out _, out _))
+            return true;
+
+        // Some Penumbra notifications do not identify a collection or mod. Keep those as a
+        // conservative refresh, but never use Inherited alone as proof that another
+        // collection should affect the current character.
+        return request.CollectionId == Guid.Empty && string.IsNullOrWhiteSpace(request.ModName);
     }
 
     private static bool IsLikelyWholeModStateRefreshRequest(PenumbraModSettingChangedMessage request)
@@ -908,18 +1411,8 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
 
     private static List<TargetedManifestRefreshMod> BuildTargetedManifestRefreshModList(
         Dictionary<string, IpcCallerPenumbra.PenumbraModSettingState> localEffectiveMods,
-        IReadOnlyCollection<PenumbraModSettingChangedMessage> requests,
-        bool fullEffectiveCollectionRefresh)
+        IReadOnlyCollection<PenumbraModSettingChangedMessage> requests)
     {
-        if (fullEffectiveCollectionRefresh)
-        {
-            return localEffectiveMods
-                .OrderByDescending(mod => mod.Value.Priority)
-                .ThenBy(mod => NormalizePath(mod.Key), StringComparer.OrdinalIgnoreCase)
-                .Select(mod => new TargetedManifestRefreshMod(mod.Key, mod.Value))
-                .ToList();
-        }
-
         var output = new List<TargetedManifestRefreshMod>();
         var visitedMods = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
@@ -975,6 +1468,14 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
         return false;
     }
 
+    private void MarkTransientManifestDirtyForNextBuild(string reason)
+    {
+        Interlocked.Exchange(ref _transientManifestDirtyForNextBuild, 1);
+        Volatile.Write(ref _startupTransientPrimeCompleted, 0);
+        ClearStartupManifestPrimeFingerprint();
+        Logger.LogDebug("Marked transient manifest state dirty for next local player build, reason={reason}", reason);
+    }
+
     private void ClearStartupManifestPrimeFingerprint()
     {
         var playerConfig = PlayerConfig;
@@ -1023,7 +1524,7 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
         }
     }
 
-    private async Task<bool> TryPrimeStartupTransientManifestAsync(string reason, CancellationToken token)
+    private async Task<bool> TryPrimeStartupTransientManifestAsync(string reason, CancellationToken token, bool publishRefresh = true, bool requestRedraw = true)
     {
         if (!_ipcManager.Penumbra.APIAvailable)
             return false;
@@ -1054,13 +1555,20 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
         if (collectionState == null)
             return false;
 
+        var activeCollectionMods = collectionState.Mods
+            .Where(mod => mod.Value.Enabled && !mod.Value.Temporary)
+            .OrderByDescending(mod => mod.Value.Priority)
+            .ToList();
+
         var knownGamePaths = BuildStartupPrimeKnownGamePathsSnapshot();
-        var startupPrimeFingerprint = BuildStartupManifestPrimeFingerprint(collectionState.Mods);
-        var totalMods = collectionState.Mods.Count;
+        var startupPrimeFingerprint = BuildStartupManifestPrimeFingerprint(collectionState.CollectionId, collectionState.Mods);
+        var totalMods = activeCollectionMods.Count;
         if (knownGamePaths.Count > 0 && IsStartupManifestPrimeCurrent(startupPrimeFingerprint))
         {
+            _lastStartupManifestPrimeCollectionId = collectionState.CollectionId;
             FinishManifestPrimeProgress(targeted: false, "Already up to date", string.Empty, totalMods, totalMods);
-            await RequestLocalPlayerRedrawAfterTransientManifestPrimeAsync(reason, token).ConfigureAwait(false);
+            if (requestRedraw)
+                await RequestLocalPlayerRedrawAfterTransientManifestPrimeAsync(reason, token).ConfigureAwait(false);
             Logger.LogTrace("Startup transient manifest prime skipped for {reason}; enabled collection state is already seeded", reason);
             return true;
         }
@@ -1073,27 +1581,23 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
         var scannedMods = 0;
         var scannedEnabledMods = 0;
         var importedAny = false;
-        foreach (var mod in collectionState.Mods
-            .OrderByDescending(m => m.Value.Enabled && !m.Value.Temporary)
-            .ThenByDescending(m => m.Value.Priority))
+        foreach (var mod in activeCollectionMods)
         {
             token.ThrowIfCancellationRequested();
-            UpdateManifestPrimeProgress(targeted: false, "Scanning Penumbra manifests", mod.Key, scannedMods, totalMods);
+            UpdateManifestPrimeProgress(targeted: false, "Scanning active Penumbra manifests", mod.Key, scannedMods, totalMods);
 
             var modPath = ResolveModDirectory(modDirectory, mod.Key);
             if (!Directory.Exists(modPath))
             {
                 scannedMods++;
-                UpdateManifestPrimeProgress(targeted: false, "Skipping missing mod directory", mod.Key, scannedMods, totalMods);
+                UpdateManifestPrimeProgress(targeted: false, "Skipping missing active mod directory", mod.Key, scannedMods, totalMods);
                 continue;
             }
 
-            var importSelectedEntries = mod.Value.Enabled && !mod.Value.Temporary;
-            await ImportManifestEntriesAsync(modPath, mod.Value.Settings, mod.Value.Priority, importSelectedEntries, importBatch, knownGamePaths, manifestIndex, token).ConfigureAwait(false);
+            await ImportManifestEntriesAsync(modPath, mod.Value.Settings, mod.Value.Priority, true, importBatch, knownGamePaths, manifestIndex, token).ConfigureAwait(false);
             scannedMods++;
-            if (importSelectedEntries)
-                scannedEnabledMods++;
-            UpdateManifestPrimeProgress(targeted: false, "Scanning Penumbra manifests", mod.Key, scannedMods, totalMods);
+            scannedEnabledMods++;
+            UpdateManifestPrimeProgress(targeted: false, "Scanning active Penumbra manifests", mod.Key, scannedMods, totalMods);
 
             if (importBatch.Count >= StartupPrimeApplyBatchSize)
             {
@@ -1123,20 +1627,25 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
             if (fingerprintChangedWithoutImports || prunedExistingManifestEntries)
                 SaveTransientConfigNow(nameof(TryPrimeStartupTransientManifestAsync));
 
-            if (prunedExistingManifestEntries)
+            if (publishRefresh && prunedExistingManifestEntries)
                 PublishLocalPlayerTransientManifestRefresh("StartupTransientManifestPrime:TransientManifest");
 
+            _lastStartupManifestPrimeCollectionId = collectionState.CollectionId;
             FinishManifestPrimeProgress(targeted: false, prunedExistingManifestEntries ? "Pruned stale transient entries" : "Already up to date", string.Empty, scannedMods, totalMods);
-            await RequestLocalPlayerRedrawAfterTransientManifestPrimeAsync(reason, token).ConfigureAwait(false);
+            if (requestRedraw)
+                await RequestLocalPlayerRedrawAfterTransientManifestPrimeAsync(reason, token).ConfigureAwait(false);
             Logger.LogTrace("Startup transient manifest prime found no new active manifest entries for {reason}", reason);
             return true;
         }
 
         var fingerprintChanged = SetStartupManifestPrimeFingerprint(startupPrimeFingerprint);
+        _lastStartupManifestPrimeCollectionId = collectionState.CollectionId;
         SaveTransientConfigNow(nameof(TryPrimeStartupTransientManifestAsync));
-        PublishLocalPlayerTransientManifestRefresh("StartupTransientManifestPrime:TransientManifest");
+        if (publishRefresh)
+            PublishLocalPlayerTransientManifestRefresh("StartupTransientManifestPrime:TransientManifest");
         FinishManifestPrimeProgress(targeted: false, "Completed", string.Empty, scannedMods, totalMods);
-        await RequestLocalPlayerRedrawAfterTransientManifestPrimeAsync(reason, token).ConfigureAwait(false);
+        if (requestRedraw)
+            await RequestLocalPlayerRedrawAfterTransientManifestPrimeAsync(reason, token).ConfigureAwait(false);
 
         Logger.LogDebug("Startup transient manifest prime completed for {reason}; scanned {mods} collection mods ({enabledMods} active), fingerprint changed={fingerprintChanged}", reason, scannedMods, scannedEnabledMods, fingerprintChanged);
         return true;
@@ -1149,24 +1658,24 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
 
         lock (playerConfig)
         {
-            removed += PruneInvalidStartupManifestGamePathsFromList(playerConfig.GlobalPersistentCache, manifestIndex);
+            removed += PruneInvalidStartupManifestGamePathsFromList(playerConfig.GlobalPersistentCache, manifestIndex, ObjectKind.Player);
 
             foreach (var kvp in playerConfig.JobSpecificCache.ToList())
             {
-                removed += PruneInvalidStartupManifestGamePathsFromList(kvp.Value, manifestIndex);
+                removed += PruneInvalidStartupManifestGamePathsFromList(kvp.Value, manifestIndex, ObjectKind.Player);
                 if (kvp.Value == null || kvp.Value.Count == 0)
                     playerConfig.JobSpecificCache.Remove(kvp.Key);
             }
 
             foreach (var kvp in playerConfig.JobSpecificPetCache.ToList())
             {
-                removed += PruneInvalidStartupManifestGamePathsFromList(kvp.Value, manifestIndex);
+                removed += PruneInvalidStartupManifestGamePathsFromList(kvp.Value, manifestIndex, ObjectKind.Pet);
                 if (kvp.Value == null || kvp.Value.Count == 0)
                     playerConfig.JobSpecificPetCache.Remove(kvp.Key);
             }
 
-            removed += PruneInvalidStartupManifestGamePathsFromList(playerConfig.MinionOrMountPersistentCache, manifestIndex);
-            removed += PruneInvalidStartupManifestGamePathsFromList(playerConfig.CompanionPersistentCache, manifestIndex);
+            removed += PruneInvalidStartupManifestGamePathsFromList(playerConfig.MinionOrMountPersistentCache, manifestIndex, ObjectKind.MinionOrMount);
+            removed += PruneInvalidStartupManifestGamePathsFromList(playerConfig.CompanionPersistentCache, manifestIndex, ObjectKind.Companion);
 
             removed += PruneInvalidStartupManifestResolvedPaths(playerConfig.PersistentResolvedFilePaths, manifestIndex);
 
@@ -1182,12 +1691,20 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
         return true;
     }
 
-    private int PruneInvalidStartupManifestGamePathsFromList(List<string>? paths, StartupManifestPrimeSelectionIndex manifestIndex)
+    private int PruneInvalidStartupManifestGamePathsFromList(List<string>? paths, StartupManifestPrimeSelectionIndex manifestIndex, ObjectKind objectKind)
     {
         if (paths == null || paths.Count == 0)
             return 0;
 
-        return paths.RemoveAll(path => ShouldPruneStartupManifestGamePath(path, manifestIndex));
+        return paths.RemoveAll(path =>
+        {
+            if (!ShouldPruneStartupManifestGamePath(path, manifestIndex))
+                return false;
+
+            RemoveRuntimeTransientPath(objectKind, path);
+            RemoveKnownResolvedFilePathForGamePath(path);
+            return true;
+        });
     }
 
     private int PruneInvalidStartupManifestResolvedPaths(List<string>? paths, StartupManifestPrimeSelectionIndex manifestIndex)
@@ -1195,7 +1712,14 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
         if (paths == null || paths.Count == 0)
             return 0;
 
-        return paths.RemoveAll(path => ShouldPruneStartupManifestResolvedPath(path, manifestIndex));
+        return paths.RemoveAll(path =>
+        {
+            if (!ShouldPruneStartupManifestResolvedPath(path, manifestIndex))
+                return false;
+
+            RemoveKnownResolvedFilePathForResolvedPath(path);
+            return true;
+        });
     }
 
     private bool ShouldPruneStartupManifestGamePath(string path, StartupManifestPrimeSelectionIndex manifestIndex)
@@ -1240,10 +1764,12 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
                 return luminaObjectKind;
         }
 
-        // Human animation/resource paths are always loaded by the player actor, even when the modpack
-        // itself is a mount/minion pack. Mount rider/sitting animations therefore belong in the player
-        // semi-transient state; putting them into MinionOrMount scope means the receiver applies them to
-        // the vehicle actor instead of the rider and the custom seated pose never appears.
+        foreach (var entry in entries)
+        {
+            if (TryInferManifestEntryObjectKindFromScope(entry, out var scopedObjectKind) && scopedObjectKind != ObjectKind.Player)
+                return scopedObjectKind;
+        }
+
         foreach (var entry in entries)
         {
             if (IsPlayerActorManifestPath(entry.GamePath))
@@ -1275,6 +1801,102 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
         }
 
         return ObjectKind.Player;
+    }
+
+    private bool TryInferManifestEntryObjectKindFromScope(ManifestTransientImportEntry entry, out ObjectKind objectKind)
+    {
+        objectKind = ObjectKind.Player;
+
+        foreach (var scopeText in EnumerateManifestEntryScopeObjectHints(entry))
+        {
+            if (TryInferLuminaPersistentObjectKindFromEmbeddedPath(scopeText, out objectKind) && objectKind != ObjectKind.Player)
+                return true;
+        }
+
+        if (IsMountMusicManifestGamePath(entry.GamePath))
+        {
+            foreach (var scopeText in EnumerateManifestEntryScopeObjectHints(entry))
+            {
+                if (TryExtractEmbeddedSummonedObjectActorPath(scopeText, out _))
+                {
+                    objectKind = ObjectKind.MinionOrMount;
+                    return true;
+                }
+            }
+        }
+
+        objectKind = ObjectKind.Player;
+        return false;
+    }
+
+    private static IEnumerable<string> EnumerateManifestEntryScopeObjectHints(ManifestTransientImportEntry entry)
+    {
+        if (!string.IsNullOrWhiteSpace(entry.GamePath))
+            yield return entry.GamePath;
+
+        if (!string.IsNullOrWhiteSpace(entry.ResolvedFilePath))
+            yield return entry.ResolvedFilePath;
+
+        if (!string.IsNullOrWhiteSpace(entry.ManifestValue))
+            yield return entry.ManifestValue;
+
+        foreach (var scopeText in entry.ScopeTexts)
+        {
+            if (!string.IsNullOrWhiteSpace(scopeText))
+                yield return scopeText;
+        }
+    }
+
+    private bool TryInferLuminaPersistentObjectKindFromEmbeddedPath(string? path, out ObjectKind objectKind)
+    {
+        objectKind = ObjectKind.Player;
+        var normalized = NormalizePath(path ?? string.Empty);
+        if (string.IsNullOrWhiteSpace(normalized))
+            return false;
+
+        if (TryInferLuminaPersistentObjectKind(normalized, out objectKind) && objectKind != ObjectKind.Player)
+            return true;
+
+        if (!TryExtractEmbeddedSummonedObjectActorPath(normalized, out var embeddedGamePath))
+        {
+            objectKind = ObjectKind.Player;
+            return false;
+        }
+
+        if (TryInferLuminaPersistentObjectKind(embeddedGamePath, out objectKind) && objectKind != ObjectKind.Player)
+            return true;
+
+        objectKind = ObjectKind.Player;
+        return false;
+    }
+
+    private static bool IsMountMusicManifestGamePath(string? gamePath)
+    {
+        var normalized = NormalizePath(gamePath ?? string.Empty);
+        if (string.IsNullOrWhiteSpace(normalized) || !normalized.EndsWith(".scd", StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        return normalized.StartsWith("music/", StringComparison.OrdinalIgnoreCase)
+            || normalized.StartsWith("bgm/", StringComparison.OrdinalIgnoreCase)
+            || normalized.Contains("/bgm_ride", StringComparison.OrdinalIgnoreCase)
+            || normalized.Contains("bgm_ride", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool TryExtractEmbeddedSummonedObjectActorPath(string? path, out string embeddedGamePath)
+    {
+        embeddedGamePath = string.Empty;
+        var normalized = NormalizePath(path ?? string.Empty);
+        if (string.IsNullOrWhiteSpace(normalized))
+            return false;
+
+        var charaIndex = normalized.IndexOf("chara/", StringComparison.OrdinalIgnoreCase);
+        if (charaIndex < 0)
+            return false;
+
+        embeddedGamePath = normalized[charaIndex..];
+        return embeddedGamePath.StartsWith("chara/monster/", StringComparison.OrdinalIgnoreCase)
+            || embeddedGamePath.StartsWith("chara/demihuman/", StringComparison.OrdinalIgnoreCase)
+            || embeddedGamePath.StartsWith("chara/minion/", StringComparison.OrdinalIgnoreCase);
     }
 
     private sealed class ModelCharaObjectKindIndex
@@ -1323,7 +1945,6 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
                         AddModelCharaObjectKind(index, mount.ModelChara.Value, ObjectKind.MinionOrMount);
                 }
 
-                // XIV's Companion sheet is the minion sheet, not RavaSync's battle-chocobo Companion object kind.
                 var minionSheet = _gameData.GetExcelSheet<Companion>();
                 if (minionSheet != null)
                 {
@@ -1377,9 +1998,6 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
             yield break;
         }
 
-        // On some generated Lumina versions this is a numeric field rather than a friendly enum.
-        // Mounts and minions overwhelmingly resolve through monster/demihuman paths; avoid human paths
-        // because those are too easy to confuse with player body/gear paths.
         yield return "monster";
         yield return "demihuman";
     }
@@ -1484,20 +2102,12 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
         return effectiveEntries;
     }
 
-    private static string FindManifestEntryGamePathForResolvedFilePath(IReadOnlyCollection<ManifestTransientImportEntry> entries, string resolvedFilePath)
-    {
-        if (string.IsNullOrWhiteSpace(resolvedFilePath))
-            return string.Empty;
-
-        var normalizedResolvedFilePath = NormalizeResolvedFilePath(resolvedFilePath);
-        return entries.FirstOrDefault(entry => string.Equals(NormalizeResolvedFilePath(entry.ResolvedFilePath), normalizedResolvedFilePath, StringComparison.OrdinalIgnoreCase))?.GamePath ?? string.Empty;
-    }
-
     private bool ApplyStartupManifestEntriesToTransientConfig(IReadOnlyCollection<ManifestTransientImportEntry> manifestEntries, string reason, HashSet<string> knownGamePaths, Dictionary<string, int> appliedManifestPriorityByGamePath)
     {
         var effectiveEntries = BuildEffectivePriorityManifestEntries(manifestEntries, appliedManifestPriorityByGamePath);
         var targetGlobalGamePaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var targetJobGamePaths = new Dictionary<uint, HashSet<string>>();
+        var targetPetJobGamePaths = new Dictionary<uint, HashSet<string>>();
         var targetJobsByGamePath = new Dictionary<string, HashSet<uint>>(StringComparer.OrdinalIgnoreCase);
         var targetObjectGamePaths = new Dictionary<ObjectKind, HashSet<string>>();
         var resolvedFilePaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -1543,6 +2153,7 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
             if (jobsForPath.Count > 0)
             {
                 targetJobsByGamePath[gamePath] = jobsForPath;
+                var mirrorHumanActorRigToPetScope = IsDeclaredHumanActorRigManifestPath(gamePath);
                 foreach (var jobId in jobsForPath)
                 {
                     if (!targetJobGamePaths.TryGetValue(jobId, out var jobPaths))
@@ -1552,6 +2163,17 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
                     }
 
                     jobPaths.Add(gamePath);
+
+                    if (mirrorHumanActorRigToPetScope)
+                    {
+                        if (!targetPetJobGamePaths.TryGetValue(jobId, out var petJobPaths))
+                        {
+                            petJobPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                            targetPetJobGamePaths[jobId] = petJobPaths;
+                        }
+
+                        petJobPaths.Add(gamePath);
+                    }
                 }
 
                 continue;
@@ -1563,6 +2185,7 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
         var playerConfig = PlayerConfig;
         var addedGlobal = 0;
         var addedJob = 0;
+        var addedPetJob = 0;
         var addedObject = 0;
         var registeredResolved = 0;
         var movedScope = 0;
@@ -1655,6 +2278,40 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
                 }
             }
 
+            foreach (var kvp in targetPetJobGamePaths.OrderBy(k => k.Key))
+            {
+                foreach (var gamePath in kvp.Value.OrderBy(p => p, StringComparer.OrdinalIgnoreCase))
+                {
+                    if (!playerConfig.JobSpecificPetCache.TryGetValue(kvp.Key, out var existingPetJobList) || existingPetJobList == null)
+                    {
+                        playerConfig.JobSpecificPetCache[kvp.Key] = existingPetJobList = [];
+                    }
+
+                    var changedThisPath = false;
+                    foreach (var otherPetJobCache in playerConfig.JobSpecificPetCache.Where(cache => cache.Key != kvp.Key).Select(cache => cache.Value))
+                    {
+                        if (otherPetJobCache == null)
+                            continue;
+
+                        if (otherPetJobCache.RemoveAll(path => string.Equals(path, gamePath, StringComparison.OrdinalIgnoreCase)) > 0)
+                        {
+                            movedScope++;
+                            changedThisPath = true;
+                        }
+                    }
+
+                    if (!existingPetJobList.Contains(gamePath, StringComparer.OrdinalIgnoreCase))
+                    {
+                        existingPetJobList.Add(gamePath);
+                        addedPetJob++;
+                        changedThisPath = true;
+                    }
+
+                    if (changedThisPath)
+                        knownGamePaths.Add(gamePath);
+                }
+            }
+
             foreach (var kvp in targetObjectGamePaths.OrderBy(k => k.Key))
             {
                 foreach (var gamePath in kvp.Value.OrderBy(p => p, StringComparer.OrdinalIgnoreCase))
@@ -1688,19 +2345,19 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
                     registeredResolved++;
             }
 
-            if (addedGlobal > 0 || addedJob > 0 || addedObject > 0 || registeredResolved > 0 || movedScope > 0)
+            if (addedGlobal > 0 || addedJob > 0 || addedPetJob > 0 || addedObject > 0 || registeredResolved > 0 || movedScope > 0)
                 playerConfig.Canonicalize();
         }
 
-        if (addedGlobal == 0 && addedJob == 0 && addedObject == 0 && registeredResolved == 0 && movedScope == 0 && resolvedFilePathMapUpdates == 0)
+        if (addedGlobal == 0 && addedJob == 0 && addedPetJob == 0 && addedObject == 0 && registeredResolved == 0 && movedScope == 0 && resolvedFilePathMapUpdates == 0)
         {
             Logger.LogTrace("Startup transient manifest prime found no new transient config paths for {reason}", reason);
             return false;
         }
 
-        Interlocked.Add(ref _manifestPrimeImportedPathCount, addedGlobal + addedJob + addedObject);
-        Logger.LogDebug("Startup transient manifest prime imported {count} paths for {reason} ({global} global, {job} job-specific, {objectScoped} object-scoped, {resolved} resolved file paths, {mapUpdates} resolved map updates, {moved} moved between scopes)",
-            addedGlobal + addedJob + addedObject, reason, addedGlobal, addedJob, addedObject, registeredResolved, resolvedFilePathMapUpdates, movedScope);
+        Interlocked.Add(ref _manifestPrimeImportedPathCount, addedGlobal + addedJob + addedPetJob + addedObject);
+        Logger.LogDebug("Startup transient manifest prime imported {count} paths for {reason} ({global} global, {job} job-specific, {petJob} pet job-specific, {objectScoped} object-scoped, {resolved} resolved file paths, {mapUpdates} resolved map updates, {moved} moved between scopes)",
+            addedGlobal + addedJob + addedPetJob + addedObject, reason, addedGlobal, addedJob, addedPetJob, addedObject, registeredResolved, resolvedFilePathMapUpdates, movedScope);
 
         return true;
     }
@@ -1733,7 +2390,7 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
         }
     }
 
-    private static string BuildStartupManifestPrimeFingerprint(Dictionary<string, IpcCallerPenumbra.PenumbraModSettingState> mods)
+    private static string BuildStartupManifestPrimeFingerprint(Guid collectionId, Dictionary<string, IpcCallerPenumbra.PenumbraModSettingState> mods)
     {
         if (mods == null || mods.Count == 0)
             return string.Empty;
@@ -1747,7 +2404,7 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
         if (rows.Count == 0)
             return string.Empty;
 
-        var source = StartupPrimeManifestRuleVersion + "\n" + string.Join('\n', rows);
+        var source = StartupPrimeManifestRuleVersion + "\ncollection:" + collectionId.ToString("N") + "\n" + string.Join('\n', rows);
         return Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(Encoding.UTF8.GetBytes(source)));
     }
 
@@ -1796,11 +2453,13 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
 
         lock (_semiTransientResourcesLock)
         {
-            var semiTransientResources = EnsureSemiTransientResourcesUnsafe();
-            foreach (var values in semiTransientResources.Values)
+            if (_semiTransientResources != null)
             {
-                foreach (var path in values)
-                    AddKnownStartupPrimePath(known, path);
+                foreach (var values in _semiTransientResources.Values)
+                {
+                    foreach (var path in values)
+                        AddKnownStartupPrimePath(known, path);
+                }
             }
         }
 
@@ -1838,7 +2497,7 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
             addedAny |= AddTransientResource(kind, normalizedPath);
         }
 
-        if (addedAny)
+        if (addedAny && kind != ObjectKind.Player)
             SendTransients(actorAddress, kind);
     }
 
@@ -1902,27 +2561,34 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
         if (_lastClassJobId != _dalamudUtil.ClassJobId)
             UpdateClassJobCache();
 
-        Dictionary<nint, ObjectKind> addresses = [];
-        Dictionary<nint, GameObjectHandler> owners = [];
-        GameObjectHandler[] pointerSnapshot;
+        Dictionary<nint, ObjectKind> addresses;
+        Dictionary<nint, GameObjectHandler> owners;
         lock (_playerRelatedPointersLock)
         {
-            pointerSnapshot = _playerRelatedPointers.ToArray();
-        }
+            if (_playerRelatedPointers.Count == 0)
+            {
+                addresses = [];
+                owners = [];
+            }
+            else
+            {
+                addresses = new Dictionary<nint, ObjectKind>(_playerRelatedPointers.Count);
+                owners = new Dictionary<nint, GameObjectHandler>(_playerRelatedPointers.Count);
 
-        foreach (var ptr in pointerSnapshot)
-        {
-            if (ptr.Address == IntPtr.Zero)
-                continue;
+                foreach (var ptr in _playerRelatedPointers)
+                {
+                    if (ptr.Address == IntPtr.Zero)
+                        continue;
 
-            addresses[ptr.Address] = ptr.ObjectKind;
-            owners[ptr.Address] = ptr;
+                    addresses[ptr.Address] = ptr.ObjectKind;
+                    owners[ptr.Address] = ptr;
+                }
+            }
         }
 
         _cachedFrameAddresses = addresses;
         _cachedFrameOwners = owners;
         CleanupAbsentObjects(addresses);
-        QueuePlayerOwnedResourceBaselineRefresh();
 
         lock (_cacheAdditionLock)
         {
@@ -1938,46 +2604,7 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
         lock (_semiTransientResourcesLock)
         {
             _semiTransientResources = null;
-            EnsureSemiTransientResourcesUnsafe();
         }
-    }
-
-    private void QueuePlayerOwnedResourceBaselineRefresh()
-    {
-        if (!_ipcManager.Penumbra.APIAvailable || Volatile.Read(ref _isAutoRecording) != 0 || IsTransientRecording)
-            return;
-
-        var nowTick = Environment.TickCount64;
-        if (nowTick < Interlocked.Read(ref _nextPlayerOwnedResourceBaselineRefreshTick))
-            return;
-
-        if (Interlocked.CompareExchange(ref _playerOwnedResourceBaselineRefreshRunning, 1, 0) != 0)
-            return;
-
-        Interlocked.Exchange(ref _nextPlayerOwnedResourceBaselineRefreshTick, nowTick + (long)_playerOwnedResourceBaselineRefreshInterval.TotalMilliseconds);
-
-        _ = Task.Run(async () =>
-        {
-            try
-            {
-                var snapshot = await CapturePlayerOwnedResourceSnapshotAsync().ConfigureAwait(false);
-                if (snapshot.Count == 0)
-                    return;
-
-                lock (_playerOwnedResourceBaselineLock)
-                {
-                    _cachedPlayerOwnedResourceFileByGamePath = snapshot;
-                }
-            }
-            catch (Exception ex)
-            {
-                Logger.LogTrace(ex, "Failed to refresh player-owned resource baseline");
-            }
-            finally
-            {
-                Interlocked.Exchange(ref _playerOwnedResourceBaselineRefreshRunning, 0);
-            }
-        });
     }
 
     private Dictionary<string, string> SnapshotCachedPlayerOwnedResourceBaseline()
@@ -2064,12 +2691,14 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
 
     private void CleanupAbsentObjects(IReadOnlyDictionary<nint, ObjectKind> presentAddresses)
     {
-        var presentKinds = presentAddresses.Values.ToHashSet();
         lock (_transientResourcesLock)
         {
+            if (_transientResources.Count == 0)
+                return;
+
             foreach (var kind in Enum.GetValues<ObjectKind>())
             {
-                if (!presentKinds.Contains(kind) && _transientResources.TryRemove(kind, out _))
+                if (!presentAddresses.Values.Contains(kind) && _transientResources.TryRemove(kind, out _))
                     Logger.LogDebug("Object not present anymore: {kind}", kind);
             }
         }
@@ -2105,30 +2734,15 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
         var isManagedTransientType = EndsWithAny(replacedGamePath, _handledFileTypes);
         var isManualRecordingObservedType = IsTransientRecording
             && (isManagedTransientType || EndsWithAny(replacedGamePath, _handledRecordingFileTypes));
-        var isAutoRecordTrigger = !IsTransientRecording && objectKind == ObjectKind.Player && IsAutoRecordTriggerPath(replacedGamePath);
 
-        if (isAutoRecordTrigger)
-            ArmAutoRecording(gameObjectAddress, objectKind, replacedGamePath);
-
-        var isAutoRecordingObservedType = !IsTransientRecording
-            && IsAutoRecordingFor(gameObjectAddress, objectKind)
-            && IsAutoRecordCapturablePath(replacedGamePath)
-            && !IsAutoRecordBaselinePath(replacedGamePath);
-
-        if (!isManualRecordingObservedType && !isAutoRecordingObservedType)
-        {
-            RememberRecentOwnedResourceLoad(gameObjectAddress, replacedGamePath);
+        if (!isManualRecordingObservedType)
             return;
-        }
 
-        var dedupeKey = $"{gameObjectAddress:X}|{replacedGamePath}|{normalizedFilePath}";
+        var dedupeKey = $"manual|{gameObjectAddress:X}|{replacedGamePath}|{normalizedFilePath}";
         lock (_cacheAdditionLock)
         {
-            if (!IsTransientRecording && !_cachedHandledPaths.Add(dedupeKey))
-            {
-                RememberRecentOwnedResourceLoad(gameObjectAddress, replacedGamePath);
+            if (!_cachedHandledPaths.Add(dedupeKey))
                 return;
-            }
         }
 
         RegisterKnownTransientFilePath(replacedGamePath, normalizedFilePath);
@@ -2136,76 +2750,18 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
 
         var semiTransientContains = GetSemiTransientResources(objectKind).Contains(replacedGamePath);
         var transientContains = false;
-        var added = false;
         lock (_transientResourcesLock)
         {
-            if (!_transientResources.TryGetValue(objectKind, out var transientResources))
-                _transientResources[objectKind] = transientResources = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
-            transientContains = transientResources.Contains(replacedGamePath);
-            if (!IsTransientRecording && isManagedTransientType && !isAutoRecordingObservedType && !transientContains && !semiTransientContains)
-                added = transientResources.Add(replacedGamePath);
-        }
-
-        if (added)
-        {
-            Logger.LogDebug("Adding transient {gamePath} for {kind} ({filePath})", replacedGamePath, objectKind, normalizedFilePath);
-            SendTransients(gameObjectAddress, objectKind, TimeSpan.FromMilliseconds(650));
+            if (_transientResources.TryGetValue(objectKind, out var transientResources))
+                transientContains = transientResources.Contains(replacedGamePath);
         }
 
         var alreadyTransient = transientContains || semiTransientContains;
 
-        if (IsTransientRecording)
-        {
-            if (!_cachedFrameOwners.TryGetValue(gameObjectAddress, out var owner))
-                return;
-
-            _recordedTransients.Add(new TransientRecord(owner, replacedGamePath, normalizedFilePath, alreadyTransient) { AddTransient = !alreadyTransient });
-            RememberRecentOwnedResourceLoad(gameObjectAddress, replacedGamePath);
-            return;
-        }
-
-        if (!isAutoRecordingObservedType)
-        {
-            RememberRecentOwnedResourceLoad(gameObjectAddress, replacedGamePath);
-            return;
-        }
-
-        if (!_cachedFrameOwners.TryGetValue(gameObjectAddress, out var autoOwner))
+        if (!_cachedFrameOwners.TryGetValue(gameObjectAddress, out var owner))
             return;
 
-        _autoRecordedTransients.Add(new TransientRecord(autoOwner, replacedGamePath, normalizedFilePath, alreadyTransient) { AddTransient = !alreadyTransient });
-
-        var addedFastPendingSupport = AddPendingAutoRecordedSupportResource(objectKind, replacedGamePath);
-        if (addedFastPendingSupport)
-            Logger.LogTrace("Queued transient support candidate for {kind}: {gamePath}", objectKind, replacedGamePath);
-
-        TouchAutoRecording(gameObjectAddress, objectKind);
-        RememberRecentOwnedResourceLoad(gameObjectAddress, replacedGamePath);
-    }
-
-    private void RememberRecentOwnedResourceLoad(nint gameObjectAddress, string gamePath)
-    {
-        if (gameObjectAddress == nint.Zero)
-            return;
-
-        var normalized = NormalizePath(gamePath);
-        if (string.IsNullOrWhiteSpace(normalized))
-            return;
-
-        var nowTick = Environment.TickCount64;
-        var perActor = _recentOwnedResourceLoadsByAddress.GetOrAdd(gameObjectAddress, _ => new ConcurrentDictionary<string, long>(StringComparer.OrdinalIgnoreCase));
-        perActor[normalized] = nowTick;
-
-        if (perActor.Count > 256)
-        {
-            var cutoff = nowTick - (long)_autoRecordRecentBaselineLifetime.TotalMilliseconds;
-            foreach (var kvp in perActor.ToArray())
-            {
-                if (unchecked(nowTick - kvp.Value) < 0 || kvp.Value < cutoff)
-                    perActor.TryRemove(kvp.Key, out _);
-            }
-        }
+        _recordedTransients.Add(new TransientRecord(owner, replacedGamePath, normalizedFilePath, alreadyTransient) { AddTransient = !alreadyTransient });
     }
 
     private HashSet<string> SnapshotRecentOwnedResourceLoads(nint gameObjectAddress, string? triggerPath)
@@ -2235,309 +2791,6 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
         return output;
     }
 
-    private bool IsAutoRecordBaselinePath(string gamePath)
-    {
-        var normalized = NormalizePath(gamePath);
-        if (string.IsNullOrWhiteSpace(normalized))
-            return true;
-
-        lock (_autoRecordLock)
-        {
-            if (string.Equals(normalized, _autoRecordTriggerPath, StringComparison.OrdinalIgnoreCase))
-                return false;
-
-            return _autoRecordBaselinePaths.Contains(normalized);
-        }
-    }
-
-    private void ArmAutoRecording(nint gameObjectAddress, ObjectKind objectKind, string triggerPath)
-    {
-        if (gameObjectAddress == nint.Zero || objectKind != ObjectKind.Player || IsAutoRecordingSuppressed())
-            return;
-
-        var startedNewWindow = false;
-        var hadPlayerOwnedBaseline = false;
-        lock (_autoRecordLock)
-        {
-            startedNewWindow = Volatile.Read(ref _isAutoRecording) == 0 || _autoRecordAddress != gameObjectAddress || _autoRecordObjectKind != objectKind;
-            if (startedNewWindow)
-            {
-                var playerOwnedBaseline = SnapshotCachedPlayerOwnedResourceBaseline();
-
-                _autoRecordedTransients = new ConcurrentBag<TransientRecord>();
-                _autoRecordStartedAt = DateTimeOffset.UtcNow;
-                _autoRecordBaselinePaths = playerOwnedBaseline.Count > 0
-                    ? playerOwnedBaseline.Keys.ToHashSet(StringComparer.OrdinalIgnoreCase)
-                    : SnapshotRecentOwnedResourceLoads(gameObjectAddress, triggerPath);
-                _autoRecordHasPlayerOwnedBaseline = playerOwnedBaseline.Count > 0;
-                _autoRecordTriggerPath = NormalizePath(triggerPath);
-                hadPlayerOwnedBaseline = _autoRecordHasPlayerOwnedBaseline;
-            }
-            else
-            {
-                hadPlayerOwnedBaseline = _autoRecordHasPlayerOwnedBaseline;
-            }
-
-            _autoRecordAddress = gameObjectAddress;
-            _autoRecordObjectKind = objectKind;
-            Volatile.Write(ref _isAutoRecording, 1);
-        }
-
-        ScheduleAutoRecordingClose(gameObjectAddress, objectKind);
-        Logger.LogTrace("Auto transient recorder {state} by {triggerPath}; quiet={quiet}ms cap={cap}ms source={source}",
-            startedNewWindow ? "armed" : "extended",
-            triggerPath,
-            _autoRecordQuietWindow.TotalMilliseconds,
-            _autoRecordMaximumWindow.TotalMilliseconds,
-            hadPlayerOwnedBaseline ? "player-owned snapshot" : "recent events");
-    }
-
-    private void TouchAutoRecording(nint gameObjectAddress, ObjectKind objectKind)
-    {
-        if (!IsAutoRecordingFor(gameObjectAddress, objectKind))
-            return;
-
-        ScheduleAutoRecordingClose(gameObjectAddress, objectKind);
-    }
-
-    private void ScheduleAutoRecordingClose(nint gameObjectAddress, ObjectKind objectKind)
-    {
-        CancellationToken token;
-        TimeSpan delay;
-        lock (_autoRecordLock)
-        {
-            if (Volatile.Read(ref _isAutoRecording) == 0 || _autoRecordAddress != gameObjectAddress || _autoRecordObjectKind != objectKind)
-                return;
-
-            var elapsed = DateTimeOffset.UtcNow - _autoRecordStartedAt;
-            var remainingCap = _autoRecordMaximumWindow - elapsed;
-            delay = remainingCap <= TimeSpan.Zero
-                ? TimeSpan.Zero
-                : remainingCap < _autoRecordQuietWindow ? remainingCap : _autoRecordQuietWindow;
-
-            try
-            {
-                _autoRecordCts.Cancel();
-                _autoRecordCts.Dispose();
-            }
-            catch (ObjectDisposedException)
-            {
-                // disposal race while shutting down
-            }
-
-            _autoRecordCts = new CancellationTokenSource();
-            token = _autoRecordCts.Token;
-        }
-
-        if (delay <= TimeSpan.Zero)
-        {
-            SaveAutoRecording(gameObjectAddress, objectKind);
-            return;
-        }
-
-        _ = Task.Run(async () =>
-        {
-            try
-            {
-                await Task.Delay(delay, token).ConfigureAwait(false);
-                SaveAutoRecording(gameObjectAddress, objectKind);
-            }
-            catch (OperationCanceledException)
-            {
-                // capture window extended or manager disposed
-            }
-        }, token);
-    }
-
-    private bool IsAutoRecordingFor(nint gameObjectAddress, ObjectKind objectKind)
-    {
-        if (Volatile.Read(ref _isAutoRecording) == 0)
-            return false;
-
-        return _autoRecordAddress == gameObjectAddress && _autoRecordObjectKind == objectKind;
-    }
-
-    private void SaveAutoRecording(nint gameObjectAddress, ObjectKind objectKind)
-    {
-        TransientRecord[] eventSnapshot;
-        HashSet<string> baselinePaths;
-        bool hasPlayerOwnedBaseline;
-        string triggerPath;
-        GameObjectHandler? owner;
-
-        lock (_autoRecordLock)
-        {
-            if (Volatile.Read(ref _isAutoRecording) == 0 || _autoRecordAddress != gameObjectAddress || _autoRecordObjectKind != objectKind)
-                return;
-
-            Volatile.Write(ref _isAutoRecording, 0);
-            eventSnapshot = _autoRecordedTransients.ToArray();
-            baselinePaths = new HashSet<string>(_autoRecordBaselinePaths, StringComparer.OrdinalIgnoreCase);
-            hasPlayerOwnedBaseline = _autoRecordHasPlayerOwnedBaseline;
-            triggerPath = _autoRecordTriggerPath;
-            _cachedFrameOwners.TryGetValue(gameObjectAddress, out owner);
-
-            _autoRecordedTransients = new ConcurrentBag<TransientRecord>();
-            _autoRecordAddress = nint.Zero;
-            _autoRecordBaselinePaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            _autoRecordHasPlayerOwnedBaseline = false;
-            _autoRecordTriggerPath = string.Empty;
-        }
-
-        _ = Task.Run(async () =>
-        {
-            try
-            {
-                await SaveAutoRecordingAsync(gameObjectAddress, objectKind, owner, eventSnapshot, baselinePaths, hasPlayerOwnedBaseline, triggerPath).ConfigureAwait(false);
-            }
-            catch (Exception ex)
-            {
-                Logger.LogDebug(ex, "Auto transient recorder failed to save support paths");
-            }
-        });
-    }
-
-    private async Task SaveAutoRecordingAsync(nint gameObjectAddress, ObjectKind objectKind, GameObjectHandler? owner, TransientRecord[] eventSnapshot, HashSet<string> baselinePaths, bool hasPlayerOwnedBaseline, string triggerPath)
-    {
-        var combined = eventSnapshot.ToList();
-
-        if (owner != null && hasPlayerOwnedBaseline && !IsAutoRecordingSuppressed())
-        {
-            var snapshotRecords = await CapturePlayerOwnedSnapshotDiffRecordsWithProbeAsync(owner, baselinePaths, triggerPath).ConfigureAwait(false);
-            if (snapshotRecords.Count > 0)
-                combined.AddRange(snapshotRecords);
-        }
-
-        if (combined.Count == 0)
-            return;
-
-        var addedTransients = SaveRecordedTransientSnapshot(combined, publishImmediately: false);
-        RemovePendingAutoRecordedSupportResources(objectKind, combined.Select(item => item.GamePath));
-
-        if (addedTransients.Count == 0 && combined.Any(item => !item.AlreadyTransient))
-        {
-            if (owner != null)
-                addedTransients.Add(owner);
-        }
-
-        if (addedTransients.Count == 0)
-            return;
-
-        foreach (var item in addedTransients)
-        {
-            if (item.Address != nint.Zero)
-                SendTransients(item.Address, item.ObjectKind, TimeSpan.FromMilliseconds(250));
-        }
-
-        Logger.LogDebug("Auto transient recorder saved {count} owner bucket(s) with new support transient(s), event={eventCount}, snapshotBaseline={snapshotBaseline}",
-            addedTransients.Count,
-            eventSnapshot.Length,
-            hasPlayerOwnedBaseline);
-    }
-
-    private async Task<List<TransientRecord>> CapturePlayerOwnedSnapshotDiffRecordsWithProbeAsync(GameObjectHandler owner, HashSet<string> baselinePaths, string triggerPath)
-    {
-        var records = new List<TransientRecord>();
-        var seenPaths = new HashSet<string>(baselinePaths, StringComparer.OrdinalIgnoreCase);
-        var sawNewPath = false;
-
-        for (var attempt = 0; attempt < AutoRecordSnapshotProbeCount && !IsAutoRecordingSuppressed(); attempt++)
-        {
-            if (attempt > 0)
-                await Task.Delay(_autoRecordSnapshotProbeDelay).ConfigureAwait(false);
-
-            var passRecords = await CapturePlayerOwnedSnapshotDiffRecordsAsync(owner, seenPaths, triggerPath).ConfigureAwait(false);
-            if (passRecords.Count == 0)
-            {
-                if (sawNewPath && attempt >= 2)
-                    break;
-
-                continue;
-            }
-
-            sawNewPath = true;
-            foreach (var record in passRecords)
-            {
-                var normalized = NormalizePath(record.GamePath);
-                if (string.IsNullOrWhiteSpace(normalized) || !seenPaths.Add(normalized))
-                    continue;
-
-                records.Add(record);
-            }
-        }
-
-        return records;
-    }
-
-    private async Task<List<TransientRecord>> CapturePlayerOwnedSnapshotDiffRecordsAsync(GameObjectHandler owner, HashSet<string> baselinePaths, string triggerPath)
-    {
-        var records = new List<TransientRecord>();
-        if (owner == null || owner.ObjectKind != ObjectKind.Player || baselinePaths.Count == 0)
-            return records;
-
-        var afterSnapshot = await CapturePlayerOwnedResourceSnapshotAsync().ConfigureAwait(false);
-        if (afterSnapshot.Count == 0)
-            return records;
-
-        var normalizedTrigger = NormalizePath(triggerPath);
-        foreach (var kvp in afterSnapshot.OrderBy(kvp => kvp.Key, StringComparer.OrdinalIgnoreCase))
-        {
-            var gamePath = NormalizePath(kvp.Key);
-            var resolvedPath = NormalizePath(kvp.Value);
-
-            if (string.IsNullOrWhiteSpace(gamePath)
-                || string.IsNullOrWhiteSpace(resolvedPath)
-                || baselinePaths.Contains(gamePath)
-                || string.Equals(gamePath, normalizedTrigger, StringComparison.OrdinalIgnoreCase)
-                || string.Equals(gamePath, resolvedPath, StringComparison.OrdinalIgnoreCase)
-                || !IsAutoRecordCapturablePath(gamePath)
-                || !CharacterDataPushSanitizer.IsServerAcceptedGamePath(gamePath)
-                || IsKnownTransientPath(owner.ObjectKind, gamePath)
-                || !File.Exists(resolvedPath))
-            {
-                continue;
-            }
-
-            RegisterKnownTransientFilePath(gamePath, resolvedPath);
-            records.Add(new TransientRecord(owner, gamePath, resolvedPath, false) { AddTransient = true });
-            AddPendingAutoRecordedSupportResource(owner.ObjectKind, gamePath);
-        }
-
-        if (records.Count > 0)
-            Logger.LogDebug("Captured {count} player-owned on-screen transient support resource(s) by snapshot diff", records.Count);
-
-        lock (_playerOwnedResourceBaselineLock)
-        {
-            _cachedPlayerOwnedResourceFileByGamePath = afterSnapshot;
-        }
-
-        return records;
-    }
-
-    private bool IsKnownTransientPath(ObjectKind objectKind, string gamePath)
-    {
-        var normalized = NormalizePath(gamePath);
-        if (string.IsNullOrWhiteSpace(normalized))
-            return true;
-
-        lock (_semiTransientResourcesLock)
-        {
-            var semiTransientResources = EnsureSemiTransientResourcesUnsafe();
-            if (semiTransientResources.TryGetValue(objectKind, out var semiTransient) && semiTransient.Contains(normalized))
-                return true;
-        }
-
-        lock (_transientResourcesLock)
-        {
-            if (_transientResources.TryGetValue(objectKind, out var transient) && transient.Contains(normalized))
-                return true;
-
-            if (_pendingAutoRecordedSupportResources.TryGetValue(objectKind, out var pending) && pending.Contains(normalized))
-                return true;
-        }
-
-        return false;
-    }
 
     private void SendTransients(nint gameObject, ObjectKind objectKind, TimeSpan? debounceOverride = null)
     {
@@ -2720,17 +2973,25 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
         _semiTransientResources = new();
         var playerConfig = PlayerConfig;
         playerConfig.Canonicalize();
-        var movedLuminaObjectScopedPaths = MoveLuminaObjectScopedPathsOutOfPlayerCaches(playerConfig);
-        if (movedLuminaObjectScopedPaths > 0)
+
+        var playerKey = PlayerPersistentDataKey;
+        if (!string.IsNullOrWhiteSpace(playerKey)
+            && !string.Equals(_luminaObjectScopeMigrationCompletedForPlayerKey, playerKey, StringComparison.Ordinal))
         {
-            try
+            var movedLuminaObjectScopedPaths = MoveLuminaObjectScopedPathsOutOfPlayerCaches(playerConfig);
+            _luminaObjectScopeMigrationCompletedForPlayerKey = playerKey;
+
+            if (movedLuminaObjectScopedPaths > 0)
             {
-                _configurationService.Save();
-                Logger.LogDebug("Moved {count} Lumina-classified mount/minion transient path(s) out of player scopes", movedLuminaObjectScopedPaths);
-            }
-            catch (Exception ex)
-            {
-                Logger.LogDebug(ex, "Failed to save transient config after Lumina object-scope migration");
+                try
+                {
+                    _configurationService.Save();
+                    Logger.LogDebug("Moved {count} Lumina-classified mount/minion transient path(s) out of player scopes", movedLuminaObjectScopedPaths);
+                }
+                catch (Exception ex)
+                {
+                    Logger.LogDebug(ex, "Failed to save transient config after Lumina object-scope migration");
+                }
             }
         }
 
@@ -2810,7 +3071,6 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
             lock (_semiTransientResourcesLock)
             {
                 _semiTransientResources = null;
-                EnsureSemiTransientResourcesUnsafe();
             }
         }
         catch (Exception ex)
@@ -2834,13 +3094,17 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
     {
         var manifestCounter = 0;
         var defaultManifest = Path.Combine(modPath, "default_mod.json");
+        var groupManifests = Directory.EnumerateFiles(modPath, "group_*.json", SearchOption.TopDirectoryOnly).ToList();
+        var defaultSupportInheritsSharedEmoteScope = groupManifests.Count > 0
+            && ShouldDefaultManifestSupportInheritSharedEmoteScope(groupManifests, selectedSettings, token);
+
         if (File.Exists(defaultManifest))
         {
-            TryImportManifestJson(modPath, defaultManifest, null, priority, importSelectedEntries, manifestEntries, knownGamePaths, manifestIndex, token);
+            TryImportManifestJson(modPath, defaultManifest, null, priority, importSelectedEntries, manifestEntries, knownGamePaths, manifestIndex, token, defaultSupportInheritsSharedEmoteScope);
             manifestCounter++;
         }
 
-        foreach (var groupManifest in Directory.EnumerateFiles(modPath, "group_*.json", SearchOption.TopDirectoryOnly))
+        foreach (var groupManifest in groupManifests)
         {
             token.ThrowIfCancellationRequested();
             TryImportManifestJson(modPath, groupManifest, selectedSettings, priority, importSelectedEntries, manifestEntries, knownGamePaths, manifestIndex, token);
@@ -2851,11 +3115,116 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
         }
     }
 
-    private void TryImportManifestJson(string modPath, string manifestPath, Dictionary<string, List<string>>? selectedSettings, int priority, bool importSelectedEntries, List<ManifestTransientImportEntry> manifestEntries, HashSet<string> knownGamePaths, StartupManifestPrimeSelectionIndex manifestIndex, CancellationToken token)
+    private static bool ShouldDefaultManifestSupportInheritSharedEmoteScope(IReadOnlyCollection<string> groupManifests, Dictionary<string, List<string>>? selectedSettings, CancellationToken token)
+        => DetermineSelectedManifestSupportScope(groupManifests, selectedSettings, token) == ManifestSelectedSupportScope.SharedEmote;
+
+    private static ManifestSelectedSupportScope DetermineSelectedManifestSupportScope(IReadOnlyCollection<string> groupManifests, Dictionary<string, List<string>>? selectedSettings, CancellationToken token)
+    {
+        var hasSelectedSharedEmoteScope = false;
+        var hasSelectedClassJobScope = false;
+
+        foreach (var groupManifest in groupManifests)
+        {
+            token.ThrowIfCancellationRequested();
+
+            try
+            {
+                using var stream = File.OpenRead(groupManifest);
+                using var doc = JsonDocument.Parse(stream, _manifestJsonOptions);
+                var root = doc.RootElement;
+                if (!root.TryGetProperty("Options", out var options) || options.ValueKind != JsonValueKind.Array)
+                    continue;
+
+                var selectedOptions = GetSelectedOptionNames(root, selectedSettings, groupManifest, out var explicitSelectionFound);
+                if (!explicitSelectionFound)
+                    selectedOptions.UnionWith(GetDefaultSelectedAuxiliaryOptionNames(root));
+
+                RemoveInactiveManifestOptionNames(selectedOptions, root, keepSelectedAuxiliarySupportOptions: true);
+                if (selectedOptions.Count == 0)
+                    continue;
+
+                foreach (var option in options.EnumerateArray())
+                {
+                    token.ThrowIfCancellationRequested();
+
+                    var optionName = option.TryGetProperty("Name", out var optionNameElement)
+                        ? optionNameElement.GetString() ?? string.Empty
+                        : string.Empty;
+                    if (!selectedOptions.Contains(optionName))
+                        continue;
+
+                    CollectManifestScopeShape(option, ref hasSelectedSharedEmoteScope, ref hasSelectedClassJobScope);
+                    if (hasSelectedClassJobScope)
+                        return ManifestSelectedSupportScope.ClassJob;
+                }
+            }
+            catch (JsonException)
+            {
+            }
+            catch (IOException)
+            {
+            }
+            catch (UnauthorizedAccessException)
+            {
+            }
+        }
+
+        if (hasSelectedClassJobScope)
+            return ManifestSelectedSupportScope.ClassJob;
+
+        if (hasSelectedSharedEmoteScope)
+            return ManifestSelectedSupportScope.SharedEmote;
+
+        return ManifestSelectedSupportScope.Neutral;
+    }
+
+    private static void CollectManifestScopeShape(JsonElement element, ref bool hasSharedEmoteScope, ref bool hasClassJobScope)
+    {
+        if (element.TryGetProperty("Files", out var files) && files.ValueKind == JsonValueKind.Object)
+        {
+            foreach (var property in files.EnumerateObject())
+            {
+                if (!TryNormalizeManifestGamePath(property.Name, out var gamePath))
+                    continue;
+
+                if (IsSharedEmoteManifestScopeTriggerPath(gamePath))
+                    hasSharedEmoteScope = true;
+
+                if (IsClassJobManifestScopeTriggerPath(gamePath))
+                    hasClassJobScope = true;
+            }
+        }
+
+        if (element.TryGetProperty("FileSwaps", out var fileSwaps) && fileSwaps.ValueKind == JsonValueKind.Object)
+        {
+            foreach (var property in fileSwaps.EnumerateObject())
+            {
+                if (TryNormalizeManifestGamePath(property.Name, out var gamePath))
+                {
+                    if (IsSharedEmoteManifestScopeTriggerPath(gamePath))
+                        hasSharedEmoteScope = true;
+
+                    if (IsClassJobManifestScopeTriggerPath(gamePath))
+                        hasClassJobScope = true;
+                }
+
+                if (TryNormalizeManifestGamePath(GetManifestStringValue(property.Value), out var replacementGamePath))
+                {
+                    if (IsSharedEmoteManifestScopeTriggerPath(replacementGamePath))
+                        hasSharedEmoteScope = true;
+
+                    if (IsClassJobManifestScopeTriggerPath(replacementGamePath))
+                        hasClassJobScope = true;
+                }
+            }
+        }
+    }
+
+    private void TryImportManifestJson(string modPath, string manifestPath, Dictionary<string, List<string>>? selectedSettings, int priority, bool importSelectedEntries, List<ManifestTransientImportEntry> manifestEntries, HashSet<string> knownGamePaths, StartupManifestPrimeSelectionIndex manifestIndex, CancellationToken token, bool forceSharedEmoteScopeForSupport = false)
     {
         try
         {
-            ImportManifestJson(modPath, manifestPath, selectedSettings, priority, importSelectedEntries, manifestEntries, knownGamePaths, manifestIndex, token);
+            ImportManifestJson(modPath, manifestPath, selectedSettings, priority, importSelectedEntries, manifestEntries, knownGamePaths, manifestIndex, token, forceSharedEmoteScopeForSupport);
         }
         catch (JsonException ex)
         {
@@ -2871,7 +3240,7 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
         }
     }
 
-    private void ImportManifestJson(string modPath, string manifestPath, Dictionary<string, List<string>>? selectedSettings, int priority, bool importSelectedEntries, List<ManifestTransientImportEntry> manifestEntries, HashSet<string> knownGamePaths, StartupManifestPrimeSelectionIndex manifestIndex, CancellationToken token)
+    private void ImportManifestJson(string modPath, string manifestPath, Dictionary<string, List<string>>? selectedSettings, int priority, bool importSelectedEntries, List<ManifestTransientImportEntry> manifestEntries, HashSet<string> knownGamePaths, StartupManifestPrimeSelectionIndex manifestIndex, CancellationToken token, bool forceSharedEmoteScopeForSupport = false)
     {
         using var stream = File.OpenRead(manifestPath);
         using var doc = JsonDocument.Parse(stream, _manifestJsonOptions);
@@ -2880,7 +3249,7 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
         if (string.Equals(Path.GetFileName(manifestPath), "default_mod.json", StringComparison.OrdinalIgnoreCase))
         {
             var hasGroupManifests = Directory.EnumerateFiles(modPath, "group_*.json", SearchOption.TopDirectoryOnly).Any();
-            ImportManifestMappings(modPath, root, priority, importSelectedEntries, importSelectedEntries, manifestEntries, NormalizePath(manifestPath) + "|default", knownGamePaths, manifestIndex, skipPhysicalPrefixedEntries: hasGroupManifests);
+            ImportManifestMappings(modPath, root, priority, importSelectedEntries, importSelectedEntries, manifestEntries, NormalizePath(manifestPath) + "|default", knownGamePaths, manifestIndex, forceSharedEmoteScopeForSupport, skipPhysicalPrefixedEntries: hasGroupManifests);
             return;
         }
 
@@ -2891,7 +3260,7 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
         if (!explicitSelectionFound)
             selectedOptions.UnionWith(GetDefaultSelectedAuxiliaryOptionNames(root));
 
-        RemoveInactiveManifestOptionNames(selectedOptions);
+        RemoveInactiveManifestOptionNames(selectedOptions, root, keepSelectedAuxiliarySupportOptions: true);
 
         foreach (var option in options.EnumerateArray())
         {
@@ -2916,25 +3285,110 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
 
         if (selectedSettings != null && TryGetSelectedSettingsForManifestGroup(groupRoot, manifestPath, selectedSettings, out var selected))
         {
-            explicitSelectionFound = true;
-            AddSelectedOptionNamesFromSettingValues(output, optionNames, groupType, selected);
-            RemoveInactiveManifestOptionNames(output);
-            return output;
+            var expandedSelectionValues = EnumerateManifestSelectedSettingValues(selected ?? []).ToList();
+            if (expandedSelectionValues.Count == 0)
+            {
+                explicitSelectionFound = true;
+                return output;
+            }
+
+            if (!expandedSelectionValues.All(IsManifestDefaultSelectionToken))
+            {
+                explicitSelectionFound = true;
+                AddSelectedOptionNamesFromSettingValues(output, optionNames, groupType, expandedSelectionValues);
+
+                if (output.Count == 0
+                    && optionNames.Count == 1
+                    && !string.Equals(groupType, "Multi", StringComparison.OrdinalIgnoreCase)
+                    && expandedSelectionValues.Any(value => int.TryParse(value, out var numericValue) && numericValue == 1))
+                {
+                    output.Add(optionNames[0]);
+                }
+
+                RemoveInactiveManifestOptionNames(output, groupRoot, keepSelectedAuxiliarySupportOptions: true);
+                return output;
+            }
         }
 
         explicitSelectionFound = false;
         AddDefaultSelectedOptionNames(output, optionNames, groupType, groupRoot);
-        RemoveInactiveManifestOptionNames(output);
+        RemoveInactiveManifestOptionNames(output, groupRoot, keepSelectedAuxiliarySupportOptions: true);
         return output;
     }
 
-    private static void RemoveInactiveManifestOptionNames(HashSet<string> optionNames)
+    private static void RemoveInactiveManifestOptionNames(HashSet<string> optionNames, JsonElement? groupRoot = null, bool keepSelectedAuxiliarySupportOptions = false)
     {
         if (optionNames.Count == 0)
             return;
 
-        optionNames.RemoveWhere(IsInactiveManifestOptionName);
+        optionNames.RemoveWhere(optionName => IsInactiveManifestOptionName(optionName)
+            && !(keepSelectedAuxiliarySupportOptions && groupRoot.HasValue && IsSelectedInactiveAuxiliarySupportOption(groupRoot.Value, optionName)));
     }
+
+    private static bool IsSelectedInactiveAuxiliarySupportOption(JsonElement groupRoot, string optionName)
+    {
+        if (string.IsNullOrWhiteSpace(optionName))
+            return false;
+
+        if (!groupRoot.TryGetProperty("Options", out var options) || options.ValueKind != JsonValueKind.Array)
+            return false;
+
+        foreach (var option in options.EnumerateArray())
+        {
+            var currentName = option.TryGetProperty("Name", out var optionNameElement)
+                ? optionNameElement.GetString() ?? string.Empty
+                : string.Empty;
+            if (!string.Equals(currentName, optionName, StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            return ManifestOptionContainsAuxiliarySupport(option);
+        }
+
+        return false;
+    }
+
+    private static bool ManifestOptionContainsAuxiliarySupport(JsonElement option)
+    {
+        if (option.TryGetProperty("Files", out var files) && files.ValueKind == JsonValueKind.Object)
+        {
+            foreach (var property in files.EnumerateObject())
+            {
+                if (TryNormalizeManifestGamePath(property.Name, out var gamePath) && IsManifestAuxiliarySupportGamePath(gamePath))
+                    return true;
+
+                if (TryNormalizeManifestGamePath(GetManifestStringValue(property.Value), out var manifestValueGamePath) && IsManifestAuxiliarySupportGamePath(manifestValueGamePath))
+                    return true;
+            }
+        }
+
+        if (option.TryGetProperty("FileSwaps", out var fileSwaps) && fileSwaps.ValueKind == JsonValueKind.Object)
+        {
+            foreach (var property in fileSwaps.EnumerateObject())
+            {
+                if (TryNormalizeManifestGamePath(property.Name, out var gamePath) && IsManifestAuxiliarySupportGamePath(gamePath))
+                    return true;
+
+                if (TryNormalizeManifestGamePath(GetManifestStringValue(property.Value), out var replacementGamePath) && IsManifestAuxiliarySupportGamePath(replacementGamePath))
+                    return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static bool IsManifestAuxiliarySupportGamePath(string? gamePath)
+    {
+        var normalized = NormalizePath(gamePath ?? string.Empty);
+        if (string.IsNullOrWhiteSpace(normalized))
+            return false;
+
+        return normalized.EndsWith(".imc", StringComparison.OrdinalIgnoreCase)
+            || EndsWithAny(normalized, _manifestPrimaryTransientFileTypes)
+            || EndsWithAny(normalized, _manifestSupportFileTypes);
+    }
+
+    private static string GetManifestStringValue(JsonElement value)
+        => value.ValueKind == JsonValueKind.String ? value.GetString() ?? string.Empty : string.Empty;
 
     private static bool IsInactiveManifestOptionName(string? optionName)
     {
@@ -3233,6 +3687,9 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
                     continue;
             }
 
+            if (isMultiGroup && numericValue == 0)
+                continue;
+
             if (numericValue >= 0 && numericValue < optionNames.Count)
             {
                 output.Add(optionNames[numericValue]);
@@ -3265,6 +3722,14 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
                     yield return value;
             }
         }
+    }
+
+    private static bool IsManifestDefaultSelectionToken(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            return true;
+
+        return NormalizeManifestSelectionKey(value) is "default" or "defaults" or "defaultsetting" or "defaultsettings" or "usedefault" or "usedefaults";
     }
 
     private static IEnumerable<string> ExpandManifestSelectedSettingValue(string rawValue)
@@ -3362,7 +3827,7 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
         return false;
     }
 
-    private void ImportManifestMappings(string modPath, JsonElement element, int priority, bool addSelectedEntries, bool selectedForIndex, List<ManifestTransientImportEntry> manifestEntries, string importScopeKey, HashSet<string> knownGamePaths, StartupManifestPrimeSelectionIndex manifestIndex, bool skipPhysicalPrefixedEntries = false)
+    private void ImportManifestMappings(string modPath, JsonElement element, int priority, bool addSelectedEntries, bool selectedForIndex, List<ManifestTransientImportEntry> manifestEntries, string importScopeKey, HashSet<string> knownGamePaths, StartupManifestPrimeSelectionIndex manifestIndex, bool forceSharedEmoteScopeForSupport = false, bool skipPhysicalPrefixedEntries = false)
     {
         var modScopeKey = NormalizePath(modPath);
         var candidates = new List<ManifestTransientMappingCandidate>();
@@ -3436,8 +3901,13 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
             .Where(candidate => ShouldImportManifestGamePath(candidate.GamePath, candidate.ResolvedFilePath, candidate.ManifestValue, scopeHasTransientTrigger, candidate.ScopeTexts))
             .ToList();
 
+        AddSelectedWeaponBodyB0001SupportCandidates(modPath, importScopeKey, candidates, eligibleCandidates, knownGamePaths, scopeHasTransientTrigger);
+
         if (eligibleCandidates.Count == 0)
             return;
+
+        var selectedManifestScope = DetermineSelectedManifestSupportScope(eligibleCandidates, forceSharedEmoteScopeForSupport);
+        var suppressClassJobScopeForSharedEmoteSupport = selectedManifestScope == ManifestSelectedSupportScope.SharedEmote;
 
         if (!addSelectedEntries)
         {
@@ -3459,9 +3929,97 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
                 ? inheritedScopeClassJobId
                 : null;
 
+            var suppressCandidateClassJobScope = suppressClassJobScopeForSharedEmoteSupport
+                && ShouldSuppressClassJobScopeForSharedEmoteSupportCandidate(candidate.GamePath);
+
             manifestEntries.Add(new ManifestTransientImportEntry(candidate.GamePath, candidate.ResolvedFilePath, candidate.ManifestValue,
-                priority, candidate.ScopeTexts, candidateInheritedScopeClassJobId));
+                priority, candidate.ScopeTexts, candidateInheritedScopeClassJobId, suppressCandidateClassJobScope));
         }
+    }
+
+    private void AddSelectedWeaponBodyB0001SupportCandidates(string modPath, string importScopeKey, IReadOnlyCollection<ManifestTransientMappingCandidate> allCandidates, List<ManifestTransientMappingCandidate> eligibleCandidates, HashSet<string> knownGamePaths, bool scopeHasTransientTrigger)
+    {
+        if (eligibleCandidates.Count == 0)
+            return;
+
+        var existingGamePaths = allCandidates
+            .Concat(eligibleCandidates)
+            .Select(candidate => candidate.GamePath)
+            .Where(path => !string.IsNullOrWhiteSpace(path))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var modScopeKey = NormalizePath(modPath);
+        var weaponIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var candidate in eligibleCandidates)
+        {
+            TryCollectWeaponBodyB0001Id(candidate.GamePath, weaponIds);
+            TryCollectWeaponBodyB0001Id(candidate.ResolvedFilePath, weaponIds);
+            TryCollectWeaponBodyB0001Id(candidate.ManifestValue, weaponIds);
+
+            foreach (var scopeText in candidate.ScopeTexts)
+                TryCollectWeaponBodyB0001Id(scopeText, weaponIds);
+        }
+
+        foreach (var weaponId in weaponIds)
+        {
+            var supportGamePaths = new[]
+            {
+                $"chara/weapon/{weaponId}/obj/body/b0001/b0001.imc",
+                $"chara/weapon/{weaponId}/skeleton/base/b0001/skl_{weaponId}b0001.sklb",
+                $"chara/weapon/{weaponId}/obj/body/b0001/model/{weaponId}b0001.mdl",
+            };
+
+            foreach (var supportGamePath in supportGamePaths)
+            {
+                var normalizedSupportGamePath = NormalizePath(supportGamePath);
+                if (existingGamePaths.Contains(normalizedSupportGamePath))
+                    continue;
+
+                if (!ShouldImportManifestGamePath(normalizedSupportGamePath, normalizedSupportGamePath, normalizedSupportGamePath, scopeHasTransientTrigger, [modScopeKey, importScopeKey]))
+                    continue;
+
+                var resolvedFilePath = ResolveManifestFilePath(modPath, normalizedSupportGamePath);
+                if (string.IsNullOrWhiteSpace(resolvedFilePath) || !File.Exists(resolvedFilePath))
+                    continue;
+
+                eligibleCandidates.Add(new ManifestTransientMappingCandidate(normalizedSupportGamePath, resolvedFilePath, normalizedSupportGamePath,
+                    [modScopeKey, importScopeKey, resolvedFilePath, normalizedSupportGamePath], knownGamePaths.Contains(normalizedSupportGamePath)));
+                existingGamePaths.Add(normalizedSupportGamePath);
+            }
+        }
+    }
+
+    private static void TryCollectWeaponBodyB0001Id(string? path, HashSet<string> weaponIds)
+    {
+        var normalized = NormalizePath(path ?? string.Empty);
+        if (string.IsNullOrWhiteSpace(normalized))
+            return;
+
+        var match = System.Text.RegularExpressions.Regex.Match(
+            normalized,
+            @"(?:^|/)chara/weapon/(w\d{4})/(?:obj/body/b0001|skeleton/base/b0001)(?:/|$)",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        if (!match.Success)
+            return;
+
+        weaponIds.Add(match.Groups[1].Value);
+    }
+
+    private static ManifestSelectedSupportScope DetermineSelectedManifestSupportScope(IReadOnlyCollection<ManifestTransientMappingCandidate> eligibleCandidates, bool forceSharedEmoteScopeForSupport)
+    {
+        var hasSharedEmoteScope = forceSharedEmoteScopeForSupport;
+        foreach (var candidate in eligibleCandidates)
+        {
+            if (IsClassJobManifestScopeTriggerPath(candidate.GamePath))
+                return ManifestSelectedSupportScope.ClassJob;
+
+            if (IsSharedEmoteManifestScopeTriggerPath(candidate.GamePath))
+                hasSharedEmoteScope = true;
+        }
+
+        return hasSharedEmoteScope
+            ? ManifestSelectedSupportScope.SharedEmote
+            : ManifestSelectedSupportScope.Neutral;
     }
 
     private static void TrackSkippedPhysicalPrefixedDefaultManifestMapping(string modPath, JsonProperty property, StartupManifestPrimeSelectionIndex manifestIndex)
@@ -3584,6 +4142,9 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
         if (TryInferLuminaPersistentObjectKind(gamePath, out var objectKind) && objectKind != ObjectKind.Player)
             return ShouldImportObjectScopedManifestGamePath(gamePath);
 
+        if (gamePath.EndsWith(".imc", StringComparison.OrdinalIgnoreCase))
+            return IsWeaponBodyB0001ManifestSupportPath(gamePath, resolvedFilePath, manifestValue);
+
         if (EndsWithAny(gamePath, _manifestSupportFileTypes))
             return ShouldImportManifestSupportPath(gamePath, resolvedFilePath, manifestValue, scopeHasTransientTrigger);
 
@@ -3593,8 +4154,8 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
         if (EndsWithAny(gamePath, _handledRecordingFileTypes))
             return false;
 
-        if (gamePath.StartsWith("sound/", StringComparison.OrdinalIgnoreCase))
-            return gamePath.EndsWith(".scd", StringComparison.OrdinalIgnoreCase);
+        if (IsSoundResourcePath(gamePath))
+            return true;
 
         if (IsVfxRelatedResourcePath(gamePath))
             return true;
@@ -3605,6 +4166,9 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
         if (gamePath.StartsWith("chara/action/", StringComparison.OrdinalIgnoreCase))
             return gamePath.EndsWith(".tmb", StringComparison.OrdinalIgnoreCase)
                 || gamePath.EndsWith(".tmb2", StringComparison.OrdinalIgnoreCase);
+
+        if (IsDeclaredHumanActorRigManifestPath(gamePath))
+            return true;
 
         if (IsHumanMountRiderAnimationPath(gamePath))
             return true;
@@ -3666,10 +4230,6 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
         if (!EndsWithAny(normalized, _handledFileTypes))
             return false;
 
-        // Lumina has already proven this model belongs to a mount/minion actor. For those actors the
-        // structural resources are part of the actor identity, not disposable player animation noise.
-        // Keeping these fixes vehicle-style mounts where the visible model arrives but the receiver keeps
-        // the vanilla skeleton/physics/animation rig, leaving wheels and attachments detached.
         return normalized.Contains("/skeleton/", StringComparison.OrdinalIgnoreCase)
             || normalized.Contains("/animation/", StringComparison.OrdinalIgnoreCase)
             || normalized.Contains("/obj/", StringComparison.OrdinalIgnoreCase)
@@ -3721,6 +4281,41 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
         return normalized.StartsWith("chara/human/", StringComparison.OrdinalIgnoreCase);
     }
 
+    private static bool IsDeclaredHumanActorRigManifestPath(string? gamePath)
+    {
+        var normalized = NormalizePath(gamePath ?? string.Empty);
+        if (string.IsNullOrWhiteSpace(normalized)
+            || !normalized.StartsWith("chara/human/", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        if (normalized.EndsWith(".sklb", StringComparison.OrdinalIgnoreCase)
+            && normalized.Contains("/skeleton/", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        if (!normalized.EndsWith(".pap", StringComparison.OrdinalIgnoreCase)
+            || !normalized.Contains("/animation/", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        if (System.Text.RegularExpressions.Regex.IsMatch(
+                normalized,
+                @"^chara/human/c\d{4}/animation/a(?!0001)\d{4}/",
+                System.Text.RegularExpressions.RegexOptions.IgnoreCase))
+        {
+            return true;
+        }
+
+        return System.Text.RegularExpressions.Regex.IsMatch(
+            normalized,
+            @"^chara/human/c\d{4}/animation/f\d{4}/resident/face\.pap$",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+    }
+
     private static bool IsWeaponPlacementSupportPath(string gamePath)
     {
         var normalized = NormalizePath(gamePath);
@@ -3756,7 +4351,13 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
         if (IsDeniedManifestSupportPath(gamePath, resolvedFilePath, manifestValue))
             return false;
 
+        if (IsWeaponBodyB0001ManifestSupportPath(gamePath, resolvedFilePath, manifestValue))
+            return true;
+
         if (ContainsAnimationSupportBodyFolderSegment(gamePath))
+            return true;
+
+        if (IsSelectedTransientWeaponPropManifestSupportPath(gamePath, resolvedFilePath, manifestValue))
             return true;
 
         if (IsSelectedEquipmentOrAccessoryManifestSupportPath(gamePath, resolvedFilePath, manifestValue, scopeHasTransientTrigger))
@@ -3784,6 +4385,59 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
     private static bool ContainsAnimationSupportBodyFolderSegment(params string?[] paths)
     {
         return paths.Any(path => ContainsPathSegment(path, "b0001"));
+    }
+
+    private static bool IsSelectedTransientWeaponPropManifestSupportPath(params string?[] paths)
+    {
+        return paths.Any(IsTransientWeaponPropModelMaterialTexturePath);
+    }
+
+    private static bool IsTransientWeaponPropModelMaterialTexturePath(string? path)
+    {
+        var normalized = NormalizePath(path ?? string.Empty);
+        if (string.IsNullOrWhiteSpace(normalized))
+            return false;
+
+        return System.Text.RegularExpressions.Regex.IsMatch(
+            normalized,
+            @"(^|/)chara/weapon/w9\d{3}/obj/body/b\d{4}/(model|material|texture)/",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+    }
+
+    private static bool IsWeaponBodyB0001ManifestSupportPath(params string?[] paths)
+    {
+        foreach (var path in paths)
+        {
+            var normalized = NormalizePath(path ?? string.Empty);
+            if (string.IsNullOrWhiteSpace(normalized))
+                continue;
+
+            if (System.Text.RegularExpressions.Regex.IsMatch(
+                    normalized,
+                    @"(?:^|/)chara/weapon/w\d{4}/obj/body/b0001/b0001\.imc$",
+                    System.Text.RegularExpressions.RegexOptions.IgnoreCase))
+            {
+                return true;
+            }
+
+            if (System.Text.RegularExpressions.Regex.IsMatch(
+                    normalized,
+                    @"(?:^|/)chara/weapon/w\d{4}/obj/body/b0001/model/w\d{4}b0001\.mdl$",
+                    System.Text.RegularExpressions.RegexOptions.IgnoreCase))
+            {
+                return true;
+            }
+
+            if (System.Text.RegularExpressions.Regex.IsMatch(
+                    normalized,
+                    @"(?:^|/)chara/weapon/w\d{4}/skeleton/base/b0001/skl_w\d{4}b0001\.sklb$",
+                    System.Text.RegularExpressions.RegexOptions.IgnoreCase))
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private static bool IsSelectedEquipmentOrAccessoryManifestSupportPath(string gamePath, string resolvedFilePath, string manifestValue, bool scopeHasTransientTrigger)
@@ -3919,6 +4573,7 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
         return normalized.EndsWith(".pap", StringComparison.OrdinalIgnoreCase)
             || normalized.EndsWith(".avfx", StringComparison.OrdinalIgnoreCase)
             || normalized.EndsWith(".atex", StringComparison.OrdinalIgnoreCase)
+            || normalized.EndsWith(".scd", StringComparison.OrdinalIgnoreCase)
             || normalized.EndsWith(".tmb", StringComparison.OrdinalIgnoreCase)
             || normalized.EndsWith(".tmb2", StringComparison.OrdinalIgnoreCase);
     }
@@ -3993,6 +4648,54 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
             || normalized.Contains("/limitbreak/", StringComparison.OrdinalIgnoreCase);
     }
 
+    private static bool IsSharedEmoteManifestScopeTriggerPath(string? gamePath)
+    {
+        var normalized = NormalizePath(gamePath ?? string.Empty);
+        if (string.IsNullOrWhiteSpace(normalized))
+            return false;
+
+        return normalized.Contains("/bt_common/emote/", StringComparison.OrdinalIgnoreCase)
+            || normalized.Contains("/bt_common/emote_sp/", StringComparison.OrdinalIgnoreCase)
+            || normalized.StartsWith("chara/action/emote/", StringComparison.OrdinalIgnoreCase)
+            || normalized.StartsWith("chara/action/emote_sp/", StringComparison.OrdinalIgnoreCase)
+            || normalized.StartsWith("vfx/emote_sp/", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsClassJobManifestScopeTriggerPath(string? gamePath)
+    {
+        var normalized = NormalizePath(gamePath ?? string.Empty);
+        if (string.IsNullOrWhiteSpace(normalized) || IsManifestSupportPathStatic(normalized))
+            return false;
+
+        if (IsJobBattleResidentAnimationPathShape(normalized))
+            return true;
+
+        if (normalized.StartsWith("chara/action/", StringComparison.OrdinalIgnoreCase)
+            && !normalized.StartsWith("chara/action/emote/", StringComparison.OrdinalIgnoreCase)
+            && !normalized.StartsWith("chara/action/emote_sp/", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        return normalized.Contains("/ability/", StringComparison.OrdinalIgnoreCase)
+            || normalized.Contains("/ws/", StringComparison.OrdinalIgnoreCase)
+            || normalized.Contains("/limitbreak/", StringComparison.OrdinalIgnoreCase)
+            || normalized.Contains("/magic/", StringComparison.OrdinalIgnoreCase)
+            || normalized.Contains("/battle/", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool ShouldSuppressClassJobScopeForSharedEmoteSupportCandidate(string? gamePath)
+    {
+        var normalized = NormalizePath(gamePath ?? string.Empty);
+        if (string.IsNullOrWhiteSpace(normalized))
+            return false;
+
+        return IsSharedEmoteManifestScopeTriggerPath(normalized)
+            || IsSoundResourcePath(normalized)
+            || IsVfxRelatedResourcePath(normalized)
+            || IsManifestSupportPathStatic(normalized);
+    }
+
     private static bool ShouldUseManifestScopeClassJobFallback(string? gamePath, uint? inheritedScopeClassJobId)
     {
         if (!inheritedScopeClassJobId.HasValue || inheritedScopeClassJobId.Value == 0)
@@ -4002,7 +4705,8 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
         if (string.IsNullOrWhiteSpace(normalized))
             return false;
 
-        return IsVfxRelatedResourcePath(normalized);
+        return IsVfxRelatedResourcePath(normalized)
+            || IsDeclaredHumanActorRigManifestPath(normalized);
     }
 
     private static bool TryResolveManifestEntryClassJobId(ManifestTransientImportEntry entry, out uint classJobId)
@@ -4021,11 +4725,14 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
 
         var gamePathCandidates = new HashSet<uint>();
         var physicalScopeCandidates = new HashSet<uint>();
-        AddManifestClassJobCandidatesFromPhysicalScope(entry.ResolvedFilePath, physicalScopeCandidates);
-        AddManifestClassJobCandidatesFromPhysicalScope(entry.ManifestValue, physicalScopeCandidates);
+        if (!entry.SuppressClassJobScopeInference)
+        {
+            AddManifestClassJobCandidatesFromPhysicalScope(entry.ResolvedFilePath, physicalScopeCandidates);
+            AddManifestClassJobCandidatesFromPhysicalScope(entry.ManifestValue, physicalScopeCandidates);
 
-        foreach (var scopeText in entry.ScopeTexts)
-            AddManifestClassJobCandidatesFromPhysicalScope(scopeText, physicalScopeCandidates);
+            foreach (var scopeText in entry.ScopeTexts)
+                AddManifestClassJobCandidatesFromPhysicalScope(scopeText, physicalScopeCandidates);
+        }
 
         if (IsJobBattleResidentAnimationPathShape(entry.GamePath))
         {
@@ -4055,7 +4762,7 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
             return false;
 
         gamePathCandidates = new HashSet<uint>();
-        if (ShouldInferManifestClassJobFromGamePath(entry.GamePath))
+        if (!entry.SuppressClassJobScopeInference && ShouldInferManifestClassJobFromGamePath(entry.GamePath))
             AddManifestClassJobCandidatesFromText(entry.GamePath, gamePathCandidates);
         if (gamePathCandidates.Count == 1)
         {
@@ -4063,7 +4770,8 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
             return true;
         }
 
-        if (entry.InheritedScopeClassJobId.HasValue
+        if (!entry.SuppressClassJobScopeInference
+            && entry.InheritedScopeClassJobId.HasValue
             && entry.InheritedScopeClassJobId.Value != 0
             && IsVfxRelatedResourcePath(entry.GamePath))
         {
@@ -4278,6 +4986,18 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
             && normalized.Contains("/bt_common/music/", StringComparison.OrdinalIgnoreCase);
     }
 
+    private static bool IsSoundResourcePath(string gamePath)
+    {
+        if (string.IsNullOrWhiteSpace(gamePath))
+            return false;
+
+        var normalized = NormalizePath(gamePath);
+        return normalized.EndsWith(".scd", StringComparison.OrdinalIgnoreCase)
+            && (StartsWithManifestGamePathRoot(normalized)
+                || normalized.Contains("/sound/", StringComparison.OrdinalIgnoreCase)
+                || normalized.Contains("/music/", StringComparison.OrdinalIgnoreCase));
+    }
+
     private static bool IsVfxRelatedResourcePath(string gamePath)
     {
         if (string.IsNullOrWhiteSpace(gamePath))
@@ -4302,6 +5022,13 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
         public HashSet<string> SelectedResolvedFilePaths { get; } = new(StringComparer.OrdinalIgnoreCase);
     }
 
+    private enum ManifestSelectedSupportScope
+    {
+        Neutral,
+        SharedEmote,
+        ClassJob,
+    }
+
     private sealed class ManifestTransientMappingCandidate
     {
         public ManifestTransientMappingCandidate(string gamePath, string resolvedFilePath, string manifestValue, IEnumerable<string> scopeTexts, bool knownGamePath)
@@ -4322,7 +5049,7 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
 
     private sealed class ManifestTransientImportEntry
     {
-        public ManifestTransientImportEntry(string gamePath, string resolvedFilePath, string manifestValue, int priority, IEnumerable<string> scopeTexts, uint? inheritedScopeClassJobId = null)
+        public ManifestTransientImportEntry(string gamePath, string resolvedFilePath, string manifestValue, int priority, IEnumerable<string> scopeTexts, uint? inheritedScopeClassJobId = null, bool suppressClassJobScopeInference = false)
         {
             GamePath = NormalizePath(gamePath);
             ResolvedFilePath = NormalizeResolvedFilePath(resolvedFilePath);
@@ -4330,6 +5057,7 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
             Priority = priority;
             ScopeTexts = scopeTexts.Where(s => !string.IsNullOrWhiteSpace(s)).Select(NormalizePath).ToHashSet(StringComparer.OrdinalIgnoreCase);
             InheritedScopeClassJobId = inheritedScopeClassJobId;
+            SuppressClassJobScopeInference = suppressClassJobScopeInference;
         }
 
         public string GamePath { get; }
@@ -4338,90 +5066,7 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
         public int Priority { get; }
         public HashSet<string> ScopeTexts { get; }
         public uint? InheritedScopeClassJobId { get; }
-    }
-
-    private bool IsAutoRecordTriggerPath(string gamePath)
-    {
-        var normalized = NormalizePath(gamePath);
-        if (string.IsNullOrWhiteSpace(normalized))
-            return false;
-
-        if (!EndsWithAny(normalized, _autoRecordTriggerFileTypes))
-            return false;
-
-        if (normalized.Contains("/skeleton/", StringComparison.OrdinalIgnoreCase)
-            || normalized.Contains("/mount.", StringComparison.OrdinalIgnoreCase))
-        {
-            return false;
-        }
-
-        if (IsIdleOrMoveAnimationPath(normalized))
-            return true;
-
-        if (normalized.Contains("/resident/", StringComparison.OrdinalIgnoreCase))
-            return false;
-
-        if (normalized.StartsWith("vfx/", StringComparison.OrdinalIgnoreCase)
-            || normalized.StartsWith("sound/", StringComparison.OrdinalIgnoreCase)
-            || normalized.Contains("/vfx/", StringComparison.OrdinalIgnoreCase))
-        {
-            return true;
-        }
-
-        if (normalized.StartsWith("chara/action/", StringComparison.OrdinalIgnoreCase))
-            return true;
-
-        return normalized.Contains("/emote/", StringComparison.OrdinalIgnoreCase)
-            || normalized.Contains("/emote_sp/", StringComparison.OrdinalIgnoreCase)
-            || normalized.Contains("/ability/", StringComparison.OrdinalIgnoreCase)
-            || normalized.Contains("/ws/", StringComparison.OrdinalIgnoreCase)
-            || normalized.Contains("/limitbreak/", StringComparison.OrdinalIgnoreCase)
-            || normalized.Contains("/event_base/", StringComparison.OrdinalIgnoreCase)
-            || normalized.Contains("/nonresident/", StringComparison.OrdinalIgnoreCase);
-    }
-
-    private static bool IsIdleOrMoveAnimationPath(string gamePath)
-    {
-        if (string.IsNullOrWhiteSpace(gamePath))
-            return false;
-
-        if (!gamePath.Contains("/resident/", StringComparison.OrdinalIgnoreCase))
-            return false;
-
-        return gamePath.Contains("/idle.", StringComparison.OrdinalIgnoreCase)
-            || gamePath.Contains("/move_", StringComparison.OrdinalIgnoreCase);
-    }
-
-    private bool IsAutoRecordCapturablePath(string gamePath)
-    {
-        var normalized = NormalizePath(gamePath);
-        if (string.IsNullOrWhiteSpace(normalized))
-            return false;
-
-        var isManagedTransientType = EndsWithAny(normalized, _handledFileTypes);
-        var isModelMaterialTexture = EndsWithAny(normalized, _handledRecordingFileTypes);
-        if (!isManagedTransientType && !isModelMaterialTexture)
-            return false;
-
-        if (isModelMaterialTexture && IsLikelyAppearanceSlotModelMaterialTexturePath(normalized) && !ContainsAnimationSupportBodyToken(normalized))
-            return false;
-
-        return true;
-    }
-
-    private static bool IsLikelyAppearanceSlotModelMaterialTexturePath(string gamePath)
-    {
-        var normalized = NormalizePath(gamePath);
-        if (string.IsNullOrWhiteSpace(normalized))
-            return false;
-
-        return normalized.StartsWith("chara/equipment/", StringComparison.OrdinalIgnoreCase)
-            || normalized.StartsWith("chara/accessory/", StringComparison.OrdinalIgnoreCase)
-            || normalized.Contains("/obj/hair/", StringComparison.OrdinalIgnoreCase)
-            || normalized.Contains("/obj/face/", StringComparison.OrdinalIgnoreCase)
-            || normalized.Contains("/obj/tail/", StringComparison.OrdinalIgnoreCase)
-            || normalized.Contains("/obj/ear/", StringComparison.OrdinalIgnoreCase)
-            || normalized.Contains("/obj/body/", StringComparison.OrdinalIgnoreCase) && normalized.StartsWith("chara/human/", StringComparison.OrdinalIgnoreCase);
+        public bool SuppressClassJobScopeInference { get; }
     }
 
     private static string ExtractResolvedFilePath(string filePath)
@@ -4485,6 +5130,7 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
             || normalized.EndsWith("pap", StringComparison.OrdinalIgnoreCase)
             || normalized.EndsWith("avfx", StringComparison.OrdinalIgnoreCase)
             || normalized.EndsWith("atex", StringComparison.OrdinalIgnoreCase)
+            || normalized.EndsWith("imc", StringComparison.OrdinalIgnoreCase)
             || normalized.EndsWith("sklb", StringComparison.OrdinalIgnoreCase)
             || normalized.EndsWith("eid", StringComparison.OrdinalIgnoreCase)
             || normalized.EndsWith("phy", StringComparison.OrdinalIgnoreCase)
@@ -4523,6 +5169,8 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
                 _startupTransientPrimeCts.Dispose();
                 _targetedManifestRefreshCts.Cancel();
                 _targetedManifestRefreshCts.Dispose();
+                _activeCollectionDirtyCheckCts.Cancel();
+                _activeCollectionDirtyCheckCts.Dispose();
             }
             catch (ObjectDisposedException)
             {

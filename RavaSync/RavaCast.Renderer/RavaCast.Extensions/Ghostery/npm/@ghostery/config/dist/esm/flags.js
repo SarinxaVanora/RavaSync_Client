@@ -1,0 +1,15 @@
+//#region node_modules/@ghostery/config/dist/esm/flags.js
+var FLAG_MODES = "modes";
+var FLAG_PAUSE_ASSISTANT = "pause-assistant";
+var FLAG_ONBOARDING_SURVEY = "onboarding-survey";
+var FLAG_NOTIFICATION_REVIEW = "notification-review";
+var FLAG_SUBFRAME_SCRIPTING = "subframe-scripting";
+var FLAGS = [
+	FLAG_MODES,
+	FLAG_PAUSE_ASSISTANT,
+	FLAG_ONBOARDING_SURVEY,
+	FLAG_NOTIFICATION_REVIEW,
+	FLAG_SUBFRAME_SCRIPTING
+];
+//#endregion
+export { FLAGS, FLAG_MODES, FLAG_NOTIFICATION_REVIEW, FLAG_ONBOARDING_SURVEY, FLAG_PAUSE_ASSISTANT, FLAG_SUBFRAME_SCRIPTING };

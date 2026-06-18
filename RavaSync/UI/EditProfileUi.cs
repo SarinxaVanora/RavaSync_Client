@@ -12,6 +12,7 @@ using RavaSync.WebAPI;
 using Microsoft.Extensions.Logging;
 using SixLabors.ImageSharp;
 using SixLabors.ImageSharp.PixelFormats;
+using Image = SixLabors.ImageSharp.Image;
 
 namespace RavaSync.UI;
 

@@ -1,0 +1,95 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows10.0.19041.0</TargetFramework>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <Platforms>x64</Platforms>
+    <PlatformTarget>x64</PlatformTarget>
+    <Prefer32Bit>false</Prefer32Bit>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UseWindowsForms>true</UseWindowsForms>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <CopyLocalLockfileAssemblies>true</CopyLocalLockfileAssemblies>
+    <DebugSymbols>false</DebugSymbols>
+    <DebugType>none</DebugType>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <CopyDebugSymbolFilesFromPackages>false</CopyDebugSymbolFilesFromPackages>
+    <CopyDocumentationFilesFromPackages>false</CopyDocumentationFilesFromPackages>
+    <PathMap>
+      C:\Users\Jamie\Desktop\RavaSync\Working folder\RavaSync Client=R:\RavaSync
+    </PathMap>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.3967.48" GeneratePathProperty="true" />
+    <PackageReference Include="SharpDX" Version="4.2.0" />
+    <PackageReference Include="SharpDX.Direct3D11" Version="4.2.0" />
+    <PackageReference Include="SharpDX.DXGI" Version="4.2.0" />
+    <PackageReference Include="SharpDX.Mathematics" Version="4.2.0" />
+  </ItemGroup>
+
+
+  <ItemGroup>
+    <None Include="RavaCast.Extensions\Ghostery\**\*" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <None Include="RavaCast.Extensions\uBlockOrigin\**\*" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <None Include="RavaCast.Extensions\uBlock Origin\**\*" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <BundleRavaCastNativeBridge>true</BundleRavaCastNativeBridge>
+    <BundleRavaCastBridgeHost>true</BundleRavaCastBridgeHost>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <Target Name="PublishRavaCastDirectStreamDependencies" AfterTargets="Publish" Condition="'$(DesignTimeBuild)' != 'true'">
+    <PropertyGroup>
+      <_RavaCastDirectStreamOutput>$(PublishDir)</_RavaCastDirectStreamOutput>
+      <_RavaCastNativeBridgeProject>$(MSBuildProjectDirectory)\..\RavaCast.Media.Native\RavaCast.Media.Native.csproj</_RavaCastNativeBridgeProject>
+      <_RavaCastBridgeHostProject>$(MSBuildProjectDirectory)\..\RavaCast.Media.BridgeHost\RavaCast.Media.BridgeHost.csproj</_RavaCastBridgeHostProject>
+    </PropertyGroup>
+
+    <Message Importance="high" Text="Publishing RavaCast Direct Stream dependencies to $(_RavaCastDirectStreamOutput)" />
+    <Exec Condition="'$(BundleRavaCastNativeBridge)' == 'true'" Command="dotnet publish &quot;$(_RavaCastNativeBridgeProject)&quot; -c $(Configuration) -r win-x64 --self-contained true -o &quot;$(_RavaCastDirectStreamOutput)&quot;" />
+    <Exec Condition="'$(BundleRavaCastBridgeHost)' == 'true'" Command="dotnet publish &quot;$(_RavaCastBridgeHostProject)&quot; -c $(Configuration) -r win-x64 --self-contained false -p:PlatformTarget=x64 -p:Prefer32Bit=false -o &quot;$(_RavaCastDirectStreamOutput)&quot;" />
+
+    <ItemGroup>
+      <_RavaCastDirectStreamRequiredFile Include="$(_RavaCastDirectStreamOutput)RavaCast.Media.Native.dll" Condition="'$(BundleRavaCastNativeBridge)' == 'true'" />
+      <_RavaCastDirectStreamRequiredFile Include="$(_RavaCastDirectStreamOutput)RavaCast.Media.BridgeHost.exe" Condition="'$(BundleRavaCastBridgeHost)' == 'true'" />
+      <_RavaCastDirectStreamRequiredFile Include="$(_RavaCastDirectStreamOutput)RavaCast.Media.BridgeHost.dll" Condition="'$(BundleRavaCastBridgeHost)' == 'true'" />
+      <_RavaCastDirectStreamRequiredFile Include="$(_RavaCastDirectStreamOutput)RavaCast.Media.BridgeHost.deps.json" Condition="'$(BundleRavaCastBridgeHost)' == 'true'" />
+      <_RavaCastDirectStreamRequiredFile Include="$(_RavaCastDirectStreamOutput)RavaCast.Media.BridgeHost.runtimeconfig.json" Condition="'$(BundleRavaCastBridgeHost)' == 'true'" />
+      <_RavaCastDirectStreamRequiredFile Include="$(_RavaCastDirectStreamOutput)datachannel.dll" Condition="'$(BundleRavaCastBridgeHost)' == 'true'" />
+      <_RavaCastDirectStreamRequiredFile Include="$(_RavaCastDirectStreamOutput)ffmpeg.exe" Condition="'$(BundleRavaCastBridgeHost)' == 'true'" />
+    </ItemGroup>
+
+    <Error Condition="!Exists('%(_RavaCastDirectStreamRequiredFile.Identity)')" Text="RavaCast Direct Stream publish is incomplete. Missing required file '%(_RavaCastDirectStreamRequiredFile.Identity)'." />
+  </Target>
+
+
+
+  <Target Name="BundleWebView2RuntimeFiles" AfterTargets="Build;Publish" Condition="'$(DesignTimeBuild)' != 'true'">
+    <PropertyGroup>
+      <_WebView2PackagePath>$(PkgMicrosoft_Web_WebView2)</_WebView2PackagePath>
+      <_WebView2OutputDir Condition="'$(PublishDir)' != ''">$(PublishDir)</_WebView2OutputDir>
+      <_WebView2OutputDir Condition="'$(_WebView2OutputDir)' == ''">$(TargetDir)</_WebView2OutputDir>
+    </PropertyGroup>
+
+    <Error Condition="'$(_WebView2PackagePath)' == ''" Text="Microsoft.Web.WebView2 NuGet package path was not resolved. Restore packages before building RavaCast.Renderer." />
+
+    <ItemGroup>
+      <_RavaCastWebView2Managed Include="$(_WebView2PackagePath)\lib\**\Microsoft.Web.WebView2.Core.dll" />
+      <_RavaCastWebView2Managed Include="$(_WebView2PackagePath)\lib\**\Microsoft.Web.WebView2.WinForms.dll" />
+      <_RavaCastWebView2Managed Include="$(_WebView2PackagePath)\lib\**\Microsoft.Web.WebView2.Wpf.dll" />
+      <_RavaCastWebView2Native Include="$(_WebView2PackagePath)\runtimes\win-x64\native\WebView2Loader.dll" />
+    </ItemGroup>
+
+    <Error Condition="'@(_RavaCastWebView2Managed)' == ''" Text="No WebView2 managed DLLs were found in the restored Microsoft.Web.WebView2 package at '$(_WebView2PackagePath)'." />
+    <Error Condition="'@(_RavaCastWebView2Native)' == ''" Text="WebView2Loader.dll win-x64 was not found in the restored Microsoft.Web.WebView2 package at '$(_WebView2PackagePath)'." />
+
+    <Message Importance="high" Text="Bundling WebView2 runtime assemblies to $(_WebView2OutputDir)" />
+    <Copy SourceFiles="@(_RavaCastWebView2Managed);@(_RavaCastWebView2Native)" DestinationFolder="$(_WebView2OutputDir)" SkipUnchangedFiles="true" />
+  </Target>
+
+
+</Project>

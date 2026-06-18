@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Threading;
@@ -70,6 +71,31 @@ public sealed partial class PairHandler
             }
         }
 
+        private static async Task WaitForGlobalRedrawDispatchSpacingAsync(bool criticalRedraw, CancellationToken token)
+        {
+            var spacingMs = criticalRedraw ? CriticalGlobalRedrawSpacingMs : NonCriticalGlobalRedrawSpacingMs;
+            if (spacingMs <= 0)
+                return;
+
+            while (true)
+            {
+                token.ThrowIfCancellationRequested();
+
+                var now = Environment.TickCount64;
+                var last = Interlocked.Read(ref _lastGlobalRedrawDispatchTick);
+                var wait = spacingMs - (now - last);
+                if (wait <= 0)
+                {
+                    if (Interlocked.CompareExchange(ref _lastGlobalRedrawDispatchTick, now, last) == last)
+                        return;
+
+                    continue;
+                }
+
+                await Task.Delay((int)Math.Min(wait, 50), token).ConfigureAwait(false);
+            }
+        }
+
         private async Task<bool> TryOnePassRedrawAsync(Guid applicationId, CancellationToken token, bool criticalRedraw, int attempt)
         {
             var handler = _charaHandler;
@@ -109,23 +135,40 @@ public sealed partial class PairHandler
             var acquired = false;
             try
             {
-                if (!criticalRedraw)
-                {
-                    await GlobalRedrawSemaphore.WaitAsync(token).ConfigureAwait(false);
-                    acquired = true;
+                await GlobalRedrawSemaphore.WaitAsync(token).ConfigureAwait(false);
+                acquired = true;
 
-                    var seed = ((PlayerNameHash?.GetHashCode(StringComparison.Ordinal) ?? 0) ^ objIndex) & 0x1F;
-                    var delayMs = SyncStorm.IsActive ? 10 + seed : 4 + (seed & 0x0F);
-                    await Task.Delay(delayMs, token).ConfigureAwait(false);
+                await WaitForGlobalRedrawDispatchSpacingAsync(criticalRedraw, token).ConfigureAwait(false);
+
+                var seed = ((PlayerNameHash?.GetHashCode(StringComparison.Ordinal) ?? 0) ^ objIndex) & 0x1F;
+                int delayMs;
+                if (criticalRedraw)
+                {
+                    delayMs = SyncStorm.IsActive
+                        ? 18 + seed
+                        : (IsRecentlyVisibleLifecycleReplay() ? 12 + (seed & 0x1F) : 4 + (seed & 0x0F));
+
+                    if (IsWineRuntime && IsRecentlyVisibleLifecycleReplay())
+                        delayMs += SyncStorm.IsActive ? 18 : 10;
                 }
+                else
+                {
+                    delayMs = SyncStorm.IsActive ? 10 + seed : 4 + (seed & 0x0F);
+                }
+
+                if (delayMs > 0)
+                    await Task.Delay(delayMs, token).ConfigureAwait(false);
 
                 handler = _charaHandler;
                 if (handler == null || handler.Address == nint.Zero)
                     return false;
 
+                var redrawStopwatch = Stopwatch.StartNew();
                 var fired = criticalRedraw
                     ? await _ipcManager.Penumbra.RedrawDirectAndWaitAsync(Logger, handler, applicationId, token).ConfigureAwait(false)
                     : await _ipcManager.Penumbra.RedrawAsync(Logger, handler, applicationId, token, criticalRedraw: false).ConfigureAwait(false);
+                redrawStopwatch.Stop();
+                LinuxSmoothMode.RecordFrameworkWork(redrawStopwatch.ElapsedMilliseconds);
 
                 if (!fired)
                     Logger.LogTrace("[{applicationId}] Penumbra redraw IPC did not fire for {player} on attempt {attempt}", applicationId, Pair.UserData.AliasOrUID, attempt);

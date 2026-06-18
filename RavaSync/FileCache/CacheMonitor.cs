@@ -23,6 +23,7 @@ public sealed class CacheMonitor : DisposableMediatorSubscriberBase
     private readonly object _csvFlushGate = new();
     private CancellationTokenSource? _csvFlushCts;
     public static readonly IImmutableList<string> AllowedFileExtensions = [".mdl", ".tex", ".mtrl", ".tmb", ".tmb2", ".pap", ".avfx", ".atex", ".sklb", ".eid", ".phy", ".phyb", ".pbd", ".scd", ".skp", ".shpk"];
+    private static readonly HashSet<string> AllowedFileExtensionSet = new(AllowedFileExtensions, StringComparer.OrdinalIgnoreCase);
     private const string AutomaticTrimScanLock = "CacheMonitor.AutomaticTrim";
     private const int AutomaticTrimDeleteRetryCount = 5;
     private static readonly TimeSpan AutomaticTrimDeleteRetryDelay = TimeSpan.FromMilliseconds(150);
@@ -157,9 +158,9 @@ public sealed class CacheMonitor : DisposableMediatorSubscriberBase
     {
         Logger.LogTrace("RavaSync FSW: FileChanged: {change} => {path}", e.ChangeType, e.FullPath);
 
-        if (!AllowedFileExtensions.Any(ext => e.FullPath.EndsWith(ext, StringComparison.OrdinalIgnoreCase))) return;
+        if (!HasAllowedFileExtension(e.FullPath)) return;
 
-        lock (_watcherChanges)
+        lock (_mareChanges)
         {
             _mareChanges[e.FullPath] = new(e.ChangeType);
         }
@@ -201,7 +202,7 @@ public sealed class CacheMonitor : DisposableMediatorSubscriberBase
     private void Fs_Changed(object sender, FileSystemEventArgs e)
     {
         if (Directory.Exists(e.FullPath)) return;
-        if (!AllowedFileExtensions.Any(ext => e.FullPath.EndsWith(ext, StringComparison.OrdinalIgnoreCase))) return;
+        if (!HasAllowedFileExtension(e.FullPath)) return;
 
         if (e.ChangeType is not (WatcherChangeTypes.Changed or WatcherChangeTypes.Deleted or WatcherChangeTypes.Created))
             return;
@@ -225,7 +226,7 @@ public sealed class CacheMonitor : DisposableMediatorSubscriberBase
             {
                 foreach (var file in directoryFiles)
                 {
-                    if (!AllowedFileExtensions.Any(ext => file.EndsWith(ext, StringComparison.OrdinalIgnoreCase))) continue;
+                    if (!HasAllowedFileExtension(file)) continue;
                     var oldPath = file.Replace(e.FullPath, e.OldFullPath, StringComparison.OrdinalIgnoreCase);
 
                     _watcherChanges.Remove(oldPath);
@@ -237,7 +238,7 @@ public sealed class CacheMonitor : DisposableMediatorSubscriberBase
         }
         else
         {
-            if (!AllowedFileExtensions.Any(ext => e.FullPath.EndsWith(ext, StringComparison.OrdinalIgnoreCase))) return;
+            if (!HasAllowedFileExtension(e.FullPath)) return;
 
             lock (_watcherChanges)
             {
@@ -1025,12 +1026,24 @@ public sealed class CacheMonitor : DisposableMediatorSubscriberBase
         }
     }
 
+    private static bool HasAllowedFileExtension(string path)
+        => AllowedFileExtensionSet.Contains(Path.GetExtension(path));
+
+    private static bool ContainsPathSegment(string path, string segment)
+    {
+        if (string.IsNullOrEmpty(path) || string.IsNullOrEmpty(segment))
+            return false;
+
+        return path.Contains($"\\{segment}\\", StringComparison.OrdinalIgnoreCase)
+            || path.Contains($"/{segment}/", StringComparison.OrdinalIgnoreCase);
+    }
+
     private static bool IsAllowedPenumbraScanPath(string file)
     {
-        return AllowedFileExtensions.Any(e => file.EndsWith(e, StringComparison.OrdinalIgnoreCase))
-            && !file.Contains(@"\bg\", StringComparison.OrdinalIgnoreCase)
-            && !file.Contains(@"\bgcommon\", StringComparison.OrdinalIgnoreCase)
-            && !file.Contains(@"\ui\", StringComparison.OrdinalIgnoreCase);
+        return HasAllowedFileExtension(file)
+            && !ContainsPathSegment(file, "bg")
+            && !ContainsPathSegment(file, "bgcommon")
+            && !ContainsPathSegment(file, "ui");
     }
 
     private static bool IsCacheHashFileCandidate(string file)

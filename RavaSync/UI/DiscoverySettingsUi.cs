@@ -24,7 +24,7 @@ public sealed class DiscoverySettingsUi : WindowMediatorSubscriberBase
         UiSharedService uiShared,
         MareConfigService configService,
         PerformanceCollectorService performanceCollectorService)
-        : base(logger, mediator, "RavaSync — Discovery Settings", performanceCollectorService)
+        : base(logger, mediator, "RavaSync — Discovery###RavaSyncDiscoverySettings", performanceCollectorService)
     {
         _uiShared = uiShared;
         _configService = configService;

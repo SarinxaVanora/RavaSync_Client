@@ -15,7 +15,6 @@ using Lumina.Excel.Sheets;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using RavaSync.API.Dto.CharaData;
-using RavaSync.Interop;
 using RavaSync.MareConfiguration;
 using RavaSync.PlayerData.Handlers;
 using RavaSync.Services.Mediator;
@@ -30,13 +29,17 @@ namespace RavaSync.Services;
 
 public class DalamudUtilService : IHostedService, IMediatorSubscriber
 {
+    // Some jobs expose actor-like combat helpers through the pet pointer.
+    // Ninja shadow clone is intentionally ignored as a pet pointer entirely.
     private readonly List<uint> _classJobIdsIgnoredForPets = [30];
+    // Dark Knight Living Shadow is still a real spawned actor, but it is short-lived and must not
+    // be treated like a persistent Summoner pet for static->transient promotion.
+    private readonly HashSet<uint> _classJobIdsWithShortLivedCombatPets = [32];
     private readonly IClientState _clientState;
     private readonly ICondition _condition;
     private readonly IDataManager _gameData;
     private readonly IGameConfig _gameConfig;
     private readonly IDutyState _dutyState;
-    private readonly BlockedCharacterHandler _blockedCharacterHandler;
     private readonly IFramework _framework;
     private readonly IGameGui _gameGui;
     private readonly ILogger<DalamudUtilService> _logger;
@@ -108,14 +111,14 @@ public class DalamudUtilService : IHostedService, IMediatorSubscriber
     private int _playerCharaScanId = 0;
     private DateTime _nextPlayerCharaScan = DateTime.MinValue;
     private DateTime _nextPlayerCharaPrune = DateTime.MinValue;
-    private static readonly TimeSpan _playerCharaScanInterval = TimeSpan.FromMilliseconds(125);
+    private static readonly TimeSpan _playerCharaScanInterval = TimeSpan.FromMilliseconds(75);
     private static readonly TimeSpan _playerCharaPruneInterval = TimeSpan.FromSeconds(2);
 
 
 
     public DalamudUtilService(ILogger<DalamudUtilService> logger, IClientState clientState, IObjectTable objectTable, IFramework framework,
         IGameGui gameGui, ICondition condition, IDataManager gameData, ITargetManager targetManager, IGameConfig gameConfig,
-        IDutyState dutyState, BlockedCharacterHandler blockedCharacterHandler, MareMediator mediator, PerformanceCollectorService performanceCollector,
+        IDutyState dutyState, MareMediator mediator, PerformanceCollectorService performanceCollector,
         MareConfigService configService, IPartyList partyList)
     {
         _logger = logger;
@@ -127,7 +130,6 @@ public class DalamudUtilService : IHostedService, IMediatorSubscriber
         _gameData = gameData;
         _gameConfig = gameConfig;
         _dutyState = dutyState;
-        _blockedCharacterHandler = blockedCharacterHandler;
         Mediator = mediator;
         _performanceCollector = performanceCollector;
         _configService = configService;
@@ -197,6 +199,8 @@ public class DalamudUtilService : IHostedService, IMediatorSubscriber
             }).ConfigureAwait(false);
         });
         IsWine = Util.IsWine();
+        if (LinuxSmoothMode.IsActive)
+            _logger.LogInformation("Linux Smooth Mode active: adaptive framework IPC pacing, restored pair download lanes and batched cache finalisation enabled");
         _cid = RebuildCID();
     }
 
@@ -289,6 +293,8 @@ public class DalamudUtilService : IHostedService, IMediatorSubscriber
     public bool IsLodEnabled { get; private set; }
     public MareMediator Mediator { get; }
     public bool IsRoleplaying => _condition[ConditionFlag.RolePlaying];
+    public bool ShouldIgnorePetForCurrentJob => _classJobIdsIgnoredForPets.Contains(_classJobId ?? 0);
+    public bool ShouldTreatPetAsShortLivedCombatSummonForCurrentJob => _classJobIdsWithShortLivedCombatPets.Contains(_classJobId ?? 0);
     public uint CurrentTerritoryId { get; private set; } = 0;
 
     public IGameObject? CreateGameObject(IntPtr reference)
@@ -344,6 +350,29 @@ public class DalamudUtilService : IHostedService, IMediatorSubscriber
     public IEnumerable<ICharacter?> GetGposeCharactersFromObjectTable()
     {
         return _objectTable.Where(o => o.ObjectIndex > 200 && o.ObjectKind == Dalamud.Game.ClientState.Objects.Enums.ObjectKind.Pc).Cast<ICharacter>();
+    }
+
+    public List<(int ObjectIndex, nint Address, string Name)> GetPlayerCharacterSnapshotsFromObjectTable()
+    {
+        EnsureIsOnFramework();
+
+        var output = new List<(int ObjectIndex, nint Address, string Name)>();
+
+        foreach (var obj in _objectTable)
+        {
+            if (obj == null || !obj.IsValid())
+                continue;
+
+            if (obj.ObjectKind != Dalamud.Game.ClientState.Objects.Enums.ObjectKind.Pc)
+                continue;
+
+            if (obj is not ICharacter character)
+                continue;
+
+            output.Add((character.ObjectIndex, character.Address, character.Name.TextValue ?? string.Empty));
+        }
+
+        return output;
     }
 
     public bool GetIsPlayerPresent()
@@ -415,7 +444,7 @@ public class DalamudUtilService : IHostedService, IMediatorSubscriber
     public unsafe IntPtr GetPetPtr(IntPtr? playerPointer = null)
     {
         EnsureIsOnFramework();
-        if (_classJobIdsIgnoredForPets.Contains(_classJobId ?? 0)) return IntPtr.Zero;
+        if (ShouldIgnorePetForCurrentJob) return IntPtr.Zero;
         var mgr = CharacterManager.Instance();
         playerPointer ??= GetPlayerPtr();
         if (playerPointer == IntPtr.Zero || (IntPtr)mgr == IntPtr.Zero) return IntPtr.Zero;
@@ -473,6 +502,17 @@ public class DalamudUtilService : IHostedService, IMediatorSubscriber
 
         UpdateLivePlayerCache(livePlayer);
         return true;
+    }
+
+    public bool AddressMatchesPlayerIdentCached(string? characterIdent, nint address)
+    {
+        EnsureIsOnFramework();
+
+        if (string.IsNullOrEmpty(characterIdent) || address == nint.Zero)
+            return false;
+
+        return TryGetCachedLivePlayerRefByAddress(address, out var livePlayer)
+            && string.Equals(livePlayer.Ident, characterIdent, StringComparison.Ordinal);
     }
 
     private IPlayerCharacter? TryGetLivePlayerCharacterByAddress(nint address)
@@ -565,6 +605,52 @@ public class DalamudUtilService : IHostedService, IMediatorSubscriber
         }
     }
 
+    private bool TryGetCachedLivePlayerRefByAddress(nint address, out LivePlayerRef livePlayer)
+    {
+        EnsureIsOnFramework();
+        livePlayer = default;
+
+        if (address == nint.Zero)
+            return false;
+
+        if (!_identByAddress.TryGetValue(address, out var ident) || string.IsNullOrEmpty(ident))
+            return false;
+
+        if (!_playerCharas.TryGetValue(ident, out var cached) || cached.Address != address)
+            return false;
+
+        livePlayer = cached.ToLiveRef(ident);
+        return livePlayer.IsValid;
+    }
+
+    private bool TryGetCachedLivePlayerRefByIdent(string characterIdent, out LivePlayerRef livePlayer, nint fallbackAddress = 0)
+    {
+        EnsureIsOnFramework();
+        livePlayer = default;
+
+        if (string.IsNullOrEmpty(characterIdent))
+            return false;
+
+        if (fallbackAddress != nint.Zero
+            && TryGetCachedLivePlayerRefByAddress(fallbackAddress, out var fallbackLive)
+            && string.Equals(fallbackLive.Ident, characterIdent, StringComparison.Ordinal))
+        {
+            livePlayer = fallbackLive;
+            return true;
+        }
+
+        if (_playerCharas.TryGetValue(characterIdent, out var cached)
+            && cached.Address != nint.Zero
+            && TryGetCachedLivePlayerRefByAddress(cached.Address, out var cachedLive)
+            && string.Equals(cachedLive.Ident, characterIdent, StringComparison.Ordinal))
+        {
+            livePlayer = cachedLive;
+            return true;
+        }
+
+        return false;
+    }
+
     private bool TryGetLivePlayerRefByAddress(nint address, out LivePlayerRef livePlayer)
     {
         EnsureIsOnFramework();
@@ -586,7 +672,7 @@ public class DalamudUtilService : IHostedService, IMediatorSubscriber
 
         _identByAddress[livePlayer.Address] = livePlayer.Ident;
 
-        var sid = RavaSync.Services.Discovery.RavaSessionId.FromIdent(livePlayer.Ident);
+        var sid = RavaSync.Services.Mesh.RavaSessionId.FromIdent(livePlayer.Ident);
         if (!string.IsNullOrEmpty(sid))
             _addressBySessionId[sid] = livePlayer.Address;
 
@@ -644,25 +730,15 @@ public class DalamudUtilService : IHostedService, IMediatorSubscriber
         if (string.IsNullOrEmpty(characterIdent))
             return false;
 
-        if (fallbackAddress != nint.Zero
-            && TryGetLivePlayerRefByAddress(fallbackAddress, out var fallbackLive)
-            && string.Equals(fallbackLive.Ident, characterIdent, StringComparison.Ordinal))
-        {
-            UpdateLivePlayerCache(fallbackLive);
-            livePlayer = fallbackLive;
+        // Hot path rule: the normal resolver is cache-first/cache-only.
+        // UpdatePlayerCharaCache() already performs one shared object-table scan on the
+        // framework thread. Do not let every PairHandler/GameObjectHandler repeat that
+        // same 0..200 object walk just because it has a fallback address.
+        if (TryGetCachedLivePlayerRefByIdent(characterIdent, out livePlayer, fallbackAddress))
             return true;
-        }
 
-        if (!forceLiveScan
-            && _playerCharas.TryGetValue(characterIdent, out var cached)
-            && cached.Address != nint.Zero
-            && TryGetLivePlayerRefByAddress(cached.Address, out var cachedLive)
-            && string.Equals(cachedLive.Ident, characterIdent, StringComparison.Ordinal))
-        {
-            UpdateLivePlayerCache(cachedLive);
-            livePlayer = cachedLive;
-            return true;
-        }
+        if (!forceLiveScan)
+            return false;
 
         return TryScanLivePlayerByIdent(characterIdent, out livePlayer);
     }
@@ -671,7 +747,7 @@ public class DalamudUtilService : IHostedService, IMediatorSubscriber
     {
         EnsureIsOnFramework();
 
-        return TryResolveLivePlayer(characterName, out var livePlayer)
+        return TryResolveLivePlayer(characterName, out var livePlayer, forceLiveScan: false)
             ? livePlayer.Address
             : IntPtr.Zero;
     }
@@ -1040,11 +1116,11 @@ public class DalamudUtilService : IHostedService, IMediatorSubscriber
     }
 
 
-    internal (string Name, nint Address) FindPlayerByNameHash(string ident)
+    internal (string Name, nint Address) FindPlayerByNameHash(string ident, bool forceLiveScan = false)
     {
         EnsureIsOnFramework();
 
-        return TryResolveLivePlayer(ident, out var livePlayer)
+        return TryResolveLivePlayer(ident, out var livePlayer, forceLiveScan: forceLiveScan)
             ? (livePlayer.Name, livePlayer.Address)
             : default;
     }

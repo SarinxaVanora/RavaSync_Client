@@ -1,0 +1,38 @@
+//#region node_modules/@ghostery/adblocker/dist/esm/crc32.js
+var POLY = 3988292384;
+var [T0, T1, T2, T3, T4, T5, T6, T7] = (() => {
+	const tables = Array.from({ length: 8 }, () => new Int32Array(256));
+	let c = 0;
+	let n = 0;
+	let k = 0;
+	for (; n !== 256; n += 1) {
+		c = n;
+		for (k = 0; k !== 8; k += 1) c = c & 1 ? POLY ^ c >>> 1 : c >>> 1;
+		tables[0][n] = c;
+	}
+	for (let i = 0; i !== 256; i += 1) {
+		c = tables[0][i];
+		for (n = 1; n !== tables.length; n += 1) {
+			c = c >>> 8 ^ tables[0][c & 255];
+			tables[n][i] = c;
+		}
+	}
+	return tables;
+})();
+function crc32(buf, start, end) {
+	const L = end - 7;
+	let C = -1;
+	let i = start;
+	while (i < L) {
+		C ^= buf[i] | buf[i + 1] << 8 | buf[i + 2] << 16 | buf[i + 3] << 24;
+		C = T7[C & 255] ^ T6[C >>> 8 & 255] ^ T5[C >>> 16 & 255] ^ T4[C >>> 24] ^ T3[buf[i + 4]] ^ T2[buf[i + 5]] ^ T1[buf[i + 6]] ^ T0[buf[i + 7]];
+		i += 8;
+	}
+	while (i < end) {
+		C = C >>> 8 ^ T0[(C ^ buf[i]) & 255];
+		i += 1;
+	}
+	return (C ^ -1) >>> 0;
+}
+//#endregion
+export { crc32 as default };

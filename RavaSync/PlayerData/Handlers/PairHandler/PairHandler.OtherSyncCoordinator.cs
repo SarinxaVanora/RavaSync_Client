@@ -64,7 +64,7 @@ public sealed partial class PairHandler
 
                 if (treatAsFirstVisible)
                 {
-                    ResetToUninitializedState();
+                    GoBackToVanillaState(revertLiveCustomizationState: true, waitForCompletion: false);
                     ScheduleRefreshUi();
                     return;
                 }
@@ -109,7 +109,7 @@ public sealed partial class PairHandler
                     return;
                 }
 
-                ResetToUninitializedState();
+                GoBackToVanillaState(revertLiveCustomizationState: true, waitForCompletion: false);
                 ScheduleRefreshUi();
             }
 
@@ -127,26 +127,28 @@ public sealed partial class PairHandler
                     Pair.AutoPausedByOtherSync &&
                     string.Equals(Pair.AutoPausedByOtherSyncName, owner, StringComparison.OrdinalIgnoreCase);
 
-                var alreadyQuiesced =
-                    string.IsNullOrEmpty(PlayerName) &&
-                    _charaHandler == null &&
-                    !IsVisible &&
-                    Interlocked.CompareExchange(ref Owner._initializeStarted, 0, 0) == 0 &&
-                    !_initialApplyPending;
-
-                if (alreadySameOwner && alreadyQuiesced)
+                if (alreadySameOwner)
+                {
+                    BroadcastLocalOtherSyncYieldState(yieldToOtherSync: true, owner: owner);
+                    ScheduleRefreshUi(immediate: true);
                     return;
+                }
 
                 Pair.AutoPausedByOtherSync = true;
                 Pair.AutoPausedByOtherSyncName = owner;
 
-                Logger.LogDebug("OtherSync owner {owner} claimed {pair}; hard wiping RavaSync visible state before yielding", owner, Pair.UserData.AliasOrUID);
+                Logger.LogDebug("OtherSync owner {owner} claimed {pair}; pausing RavaSync work without forcing vanilla teardown", owner, Pair.UserData.AliasOrUID);
 
-                ResetToUninitializedState();
+                // OtherSync ownership is a coordination pause, not a visual teardown.
+                // RavaSync should stop downloading/applying for this pair and let the owning
+                // sync provider settle its own state, but it must not run the hard vanilla
+                // reset path here or it can fight the provider that just took over.
+                CancelPairSyncWork(clearDesired: false);
+                Pair.SetVisibleTransferStatus(Pair.VisibleTransferIndicator.None);
+                Pair.SetCurrentDownloadStatus(null);
+                Pair.SetCurrentDownloadSummary(Pair.DownloadProgressSummary.None);
+                SetUploading(isUploading: false);
 
-                // Yielding to another sync provider is intentionally quiescent. We want the hard
-                // wipe, but we do not want RavaSync to immediately schedule a first-visible reapply
-                // while the other provider owns the character.
                 _initialApplyPending = false;
                 _redrawOnNextApplication = false;
                 _forceApplyMods = true;
