@@ -36,7 +36,8 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
     private readonly object _outboundRecipientUidsLock = new();
     private HashSet<string> _outboundRecipientUids = new(StringComparer.Ordinal);
     private readonly SemaphoreSlim _centralRepairUploadSemaphore = new(1, 1);
-    private CancellationTokenSource? _uploadCancellationTokenSource = new();
+    private readonly object _uploadCancellationLock = new();
+    private CancellationTokenSource? _uploadCancellationTokenSource;
     private static readonly TimeSpan VerifiedHashTtl = TimeSpan.FromHours(12);
     private const int MaxCdnExistenceChecks = 8;
     private const int HealthyCdnProbeAttempts = 3;
@@ -209,16 +210,25 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
 
     public bool CancelUpload()
     {
+        var hadVisibleUploads = false;
         lock (_currentUploadsLock)
         {
-            if (CurrentUploads.Count <= 0)
-                return false;
+            hadVisibleUploads = CurrentUploads.Count > 0;
         }
 
+        CancellationTokenSource? ctsToCancel;
+        lock (_uploadCancellationLock)
+        {
+            ctsToCancel = _uploadCancellationTokenSource;
+            _uploadCancellationTokenSource = null;
+        }
+
+        if (!hadVisibleUploads && ctsToCancel == null)
+            return false;
+
         Logger.LogDebug("Cancelling current upload");
-        _uploadCancellationTokenSource?.Cancel();
-        _uploadCancellationTokenSource?.Dispose();
-        _uploadCancellationTokenSource = null;
+        try { ctsToCancel?.Cancel(); } catch { /* best effort */ }
+
         CompleteAndClearCurrentUploads();
         ClearLocalOutboundUploadRecipients();
         return true;
@@ -887,8 +897,13 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
     {
         CancelUpload();
 
-        _uploadCancellationTokenSource = new CancellationTokenSource();
-        var uploadToken = _uploadCancellationTokenSource.Token;
+        var uploadCts = new CancellationTokenSource();
+        lock (_uploadCancellationLock)
+        {
+            _uploadCancellationTokenSource = uploadCts;
+        }
+
+        var uploadToken = uploadCts.Token;
 
         try
         {
@@ -1029,8 +1044,13 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
         }
         finally
         {
-            try { _uploadCancellationTokenSource?.Dispose(); } catch { }
-            _uploadCancellationTokenSource = null;
+            lock (_uploadCancellationLock)
+            {
+                if (ReferenceEquals(_uploadCancellationTokenSource, uploadCts))
+                    _uploadCancellationTokenSource = null;
+            }
+
+            try { uploadCts.Dispose(); } catch { }
 
             CompleteAndClearCurrentUploads();
             ClearLocalOutboundUploadRecipients();
@@ -1300,9 +1320,15 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
 
     private void Reset()
     {
-        _uploadCancellationTokenSource?.Cancel();
-        _uploadCancellationTokenSource?.Dispose();
-        _uploadCancellationTokenSource = null;
+        CancellationTokenSource? ctsToCancel;
+        lock (_uploadCancellationLock)
+        {
+            ctsToCancel = _uploadCancellationTokenSource;
+            _uploadCancellationTokenSource = null;
+        }
+
+        try { ctsToCancel?.Cancel(); } catch { /* best effort */ }
+
         CompleteAndClearCurrentUploads();
         ClearLocalOutboundUploadRecipients();
         _recentOutboundRecipientUids.Clear();

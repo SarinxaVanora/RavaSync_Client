@@ -132,11 +132,11 @@ internal sealed class FfmpegOpusAudioSender : IDisposable
             var created = new FfmpegOpusAudioSender(process, onBytes, onStatus, capture);
             capture.DataAvailable += created.OnLoopbackDataAvailable;
             capture.RecordingStopped += created.OnLoopbackRecordingStopped;
-            Program.Log($"Windows browser-only audio capture starting for the RavaCast WebView2 browser process tree pid={config.AudioSourceProcessId}. {sampleDetail}");
+            Program.Log($"Windows browser-only audio capture starting for the RavaCast renderer/WebView2 process tree pid={config.AudioSourceProcessId}. {sampleDetail}");
             capture.StartRecording();
 
             sender = created;
-            detail = $"Windows browser-only audio capture started for the RavaCast WebView2 browser process tree pid={config.AudioSourceProcessId} through Windows process loopback + FFmpeg Opus ({bitrate} kbps). {sampleDetail} This does not capture the host's whole default audio output.";
+            detail = $"Windows browser-only audio capture started for the RavaCast renderer/WebView2 process tree pid={config.AudioSourceProcessId} through Windows process loopback + FFmpeg Opus ({bitrate} kbps). {sampleDetail} This does not capture the host's whole default audio output.";
             Program.Log(detail);
             return true;
         }
@@ -372,14 +372,19 @@ internal sealed class FfmpegOpusAudioSender : IDisposable
 
 internal sealed class WindowsBrowserProcessLoopbackCapture : IWaveIn
 {
+    private const double ActivePcmThreshold = 0.0005;
     private readonly uint _rootProcessId;
     private readonly List<WindowsProcessLoopbackCapture> _captures = [];
     private readonly Dictionary<WindowsProcessLoopbackCapture, string> _labels = [];
+    private readonly Dictionary<uint, WindowsProcessLoopbackCapture> _capturesByPid = [];
     private readonly object _gate = new();
     private WindowsProcessLoopbackCapture? _selectedCapture;
     private string _selectedLabel = string.Empty;
+    private double _selectedPeak;
+    private DateTime _selectedSilentSinceUtc = DateTime.MinValue;
     private DateTime _lastSilentStatusUtc = DateTime.MinValue;
     private DateTime _lastSwitchStatusUtc = DateTime.MinValue;
+    private DateTime _lastCandidateRefreshUtc = DateTime.MinValue;
     private volatile bool _recording;
 
     private WindowsBrowserProcessLoopbackCapture(uint rootProcessId, IReadOnlyList<(uint Pid, string Label)> candidates)
@@ -388,21 +393,7 @@ internal sealed class WindowsBrowserProcessLoopbackCapture : IWaveIn
         if (candidates.Count == 0) throw new InvalidOperationException("No RavaCast/WebView2 process-loopback candidates were found.");
 
         foreach (var (pid, label) in candidates)
-        {
-            try
-            {
-                var capture = new WindowsProcessLoopbackCapture(pid, includeTargetProcessTree: true);
-                capture.DataAvailable += OnCandidateDataAvailable;
-                capture.RecordingStopped += OnCandidateRecordingStopped;
-                _captures.Add(capture);
-                _labels[capture] = label;
-                WaveFormat ??= capture.WaveFormat;
-            }
-            catch (Exception ex)
-            {
-                Program.Log($"Windows browser-only audio candidate {label} could not be activated: {Program.Flatten(ex)}");
-            }
-        }
+            TryAddCandidate(pid, label, startImmediately: false);
 
         if (_captures.Count == 0) throw new InvalidOperationException("No RavaCast/WebView2 process-loopback candidates could be activated.");
         WaveFormat ??= WaveFormat.CreateIeeeFloatWaveFormat(48000, 2);
@@ -430,7 +421,10 @@ internal sealed class WindowsBrowserProcessLoopbackCapture : IWaveIn
     {
         if (_recording) return;
         _recording = true;
-        foreach (var capture in _captures)
+        WindowsProcessLoopbackCapture[] captures;
+        lock (_gate)
+            captures = _captures.ToArray();
+        foreach (var capture in captures)
         {
             try { capture.StartRecording(); }
             catch (Exception ex) { Program.Log($"Windows browser-only audio candidate {_labels.GetValueOrDefault(capture, "unknown")} failed to start: {Program.Flatten(ex)}"); }
@@ -440,7 +434,10 @@ internal sealed class WindowsBrowserProcessLoopbackCapture : IWaveIn
     public void StopRecording()
     {
         _recording = false;
-        foreach (var capture in _captures)
+        WindowsProcessLoopbackCapture[] captures;
+        lock (_gate)
+            captures = _captures.ToArray();
+        foreach (var capture in captures)
         {
             try { capture.StopRecording(); } catch { }
         }
@@ -449,14 +446,92 @@ internal sealed class WindowsBrowserProcessLoopbackCapture : IWaveIn
     public void Dispose()
     {
         StopRecording();
-        foreach (var capture in _captures)
+        WindowsProcessLoopbackCapture[] captures;
+        lock (_gate)
+            captures = _captures.ToArray();
+        foreach (var capture in captures)
         {
             try { capture.DataAvailable -= OnCandidateDataAvailable; } catch { }
             try { capture.RecordingStopped -= OnCandidateRecordingStopped; } catch { }
             try { capture.Dispose(); } catch { }
         }
-        _captures.Clear();
-        _labels.Clear();
+        lock (_gate)
+        {
+            _captures.Clear();
+            _labels.Clear();
+            _capturesByPid.Clear();
+            _selectedCapture = null;
+        }
+    }
+
+    private bool TryAddCandidate(uint pid, string label, bool startImmediately)
+    {
+        WindowsProcessLoopbackCapture? capture = null;
+        try
+        {
+            lock (_gate)
+            {
+                if (_capturesByPid.ContainsKey(pid)) return false;
+            }
+
+            capture = new WindowsProcessLoopbackCapture(pid, includeTargetProcessTree: true);
+            capture.DataAvailable += OnCandidateDataAvailable;
+            capture.RecordingStopped += OnCandidateRecordingStopped;
+
+            lock (_gate)
+            {
+                if (_capturesByPid.ContainsKey(pid))
+                {
+                    capture.DataAvailable -= OnCandidateDataAvailable;
+                    capture.RecordingStopped -= OnCandidateRecordingStopped;
+                    capture.Dispose();
+                    return false;
+                }
+
+                _captures.Add(capture);
+                _labels[capture] = label;
+                _capturesByPid[pid] = capture;
+                WaveFormat ??= capture.WaveFormat;
+            }
+
+            if (startImmediately && _recording)
+                capture.StartRecording();
+
+            Program.Log($"Windows browser-only audio added process-loopback candidate {label}.");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            try
+            {
+                if (capture is not null)
+                {
+                    capture.DataAvailable -= OnCandidateDataAvailable;
+                    capture.RecordingStopped -= OnCandidateRecordingStopped;
+                    capture.Dispose();
+                }
+            }
+            catch { }
+            Program.Log($"Windows browser-only audio candidate {label} could not be activated: {Program.Flatten(ex)}");
+            return false;
+        }
+    }
+
+    private void RefreshCandidateProcesses(string reason)
+    {
+        var now = DateTime.UtcNow;
+        if ((now - _lastCandidateRefreshUtc).TotalSeconds < 2) return;
+        _lastCandidateRefreshUtc = now;
+
+        var added = 0;
+        foreach (var (pid, label) in FindCandidateProcesses(_rootProcessId))
+        {
+            if (TryAddCandidate(pid, label, startImmediately: true))
+                added++;
+        }
+
+        if (added > 0)
+            Program.Log($"Windows browser-only audio refreshed process-loopback candidates after {reason}; added={added:n0}.");
     }
 
     private void OnCandidateDataAvailable(object? sender, WaveInEventArgs e)
@@ -465,35 +540,52 @@ internal sealed class WindowsBrowserProcessLoopbackCapture : IWaveIn
         var label = _labels.GetValueOrDefault(capture, "unknown");
         var peak = FfmpegOpusAudioSender.CalculatePcmPeak(e.Buffer, e.BytesRecorded, capture.WaveFormat);
         var shouldForward = false;
+        var shouldRefresh = false;
 
         lock (_gate)
         {
+            var now = DateTime.UtcNow;
             if (_selectedCapture == capture)
             {
                 shouldForward = true;
+                _selectedPeak = peak;
+                if (peak > ActivePcmThreshold)
+                    _selectedSilentSinceUtc = DateTime.MinValue;
+                else if (_selectedSilentSinceUtc == DateTime.MinValue)
+                    _selectedSilentSinceUtc = now;
             }
-            else if (peak > 0.0005)
+            else if (peak > ActivePcmThreshold)
             {
-                _selectedCapture = capture;
-                _selectedLabel = label;
-                shouldForward = true;
-                var now = DateTime.UtcNow;
-                if ((now - _lastSwitchStatusUtc).TotalSeconds >= 1)
+                var selectedSilentMs = _selectedSilentSinceUtc == DateTime.MinValue ? 0 : (now - _selectedSilentSinceUtc).TotalMilliseconds;
+                var selectedMissingOrSilent = _selectedCapture is null || selectedSilentMs >= 250 || _selectedPeak <= ActivePcmThreshold;
+                var louderThanSelected = peak > Math.Max(ActivePcmThreshold, _selectedPeak * 2.0) && (now - _lastSwitchStatusUtc).TotalMilliseconds >= 500;
+                if (selectedMissingOrSilent || louderThanSelected)
                 {
-                    _lastSwitchStatusUtc = now;
-                    Program.Log($"Windows browser-only audio selected active source {_selectedLabel}; pcmPeak={peak:0.000}. Silent candidates will be ignored.");
+                    _selectedCapture = capture;
+                    _selectedLabel = label;
+                    _selectedPeak = peak;
+                    _selectedSilentSinceUtc = DateTime.MinValue;
+                    shouldForward = true;
+                    if ((now - _lastSwitchStatusUtc).TotalMilliseconds >= 500)
+                    {
+                        _lastSwitchStatusUtc = now;
+                        Program.Log($"Windows browser-only audio selected active source {_selectedLabel}; pcmPeak={peak:0.000}. Other candidates stay armed for WebView2 process changes.");
+                    }
                 }
             }
             else if (_selectedCapture is null)
             {
-                var now = DateTime.UtcNow;
                 if ((now - _lastSilentStatusUtc).TotalSeconds >= 3)
                 {
                     _lastSilentStatusUtc = now;
+                    shouldRefresh = true;
                     Program.Log($"Windows browser-only audio is waiting for non-silent PCM from RavaCast/WebView2 candidates; latest silent candidate={label}; pcmPeak={peak:0.000}.");
                 }
             }
         }
+
+        if (shouldRefresh)
+            RefreshCandidateProcesses("silent candidates");
 
         if (shouldForward)
             DataAvailable?.Invoke(this, e);
@@ -509,11 +601,58 @@ internal sealed class WindowsBrowserProcessLoopbackCapture : IWaveIn
 
     private static IReadOnlyList<(uint Pid, string Label)> FindCandidateProcesses(uint webView2BrowserProcessId)
     {
-        // Keep Direct Stream audio strictly scoped to RavaCast's own WebView2 browser process tree.
-        // The earlier audio-session probing path could pick up unrelated browser sessions on the
-        // host's default render endpoint, which made Direct Stream behave like whole-device capture.
-        Program.Log($"Windows browser-only audio using strict WebView2 process-loopback root pid={webView2BrowserProcessId}; default-device/session capture is not used.");
-        return [(webView2BrowserProcessId, $"WebView2 browser pid={webView2BrowserProcessId} tree")];
+        // Keep Direct Stream audio scoped to RavaCast's own renderer/WebView2 process family, but do not
+        // rely on one root pid being the active Windows audio-session owner. Some WebView2 startup/site
+        // paths put audio on a child msedgewebview2 process, and process-tree capture can be silent on a
+        // subset of Windows/driver combinations even while a direct child process capture works.
+        var processes = SafeGetProcesses();
+        var parentByPid = GetParentProcessMap();
+        var nameByPid = new Dictionary<uint, string>();
+        foreach (var process in processes)
+        {
+            try { nameByPid[(uint)process.Id] = SafeProcessName(process); }
+            catch { }
+        }
+
+        var candidates = new List<(uint Pid, string Label)>();
+        var seen = new HashSet<uint>();
+        void Add(uint pid, string label)
+        {
+            if (pid == 0 || !seen.Add(pid)) return;
+            candidates.Add((pid, label));
+        }
+
+        Add(webView2BrowserProcessId, $"RavaCast WebView2/browser audio root pid={webView2BrowserProcessId} tree");
+
+        var ancestor = webView2BrowserProcessId;
+        var ancestorDepth = 0;
+        while (parentByPid.TryGetValue(ancestor, out var parentPid) && parentPid != 0 && ancestorDepth++ < 8)
+        {
+            ancestor = parentPid;
+            var ancestorName = nameByPid.TryGetValue(ancestor, out var parentName) ? parentName : string.Empty;
+            if (ancestorName.Contains("RavaCast", StringComparison.OrdinalIgnoreCase))
+                Add(ancestor, $"RavaCast parent {ancestorName} pid={ancestor} tree");
+        }
+
+        foreach (var process in processes)
+        {
+            uint pid;
+            try { pid = (uint)process.Id; }
+            catch { continue; }
+
+            if (pid == webView2BrowserProcessId || !IsDescendantOf(pid, webView2BrowserProcessId, parentByPid))
+                continue;
+
+            var name = nameByPid.TryGetValue(pid, out var processName) ? processName : SafeProcessName(process);
+            if (IsBrowserAudioProcessName(name) || name.Contains("RavaCast", StringComparison.OrdinalIgnoreCase))
+                Add(pid, $"RavaCast/WebView2 child {name} pid={pid} tree");
+        }
+
+        foreach (var session in FindBrowserAudioSessionCandidates(processes, nameByPid, parentByPid, webView2BrowserProcessId))
+            Add(session.Pid, $"RavaCast/WebView active audio session {session.Name} pid={session.Pid} state={session.State} peak={session.Peak:0.000}");
+
+        Program.Log("Windows browser-only audio using RavaCast/WebView2 process-loopback candidates: " + string.Join(", ", candidates.Select(c => c.Label)) + ". Default-device whole-system capture is not used.");
+        return candidates;
     }
 
     private static List<(uint Pid, string Name, float Peak, string State)> FindBrowserAudioSessionCandidates(Process[] processes, Dictionary<uint, string> nameByPid, Dictionary<uint, uint> parentByPid, uint rendererProcessId)
@@ -536,8 +675,6 @@ internal sealed class WindowsBrowserProcessLoopbackCapture : IWaveIn
 
                 var name = nameByPid.TryGetValue(pid, out var processName) ? processName : SafeProcessNameByPid(processes, pid);
                 var isRendererFamily = pid == rendererProcessId || IsDescendantOf(pid, rendererProcessId, parentByPid);
-                var isBrowserLike = IsBrowserAudioProcessName(name);
-                if (!isRendererFamily && !isBrowserLike) continue;
 
                 float peak;
                 try { peak = session.AudioMeterInformation.MasterPeakValue; }
@@ -545,7 +682,17 @@ internal sealed class WindowsBrowserProcessLoopbackCapture : IWaveIn
 
                 var state = "unknown";
                 try { state = session.State.ToString(); } catch { }
-                sessions.Add((pid, name, peak, state));
+
+                // WebView2 can own the live audio session from an msedgewebview2.exe process that is
+                // not reported as a normal child of the top-level app/window process. OBS documents the
+                // same class of issue for WebView2-backed apps: application capture may need to target
+                // the WebView2 subprocess itself, not the visible owner window. Keep the rescue path
+                // application-scoped by adding active browser-like sessions as individual process-loopback
+                // candidates, rather than falling back to default-device/whole-desktop capture.
+                var isActiveBrowserAudio = IsBrowserAudioProcessName(name) && (state.Equals("Active", StringComparison.OrdinalIgnoreCase) || peak > ActivePcmThreshold);
+                if (!isRendererFamily && !isActiveBrowserAudio) continue;
+
+                sessions.Add((pid, name, peak, isRendererFamily ? state : state + "/external-webview"));
             }
         }
         catch (Exception ex)
@@ -749,9 +896,12 @@ internal sealed class WindowsProcessLoopbackCapture : IWaveIn
             // target RavaCast.Renderer process tree, not the whole desktop output.
             mixFormat = AllocWaveFormatPointer(WaveFormat);
 
+            using var receiveEvent = new EventWaitHandle(false, EventResetMode.AutoReset);
             var session = Guid.Empty;
-            var hr = audioClient.Initialize(AudioClientShareMode.Shared, AudioClientStreamFlags.Loopback, 10_000_000, 0, mixFormat, ref session);
+            var hr = audioClient.Initialize(AudioClientShareMode.Shared, AudioClientStreamFlags.Loopback | AudioClientStreamFlags.EventCallback, 10_000_000, 0, mixFormat, ref session);
             ThrowForHResult(hr, "IAudioClient.Initialize failed for process loopback capture");
+            hr = audioClient.SetEventHandle(receiveEvent.SafeWaitHandle.DangerousGetHandle());
+            ThrowForHResult(hr, "IAudioClient.SetEventHandle failed for process loopback capture");
 
             var audioCaptureClientGuid = IAudioCaptureClientGuid;
             hr = audioClient.GetService(ref audioCaptureClientGuid, out var service);
@@ -762,17 +912,14 @@ internal sealed class WindowsProcessLoopbackCapture : IWaveIn
             ThrowForHResult(hr, "IAudioClient.Start failed for process loopback capture");
 
             var blockAlign = Math.Max(1, WaveFormat.BlockAlign);
-            var sleep = TimeSpan.FromMilliseconds(5);
             var zeroBuffer = Array.Empty<byte>();
 
             while (!_cts.IsCancellationRequested && _recording)
             {
+                receiveEvent.WaitOne(100);
                 hr = captureClient.GetNextPacketSize(out var packetFrames);
                 if (hr == AudclntSBufferEmpty || packetFrames == 0)
-                {
-                    Thread.Sleep(sleep);
                     continue;
-                }
 
                 ThrowForHResult(hr, "IAudioCaptureClient.GetNextPacketSize failed");
 
@@ -824,51 +971,44 @@ internal sealed class WindowsProcessLoopbackCapture : IWaveIn
 
     private static WaveFormat GetProcessLoopbackMixFormat(uint targetProcessId, bool includeTargetProcessTree)
     {
-        try
-        {
-            using var enumerator = new MMDeviceEnumerator();
-            using var device = enumerator.GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia);
-            var format = device.AudioClient.MixFormat;
-            Program.Log($"Browser-only process loopback will initialise with default render endpoint mix format: {format.SampleRate} Hz, {format.Channels} channel(s), {format.BitsPerSample}-bit {format.Encoding}.");
-            return format;
-        }
-        catch (Exception ex)
-        {
-            Program.Log("Browser-only process loopback could not read the default render endpoint mix format; falling back to 48 kHz stereo float. " + Program.Flatten(ex));
-            return WaveFormat.CreateIeeeFloatWaveFormat(48000, 2);
-        }
+        // OBS initialises Application Audio Capture with the program output format rather than trusting
+        // the current playback device mix format. Keep RavaCast equally predictable: the process-loopback
+        // client always delivers 48 kHz stereo 32-bit float PCM into FFmpeg, and FFmpeg then encodes Opus.
+        var format = WaveFormat.CreateIeeeFloatWaveFormat(48000, 2);
+        Program.Log($"Browser-only process loopback will initialise with OBS-style fixed capture format: {format.SampleRate} Hz, {format.Channels} channel(s), {format.BitsPerSample}-bit {format.Encoding}; targetPid={targetProcessId}; includeTree={includeTargetProcessTree}.");
+        return format;
     }
 
     private static IntPtr AllocWaveFormatPointer(WaveFormat format)
     {
-        var encoding = format.Encoding;
-        var channels = (ushort)Math.Clamp(format.Channels, 1, ushort.MaxValue);
-        var sampleRate = Math.Max(8000, format.SampleRate);
+        var channels = (ushort)Math.Clamp(format.Channels > 0 ? format.Channels : 2, 1, ushort.MaxValue);
+        var sampleRate = Math.Max(8000, format.SampleRate > 0 ? format.SampleRate : 48000);
         var bits = (ushort)Math.Clamp(format.BitsPerSample > 0 ? format.BitsPerSample : 32, 8, ushort.MaxValue);
-
-        ushort tag;
-        if (encoding == WaveFormatEncoding.IeeeFloat || encoding == WaveFormatEncoding.Extensible && bits == 32)
-            tag = 3; // WAVE_FORMAT_IEEE_FLOAT
-        else
-            tag = 1; // WAVE_FORMAT_PCM
-
         var bytesPerSample = Math.Max(1, bits / 8);
         var blockAlign = (ushort)Math.Clamp(channels * bytesPerSample, 1, ushort.MaxValue);
         var averageBytesPerSecond = checked(sampleRate * blockAlign);
 
-        // WAVEFORMATEX: tag/channels/sampleRate/avgBytesPerSec/blockAlign/bitsPerSample/cbSize.
-        // A simple WAVEFORMATEX is enough here and avoids calling GetMixFormat on VAD\Process_Loopback,
-        // which can return E_NOTIMPL even though process-loopback activation itself works.
-        var ptr = Marshal.AllocCoTaskMem(18);
+        // WAVEFORMATEXTENSIBLE, matching the shape OBS uses for process-loopback capture. This avoids a
+        // class of silent captures caused by asking the virtual Process_Loopback device for the physical
+        // endpoint's mixed format or by giving it a minimal WAVEFORMATEX with no channel mask/subformat.
+        var ptr = Marshal.AllocCoTaskMem(40);
         try
         {
-            Marshal.WriteInt16(ptr, 0, unchecked((short)tag));
+            Marshal.WriteInt16(ptr, 0, unchecked((short)0xFFFE)); // WAVE_FORMAT_EXTENSIBLE
             Marshal.WriteInt16(ptr, 2, unchecked((short)channels));
             Marshal.WriteInt32(ptr, 4, sampleRate);
             Marshal.WriteInt32(ptr, 8, averageBytesPerSecond);
             Marshal.WriteInt16(ptr, 12, unchecked((short)blockAlign));
             Marshal.WriteInt16(ptr, 14, unchecked((short)bits));
-            Marshal.WriteInt16(ptr, 16, 0);
+            Marshal.WriteInt16(ptr, 16, 22); // cbSize
+            Marshal.WriteInt16(ptr, 18, unchecked((short)bits)); // wValidBitsPerSample
+            Marshal.WriteInt32(ptr, 20, channels switch
+            {
+                1 => 0x4, // SPEAKER_FRONT_CENTER
+                2 => 0x3, // SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT
+                _ => 0
+            });
+            Marshal.Copy(IeeeFloatSubFormatGuid.ToByteArray(), 0, IntPtr.Add(ptr, 24), 16);
             return ptr;
         }
         catch

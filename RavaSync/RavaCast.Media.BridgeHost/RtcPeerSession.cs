@@ -1148,7 +1148,20 @@ internal sealed class RtcPeerSession : IDisposable
             return;
         }
 
-        if (looksRtp)
+        if (looksRtp && source.Equals("message", StringComparison.OrdinalIgnoreCase) && TryExtractAnyRtpPayload(packet, out var anyRtpPayload, out var actualPayloadType))
+        {
+            var rtpPayloads = Interlocked.Increment(ref _audioTrackRtpPayloadsSeen);
+            if (!_firstAudioRtpPayloadLogged)
+            {
+                _firstAudioRtpPayloadLogged = true;
+                Program.Log($"Direct Stream receiver extracted first Opus RTP payload with non-standard payloadType={actualPayloadType} from {PeerId}: payload={anyRtpPayload.Length} bytes; rtpPayloads={rtpPayloads:n0}; firstBytes={FormatFirstBytes(anyRtpPayload)}.");
+            }
+
+            ReceiveOpusAudioFrameBytes(anyRtpPayload);
+            return;
+        }
+
+        if (looksRtp && source.Equals("message", StringComparison.OrdinalIgnoreCase))
         {
             var dropped = Interlocked.Increment(ref _audioTrackDroppedPacketsSeen);
             if (dropped == 1 || dropped % 128 == 0)
@@ -1156,8 +1169,10 @@ internal sealed class RtcPeerSession : IDisposable
             return;
         }
 
-        // Some libdatachannel builds give the application the raw Opus payload rather than the RTP
-        // packet when no native Opus depacketizer is available. Treat non-RTP track bytes as raw Opus.
+        // Some libdatachannel builds give the application the raw Opus payload through the frame callback
+        // rather than a full RTP packet when no native Opus depacketizer is available. Raw Opus bytes can
+        // occasionally look like an RTP v2 header by coincidence, so only drop unexpected RTP-looking audio
+        // from the message callback. Frame-callback audio is treated as the depacketized Opus payload.
         Interlocked.Increment(ref _audioTrackRawPayloadsSeen);
         if (LooksLikeOggPage(packet))
             ReceiveAudioBytes(packet);
@@ -1167,13 +1182,22 @@ internal sealed class RtcPeerSession : IDisposable
 
     private static bool TryExtractRtpPayload(byte[] packet, byte expectedPayloadType, out byte[] payload)
     {
+        if (!TryExtractAnyRtpPayload(packet, out payload, out var payloadType)) return false;
+        if (payloadType == expectedPayloadType) return true;
         payload = [];
+        return false;
+    }
+
+    private static bool TryExtractAnyRtpPayload(byte[] packet, out byte[] payload, out int payloadType)
+    {
+        payload = [];
+        payloadType = -1;
         if (packet.Length < 12) return false;
         if ((packet[0] >> 6) != 2) return false;
 
         var csrcCount = packet[0] & 0x0F;
         var extension = (packet[0] & 0x10) != 0;
-        var payloadType = packet[1] & 0x7F;
+        payloadType = packet[1] & 0x7F;
         var offset = 12 + (csrcCount * 4);
         if (offset > packet.Length) return false;
 
@@ -1185,7 +1209,7 @@ internal sealed class RtcPeerSession : IDisposable
             if (offset > packet.Length) return false;
         }
 
-        if (offset >= packet.Length || payloadType != expectedPayloadType) return false;
+        if (offset >= packet.Length) return false;
         payload = new byte[packet.Length - offset];
         Buffer.BlockCopy(packet, offset, payload, 0, payload.Length);
         return payload.Length > 0;

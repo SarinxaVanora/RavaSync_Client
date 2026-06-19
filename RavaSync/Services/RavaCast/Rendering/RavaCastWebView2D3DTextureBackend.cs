@@ -764,8 +764,16 @@ public sealed class RavaCastWebView2D3DTextureBackend : IRavaCastTextureBackend
         {
             _isStarting = false;
             _connected = false;
+            var rendererExitDetail = _process is { HasExited: true } ? $"Renderer exited with code {_process.ExitCode}." : null;
+            if (!_disposed && (_directStreamReceiverActive || _directStreamPublisherActive))
+            {
+                _directStreamReceiverActive = false;
+                _directStreamPublisherActive = false;
+                _usingDirectStreamReceiverTexture = false;
+                SetDirectStreamStatus(false, false, "Direct Stream stopped", rendererExitDetail ?? "Renderer process stopped before media was available.");
+            }
             if (!_disposed && IsOpen)
-                SetStatus("Video output stopped", _process is { HasExited: true } ? $"Renderer exited with code {_process.ExitCode}." : null);
+                SetStatus("Video output stopped", rendererExitDetail);
             else if (!_disposed)
                 SetStatus("Ready", null);
         }

@@ -693,25 +693,38 @@ public sealed class MissingFileMeshService : DisposableMediatorSubscriberBase
             return;
 
         var key = BuildPendingCharacterPushKey(payload.RequestId, payload.SenderUid);
-        if (!_pendingInboundCharacterPushByKey.TryRemove(key, out var pending))
+        var hadPendingOffer = _pendingInboundCharacterPushByKey.TryRemove(key, out var pending);
+
+        if (!hadPendingOffer)
         {
-            Logger.LogDebug("Mesh character data ready arrived without a pending offer. Sender={sender}, RequestId={requestId}", payload.SenderUid, payload.RequestId);
-            return;
+            if (HasPendingInboundCharacterPushForSender(payload.SenderUid))
+            {
+                Logger.LogDebug("Mesh character data ready arrived for an older/non-current pending offer. Sender={sender}, RequestId={requestId}", payload.SenderUid, payload.RequestId);
+                return;
+            }
+
+            if (payload.CharacterDataJsonUtf8 == null || payload.CharacterDataJsonUtf8.Length == 0)
+            {
+                Logger.LogDebug("Mesh character data ready arrived without a pending offer and without inline data. Sender={sender}, RequestId={requestId}", payload.SenderUid, payload.RequestId);
+                return;
+            }
+
+            Logger.LogDebug("Mesh character data ready arrived without a pending offer, but included inline data; accepting it as the completion signal. Sender={sender}, RequestId={requestId}", payload.SenderUid, payload.RequestId);
         }
 
         FileDownloadManager.RegisterDirectCdnSizeHints(payload.HashSizeHints);
 
         var characterJson = payload.CharacterDataJsonUtf8 != null && payload.CharacterDataJsonUtf8.Length > 0
             ? payload.CharacterDataJsonUtf8
-            : pending.CharacterDataJsonUtf8;
+            : pending!.CharacterDataJsonUtf8;
 
         var effectiveDataHash = !string.IsNullOrWhiteSpace(payload.DataHash)
             ? payload.DataHash
-            : pending.DataHash;
+            : pending?.DataHash ?? string.Empty;
 
-        MarkRecentMeshReadyForCharacterData(pending.SenderUid, effectiveDataHash);
+        MarkRecentMeshReadyForCharacterData(payload.SenderUid, effectiveDataHash);
 
-        if (!TryReceiveCharacterData(pending.SenderUid, characterJson))
+        if (!TryReceiveCharacterData(payload.SenderUid, characterJson))
             return;
 
         var ack = BuildCharacterDataPayload(new CharacterDataMeshPayload
@@ -730,7 +743,11 @@ public sealed class MissingFileMeshService : DisposableMediatorSubscriberBase
             IsAck = true
         });
 
-        _ = _mesh.SendAsync(string.IsNullOrWhiteSpace(pending.FromSessionId) ? msg.FromSessionId : pending.FromSessionId, new RavaGame(string.Empty, ack));
+        var ackSessionId = hadPendingOffer && !string.IsNullOrWhiteSpace(pending?.FromSessionId)
+            ? pending!.FromSessionId
+            : msg.FromSessionId;
+
+        _ = _mesh.SendAsync(ackSessionId, new RavaGame(string.Empty, ack));
     }
 
     private bool TryReceiveCharacterData(string senderUid, byte[] characterDataJsonUtf8)
@@ -839,6 +856,20 @@ public sealed class MissingFileMeshService : DisposableMediatorSubscriberBase
                 _pendingInboundCharacterPushByKey.TryRemove(kvp.Key, out _);
             }
         }
+    }
+
+    private bool HasPendingInboundCharacterPushForSender(string senderUid)
+    {
+        if (string.IsNullOrWhiteSpace(senderUid))
+            return false;
+
+        foreach (var kvp in _pendingInboundCharacterPushByKey.ToArray())
+        {
+            if (string.Equals(kvp.Value.SenderUid, senderUid, StringComparison.Ordinal))
+                return true;
+        }
+
+        return false;
     }
 
     private void ClearPendingCharacterPushes()

@@ -201,11 +201,22 @@ public sealed partial class PairHandler
                     return block;
 
                 var needsPenumbraBinding = updateModdedPaths || updateManip || lifecycleRedrawRequestedFromPlan || _redrawOnNextApplication || forceApplyModsForThisApply;
-                var primePenumbraBeforeDrawSettle = needsPenumbraBinding && (updateModdedPaths || downloadedAny || forceApplyModsForThisApply || lifecycleApplyRequestedFromPlan || lifecycleRedrawRequestedFromPlan);
+                var hasPlayerHavokRiskAssetsInPlan = HasPlayerHavokRedrawRiskAsset(assetPlan)
+                    && (updateModdedPaths || downloadedAny || forceApplyModsForThisApply || lifecycleApplyRequestedFromPlan || lifecycleRedrawRequestedFromPlan);
+                var primePenumbraBeforeDrawSettle = needsPenumbraBinding
+                    && !hasPlayerHavokRiskAssetsInPlan
+                    && (updateModdedPaths || downloadedAny || forceApplyModsForThisApply || lifecycleApplyRequestedFromPlan || lifecycleRedrawRequestedFromPlan);
                 if (!primePenumbraBeforeDrawSettle)
-                    await WaitForTargetDrawSettleAsync(applicationId, lifecycleRedrawRequestedFromPlan, token).ConfigureAwait(false);
+                {
+                    if (hasPlayerHavokRiskAssetsInPlan)
+                        Logger.LogTrace("[{applicationId}] Using Havok-safe player animation lane for {pair}; temp files will not be primed before draw settle", applicationId, Pair.UserData.AliasOrUID);
+
+                    await WaitForTargetDrawSettleAsync(applicationId, lifecycleRedrawRequestedFromPlan || hasPlayerHavokRiskAssetsInPlan, token).ConfigureAwait(false);
+                }
                 else if (_charaHandler?.CurrentDrawCondition != GameObjectHandler.DrawCondition.None)
+                {
                     Logger.LogTrace("[{applicationId}] Priming receiver temp files before draw settle for {pair}; draw state={draw}", applicationId, Pair.UserData.AliasOrUID, _charaHandler?.CurrentDrawCondition);
+                }
 
                 if (IsWineRuntime)
                     LogWineApplyPhase("receiver draw settle");
@@ -372,8 +383,11 @@ public sealed partial class PairHandler
                 }
 
                 var playerWornEquipmentOrAccessoryOnlyApply = IsPlayerWornEquipmentOrAccessoryOnlyApply(assetPlan, updatedData, previousTempMods, tempMods);
+                var playerHavokRiskAssetChanged = HasPlayerHavokRedrawRiskAssetChanged(assetPlan, previousTempMods, tempMods);
                 var redrawRequired = ShouldRedrawForApply(lifecycleRedrawRequestedFromPlan, assetPlan, previousTempMods, tempMods, previousTransientSupportFingerprint, penumbraChanged, manipulationChanged, updatedData, playerWornEquipmentOrAccessoryOnlyApply);
-                if (suppressNonLifecycleRedraw && !lifecycleRedrawRequestedFromPlan)
+                if (playerHavokRiskAssetChanged)
+                    redrawRequired = true;
+                if (suppressNonLifecycleRedraw && !lifecycleRedrawRequestedFromPlan && !playerHavokRiskAssetChanged)
                     redrawRequired = false;
                 var forceLightweightMetadataReapply = forceApplyModsForThisApply || bindingReassigned;
                 var playerGlamourerApplyRequested = updatedData.TryGetValue(ObjectKind.Player, out var playerApplyChanges)
@@ -428,6 +442,12 @@ public sealed partial class PairHandler
                         Pair.UserData.AliasOrUID);
                 }
 
+                var deferPlayerGlamourerUntilAfterHavokRedraw = playerHavokRiskAssetChanged
+                    && playerGlamourerApplyRequested
+                    && redrawRequired;
+                if (deferPlayerGlamourerUntilAfterHavokRedraw)
+                    Logger.LogTrace("[{applicationId}] Deferring player Glamourer state until after Havok-safe redraw for {pair}", applicationId, Pair.UserData.AliasOrUID);
+
                 var queuePostDrawPlayerSnap = applyTouchesPlayer
                     && playerGlamourerApplyRequested
                     && !redrawRequired
@@ -454,6 +474,7 @@ public sealed partial class PairHandler
                         awaitGlamourer && changeSet.Key == ObjectKind.Player,
                         waitForAuthoritativePlayerAppearanceSettle && changeSet.Key == ObjectKind.Player,
                         glamourerApplyFlags,
+                        deferPlayerGlamourerUntilAfterHavokRedraw,
                         token).ConfigureAwait(false);
                 }
 
@@ -466,12 +487,16 @@ public sealed partial class PairHandler
                         return PairSyncCommitResult.ActorChanged(target.Reason, retryImmediately: false);
 
                     var playerCriticalRedrawAsset = HasPlayerCriticalRedrawAsset(assetPlan, updatedData, previousTempMods, tempMods);
-                    var redrawFired = await OnePassRedrawAsync(applicationId, token, criticalRedraw: lifecycleRedrawRequestedFromPlan || playerCriticalRedrawAsset).ConfigureAwait(false);
-                    if ((lifecycleRedrawRequestedFromPlan || playerCriticalRedrawAsset) && !redrawFired)
+                    var criticalRedraw = lifecycleRedrawRequestedFromPlan || playerCriticalRedrawAsset || playerHavokRiskAssetChanged;
+                    var redrawFired = await OnePassRedrawAsync(applicationId, token, criticalRedraw: criticalRedraw).ConfigureAwait(false);
+                    if (criticalRedraw && !redrawFired)
                     {
                         MarkInitialApplyRequired();
                         return PairSyncCommitResult.Deferred("required receiver redraw did not acknowledge", retryImmediately: true);
                     }
+
+                    if (deferPlayerGlamourerUntilAfterHavokRedraw)
+                        await ApplyDeferredPlayerGlamourerAfterHavokRedrawAsync(applicationId, charaData, glamourerApplyFlags, token).ConfigureAwait(false);
                 }
                 else if (penumbraChanged && !playerWornEquipmentOrAccessoryOnlyApply && !playerGlamourerApplyRequested && HasPlayerGlamourerPayload(charaData) && _charaHandler != null && _charaHandler.Address != nint.Zero)
                 {
@@ -745,6 +770,39 @@ public sealed partial class PairHandler
                 .ToList();
         }
 
+        private async Task ApplyDeferredPlayerGlamourerAfterHavokRedrawAsync(Guid applicationId, CharacterData charaData, ApplyFlag glamourerApplyFlags, CancellationToken token)
+        {
+            if (!charaData.GlamourerData.TryGetValue(ObjectKind.Player, out var glamourerPayload)
+                || string.IsNullOrWhiteSpace(glamourerPayload))
+                return;
+
+            var handler = _charaHandler;
+            if (!IsVisible || handler == null || handler.Address == nint.Zero)
+                return;
+
+            var strictAddress = ResolveStrictVisiblePlayerAddress(handler.Address);
+            if (strictAddress == nint.Zero || !IsExpectedPlayerAddress(strictAddress))
+                return;
+
+            if (handler.CurrentDrawCondition != GameObjectHandler.DrawCondition.None)
+            {
+                Logger.LogTrace("[{applicationId}] Waiting for Havok-safe redraw to settle before deferred player Glamourer state for {pair}", applicationId, Pair.UserData.AliasOrUID);
+                await _dalamudUtil.WaitWhileCharacterIsDrawing(Logger, handler, applicationId, IsWineRuntime ? 3000 : 2000, token).ConfigureAwait(false);
+            }
+
+            token.ThrowIfCancellationRequested();
+            handler = _charaHandler;
+            if (!IsVisible || handler == null || handler.Address == nint.Zero)
+                return;
+
+            strictAddress = ResolveStrictVisiblePlayerAddress(handler.Address);
+            if (strictAddress == nint.Zero || !IsExpectedPlayerAddress(strictAddress))
+                return;
+
+            Logger.LogTrace("[{applicationId}] Applying deferred player Glamourer state after Havok-safe redraw for {pair}; flags={flags}", applicationId, Pair.UserData.AliasOrUID, glamourerApplyFlags);
+            await _ipcManager.Glamourer.ApplyAllAsync(Logger, handler, glamourerPayload, applicationId, token, fireAndForget: false, flags: glamourerApplyFlags, waitForDrawSettle: false).ConfigureAwait(false);
+        }
+
         private void QueuePostDrawPlayerAppearanceSnap(Guid applicationId, CharacterData charaData, ApplyFlag glamourerApplyFlags, string expectedPayloadFingerprint)
         {
             if (!charaData.GlamourerData.TryGetValue(ObjectKind.Player, out var glamourerPayload)
@@ -931,6 +989,54 @@ public sealed partial class PairHandler
                 return true;
 
             return HasPlayerCriticalRedrawAssetChanged(assetPlan, previousTempMods, currentTempMods);
+        }
+
+        private static bool HasPlayerHavokRedrawRiskAsset(PairSyncAssetPlan assetPlan)
+            => assetPlan.Entries.Any(static entry => IsPlayerHavokRedrawRiskAsset(entry));
+
+        private static bool HasPlayerHavokRedrawRiskAssetChanged(PairSyncAssetPlan assetPlan, IReadOnlyDictionary<string, string>? previousTempMods, IReadOnlyDictionary<string, string> currentTempMods)
+        {
+            if (!assetPlan.HasAssets && (previousTempMods == null || previousTempMods.Count == 0) && currentTempMods.Count == 0)
+                return false;
+
+            var changedGamePaths = GetChangedTempModGamePaths(previousTempMods, currentTempMods)
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+            if (assetPlan.Entries.Any(entry => IsPlayerHavokRedrawRiskAsset(entry)
+                    && (previousTempMods == null || previousTempMods.Count == 0 || changedGamePaths.Contains(NormalizeGamePath(entry.GamePath)))))
+            {
+                return true;
+            }
+
+            // Removals are not present in the current asset plan, but switching a player
+            // animation/timeline/skeleton path back to vanilla still changes the live Havok
+            // resource set and should use the same safe redraw lane.
+            return changedGamePaths.Any(IsPlayerHavokRedrawRiskGamePath);
+        }
+
+        private static bool IsPlayerHavokRedrawRiskAsset(PairSyncAssetEntry entry)
+            => entry.ObjectKind == ObjectKind.Player
+                && IsPlayerHavokRedrawRiskGamePath(entry.GamePath);
+
+        private static bool IsPlayerHavokRedrawRiskGamePath(string gamePath)
+        {
+            gamePath = NormalizeGamePath(gamePath);
+            if (string.IsNullOrWhiteSpace(gamePath) || LooksLikeOwnedObjectAssetPath(gamePath))
+                return false;
+
+            if (gamePath.EndsWith(".pap", StringComparison.OrdinalIgnoreCase)
+                || gamePath.EndsWith(".tmb", StringComparison.OrdinalIgnoreCase)
+                || gamePath.EndsWith(".tmb2", StringComparison.OrdinalIgnoreCase)
+                || gamePath.EndsWith(".sklb", StringComparison.OrdinalIgnoreCase)
+                || gamePath.EndsWith(".atch", StringComparison.OrdinalIgnoreCase)
+                || gamePath.EndsWith(".phy", StringComparison.OrdinalIgnoreCase)
+                || gamePath.EndsWith(".phyb", StringComparison.OrdinalIgnoreCase)
+                || gamePath.EndsWith(".pbd", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+
+            return false;
         }
 
         private static bool HasPlayerCriticalRedrawAsset(PairSyncAssetPlan assetPlan, Dictionary<ObjectKind, HashSet<PlayerChanges>> updatedData, IReadOnlyDictionary<string, string>? previousTempMods, IReadOnlyDictionary<string, string> currentTempMods)

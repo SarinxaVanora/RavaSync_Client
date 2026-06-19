@@ -42,6 +42,7 @@ public sealed class RavaCastUi : WindowMediatorSubscriberBase
     private bool _directStreamFirewallCheckInFlight;
     private bool _directStreamFirewallStatusKnown;
     private long _lastDirectStreamFirewallCheckTick;
+    private long _directStreamFirewallPermissionRequestedTick;
     private bool _webView2RuntimeInstallInFlight;
     private string _webView2RuntimeInstallStatus = string.Empty;
     private string _pageUrl = string.Empty;
@@ -415,7 +416,9 @@ public sealed class RavaCastUi : WindowMediatorSubscriberBase
                 if (_backendInstaller.TryRequestDirectStreamFirewallPermission(out var firewallMessage))
                 {
                     _firewallStatus = firewallMessage;
+                    _directStreamFirewallPermissionRequestedTick = Environment.TickCount64;
                     _directStreamFirewallStatusKnown = false;
+                    _lastDirectStreamFirewallCheckTick = 0;
                     RefreshDirectStreamFirewallStatus(force: true);
                 }
                 else
@@ -443,7 +446,9 @@ public sealed class RavaCastUi : WindowMediatorSubscriberBase
             // remainder of this plugin session. Re-checking a working firewall setup only risks hitches.
             if (_directStreamFirewallAllowed) return;
             if (_directStreamFirewallCheckInFlight) return;
-            if (!force && now - _lastDirectStreamFirewallCheckTick < 30000) return;
+            var recentlyRequestedPermission = _directStreamFirewallPermissionRequestedTick > 0 && now - _directStreamFirewallPermissionRequestedTick < 30000;
+            var checkIntervalMs = recentlyRequestedPermission ? 1500 : 30000;
+            if (!force && now - _lastDirectStreamFirewallCheckTick < checkIntervalMs) return;
             _lastDirectStreamFirewallCheckTick = now;
             _directStreamFirewallCheckInFlight = true;
             if (force)
@@ -468,6 +473,8 @@ public sealed class RavaCastUi : WindowMediatorSubscriberBase
             {
                 _directStreamFirewallAllowed = allowed;
                 _directStreamFirewallStatusKnown = true;
+                if (allowed)
+                    _directStreamFirewallPermissionRequestedTick = 0;
                 _firewallStatus = allowed
                     ? string.Empty
                     : string.IsNullOrWhiteSpace(detail) ? "Direct Stream firewall status could not be confirmed." : detail;

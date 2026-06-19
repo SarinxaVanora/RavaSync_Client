@@ -27,6 +27,8 @@ public sealed class RavaCastWorldImageRenderer : IDisposable
     private readonly ILogger<RavaCastWorldImageRenderer> _logger;
     private bool _disposed;
     private bool _initialiseFailed;
+    private long _lastInitialiseFailedTick;
+    private int _consecutiveRenderFailures;
     private string? _lastError;
 
     private D3DDevice? _device;
@@ -123,12 +125,19 @@ public sealed class RavaCastWorldImageRenderer : IDisposable
             }
 
             textureId = new ImTextureID(_targetSrv!.NativePointer);
+            _consecutiveRenderFailures = 0;
             _lastError = null;
             return textureId.Handle != 0;
         }
         catch (Exception ex)
         {
             _lastError = ex.Message;
+            if (++_consecutiveRenderFailures >= 3)
+            {
+                _consecutiveRenderFailures = 0;
+                _initialiseFailed = false;
+                DisposeDxObjects();
+            }
             return false;
         }
     }
@@ -138,7 +147,12 @@ public sealed class RavaCastWorldImageRenderer : IDisposable
         if (_device is not null)
             return true;
         if (_initialiseFailed)
-            return false;
+        {
+            var now = Environment.TickCount64;
+            if (now - _lastInitialiseFailedTick < 2000)
+                return false;
+            _initialiseFailed = false;
+        }
 
         try
         {
@@ -146,7 +160,6 @@ public sealed class RavaCastWorldImageRenderer : IDisposable
             if (device is null || device->D3D11Forwarder == null)
             {
                 _lastError = "Game D3D11 device unavailable";
-                _initialiseFailed = true;
                 return false;
             }
 
@@ -192,6 +205,7 @@ public sealed class RavaCastWorldImageRenderer : IDisposable
         {
             _lastError = ex.Message;
             _initialiseFailed = true;
+            _lastInitialiseFailedTick = Environment.TickCount64;
             _logger.LogWarning(ex, "Failed to initialise RavaCast world-image renderer");
             DisposeDxObjects();
             return false;
@@ -529,6 +543,7 @@ public sealed class RavaCastWorldImageRenderer : IDisposable
         _context = null;
         _device = null;
         _cachedDepthPtr = IntPtr.Zero;
+        _consecutiveRenderFailures = 0;
     }
 
     [StructLayout(LayoutKind.Sequential)]

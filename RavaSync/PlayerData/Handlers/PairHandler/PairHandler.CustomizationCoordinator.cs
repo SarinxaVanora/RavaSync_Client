@@ -175,7 +175,7 @@ public sealed partial class PairHandler
 
                 var lightweightOwnedObjectFlags = ApplyFlag.Once | ApplyFlag.Equipment | ApplyFlag.Customization;
                 var changeSet = new KeyValuePair<ObjectKind, HashSet<PlayerChanges>>(objectKind, retryChanges);
-                await ApplyCustomizationDataAsync(applicationId, changeSet, charaData, false, false, false, false, lightweightOwnedObjectFlags, token).ConfigureAwait(false);
+                await ApplyCustomizationDataAsync(applicationId, changeSet, charaData, false, false, false, false, lightweightOwnedObjectFlags, false, token).ConfigureAwait(false);
                 return true;
             }
 
@@ -225,7 +225,7 @@ public sealed partial class PairHandler
                 return true;
             }
 
-            public async Task<bool> ApplyCustomizationDataAsync(Guid applicationId, KeyValuePair<ObjectKind, HashSet<PlayerChanges>> changes, CharacterData charaData, bool allowPlayerRedraw, bool forceLightweightMetadataReapply, bool awaitPlayerGlamourerApply, bool waitForPlayerGlamourerDrawSettle, ApplyFlag glamourerApplyFlags, CancellationToken token)
+            public async Task<bool> ApplyCustomizationDataAsync(Guid applicationId, KeyValuePair<ObjectKind, HashSet<PlayerChanges>> changes, CharacterData charaData, bool allowPlayerRedraw, bool forceLightweightMetadataReapply, bool awaitPlayerGlamourerApply, bool waitForPlayerGlamourerDrawSettle, ApplyFlag glamourerApplyFlags, bool deferPlayerGlamourerUntilAfterRedraw, CancellationToken token)
             {
                 if (PlayerCharacter == nint.Zero) return false;
                 var ptr = PlayerCharacter;
@@ -327,6 +327,12 @@ public sealed partial class PairHandler
                                 break;
 
                             case PlayerChanges.Glamourer:
+                                if (deferPlayerGlamourerUntilAfterRedraw && changes.Key == ObjectKind.Player)
+                                {
+                                    Logger.LogTrace("[{applicationId}] Skipping pre-redraw player Glamourer apply for Havok-safe redraw lane", applicationId);
+                                    break;
+                                }
+
                                 if (charaData.GlamourerData.TryGetValue(changes.Key, out var glamourerData))
                                 {
                                     var waitForThisGlamourerApply = awaitPlayerGlamourerApply && changes.Key == ObjectKind.Player;

@@ -865,8 +865,11 @@ internal static class Program
             TopMost = false
         };
 
-        var gameRect = TryGetGameRect(out var rect) ? rect : Screen.PrimaryScreen?.Bounds ?? new Rectangle(0, 0, _width, _height);
-        form.Location = new Point(gameRect.Left + 16, gameRect.Top + 16);
+        // Start parked off-screen. The renderer owns a real WebView2/Chromium HWND, so even a
+        // no-activate/tool window can flash above the game for a frame if it is created inside the
+        // game rectangle before the z-order timer has a chance to run. ShowWindow is the only path
+        // that should ever bring this host back on-screen for user interaction.
+        form.Location = new Point(HiddenHostParkingX, HiddenHostParkingY);
         return form;
     }
 
@@ -4987,6 +4990,8 @@ internal static class Program
         private static bool PublisherActive;
         private static bool PublisherStartInFlight;
         private static bool ReceiverActive;
+        private static bool DirectStreamMuted;
+        private static float DirectStreamVolume = 0.5f;
         private static IntPtr LastReceiverSharedTextureHandle;
         private static int LastReceiverSharedTextureWidth;
         private static int LastReceiverSharedTextureHeight;
@@ -5086,7 +5091,7 @@ internal static class Program
             {
                 op = "directStreamStatus",
                 text = "Starting Direct Stream v2 publisher",
-                detail = $"Cast={request.CastId}; source=0x{request.SharedTextureHandle.ToInt64():X}; source={request.SourceWidth}x{request.SourceHeight}; target={request.TargetWidth}x{request.TargetHeight}@{request.Fps}; video={request.VideoBitrateKbps}kbps audio={request.AudioBitrateKbps}kbps; webView2AudioPid={request.AudioSourceProcessId}; transport=libdatachannel; codecPath=ffmpeg-libav-opus",
+                detail = $"Cast={request.CastId}; source=0x{request.SharedTextureHandle.ToInt64():X}; source={request.SourceWidth}x{request.SourceHeight}; target={request.TargetWidth}x{request.TargetHeight}@{request.Fps}; video={request.VideoBitrateKbps}kbps audio={request.AudioBitrateKbps}kbps; audioRootPid={request.AudioSourceProcessId}; transport=libdatachannel; codecPath=ffmpeg-libav-opus",
                 publisherActive = false,
                 receiverActive = ReceiverActive,
                 nativeMediaAvailable = NativeMediaAvailable
@@ -5165,6 +5170,11 @@ internal static class Program
 
         private static int ResolveDirectStreamAudioSourceProcessId()
         {
+            // Prefer WebView2's real browser-process root for application audio capture. OBS-style
+            // application capture can miss WebView2 audio if it targets only the owner window process, because
+            // Chromium/WebView2 commonly renders audio from a browser/renderer subprocess rather than the
+            // app window process itself. Fall back to the RavaCast renderer process only if this runtime cannot
+            // expose BrowserProcessId.
             try
             {
                 if (_core is not null)
@@ -5173,15 +5183,14 @@ internal static class Program
                     var value = property?.GetValue(_core);
                     var pid = value switch
                     {
-                        int i => i,
-                        uint u when u <= int.MaxValue => (int)u,
+                        int i when i > 0 => i,
+                        uint u when u > 0 && u <= int.MaxValue => (int)u,
                         long l when l > 0 && l <= int.MaxValue => (int)l,
-                        ulong ul when ul <= int.MaxValue => (int)ul,
+                        ulong ul when ul > 0 && ul <= int.MaxValue => (int)ul,
                         _ => 0
                     };
 
-                    if (pid > 0)
-                        return pid;
+                    if (pid > 0) return pid;
                 }
             }
             catch { }
@@ -5325,17 +5334,25 @@ internal static class Program
         public static void SetAudio(bool muted, float volume)
         {
             var safeVolume = Math.Clamp(volume, 0f, 1f);
+            DirectStreamMuted = muted;
+            DirectStreamVolume = safeVolume;
             _ = Task.Run(() =>
             {
                 try
                 {
-                    if (Initialised) RavaCastMedia_SetAudio(muted ? 1 : 0, safeVolume);
+                    ApplyAudioStateToNative();
                 }
                 catch (Exception ex)
                 {
                     LastNativeError = ex.Message;
                 }
             });
+        }
+
+        private static void ApplyAudioStateToNative()
+        {
+            if (!Initialised) return;
+            RavaCastMedia_SetAudio(DirectStreamMuted ? 1 : 0, Math.Clamp(DirectStreamVolume, 0f, 1f));
         }
 
         public static void AddPeer(JsonElement root)
@@ -5468,6 +5485,7 @@ internal static class Program
                     }
 
                     Program.Send(new { op = "directStreamStatus", text = "Direct Stream v2 bridge loaded", detail = "libdatachannel transport path is active. FFmpeg H.264 live video and Opus audio over an RTP media track are wired.", publisherActive = PublisherActive, receiverActive = ReceiverActive, nativeMediaAvailable = true });
+                    ApplyAudioStateToNative();
                     return true;
                 }
                 catch (Exception ex) when (ex is DllNotFoundException or EntryPointNotFoundException or BadImageFormatException or MarshalDirectiveException)

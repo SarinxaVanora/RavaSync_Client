@@ -152,7 +152,8 @@ internal sealed class DirectStreamPublisherMediaHub : IDisposable
 
         if (accepted)
         {
-            _ = _transport.SendStatusAsync("Shared live video ready", detail + $" One FFmpeg video encoder is now feeding {_sessions.Count} viewer peer(s). Audio will start after the first encoded video frame so it cannot race ahead of the captured browser picture.", true, _receiverActive(), true, _viewerCount());
+            _ = _transport.SendStatusAsync("Shared live video ready", detail + $" One FFmpeg video encoder is now feeding {_sessions.Count} viewer peer(s). Audio will start as soon as the viewer audio path is open and the browser emits PCM.", true, _receiverActive(), true, _viewerCount());
+            TryStartAudio("shared video encoder ready");
         }
         else if (!success)
         {
@@ -285,6 +286,7 @@ internal sealed class DirectStreamPublisherMediaHub : IDisposable
         var queued = _sessions.Values.Sum(s => s.SharedVideoQueuedFrames);
         var dropped = _sessions.Values.Sum(s => s.SharedVideoDroppedFrames);
         var dropDetail = dropped > 0 ? $"; stale queued frames dropped={dropped:n0}" : string.Empty;
+        if (ready > 0) TryStartAudio("shared video encoder heartbeat");
         _ = _transport.SendStatusAsync("Sending shared live video", detail + $" Shared encoder fan-out: ready viewers={ready}/{_sessions.Count}; encoded frames broadcast={frames:n0}; viewer frame queues={targets:n0}; queued peer frames={queued:n0}{dropDetail}.", true, _receiverActive(), true, _viewerCount());
     }
 

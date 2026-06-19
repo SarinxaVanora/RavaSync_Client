@@ -134,6 +134,7 @@ public sealed record RavaCastStatePayload(
     public string DirectStreamStatus { get; init; } = string.Empty;
     public string DirectStreamDetail { get; init; } = string.Empty;
     public bool DirectStreamNativeMediaAvailable { get; init; }
+    public long NavigationRevision { get; init; }
 }
 
 [MessagePackObject(keyAsPropertyName: true)]
@@ -205,6 +206,7 @@ public sealed record RavaCastSummary(
     public string DirectStreamStatus { get; init; } = string.Empty;
     public string DirectStreamDetail { get; init; } = string.Empty;
     public bool DirectStreamNativeMediaAvailable { get; init; }
+    public long NavigationRevision { get; init; }
 }
 
 

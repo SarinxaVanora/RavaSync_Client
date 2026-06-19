@@ -53,6 +53,7 @@ public sealed class RavaCastBackendInstallerService : IDisposable
     public string RendererPath => Path.Combine(InstallDirectory, RendererExeName);
     public string NativeBridgePath => Path.Combine(InstallDirectory, NativeBridgeDllName);
     public string BridgeHostPath => Path.Combine(InstallDirectory, BridgeHostExeName);
+    private string FirewallStatusPath => Path.Combine(DownloadDirectory, "AllowRavaCastDirectStreamFirewall.status.txt");
     private string CurrentFirewallRuleSuffix => BuildFirewallRuleSuffix(BridgeHostPath);
     private string CurrentFirewallRuleUdp => $"{FirewallRuleBase} UDP {CurrentFirewallRuleSuffix}";
     private string CurrentFirewallRuleTcp => $"{FirewallRuleBase} TCP {CurrentFirewallRuleSuffix}";
@@ -268,6 +269,13 @@ public sealed class RavaCastBackendInstallerService : IDisposable
             return false;
         }
 
+        if (TryReadFirewallInstallStatus(out var installedFromStatus, out var statusDetail))
+        {
+            detail = statusDetail;
+            if (installedFromStatus)
+                return true;
+        }
+
         var udpRule = CurrentFirewallRuleUdp;
         var tcpRule = CurrentFirewallRuleTcp;
         var udp = TryGetFirewallRule(udpRule, out var udpDetail);
@@ -316,7 +324,7 @@ public sealed class RavaCastBackendInstallerService : IDisposable
         {
             Directory.CreateDirectory(DownloadDirectory);
             var scriptPath = Path.Combine(DownloadDirectory, "AllowRavaCastDirectStreamFirewall.ps1");
-            var statusPath = Path.Combine(DownloadDirectory, "AllowRavaCastDirectStreamFirewall.status.txt");
+            var statusPath = FirewallStatusPath;
             var bridgeHostLiteral = EscapePowerShellSingleQuoted(BridgeHostPath);
             var statusLiteral = EscapePowerShellSingleQuoted(statusPath);
             var udpLiteral = EscapePowerShellSingleQuoted(CurrentFirewallRuleUdp);
@@ -383,6 +391,50 @@ public sealed class RavaCastBackendInstallerService : IDisposable
     }
 
     private static string EscapePowerShellSingleQuoted(string value) => (value ?? string.Empty).Replace("'", "''");
+
+    private bool TryReadFirewallInstallStatus(out bool installed, out string detail)
+    {
+        installed = false;
+        detail = string.Empty;
+
+        try
+        {
+            if (!File.Exists(FirewallStatusPath)) return false;
+
+            var text = File.ReadAllText(FirewallStatusPath, Encoding.UTF8).Trim();
+            if (string.IsNullOrWhiteSpace(text)) return false;
+
+            var parts = text.Split(new[] { '|' }, 3);
+            if (parts.Length == 0) return false;
+
+            if (string.Equals(parts[0], "OK", StringComparison.OrdinalIgnoreCase))
+            {
+                var program = parts.Length >= 3 ? parts[2] : string.Empty;
+                if (FirewallRuleOutputMatchesProgram(program, BridgeHostPath))
+                {
+                    installed = true;
+                    detail = "Direct Stream firewall rules were installed for this BridgeHost.";
+                    return true;
+                }
+
+                detail = "A Direct Stream firewall install status was found, but it was for a different BridgeHost path.";
+                return true;
+            }
+
+            if (string.Equals(parts[0], "ERROR", StringComparison.OrdinalIgnoreCase))
+            {
+                detail = parts.Length >= 3 ? "Direct Stream firewall install failed: " + parts[2] : "Direct Stream firewall install failed.";
+                return true;
+            }
+        }
+        catch (Exception ex)
+        {
+            detail = "Could not read Direct Stream firewall install status: " + ex.Message;
+            return true;
+        }
+
+        return false;
+    }
 
     private bool TryGetFirewallRule(string ruleName, out string detail)
     {

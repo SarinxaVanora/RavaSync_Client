@@ -43,6 +43,10 @@ public sealed class RavaCastService : DisposableMediatorSubscriberBase, IHostedS
     private const int DirectStreamSignalAssemblyTtlMs = 30000;
     private const int LivePlaneBroadcastIntervalMs = 250;
     private const int LivePlaneFinalDebounceMs = 300;
+    private const int PlaybackRecoveryIntervalMs = 1250;
+    private const int HostedObservedUrlSyncDebounceMs = 1200;
+    private const int HostedObservedUrlSyncMinimumIntervalMs = 1800;
+    private static readonly int[] PasswordProtectedJoinRetryDelaysMs = [350, 900, 1800, 3200, 5200];
 
     private long _lastBroadcastTick;
     private long _lastPruneTick;
@@ -50,10 +54,15 @@ public sealed class RavaCastService : DisposableMediatorSubscriberBase, IHostedS
     private long _lastHostedPlaneBroadcastTick;
     private long _pendingHostedPlaneFinalBroadcastTick;
     private long _pendingHostedBrowserNavigationSyncTick;
+    private long _lastPlaybackRecoveryTick;
+    private long _pendingHostedObservedUrlSinceTick;
+    private long _lastHostedObservedUrlBroadcastTick;
+    private string _pendingHostedObservedUrl = string.Empty;
     private readonly ConcurrentDictionary<Guid, RavaCastSummary> _activeCasts = new();
     private readonly ConcurrentDictionary<string, bool> _joinedViewers = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, bool> _directStreamReadyViewers = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<Guid, bool> _pendingJoinMuted = new();
+    private readonly ConcurrentDictionary<Guid, long> _pendingPasswordProtectedJoinRetries = new();
     private readonly ConcurrentDictionary<string, DirectStreamSignalAssembly> _directStreamSignalAssemblies = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, long> _completedDirectStreamSignalAssemblies = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _directStreamSignalSendGates = new(StringComparer.Ordinal);
@@ -96,6 +105,7 @@ public sealed class RavaCastService : DisposableMediatorSubscriberBase, IHostedS
         public bool DirectStreamPublisherRequested { get; set; }
         public string DirectStreamStatus { get; set; } = string.Empty;
         public string DirectStreamDetail { get; set; } = string.Empty;
+        public long NavigationRevision { get; set; }
     }
 
     private sealed class JoinedCast
@@ -125,6 +135,7 @@ public sealed class RavaCastService : DisposableMediatorSubscriberBase, IHostedS
         public string DirectStreamStatus { get; set; } = string.Empty;
         public string DirectStreamDetail { get; set; } = string.Empty;
         public bool DirectStreamReceiverRequested { get; set; }
+        public long NavigationRevision { get; set; }
     }
 
     private sealed class DirectStreamSignalAssembly
@@ -211,6 +222,7 @@ public sealed class RavaCastService : DisposableMediatorSubscriberBase, IHostedS
         CancelPendingHostedPlaneBroadcast();
         CancelPendingHostedBrowserNavigationSync();
         _pendingJoinMuted.Clear();
+        _pendingPasswordProtectedJoinRetries.Clear();
         _directStreamSignalAssemblies.Clear();
         _completedDirectStreamSignalAssemblies.Clear();
         _directStreamSignalSendGates.Clear();
@@ -271,15 +283,18 @@ public sealed class RavaCastService : DisposableMediatorSubscriberBase, IHostedS
         {
             _lastSurfaceSyncTick = now;
 
-            // Hard rule: framework ticks must never promote ordinary browser redirects/history churn
-            // into new RavaCast navigation requests. Modern media sites mutate location constantly; treating
-            // that as a fresh URL Share navigation made viewers reload or fall behind. Explicit URL-bar/Back
-            // actions schedule a one-shot URL sync instead. Periodic sync is for playback time and consent only.
             if (_hosted is { Mode: RavaCastMode.UrlShare })
             {
+                SyncHostedObservedUrlFromSurface(now);
                 SyncHostedMediaStateFromSurface();
                 SyncHostedConsentCookiesFromSurface();
             }
+        }
+
+        if (now - _lastPlaybackRecoveryTick >= PlaybackRecoveryIntervalMs)
+        {
+            _lastPlaybackRecoveryTick = now;
+            RecoverActivePlaybackSurface();
         }
     }
 
@@ -369,6 +384,7 @@ public sealed class RavaCastService : DisposableMediatorSubscriberBase, IHostedS
         _directStreamReadyViewers.Clear();
         CancelPendingHostedPlaneBroadcast();
         CancelPendingHostedBrowserNavigationSync();
+        ClearPendingHostedObservedUrlSync();
 
         var passwordSalt = string.Empty;
         var passwordHash = string.Empty;
@@ -418,6 +434,7 @@ public sealed class RavaCastService : DisposableMediatorSubscriberBase, IHostedS
         _directStreamReadyViewers.Clear();
         CancelPendingHostedPlaneBroadcast();
         CancelPendingHostedBrowserNavigationSync();
+        ClearPendingHostedObservedUrlSync();
         _surface.Close();
     }
 
@@ -433,25 +450,74 @@ public sealed class RavaCastService : DisposableMediatorSubscriberBase, IHostedS
         if (string.IsNullOrWhiteSpace(currentUrl)) return;
         if (!TryValidatePublicWebUrl(currentUrl, out var uri, out _)) return;
         var nextUrl = uri.ToString();
-        if (string.Equals(_hosted.Url, nextUrl, StringComparison.OrdinalIgnoreCase)) return;
+        PromoteHostedObservedUrl(uri, nextUrl, immediateNavigation: true);
+    }
 
+    private void SyncHostedObservedUrlFromSurface(long now)
+    {
+        if (_hosted is null || _hosted.Mode != RavaCastMode.UrlShare) return;
+
+        var media = _surface.CurrentMedia;
+        var currentUrl = !string.IsNullOrWhiteSpace(media.Url) ? media.Url : _surface.CurrentUrl;
+        if (string.IsNullOrWhiteSpace(currentUrl))
+        {
+            ClearPendingHostedObservedUrlSync();
+            return;
+        }
+
+        if (!TryValidatePublicWebUrl(currentUrl, out var uri, out _))
+        {
+            ClearPendingHostedObservedUrlSync();
+            return;
+        }
+
+        var nextUrl = uri.ToString();
+        if (string.Equals(_hosted.Url, nextUrl, StringComparison.OrdinalIgnoreCase))
+        {
+            ClearPendingHostedObservedUrlSync();
+            return;
+        }
+
+        if (!string.Equals(_pendingHostedObservedUrl, nextUrl, StringComparison.OrdinalIgnoreCase))
+        {
+            _pendingHostedObservedUrl = nextUrl;
+            _pendingHostedObservedUrlSinceTick = now;
+            return;
+        }
+
+        if (now - _pendingHostedObservedUrlSinceTick < HostedObservedUrlSyncDebounceMs) return;
+        if (now - _lastHostedObservedUrlBroadcastTick < HostedObservedUrlSyncMinimumIntervalMs) return;
+
+        PromoteHostedObservedUrl(uri, nextUrl, immediateNavigation: false);
+    }
+
+    private void PromoteHostedObservedUrl(Uri uri, string nextUrl, bool immediateNavigation)
+    {
+        if (_hosted is null || _hosted.Mode != RavaCastMode.UrlShare) return;
+        if (string.Equals(_hosted.Url, nextUrl, StringComparison.OrdinalIgnoreCase))
+        {
+            ClearPendingHostedObservedUrlSync();
+            return;
+        }
+
+        var media = _surface.CurrentMedia;
         _hosted.Url = nextUrl;
         _hosted.SourceDomain = uri.Host;
-        _hosted.MediaTitle = !string.IsNullOrWhiteSpace(_surface.CurrentMedia.Title) ? _surface.CurrentMedia.Title : uri.Host;
-        _hosted.IsPlaying = true;
-        _hosted.PositionSeconds = 0;
-        _hosted.DurationSeconds = null;
-        _hosted.StateUtc = DateTime.UtcNow;
-        BroadcastHostedStateNearby(RavaCastOp.StateSnapshot);
-        BroadcastHostedStateToJoined();
+        _hosted.MediaTitle = !string.IsNullOrWhiteSpace(media.Title) ? media.Title : uri.Host;
+        _hosted.IsPlaying = immediateNavigation ? true : media.IsPlaying;
+        _hosted.PositionSeconds = immediateNavigation ? 0 : Math.Max(0, media.PositionSeconds);
+        _hosted.DurationSeconds = immediateNavigation ? null : (media.DurationSeconds is > 0 ? media.DurationSeconds : null);
+        _hosted.StateUtc = immediateNavigation || media.StateUtc == default ? DateTime.UtcNow : media.StateUtc;
+        _hosted.NavigationRevision++;
+        _lastHostedObservedUrlBroadcastTick = Environment.TickCount64;
+        ClearPendingHostedObservedUrlSync();
+        BroadcastHostedNavigationStateReliably();
     }
 
     private void SyncHostedMediaStateFromSurface()
     {
         if (_hosted is null || _hosted.Mode != RavaCastMode.UrlShare) return;
         var media = _surface.CurrentMedia;
-        // Do not turn passive location changes from media sites into URL Share navigation.
-        // Explicit URL-bar and Back actions call SyncHostedUrlFromSurface via a one-shot schedule.
         var title = !string.IsNullOrWhiteSpace(media.Title) ? media.Title : _hosted.SourceDomain;
         var position = Math.Max(0, media.PositionSeconds);
         var duration = media.DurationSeconds is > 0 ? media.DurationSeconds : null;
@@ -542,9 +608,10 @@ public sealed class RavaCastService : DisposableMediatorSubscriberBase, IHostedS
         _hosted.PositionSeconds = 0;
         _hosted.DurationSeconds = null;
         _hosted.StateUtc = DateTime.UtcNow;
+        _hosted.NavigationRevision++;
+        ClearPendingHostedObservedUrlSync();
         _surface.Open(_hosted.Url, muted: _surface.Muted, _localVolume);
-        BroadcastHostedStateNearby(RavaCastOp.StateSnapshot);
-        BroadcastHostedStateToJoined();
+        BroadcastHostedNavigationStateReliably();
         return true;
     }
 
@@ -582,6 +649,12 @@ public sealed class RavaCastService : DisposableMediatorSubscriberBase, IHostedS
 
     private void CancelPendingHostedBrowserNavigationSync()
         => _pendingHostedBrowserNavigationSyncTick = 0;
+
+    private void ClearPendingHostedObservedUrlSync()
+    {
+        _pendingHostedObservedUrl = string.Empty;
+        _pendingHostedObservedUrlSinceTick = 0;
+    }
 
     public bool ShouldBroadcastHostedPlaneNow(bool force)
     {
@@ -695,13 +768,44 @@ public sealed class RavaCastService : DisposableMediatorSubscriberBase, IHostedS
 
         // Password-protected lobbies must wait for the host's accepted StateSnapshot before opening
         // the browser/Direct Stream receiver. Otherwise a wrong password would still let the viewer
-        // open the advertised URL locally before the host can reject the join.
+        // open the advertised URL locally before the host can reject the join. Because that accepted
+        // snapshot is an extra targeted mesh hop that normal lobbies do not need, retry the join request
+        // briefly until the host accepts it so passworded lobbies do not feel like a dead button when one
+        // packet arrives during a busy/object-table frame.
         if (summary.PasswordProtected)
+        {
+            _pendingPasswordProtectedJoinRetries[castId] = Environment.TickCount64;
+            _ = RetryPasswordProtectedJoinUntilAcceptedAsync(castId, summary.HostSessionId, mySession, payload);
             return;
+        }
 
         ApplyState(summary, muted, mySession);
         if (summary.Mode == RavaCastMode.DirectStream)
             StartJoinedDirectStreamReceiver(summary);
+    }
+
+    private async Task RetryPasswordProtectedJoinUntilAcceptedAsync(Guid castId, string hostSessionId, string mySession, RavaCastJoinPayload payload)
+    {
+        try
+        {
+            var token = _pendingPasswordProtectedJoinRetries.TryGetValue(castId, out var existingToken) ? existingToken : Environment.TickCount64;
+            foreach (var delayMs in PasswordProtectedJoinRetryDelaysMs)
+            {
+                await Task.Delay(delayMs).ConfigureAwait(false);
+
+                if (!_pendingPasswordProtectedJoinRetries.TryGetValue(castId, out var activeToken) || activeToken != token) return;
+                if (!_pendingJoinMuted.ContainsKey(castId)) return;
+                if (_joined is not null && _joined.CastId == castId) return;
+
+                SendEnvelope(mySession, hostSessionId, new RavaCastEnvelope(castId, RavaCastOp.Join, MessagePackSerializer.Serialize(payload)));
+            }
+        }
+        catch (OperationCanceledException) { }
+        catch (ObjectDisposedException) { }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to retry RavaCast password-protected join request");
+        }
     }
 
     public void RequestState()
@@ -789,6 +893,41 @@ public sealed class RavaCastService : DisposableMediatorSubscriberBase, IHostedS
         return "https://" + text.TrimStart('/');
     }
 
+    private void RecoverActivePlaybackSurface()
+    {
+        if (_joined is not null)
+        {
+            if (_joined.Mode == RavaCastMode.UrlShare)
+            {
+                if (!_surface.IsOpen && !string.IsNullOrWhiteSpace(_joined.Url))
+                {
+                    _surface.Open(_joined.Url, _joined.IsMuted, _joined.Volume);
+                    _surface.ApplyMediaState(_joined.PositionSeconds, _joined.IsPlaying, force: true);
+                }
+                return;
+            }
+
+            if (_joined.Mode == RavaCastMode.DirectStream)
+            {
+                var ds = _surface.DirectStreamStatus;
+                if (ds.NativeMediaAvailable && (!_joined.DirectStreamReceiverRequested || !ds.ReceiverActive))
+                {
+                    var summary = BuildSummaryFromJoined(_joined);
+                    _joined.DirectStreamReceiverRequested = false;
+                    StartJoinedDirectStreamReceiver(summary);
+                }
+            }
+
+            return;
+        }
+
+        if (_hosted is { Mode: RavaCastMode.UrlShare } hosted && !_surface.IsOpen && !string.IsNullOrWhiteSpace(hosted.Url))
+        {
+            _surface.Open(hosted.Url, muted: false, _localVolume);
+            _surface.ApplyMediaState(hosted.PositionSeconds, hosted.IsPlaying, force: true);
+        }
+    }
+
     public void Leave()
     {
         if (_joined is not null)
@@ -804,6 +943,11 @@ public sealed class RavaCastService : DisposableMediatorSubscriberBase, IHostedS
 
         _surface.StopDirectStreamReceiver();
         _joined = null;
+        foreach (var castId in _pendingJoinMuted.Keys.ToArray())
+        {
+            _pendingJoinMuted.TryRemove(castId, out _);
+            _pendingPasswordProtectedJoinRetries.TryRemove(castId, out _);
+        }
         _surface.Close();
     }
 
@@ -1415,12 +1559,18 @@ public sealed class RavaCastService : DisposableMediatorSubscriberBase, IHostedS
         }
     }
 
+
+    private void StoreActiveSummary(RavaCastSummary summary)
+    {
+        _activeCasts.AddOrUpdate(summary.CastId, summary, (_, existing) => summary.NavigationRevision < existing.NavigationRevision ? existing : summary);
+    }
+
     private void HandleAdvertise(RavaCastEnvelope env)
     {
         if (env.Payload is null) return;
         var state = MessagePackSerializer.Deserialize<RavaCastStatePayload>(env.Payload);
         var summary = ToSummary(env.CastId, state, Environment.TickCount64);
-        _activeCasts[env.CastId] = summary;
+        StoreActiveSummary(summary);
 
         if (_joined is not null && _joined.CastId == env.CastId)
             ApplyState(summary, _joined.IsMuted);
@@ -1431,10 +1581,13 @@ public sealed class RavaCastService : DisposableMediatorSubscriberBase, IHostedS
         if (env.Payload is null) return;
         var state = MessagePackSerializer.Deserialize<RavaCastStatePayload>(env.Payload);
         var summary = ToSummary(env.CastId, state, Environment.TickCount64);
-        _activeCasts[env.CastId] = summary;
+        StoreActiveSummary(summary);
 
         if (_pendingJoinMuted.TryRemove(env.CastId, out var muted))
+        {
+            _pendingPasswordProtectedJoinRetries.TryRemove(env.CastId, out _);
             ApplyState(summary, muted);
+        }
         else if (_joined is not null && _joined.CastId == env.CastId)
             ApplyState(summary, _joined.IsMuted);
     }
@@ -1452,12 +1605,54 @@ public sealed class RavaCastService : DisposableMediatorSubscriberBase, IHostedS
         }
         _joinedViewers[viewerSession] = true;
         SendHostedState(viewerSession, RavaCastOp.StateSnapshot);
+        if (_hosted.PasswordProtected)
+            _ = RepeatAcceptedPasswordProtectedJoinStateAsync(_hosted.CastId, viewerSession);
         if (_hosted.Mode == RavaCastMode.DirectStream)
         {
             StartHostedDirectStreamPublisher(notifyExistingViewers: false);
             SendDirectStreamStart(viewerSession);
+            if (_hosted.PasswordProtected)
+                _ = RepeatDirectStreamStartForAcceptedPasswordProtectedJoinAsync(_hosted.CastId, viewerSession);
         }
         BroadcastHostedStateNearby(RavaCastOp.Advertise);
+    }
+
+    private async Task RepeatAcceptedPasswordProtectedJoinStateAsync(Guid castId, string viewerSession)
+    {
+        try
+        {
+            foreach (var delayMs in new[] { 250, 800, 1600 })
+            {
+                await Task.Delay(delayMs).ConfigureAwait(false);
+                if (_hosted is null || _hosted.CastId != castId || !_joinedViewers.ContainsKey(viewerSession)) return;
+                SendHostedState(viewerSession, RavaCastOp.StateSnapshot);
+            }
+        }
+        catch (OperationCanceledException) { }
+        catch (ObjectDisposedException) { }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to repeat accepted RavaCast password-protected join state");
+        }
+    }
+
+    private async Task RepeatDirectStreamStartForAcceptedPasswordProtectedJoinAsync(Guid castId, string viewerSession)
+    {
+        try
+        {
+            foreach (var delayMs in new[] { 500, 1400, 2600 })
+            {
+                await Task.Delay(delayMs).ConfigureAwait(false);
+                if (_hosted is null || _hosted.CastId != castId || _hosted.Mode != RavaCastMode.DirectStream || !_joinedViewers.ContainsKey(viewerSession)) return;
+                SendDirectStreamStart(viewerSession);
+            }
+        }
+        catch (OperationCanceledException) { }
+        catch (ObjectDisposedException) { }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to repeat RavaCast Direct Stream start after accepted password-protected join");
+        }
     }
 
     private void HandleLeave(RavaCastEnvelope env)
@@ -1485,6 +1680,8 @@ public sealed class RavaCastService : DisposableMediatorSubscriberBase, IHostedS
     private void HandleScreenClosed(RavaCastEnvelope env)
     {
         _activeCasts.TryRemove(env.CastId, out _);
+        _pendingJoinMuted.TryRemove(env.CastId, out _);
+        _pendingPasswordProtectedJoinRetries.TryRemove(env.CastId, out _);
         RemoveDirectStreamSignalAssembliesForCast(env.CastId);
         if (_joined is not null && _joined.CastId == env.CastId)
         {
@@ -1498,6 +1695,9 @@ public sealed class RavaCastService : DisposableMediatorSubscriberBase, IHostedS
     {
         var previous = _joined;
         var sameCast = previous is not null && previous.CastId == summary.CastId;
+        if (sameCast && summary.NavigationRevision < previous!.NavigationRevision)
+            return;
+
         var sameUrl = previous is not null && string.Equals(previous.Url, summary.Url, StringComparison.OrdinalIgnoreCase);
         var effectiveMuted = sameCast ? previous!.IsMuted : muted;
         var effectiveVolume = sameCast ? previous!.Volume : _localVolume;
@@ -1507,13 +1707,13 @@ public sealed class RavaCastService : DisposableMediatorSubscriberBase, IHostedS
                 ? previous.ViewerSessionId
                 : GetMySessionId();
         var sameDirectStreamRequest = sameCast && previous!.Mode == summary.Mode && previous.DirectStreamQuality == summary.DirectStreamQuality;
-        var directStreamReceiverRequested = sameDirectStreamRequest && previous.DirectStreamReceiverRequested;
+        var currentDirectStreamStatus = _surface.DirectStreamStatus;
+        var directStreamReceiverRequested = sameDirectStreamRequest && previous.DirectStreamReceiverRequested && currentDirectStreamStatus.ReceiverActive;
         var effectiveDirectStreamStatus = sameCast && !string.IsNullOrWhiteSpace(previous!.DirectStreamStatus) ? previous.DirectStreamStatus : summary.DirectStreamStatus;
         var effectiveDirectStreamDetail = sameCast && !string.IsNullOrWhiteSpace(previous!.DirectStreamDetail) ? previous.DirectStreamDetail : summary.DirectStreamDetail;
-        // URL Share viewers must not re-open just because the browser's current URL changed after a normal
-        // site redirect/history update. The host's shared URL is the navigation request; the renderer's CurrentUrl
-        // is the live browser URL and can legitimately differ (YouTube is especially noisy here). Re-opening on
-        // CurrentUrl mismatch caused joined URL Share viewers to reload forever.
+        // URL Share viewers should only re-open when the host promotes a new shared URL revision.
+        // The renderer's CurrentUrl can still differ briefly while media sites redirect or mutate history,
+        // so do not compare against local CurrentUrl here.
         var shouldOpenSurface = !sameCast || !sameUrl || !_surface.IsOpen;
         // URL Share should not run a network-style clock against the page. The local browser owns
         // its own audio/video clock; RavaCast only uses host media state as the initial join/new-URL
@@ -1546,7 +1746,8 @@ public sealed class RavaCastService : DisposableMediatorSubscriberBase, IHostedS
             DirectStreamQuality = summary.DirectStreamQuality,
             DirectStreamStatus = effectiveDirectStreamStatus,
             DirectStreamDetail = effectiveDirectStreamDetail,
-            DirectStreamReceiverRequested = directStreamReceiverRequested
+            DirectStreamReceiverRequested = directStreamReceiverRequested,
+            NavigationRevision = summary.NavigationRevision
         };
 
         if (summary.Mode == RavaCastMode.DirectStream)
@@ -1570,11 +1771,23 @@ public sealed class RavaCastService : DisposableMediatorSubscriberBase, IHostedS
             _surface.Open(summary.Url, effectiveMuted, effectiveVolume);
         _surface.ApplyMediaState(effectivePlaybackPosition, summary.IsPlaying, force: shouldOpenSurface || !sameCast || !sameUrl);
 
-        // Only navigate the local URL Share browser when the host URL actually changed
-        // or the surface had to be opened. After that, leave the viewer's WebView alone
-        // so normal site redirects/history/playback state do not get hammered back to
-        // the original URL on every state refresh.
+        // Only navigate the local URL Share browser when the host URL revision changed
+        // or the surface had to be opened. The host promotes real browser URL changes
+        // through NavigationRevision, so normal repeated state refreshes stay harmless.
     }
+
+    private static RavaCastSummary BuildSummaryFromJoined(JoinedCast joined)
+        => new(joined.CastId, joined.HostSessionId, joined.HostName, joined.CastName, joined.Url, joined.SourceDomain, joined.MediaTitle, joined.IsPlaying,
+            joined.PositionSeconds, joined.DurationSeconds, joined.StateUtc, joined.JoinedCount, joined.Plane, joined.Queue, joined.ConsentCookies, Environment.TickCount64)
+        {
+            Mode = joined.Mode,
+            PasswordProtected = joined.PasswordProtected,
+            PasswordSalt = joined.PasswordSalt,
+            DirectStreamQuality = joined.DirectStreamQuality,
+            DirectStreamStatus = joined.DirectStreamStatus,
+            DirectStreamDetail = joined.DirectStreamDetail,
+            NavigationRevision = joined.NavigationRevision
+        };
 
     private RavaCastSummary ToSummary(Guid castId, RavaCastStatePayload state, long lastSeenTick)
     {
@@ -1589,7 +1802,8 @@ public sealed class RavaCastService : DisposableMediatorSubscriberBase, IHostedS
             DirectStreamQuality = state.DirectStreamQuality,
             DirectStreamStatus = state.DirectStreamStatus ?? string.Empty,
             DirectStreamDetail = state.DirectStreamDetail ?? string.Empty,
-            DirectStreamNativeMediaAvailable = state.DirectStreamNativeMediaAvailable
+            DirectStreamNativeMediaAvailable = state.DirectStreamNativeMediaAvailable,
+            NavigationRevision = state.NavigationRevision
         };
     }
 
@@ -1607,7 +1821,8 @@ public sealed class RavaCastService : DisposableMediatorSubscriberBase, IHostedS
             DirectStreamQuality = _hosted.DirectStreamQuality,
             DirectStreamStatus = GetHostedDirectStreamStatus(ds),
             DirectStreamDetail = GetHostedDirectStreamDetail(ds),
-            DirectStreamNativeMediaAvailable = ds.NativeMediaAvailable
+            DirectStreamNativeMediaAvailable = ds.NativeMediaAvailable,
+            NavigationRevision = _hosted.NavigationRevision
         };
     }
 
@@ -1631,6 +1846,38 @@ public sealed class RavaCastService : DisposableMediatorSubscriberBase, IHostedS
         return ds.Detail ?? string.Empty;
     }
 
+
+
+    private void BroadcastHostedNavigationStateReliably()
+    {
+        if (_hosted is null) return;
+        _lastBroadcastTick = Environment.TickCount64;
+        var castId = _hosted.CastId;
+        var navigationRevision = _hosted.NavigationRevision;
+        BroadcastHostedStateNearby(RavaCastOp.StateSnapshot);
+        BroadcastHostedStateToJoined();
+        _ = RepeatHostedNavigationStateAsync(castId, navigationRevision);
+    }
+
+    private async Task RepeatHostedNavigationStateAsync(Guid castId, long navigationRevision)
+    {
+        try
+        {
+            foreach (var delayMs in new[] { 300, 900, 1800 })
+            {
+                await Task.Delay(delayMs).ConfigureAwait(false);
+                if (_hosted is null || _hosted.CastId != castId || _hosted.NavigationRevision != navigationRevision) return;
+                BroadcastHostedStateNearby(RavaCastOp.StateSnapshot);
+                BroadcastHostedStateToJoined();
+            }
+        }
+        catch (OperationCanceledException) { }
+        catch (ObjectDisposedException) { }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to repeat RavaCast navigation state");
+        }
+    }
 
     private void BroadcastHostedStateNearby(RavaCastOp op)
     {
@@ -1761,7 +2008,8 @@ public sealed class RavaCastService : DisposableMediatorSubscriberBase, IHostedS
         if (string.IsNullOrWhiteSpace(mySession)) return;
         _joined.ViewerSessionId = mySession;
 
-        if (_joined.DirectStreamReceiverRequested)
+        var ds = _surface.DirectStreamStatus;
+        if (_joined.DirectStreamReceiverRequested && ds.ReceiverActive)
             return;
 
         _joined.DirectStreamReceiverRequested = true;
