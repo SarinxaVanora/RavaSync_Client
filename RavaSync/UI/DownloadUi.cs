@@ -216,10 +216,18 @@ public class DownloadUi : WindowMediatorSubscriberBase
                         totalToUpload += c.Total;
                     }
 
+                    var waitingUploadStatus = currentUploads
+                        .OfType<UploadFileTransfer>()
+                        .Select(u => u.StatusText)
+                        .FirstOrDefault(s => !string.IsNullOrWhiteSpace(s));
+                    var uploadHeader = string.IsNullOrWhiteSpace(waitingUploadStatus)
+                        ? $"Sending files {doneUploads}/{totalUploads}"
+                        : waitingUploadStatus!;
+
                     UiSharedService.DrawOutlinedFont($"▲", ImGuiColors.DalamudWhite, new Vector4(0, 0, 0, 255), 1);
                     ImGui.SameLine();
                     var xDistance = ImGui.GetCursorPosX();
-                    UiSharedService.DrawOutlinedFont($"Sending files {doneUploads}/{totalUploads}",
+                    UiSharedService.DrawOutlinedFont(uploadHeader,
                         ImGuiColors.DalamudWhite, new Vector4(0, 0, 0, 255), 1);
                     ImGui.NewLine();
                     ImGui.SameLine(xDistance);
@@ -1131,6 +1139,7 @@ public class DownloadUi : WindowMediatorSubscriberBase
         long ulTotalUploaded = 0;
         long ulTotalToUpload = 0;
 
+        string? waitingUploadText = null;
         if (uploads != null)
         {
             foreach (var c in uploads)
@@ -1138,13 +1147,18 @@ public class DownloadUi : WindowMediatorSubscriberBase
                 if (c.IsTransferred) ulDoneUploads++;
                 ulTotalUploaded += c.Transferred;
                 ulTotalToUpload += c.Total;
+
+                if (waitingUploadText == null && c is UploadFileTransfer upload && !string.IsNullOrWhiteSpace(upload.StatusText))
+                    waitingUploadText = upload.StatusText;
             }
         }
 
         var ulPct = (ulTotalToUpload <= 0) ? 0f : (float)(ulTotalUploaded / (double)ulTotalToUpload);
         ulPct = Math.Clamp(ulPct, 0f, 1f);
 
-        var ulText = $"Sending files  {ulDoneUploads}/{ulTotalUploads}  ({UiSharedService.ByteToString(ulTotalUploaded, addSuffix: false)}/{UiSharedService.ByteToString(ulTotalToUpload)})";
+        var ulText = string.IsNullOrWhiteSpace(waitingUploadText)
+            ? $"Sending files  {ulDoneUploads}/{ulTotalUploads}  ({UiSharedService.ByteToString(ulTotalUploaded, addSuffix: false)}/{UiSharedService.ByteToString(ulTotalToUpload)})"
+            : waitingUploadText!;
 
         // ===== Draw bars (stacked vs row) =====
         void DrawDownloadBar()

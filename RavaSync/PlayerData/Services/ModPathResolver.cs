@@ -302,11 +302,28 @@ public sealed class ModPathResolver
         if (!_configService.Current.GlobalSyncVfx && IsVfxGamePathExtension(ext))
             return false;
 
+        if (IsUiOrInterfaceGamePath(normalized))
+            return false;
+
         return true;
     }
 
     private static bool IsVfxGamePathExtension(string extension)
         => extension is ".avfx" or ".atex" or ".shpk" or ".eid" or ".skp";
+
+    private static bool IsUiOrInterfaceGamePath(string? gamePath)
+    {
+        var normalized = NormalizeGamePath(gamePath).TrimStart('/');
+        if (string.IsNullOrWhiteSpace(normalized))
+            return false;
+
+        return normalized.StartsWith("ui/", StringComparison.OrdinalIgnoreCase)
+            || normalized.StartsWith("addon/", StringComparison.OrdinalIgnoreCase)
+            || normalized.StartsWith("font/", StringComparison.OrdinalIgnoreCase)
+            || normalized.Contains("/ui/", StringComparison.OrdinalIgnoreCase)
+            || normalized.Contains("/addon/", StringComparison.OrdinalIgnoreCase)
+            || normalized.Contains("/font/", StringComparison.OrdinalIgnoreCase);
+    }
 
     private static string NormalizeGamePath(string? value)
         => string.IsNullOrWhiteSpace(value) ? string.Empty : value.Replace('\\', '/').Trim();

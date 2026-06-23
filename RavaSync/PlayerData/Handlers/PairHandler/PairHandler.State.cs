@@ -1,7 +1,9 @@
 using System.Threading;
+using System.Threading.Tasks;
 
 using Microsoft.Extensions.Logging;
 using RavaSync.API.Data.Enum;
+using RavaSync.PlayerData.Data;
 using RavaSync.PlayerData.Pairs;
 using RavaSync.Utils;
 
@@ -44,8 +46,15 @@ public sealed partial class PairHandler
 
         _lastAssignedObjectIndex = null;
         _lastAssignedPlayerAddress = nint.Zero;
+        _lastAssignedOwnedObjectIndices.Clear();
+        _summonedActorBindingInFlight.Clear();
+        _nextSummonedActorBindingAttemptTick.Clear();
+        _summonedActorRedrawCooldownByKey.Clear();
+        _penumbraCoordinator.ClearSummonedActorBindingState();
         _lastAssignedCollectionAssignUtc = DateTime.MinValue;
         _nextTempCollectionRetryNotBeforeUtc = DateTime.MinValue;
+        _nextVisiblePenumbraBindingValidationTick = 0;
+        Interlocked.Exchange(ref _visiblePenumbraBindingValidationInFlight, 0);
     }
 
     private void ResetAppliedModTrackingState()
@@ -56,6 +65,7 @@ public sealed partial class PairHandler
         _lastAppliedMountMusicTempModsSnapshot = null;
         _lastAppliedTransientSupportFingerprint = null;
         _lastAppliedManipulationFingerprint = null;
+        ClearPairSyncAssetPlanCache();
         Pair.ClearActiveSyncIndicators();
         ClearAppliedLightweightState();
     }
@@ -86,14 +96,16 @@ public sealed partial class PairHandler
         }
     }
 
-    private void MarkInitialApplyRequired(bool redrawOnNextApplication = true)
+    private void MarkInitialApplyRequired(bool redrawOnNextApplication = true, bool signalWorker = true)
     {
         _initialApplyPending = true;
         _lastAttemptedDataHash = null;
         _redrawOnNextApplication = redrawOnNextApplication;
         ResetVisibleReplayReadiness();
         _nextVisibilityWorkTick = 0;
-        _syncWorker?.Signal(PairSyncReason.InitialApplyRequired);
+
+        if (signalWorker)
+            _syncWorker?.Signal(PairSyncReason.InitialApplyRequired);
     }
 
     private void ResetVisibleReplayReadiness()
@@ -157,6 +169,9 @@ public sealed partial class PairHandler
         Pair.SetVisibleTransferStatus(Pair.VisibleTransferIndicator.None);
         Pair.SetCurrentDownloadStatus(null);
         Pair.SetCurrentDownloadSummary(Pair.DownloadProgressSummary.None);
+
+        if (IsVisible && !Pair.IsPaused && Pair.LastReceivedCharacterData is CharacterData)
+            _ = Task.Run(() => TrySubmitLastReceivedVisibleAuthoritativeApply(reason, PairSyncReason.BecameVisible, skipIfBusy: false));
     }
 
 

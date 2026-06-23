@@ -5,6 +5,7 @@ using System.IO;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
+using Dalamud.Game.ClientState.Objects.Types;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using RavaSync.API.Data;
@@ -28,11 +29,18 @@ public sealed partial class PairHandler
 {
     private sealed class PenumbraCoordinator : CoordinatorBase
     {
+        private readonly ConcurrentDictionary<nint, (int ObjectIndex, nint Address, long LastRedrawTick)> _lastAssignedSummonedActorIndices = new();
+
         public PenumbraCoordinator(PairHandler owner) : base(owner)
         {
         }
 
-            public async Task<(bool Bound, bool Reassigned)> EnsurePenumbraCollectionBindingAsync(Guid applicationId)
+        public void ClearSummonedActorBindingState()
+        {
+            _lastAssignedSummonedActorIndices.Clear();
+        }
+
+        public async Task<(bool Bound, bool Reassigned)> EnsurePenumbraCollectionBindingAsync(Guid applicationId)
             {
                 var (objIndex, ownershipAddr, bindingValid) = await _dalamudUtil
                     .RunOnFrameworkThread(() =>
@@ -88,7 +96,31 @@ public sealed partial class PairHandler
                     || _penumbraCollection == Guid.Empty;
 
                 if (!needsAssign)
-                    return (true, false);
+                {
+                    var liveBinding = await _ipcManager.Penumbra.TryGetObjectEffectiveCollectionMatchAsync(
+                        Logger,
+                        _penumbraCollection,
+                        objIndex,
+                        Pair.Ident,
+                        ownershipAddr,
+                        PlayerName ?? Pair.UserData.AliasOrUID).ConfigureAwait(false);
+
+                    if (liveBinding.Checked && liveBinding.Matches)
+                        return (true, false);
+
+                    Logger.LogDebug(
+                        "[{applicationId}] Cached Penumbra temp collection binding for {player}/{uid} was not live at idx {idx}: effective={effective}/{name}, expected={expected}; forcing receiver rebind",
+                        applicationId,
+                        PlayerName,
+                        Pair.UserData.UID,
+                        objIndex,
+                        liveBinding.EffectiveCollectionId,
+                        liveBinding.EffectiveCollectionName,
+                        _penumbraCollection);
+
+                    needsAssign = true;
+                    _lastAssignedCollectionAssignUtc = DateTime.MinValue;
+                }
 
                 if (nowUtc < _nextTempCollectionRetryNotBeforeUtc)
                 {
@@ -120,6 +152,31 @@ public sealed partial class PairHandler
                     return (false, false);
                 }
 
+                var verifiedLiveBinding = await _ipcManager.Penumbra.TryGetObjectEffectiveCollectionMatchAsync(
+                    Logger,
+                    _penumbraCollection,
+                    objIndex,
+                    Pair.Ident,
+                    ownershipAddr,
+                    PlayerName ?? Pair.UserData.AliasOrUID).ConfigureAwait(false);
+
+                if (!verifiedLiveBinding.Checked || !verifiedLiveBinding.Matches)
+                {
+                    Logger.LogDebug(
+                        "[{applicationId}] Penumbra accepted receiver collection assignment for {player}/{uid}, but the live effective collection at idx {idx} is {effective}/{name}, expected {expected}; retrying instead of committing vanilla state",
+                        applicationId,
+                        PlayerName,
+                        Pair.UserData.UID,
+                        objIndex,
+                        verifiedLiveBinding.EffectiveCollectionId,
+                        verifiedLiveBinding.EffectiveCollectionName,
+                        _penumbraCollection);
+                    _initialApplyPending = true;
+                    _lastAssignedCollectionAssignUtc = DateTime.MinValue;
+                    _nextTempCollectionRetryNotBeforeUtc = nowUtc.AddSeconds(1);
+                    return (false, false);
+                }
+
                 _nextTempCollectionRetryNotBeforeUtc = DateTime.MinValue;
                 _lastAssignedObjectIndex = objIndex;
                 _lastAssignedPlayerAddress = ownershipAddr;
@@ -131,6 +188,141 @@ public sealed partial class PairHandler
                 }
 
                 return (true, needsAssign);
+            }
+
+
+            public async Task<bool> EnsureOwnedObjectPenumbraCollectionBindingAsync(Guid applicationId, GameObjectHandler handler, ObjectKind objectKind)
+            {
+                if (objectKind == ObjectKind.Player)
+                    return true;
+
+                if (handler == null || handler.Address == nint.Zero)
+                    return false;
+
+                var binding = await _dalamudUtil.RunOnFrameworkThread(() =>
+                {
+                    var playerAddress = ResolveStablePlayerAddress();
+                    if (playerAddress == nint.Zero)
+                        return (Index: -1, Address: nint.Zero, DisplayName: string.Empty, Valid: false);
+
+                    var expectedOwnedAddress = ResolveOwnedObjectAddressForRetry(playerAddress, objectKind);
+                    if (expectedOwnedAddress == nint.Zero || expectedOwnedAddress != handler.Address)
+                        return (Index: -1, Address: nint.Zero, DisplayName: string.Empty, Valid: false);
+
+                    var obj = handler.GetGameObject();
+                    if (obj == null || obj.Address == nint.Zero || obj.Address != expectedOwnedAddress)
+                        return (Index: -1, Address: nint.Zero, DisplayName: string.Empty, Valid: false);
+
+                    var localPlayerAddress = _dalamudUtil.GetPlayerPtr();
+                    if (localPlayerAddress != nint.Zero && obj.Address == localPlayerAddress)
+                    {
+                        Logger.LogWarning("[{applicationId}] Refusing to bind remote pair {player}/{uid} owned {objectKind} to the local player object index {idx}",
+                            applicationId, PlayerName, Pair.UserData.UID, objectKind, obj.ObjectIndex);
+                        return (Index: -1, Address: nint.Zero, DisplayName: string.Empty, Valid: false);
+                    }
+
+                    return (Index: obj.ObjectIndex, Address: obj.Address, DisplayName: handler.Name ?? string.Empty, Valid: obj.ObjectIndex >= 0);
+                }).ConfigureAwait(false);
+
+                if (!binding.Valid || binding.Index < 0 || binding.Address == nint.Zero)
+                    return false;
+
+                if (_lastAssignedOwnedObjectIndices.TryGetValue(objectKind, out var existing)
+                    && existing.ObjectIndex == binding.Index
+                    && existing.Address == binding.Address
+                    && _penumbraCollection != Guid.Empty)
+                {
+                    return true;
+                }
+
+                await EnsurePenumbraCollectionAsync().ConfigureAwait(false);
+
+                var ok = await _ipcManager.Penumbra.AssignTemporaryCollectionToVerifiedCharacterAsync(
+                    Logger,
+                    _penumbraCollection,
+                    binding.Index,
+                    string.Empty,
+                    binding.Address,
+                    string.IsNullOrWhiteSpace(binding.DisplayName) ? $"{PlayerName ?? Pair.UserData.AliasOrUID} {objectKind}" : binding.DisplayName).ConfigureAwait(false);
+
+                if (!ok)
+                {
+                    Logger.LogDebug("[{applicationId}] Could not claim Penumbra temp collection for {player} owned {objectKind} idx {idx}; retrying when the object settles",
+                        applicationId, PlayerName, objectKind, binding.Index);
+                    _lastAssignedOwnedObjectIndices.Remove(objectKind);
+                    return false;
+                }
+
+                _lastAssignedOwnedObjectIndices[objectKind] = (binding.Index, binding.Address);
+                Logger.LogTrace("[{applicationId}] Bound RavaSync Penumbra temp collection {collection} to {player} owned {objectKind} idx {idx} addr {addr:X}",
+                    applicationId, _penumbraCollection, PlayerName, objectKind, binding.Index, binding.Address);
+                return true;
+            }
+
+
+            public async Task<bool> EnsureSummonedActorPenumbraCollectionBindingAsync(Guid applicationId, nint actorAddress, string reason)
+            {
+                if (actorAddress == nint.Zero)
+                    return false;
+
+                var binding = await _dalamudUtil.RunOnFrameworkThread(() =>
+                {
+                    var playerAddress = ResolveStablePlayerAddress();
+                    if (playerAddress == nint.Zero || actorAddress == playerAddress)
+                        return (Index: -1, Address: nint.Zero, DisplayName: string.Empty, Valid: false);
+
+                    if (!_dalamudUtil.IsOwnedActorOfPlayer(playerAddress, actorAddress))
+                        return (Index: -1, Address: nint.Zero, DisplayName: string.Empty, Valid: false);
+
+                    var obj = _dalamudUtil.CreateGameObject(actorAddress);
+                    if (obj == null || obj.Address == nint.Zero || obj.Address != actorAddress || obj is not ICharacter)
+                        return (Index: -1, Address: nint.Zero, DisplayName: string.Empty, Valid: false);
+
+                    var localPlayerAddress = _dalamudUtil.GetPlayerPtr();
+                    if (localPlayerAddress != nint.Zero && obj.Address == localPlayerAddress)
+                    {
+                        Logger.LogWarning("[{applicationId}] Refusing to bind remote pair {player}/{uid} summoned actor to the local player object index {idx}",
+                            applicationId, PlayerName, Pair.UserData.UID, obj.ObjectIndex);
+                        return (Index: -1, Address: nint.Zero, DisplayName: string.Empty, Valid: false);
+                    }
+
+                    return (Index: obj.ObjectIndex, Address: obj.Address, DisplayName: obj.Name.TextValue ?? string.Empty, Valid: obj.ObjectIndex >= 0);
+                }).ConfigureAwait(false);
+
+                if (!binding.Valid || binding.Index < 0 || binding.Address == nint.Zero)
+                    return false;
+
+                var nowTick = Environment.TickCount64;
+                if (_lastAssignedSummonedActorIndices.TryGetValue(binding.Address, out var existing)
+                    && existing.ObjectIndex == binding.Index
+                    && existing.Address == binding.Address
+                    && _penumbraCollection != Guid.Empty)
+                {
+                    return false;
+                }
+
+                await EnsurePenumbraCollectionAsync().ConfigureAwait(false);
+
+                var ok = await _ipcManager.Penumbra.AssignTemporaryCollectionToVerifiedCharacterAsync(
+                    Logger,
+                    _penumbraCollection,
+                    binding.Index,
+                    string.Empty,
+                    binding.Address,
+                    string.IsNullOrWhiteSpace(binding.DisplayName) ? $"{PlayerName ?? Pair.UserData.AliasOrUID} {reason}" : binding.DisplayName).ConfigureAwait(false);
+
+                if (!ok)
+                {
+                    Logger.LogDebug("[{applicationId}] Could not claim Penumbra temp collection for {player} {reason} idx {idx}; actor will retry on the next resource load",
+                        applicationId, PlayerName, reason, binding.Index);
+                    _lastAssignedSummonedActorIndices.TryRemove(binding.Address, out _);
+                    return false;
+                }
+
+                _lastAssignedSummonedActorIndices[binding.Address] = (binding.Index, binding.Address, nowTick);
+                Logger.LogTrace("[{applicationId}] Bound RavaSync Penumbra temp collection {collection} to {player} {reason} idx {idx} addr {addr:X}",
+                    applicationId, _penumbraCollection, PlayerName, reason, binding.Index, binding.Address);
+                return true;
             }
 
 

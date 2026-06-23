@@ -27,7 +27,6 @@ public sealed class CharacterRavaSidecarUtility
     public sealed record OtherSyncPayload(int v, string tu, bool a, string o);
     public sealed record SyncManifestAsset(int ok, string gp, string h, string fs, string k, string c);
     public sealed record SyncManifestPayload(int v, string pf, string af, string mf, int total, int critical, SyncManifestAsset[] assets);
-
     public bool TryEmbedPerformance(CharacterData? charaData, long vramBytes, long triangles)
     {
         if (charaData == null)
@@ -103,12 +102,18 @@ public sealed class CharacterRavaSidecarUtility
         if (charaData == null)
             return false;
 
+        // This manifest is the authoritative file-map contract, not a nice-to-have sidecar.
+        // It must be sent even when the file list is empty, otherwise receivers cannot
+        // distinguish a genuine vanilla/clear payload from a stripped/metadata-only payload.
         manifest = BuildManifest(charaData);
-        if (manifest.assets.Length == 0)
-            return false;
-
         return TryEmbedPayload(charaData, SyncManifestPropertyName, EncodePayload(manifest));
     }
+
+    public static bool ManifestHasAssetsForObjectKind(SyncManifestPayload? manifest, ObjectKind objectKind)
+        => manifest?.assets?.Any(asset => asset.ok == (int)objectKind) == true;
+
+    public static bool ManifestRepresentsAuthoritativeEmptyFileSet(SyncManifestPayload? manifest)
+        => manifest != null && manifest.total == 0 && (manifest.assets == null || manifest.assets.Length == 0);
 
     public bool TryExtractSyncManifest(CharacterData? charaData, out SyncManifestPayload? manifest)
         => TryExtractPayload(charaData, SyncManifestPropertyName, p => p?.v == CurrentVersion, out manifest);
@@ -267,6 +272,16 @@ public sealed class CharacterRavaSidecarUtility
         return false;
     }
 
+    private static bool TryPeekPayload<TPayload>(CharacterData? charaData, string payloadName, Func<TPayload?, bool> isValid, out TPayload? payload)
+    {
+        payload = default;
+        if (charaData == null)
+            return false;
+
+        return TryPeekFromCarrier(charaData.PetNamesData ?? string.Empty, payloadName, isValid, out payload)
+            || TryPeekFromCarrier(charaData.MoodlesData ?? string.Empty, payloadName, isValid, out payload);
+    }
+
     private static bool TryEmbedIntoCarrier(string carrier, string payloadName, string payloadBase64, bool allowEmptyCarrier, out string updatedCarrier)
     {
         updatedCarrier = carrier ?? string.Empty;
@@ -292,6 +307,37 @@ public sealed class CharacterRavaSidecarUtility
         sidecar[payloadName] = payloadBase64;
         updatedCarrier = root.ToJsonString();
         return true;
+    }
+
+    private static bool TryPeekFromCarrier<TPayload>(string carrier, string payloadName, Func<TPayload?, bool> isValid, out TPayload? payload)
+    {
+        payload = default;
+        if (string.IsNullOrWhiteSpace(carrier))
+            return false;
+
+        var root = ParseJsonObject(carrier);
+        if (root == null || root[RootPropertyName] is not JsonObject sidecar)
+            return false;
+
+        var encoded = sidecar[payloadName]?.GetValue<string>();
+        if (string.IsNullOrWhiteSpace(encoded))
+            return false;
+
+        try
+        {
+            payload = JsonSerializer.Deserialize<TPayload>(Encoding.UTF8.GetString(Convert.FromBase64String(encoded)));
+        }
+        catch
+        {
+            payload = default;
+            return false;
+        }
+
+        if (isValid(payload))
+            return true;
+
+        payload = default;
+        return false;
     }
 
     private static bool TryExtractFromCarrier<TPayload>(string carrier, string payloadName, Func<TPayload?, bool> isValid, out string sanitizedCarrier, out TPayload? payload)

@@ -13,6 +13,14 @@ namespace RavaSync.PlayerData.Pairs;
 
 public class VisibleUserDataDistributor : DisposableMediatorSubscriberBase
 {
+    // RAVASYNC_VISIBILITY_DIAGNOSTICS: temporary Info-level sender/transport tracing. Search '[VIS-DIAG]' to remove later.
+    private const string VisibilityDiagnosticsPrefix = "[VIS-DIAG]";
+
+    private void LogVisibilityDiagnostic(string message, params object[] args)
+    {
+        Logger.LogInformation(VisibilityDiagnosticsPrefix + " " + message, args);
+    }
+
     private sealed record LocalOtherSyncClaim(bool Active, string Owner);
     private readonly ApiController _apiController;
     private readonly DalamudUtilService _dalamudUtil;
@@ -78,7 +86,7 @@ public class VisibleUserDataDistributor : DisposableMediatorSubscriberBase
     private const int DisplayedMetricsPreSendWaitMs = 250;
     private const int OutboundPushCoalesceDelayMs = 125;
     private const int MaxOutboundPushCoalesceWaitMs = 500;
-    private const int DuplicateOutboundSuppressWindowMs = 10_000;
+    private const int DuplicateOutboundSuppressWindowMs = 2_000;
     private const int SidecarOnlyOutboundMinIntervalMs = 60_000;
     private static readonly TimeSpan SidecarRefreshMinInterval = TimeSpan.FromSeconds(60);
 
@@ -115,7 +123,7 @@ public class VisibleUserDataDistributor : DisposableMediatorSubscriberBase
         });
         Mediator.Subscribe<CharacterDataCreatedMessage>(this, (msg) =>
         {
-            var newData = msg.CharacterData;
+            var newData = msg.CharacterData.DeepClone();
             var newPayloadFingerprint = PairApplyUtilities.ComputeCharacterDataPayloadFingerprint(newData);
 
             if (_lastCreatedData == null || !string.Equals(newPayloadFingerprint, _lastCreatedDataPayloadFingerprint, StringComparison.Ordinal))
@@ -150,11 +158,14 @@ public class VisibleUserDataDistributor : DisposableMediatorSubscriberBase
             {
                 Logger.LogTrace("Data hash {hash}/{payload} equal to stored data", newData.DataHash.Value, newPayloadFingerprint);
 
-                if (msg.ForceOutbound && Logger.IsEnabled(LogLevel.Trace))
+                if (msg.ForceOutbound)
                 {
-                    Logger.LogTrace(
-                        "Suppressing force-outbound push for unchanged local payload; reason={reason}",
-                        msg.Reason);
+                    var queuedCount = QueueVisibleUsersForPush();
+                    if (queuedCount > 0)
+                    {
+                        Logger.LogDebug("Force-pushing unchanged local payload for {count} visible players; reason={reason}", queuedCount, msg.Reason);
+                        PushCharacterData(forceOutbound: true, bypassDuplicateSuppression: true);
+                    }
                 }
             }
         });
@@ -492,23 +503,21 @@ public class VisibleUserDataDistributor : DisposableMediatorSubscriberBase
 
     private static string BuildUploadBarrierKey(CharacterData data)
     {
-        if (data.FileReplacements.Count == 0)
-            return string.Empty;
-
         var hashes = CollectPayloadFileHashes(data)
-            .OrderBy(h => h, StringComparer.Ordinal);
+            .OrderBy(h => h, StringComparer.Ordinal)
+            .ToArray();
 
-        return string.Join('|', hashes);
+        return hashes.Length == 0 ? string.Empty : string.Join('|', hashes);
     }
 
     private static HashSet<string> CollectPayloadFileHashes(CharacterData data)
     {
-        if (data.FileReplacements.Count == 0)
+        if (data?.FileReplacements == null || data.FileReplacements.Count == 0)
             return new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         return data.FileReplacements
-            .SelectMany(kvp => kvp.Value)
-            .Where(fr => string.IsNullOrWhiteSpace(fr.FileSwapPath) && !string.IsNullOrWhiteSpace(fr.Hash))
+            .SelectMany(kvp => kvp.Value ?? [])
+            .Where(fr => fr != null && string.IsNullOrWhiteSpace(fr.FileSwapPath) && !string.IsNullOrWhiteSpace(fr.Hash))
             .Select(fr => fr.Hash.Trim().ToUpperInvariant())
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
     }
@@ -527,6 +536,20 @@ public class VisibleUserDataDistributor : DisposableMediatorSubscriberBase
     {
         _lastUploadBarrierKey = barrierKey;
         _lastUploadBarrierHashes = new HashSet<string>(payloadHashes, StringComparer.OrdinalIgnoreCase);
+    }
+
+    private bool HasConfirmedUploadBarrierForRecipients(HashSet<string> payloadHashes, HashSet<string> targetRecipientUids)
+    {
+        if (payloadHashes.Count == 0)
+            return true;
+
+        if (string.IsNullOrEmpty(_lastUploadBarrierKey))
+            return false;
+
+        if (!targetRecipientUids.IsSubsetOf(_authorizedRecipientUids))
+            return false;
+
+        return payloadHashes.IsSubsetOf(_lastUploadBarrierHashes);
     }
 
     private Dictionary<string, string> ResolveTargetMeshSessions(IEnumerable<UserData> targetUsers)
@@ -572,6 +595,13 @@ public class VisibleUserDataDistributor : DisposableMediatorSubscriberBase
         if (targetUsers.Count == 0)
             return targetUsers;
 
+        LogVisibilityDiagnostic("SEND duplicate-filter enter hash={hash} targets={targets} forceBarrier={forceBarrier} forceOutbound={forceOutbound} bypassDup={bypassDup}",
+            dataToSend.DataHash.Value,
+            string.Join(", ", targetUsers.Select(k => k.AliasOrUID)),
+            forceBarrier,
+            forceOutbound,
+            bypassDuplicateSuppression);
+
         var nowTick = Environment.TickCount64;
         var filtered = new List<UserData>(targetUsers.Count);
 
@@ -580,11 +610,17 @@ public class VisibleUserDataDistributor : DisposableMediatorSubscriberBase
             foreach (var user in targetUsers)
             {
                 if (!IsCurrentlyVisibleOutboundRecipient(user))
+                {
+                    LogVisibilityDiagnostic("SEND duplicate-filter drop target={target} reason=not-currently-visible", user.AliasOrUID);
                     continue;
+                }
 
                 var uid = user.UID;
                 if (string.IsNullOrWhiteSpace(uid))
+                {
+                    LogVisibilityDiagnostic("SEND duplicate-filter drop target={target} reason=blank-uid", user.AliasOrUID);
                     continue;
+                }
 
                 var perUserData = GetTargetedCharacterData(dataByUid, uid, dataToSend);
                 var perUserFullSignature = BuildFullOutboundSignature(perUserData);
@@ -600,15 +636,19 @@ public class VisibleUserDataDistributor : DisposableMediatorSubscriberBase
                 var elapsedSinceLastSend = unchecked(nowTick - lastSendTick);
                 var elapsedSinceSidecarOnly = unchecked(nowTick - lastSidecarOnlyTick);
 
-                // Always suppress exact duplicate payloads inside the short outbound window.
-                // Visibility gain and reconnect still send once because their per-recipient state is
-                // cleared when visibility/connection drops; the bypass flag is only allowed to skip
-                // slower sidecar-only throttles, not to double-send the same final payload.
+                // Normally suppress exact duplicates inside the short outbound window, but respect
+                // force/bypass sends as repair/replay paths. A receiver can miss or drop a previous
+                // update even when the local payload did not change, so forced pushes must be allowed
+                // to leave this sender.
                 if (sameFullPayload
                     && elapsedSinceLastSend >= 0
                     && elapsedSinceLastSend < DuplicateOutboundSuppressWindowMs
-                    && !forceBarrier)
+                    && !forceBarrier
+                    && !forceOutbound
+                    && !bypassDuplicateSuppression)
                 {
+                    LogVisibilityDiagnostic("SEND duplicate-filter suppress target={target} uid={uid} reason=exact-duplicate elapsedMs={elapsed} windowMs={window}",
+                        user.AliasOrUID, uid, elapsedSinceLastSend, DuplicateOutboundSuppressWindowMs);
                     continue;
                 }
 
@@ -620,9 +660,13 @@ public class VisibleUserDataDistributor : DisposableMediatorSubscriberBase
                     && !forceOutbound
                     && !bypassDuplicateSuppression)
                 {
+                    LogVisibilityDiagnostic("SEND duplicate-filter suppress target={target} uid={uid} reason=sidecar-only elapsedMs={elapsed} windowMs={window}",
+                        user.AliasOrUID, uid, elapsedSinceSidecarOnly, SidecarOnlyOutboundMinIntervalMs);
                     continue;
                 }
 
+                LogVisibilityDiagnostic("SEND duplicate-filter keep target={target} uid={uid} sameFull={sameFull} sameAppearance={sameAppearance} elapsedMs={elapsed}",
+                    user.AliasOrUID, uid, sameFullPayload, sameAppearancePayload, elapsedSinceLastSend);
                 filtered.Add(user);
             }
         }
@@ -633,6 +677,9 @@ public class VisibleUserDataDistributor : DisposableMediatorSubscriberBase
                 "Suppressed outbound duplicate/sidecar-only character data push for {count} recipients",
                 targetUsers.Count);
         }
+
+        LogVisibilityDiagnostic("SEND duplicate-filter result kept={kept}/{total} targets={targets}",
+            filtered.Count, targetUsers.Count, string.Join(", ", filtered.Select(k => k.AliasOrUID)));
 
         return filtered;
     }
@@ -678,14 +725,23 @@ public class VisibleUserDataDistributor : DisposableMediatorSubscriberBase
 
     private async Task<bool> PushCharacterDataServerFallbackAsync(CharacterData data, List<UserData> targetUsers, IReadOnlyDictionary<string, CharacterData>? dataByUid = null)
     {
+        var success = false;
         targetUsers = FilterUsersToCurrentlyVisibleRecipients(targetUsers);
+        LogVisibilityDiagnostic("SEND server-fallback enter hash={hash} visibleTargets={targets}", data.DataHash.Value, string.Join(", ", targetUsers.Select(k => k.AliasOrUID)));
         if (targetUsers.Count == 0)
+        {
+            LogVisibilityDiagnostic("SEND server-fallback skipped hash={hash} reason=no-visible-targets", data.DataHash.Value);
             return true;
+        }
 
         if (dataByUid == null || dataByUid.Count == 0)
-            return await _apiController.PushCharacterData(data.DeepClone(), targetUsers).ConfigureAwait(false);
+        {
+            success = await _apiController.PushCharacterData(data.DeepClone(), targetUsers).ConfigureAwait(false);
+            LogVisibilityDiagnostic("SEND server-fallback shared-payload result hash={hash} success={success} targets={targets}", data.DataHash.Value, success, string.Join(", ", targetUsers.Select(k => k.AliasOrUID)));
+            return success;
+        }
 
-        var success = true;
+        success = true;
         foreach (var user in targetUsers)
         {
             if (!IsCurrentlyVisibleOutboundRecipient(user))
@@ -693,7 +749,9 @@ public class VisibleUserDataDistributor : DisposableMediatorSubscriberBase
 
             var uid = user.UID ?? string.Empty;
             var perUserData = GetTargetedCharacterData(dataByUid, uid, data);
-            success &= await _apiController.PushCharacterData(perUserData.DeepClone(), [user]).ConfigureAwait(false);
+            var perUserSuccess = await _apiController.PushCharacterData(perUserData.DeepClone(), [user]).ConfigureAwait(false);
+            LogVisibilityDiagnostic("SEND server-fallback per-user result target={target} uid={uid} hash={hash} success={success}", user.AliasOrUID, uid, perUserData.DataHash.Value, perUserSuccess);
+            success &= perUserSuccess;
         }
 
         return success;
@@ -702,6 +760,12 @@ public class VisibleUserDataDistributor : DisposableMediatorSubscriberBase
     private async Task<bool> CompleteMeshCharacterPushOrFallbackAsync(CharacterData data, List<UserData> targetUsers, MissingFileMeshService.MeshCharacterPushOfferResult? meshOffer, IReadOnlyDictionary<string, string> targetMeshSessions, IReadOnlyDictionary<string, CharacterData>? dataByUid = null)
     {
         targetUsers = FilterUsersToCurrentlyVisibleRecipients(targetUsers);
+        LogVisibilityDiagnostic("SEND complete-mesh-or-fallback enter hash={hash} visibleTargets={targets} meshOffer={meshOffer} sessions={sessions}",
+            data.DataHash.Value,
+            string.Join(", ", targetUsers.Select(k => k.AliasOrUID)),
+            meshOffer != null,
+            targetMeshSessions.Count);
+        var fallbackUsers = targetUsers;
         if (targetUsers.Count == 0)
             return true;
 
@@ -714,30 +778,49 @@ public class VisibleUserDataDistributor : DisposableMediatorSubscriberBase
 
         if (meshAccepted.Count > 0)
         {
+            LogVisibilityDiagnostic("SEND mesh-ready signal start hash={hash} request={request} accepted={accepted}", data.DataHash.Value, meshOffer!.RequestId, string.Join(", ", meshAccepted));
             meshReadyAcked = await _missingFileMeshService
-                .SignalCharacterDataReadyAsync(targetMeshSessions, meshOffer!.RequestId, meshAccepted, data, _runtimeCts.Token, dataByUid)
+                .SignalCharacterDataReadyAsync(() => ResolveTargetMeshSessions(targetUsers), meshOffer!.RequestId, meshAccepted, data, _runtimeCts.Token, dataByUid)
                 .ConfigureAwait(false);
+            LogVisibilityDiagnostic("SEND mesh-ready signal result hash={hash} request={request} acked={acked} missingAck={missing}",
+                data.DataHash.Value,
+                meshOffer!.RequestId,
+                string.Join(", ", meshReadyAcked),
+                string.Join(", ", meshAccepted.Except(meshReadyAcked, StringComparer.Ordinal)));
 
-            var missingReadyAck = meshAccepted.Except(meshReadyAcked, StringComparer.Ordinal).ToList();
+            var missingReadyAck = meshAccepted.Except(meshReadyAcked, StringComparer.Ordinal).ToHashSet(StringComparer.Ordinal);
             if (missingReadyAck.Count > 0 && Logger.IsEnabled(LogLevel.Debug))
             {
                 Logger.LogDebug(
-                    "Mesh character push ready ACK was not received from {count} accepted recipient(s); not server-falling back because the offer was accepted and ready was retried",
+                    "Mesh character push ready ACK was not received from {count} accepted recipient(s); using server fallback for those recipients",
                     missingReadyAck.Count);
             }
+
+            fallbackUsers = targetUsers
+                .Where(u => string.IsNullOrWhiteSpace(u.UID) || !meshAccepted.Contains(u.UID) || missingReadyAck.Contains(u.UID))
+                .ToList();
+
+            if (fallbackUsers.Count == 0)
+            {
+                LogVisibilityDiagnostic("SEND complete-mesh-or-fallback done hash={hash} route=mesh-only", data.DataHash.Value);
+                return true;
+            }
+
+            LogVisibilityDiagnostic("SEND complete-mesh-or-fallback falling-back hash={hash} targets={targets}", data.DataHash.Value, string.Join(", ", fallbackUsers.Select(k => k.AliasOrUID)));
+            return await PushCharacterDataServerFallbackAsync(data, fallbackUsers, dataByUid).ConfigureAwait(false);
         }
 
-        var fallbackUsers = targetUsers
+        fallbackUsers = targetUsers
             .Where(u => string.IsNullOrWhiteSpace(u.UID) || !meshAccepted.Contains(u.UID))
             .ToList();
 
         if (fallbackUsers.Count == 0)
+        {
+            LogVisibilityDiagnostic("SEND complete-mesh-or-fallback done hash={hash} route=no-targets", data.DataHash.Value);
             return true;
+        }
 
-        // Server fallback is only for recipients that never accepted the Mesh offer at all
-        // (old client/no Mesh/no offer response). If an offer was accepted, do not also hit
-        // UserPushData just because the final ready ACK was slow or lost; that would create
-        // a new duplicate-push source on top of any pre-existing push coalescing issues.
+        LogVisibilityDiagnostic("SEND complete-mesh-or-fallback no-mesh-accepted hash={hash} fallbackTargets={targets}", data.DataHash.Value, string.Join(", ", fallbackUsers.Select(k => k.AliasOrUID)));
         return await PushCharacterDataServerFallbackAsync(data, fallbackUsers, dataByUid).ConfigureAwait(false);
     }
 
@@ -1106,6 +1189,15 @@ public class VisibleUserDataDistributor : DisposableMediatorSubscriberBase
                     sendRevision = _queuedPushRevisionCounter;
                 }
 
+                LogVisibilityDiagnostic("SEND worker snapshot hash={hash} payload={payload} queuedTargets={targets} forceBarrier={forceBarrier} forceOutbound={forceOutbound} bypassDup={bypassDup} revision={revision}",
+                    dataToSend.DataHash.Value,
+                    PairApplyUtilities.ComputeCharacterDataPayloadFingerprint(dataToSend),
+                    string.Join(", ", targetUsers.Select(k => k.AliasOrUID)),
+                    forceBarrier,
+                    forceOutboundSend,
+                    bypassDuplicateSuppression,
+                    sendRevision);
+
                 var dataHash = dataToSend.DataHash.Value;
                 if (!_characterAnalyzer.TryGetDisplayedHeaderMetrics(dataHash, out var displayedVramBytes, out var displayedTriangles))
                 {
@@ -1120,14 +1212,16 @@ public class VisibleUserDataDistributor : DisposableMediatorSubscriberBase
                     _characterAnalyzer.TryGetDisplayedHeaderMetrics(dataHash, out displayedVramBytes, out displayedTriangles);
                 }
 
-                if (includeSyncManifest && _characterRavaSidecarUtility.TryEmbedSyncManifest(dataToSend, out var syncManifest) && Logger.IsEnabled(LogLevel.Trace))
+                var embeddedSyncManifest = _characterRavaSidecarUtility.TryEmbedSyncManifest(dataToSend, out var syncManifest);
+                if (embeddedSyncManifest && Logger.IsEnabled(LogLevel.Trace))
                 {
                     Logger.LogTrace(
-                        "Embedded sync manifest for outbound data {hash}: {total} assets, {critical} critical, manifest {manifestFingerprint}",
+                        "Embedded authoritative sync manifest for outbound data {hash}: {total} assets, {critical} critical, manifest {manifestFingerprint}, requested={requested}",
                         dataHash,
                         syncManifest?.total ?? 0,
                         syncManifest?.critical ?? 0,
-                        syncManifest?.mf ?? string.Empty);
+                        syncManifest?.mf ?? string.Empty,
+                        includeSyncManifest);
                 }
 
                 if ((displayedVramBytes > 0 || displayedTriangles > 0)
@@ -1140,6 +1234,7 @@ public class VisibleUserDataDistributor : DisposableMediatorSubscriberBase
                 _characterRavaSidecarUtility.TryEmbedActiveSoundIndicator(dataToSend, _localActiveSyncIndicatorService.IsPlayingSound);
 
                 targetUsers = FilterUsersToCurrentlyVisibleRecipients(targetUsers);
+                LogVisibilityDiagnostic("SEND visible-filter #1 hash={hash} kept={kept}/{total} targets={targets}", dataToSend.DataHash.Value, targetUsers.Count, originalTargetUsers.Count, string.Join(", ", targetUsers.Select(k => k.AliasOrUID)));
                 if (targetUsers.Count == 0)
                 {
                     RemoveQueuedUsers(originalTargetUsers, sendRevision);
@@ -1149,6 +1244,7 @@ public class VisibleUserDataDistributor : DisposableMediatorSubscriberBase
                 var outboundDataByUid = BuildTargetedCharacterDataByUid(dataToSend, targetUsers);
 
                 targetUsers = FilterUsersForOutboundSend(dataToSend, targetUsers, forceBarrier, forceOutboundSend, bypassDuplicateSuppression, outboundDataByUid);
+                LogVisibilityDiagnostic("SEND outbound-filter hash={hash} kept={count} targets={targets}", dataToSend.DataHash.Value, targetUsers.Count, string.Join(", ", targetUsers.Select(k => k.AliasOrUID)));
                 if (targetUsers.Count == 0)
                 {
                     RemoveQueuedUsers(originalTargetUsers, sendRevision);
@@ -1156,6 +1252,7 @@ public class VisibleUserDataDistributor : DisposableMediatorSubscriberBase
                 }
 
                 targetUsers = FilterUsersToCurrentlyVisibleRecipients(targetUsers);
+                LogVisibilityDiagnostic("SEND visible-filter #2 hash={hash} kept={count} targets={targets}", dataToSend.DataHash.Value, targetUsers.Count, string.Join(", ", targetUsers.Select(k => k.AliasOrUID)));
                 if (targetUsers.Count == 0)
                 {
                     RemoveQueuedUsers(originalTargetUsers, sendRevision);
@@ -1168,6 +1265,12 @@ public class VisibleUserDataDistributor : DisposableMediatorSubscriberBase
                 var targetMeshSessions = ResolveTargetMeshSessions(targetUsers);
                 var barrierKey = BuildUploadBarrierKey(dataToSend);
                 var payloadFileHashes = CollectPayloadFileHashes(dataToSend);
+                LogVisibilityDiagnostic("SEND routing-start hash={hash} payloadFiles={fileCount} sessions={sessions} recipients={recipients} barrierKey={barrierKey}",
+                    dataToSend.DataHash.Value,
+                    payloadFileHashes.Count,
+                    targetMeshSessions.Count,
+                    targetRecipientUids.Count,
+                    barrierKey);
 
                 var barrierKeyChanged = !string.Equals(_lastUploadBarrierKey, barrierKey, StringComparison.Ordinal);
                 var hasUnauthorizedRecipients = !targetRecipientUids.IsSubsetOf(_authorizedRecipientUids);
@@ -1186,6 +1289,13 @@ public class VisibleUserDataDistributor : DisposableMediatorSubscriberBase
                         .ConfigureAwait(false);
                 }
 
+                LogVisibilityDiagnostic("SEND mesh-offer result hash={hash} offered={offered} accepted={accepted} missing={missing} missingHashes={missingHashes}",
+                    dataToSend.DataHash.Value,
+                    meshOffer != null,
+                    meshOffer?.AcceptedUids.Count ?? 0,
+                    meshOffer?.MissingHashes.Count ?? -1,
+                    meshOffer == null ? string.Empty : string.Join(", ", meshOffer.MissingHashes.Take(20)));
+
                 var meshAcceptedAllRecipients = meshOffer != null && targetRecipientUids.IsSubsetOf(meshOffer.AcceptedUids);
 
                 IReadOnlyCollection<string>? scopedBarrierHashes = null;
@@ -1194,6 +1304,20 @@ public class VisibleUserDataDistributor : DisposableMediatorSubscriberBase
                 {
                     scopedBarrierHashes = meshOffer!.MissingHashes;
                     mustRunUploadBarrier = scopedBarrierHashes.Count > 0;
+
+                    if (!mustRunUploadBarrier
+                        && payloadFileHashes.Count > 0
+                        && !HasConfirmedUploadBarrierForRecipients(payloadFileHashes, targetRecipientUids))
+                    {
+                        scopedBarrierHashes = payloadFileHashes;
+                        mustRunUploadBarrier = true;
+
+                        Logger.LogDebug(
+                            "Mesh character-data preflight reported no missing hashes for {hash}, but this sender has not confirmed CDN upload/share for all {count} payload hash(es) and all {recipients} visible recipient(s); forcing upload/share barrier before ready signal",
+                            dataToSend.DataHash.Value,
+                            payloadFileHashes.Count,
+                            targetRecipientUids.Count);
+                    }
                 }
                 else if (fullBarrierRequired)
                 {
@@ -1217,6 +1341,15 @@ public class VisibleUserDataDistributor : DisposableMediatorSubscriberBase
                         meshAcceptedAllRecipients,
                         meshOffer?.MissingHashes.Count ?? -1);
                 }
+
+                LogVisibilityDiagnostic("SEND barrier decision hash={hash} meshAll={meshAll} mustBarrier={mustBarrier} scopedHashes={scopedHashes} fullBarrier={fullBarrier} addedHashes={addedHashes} removedOnly={removedOnly}",
+                    dataToSend.DataHash.Value,
+                    meshAcceptedAllRecipients,
+                    mustRunUploadBarrier,
+                    scopedBarrierHashes?.Count ?? -1,
+                    fullBarrierRequired,
+                    addedPayloadHashes.Count,
+                    removedOnlyHashChange);
 
                 if (!mustRunUploadBarrier)
                 {
@@ -1248,6 +1381,12 @@ public class VisibleUserDataDistributor : DisposableMediatorSubscriberBase
                 var meshSourceData = dataToSend.DeepClone();
                 _uploadingCharacterData = dataToSend;
 
+                LogVisibilityDiagnostic("SEND upload-barrier start hash={hash} targets={targets} scopedHashes={scopedHashes} meshAll={meshAll}",
+                    dataToSend.DataHash.Value,
+                    string.Join(", ", targetUsers.Select(k => k.AliasOrUID)),
+                    scopedBarrierHashes?.Count ?? -1,
+                    meshAcceptedAllRecipients);
+
                 Logger.LogDebug(
                     "Starting UploadTask for {hash}, barrierKeyChanged: {keyChanged}, unauthorizedRecipients: {unauth}, forced: {frc}, meshAcceptedAll: {meshAll}, meshMissing: {meshMissing}, scopedHashes: {scopedHashes}",
                     dataToSend.DataHash.Value, barrierKeyChanged, hasUnauthorizedRecipients, forceBarrier, meshAcceptedAllRecipients, meshOffer?.MissingHashes.Count ?? -1, scopedBarrierHashes?.Count ?? -1);
@@ -1264,6 +1403,7 @@ public class VisibleUserDataDistributor : DisposableMediatorSubscriberBase
                 if (!uploadResult.Success)
                 {
                     Logger.LogWarning("Upload/share failed for {hash}: {error}", _uploadingCharacterData?.DataHash.Value ?? "UNKNOWN", uploadResult.Error ?? "Unknown error");
+                    LogVisibilityDiagnostic("SEND upload-barrier failed hash={hash} error={error}", _uploadingCharacterData?.DataHash.Value ?? "UNKNOWN", uploadResult.Error ?? "Unknown error");
                     _uploadingCharacterData = null;
                     _fileUploadTask = null;
                     return;
@@ -1271,6 +1411,8 @@ public class VisibleUserDataDistributor : DisposableMediatorSubscriberBase
 
                 dataToSend = uploadResult.Data;
                 RestoreMeshRoutedPluginPayloads(dataToSend, meshSourceData);
+                barrierKey = BuildUploadBarrierKey(dataToSend);
+                payloadFileHashes = CollectPayloadFileHashes(dataToSend);
 
                 targetUsers = FilterUsersToCurrentlyVisibleRecipients(targetUsers);
                 if (targetUsers.Count == 0)
@@ -1280,6 +1422,8 @@ public class VisibleUserDataDistributor : DisposableMediatorSubscriberBase
                     _fileUploadTask = null;
                     return;
                 }
+
+                LogVisibilityDiagnostic("SEND upload-barrier complete hash={hash} targets={targets} payloadFiles={files}", dataToSend.DataHash.Value, string.Join(", ", targetUsers.Select(k => k.AliasOrUID)), payloadFileHashes.Count);
 
                 if (Logger.IsEnabled(LogLevel.Debug))
                     Logger.LogDebug("Upload/share barrier complete; releasing user data push to {users}", string.Join(", ", targetUsers.Select(k => k.AliasOrUID)));

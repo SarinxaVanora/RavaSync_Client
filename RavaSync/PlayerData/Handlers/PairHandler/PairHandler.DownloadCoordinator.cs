@@ -313,11 +313,14 @@ public sealed partial class PairHandler
                         .Distinct(StringComparer.OrdinalIgnoreCase)
                         .ToList();
 
+                    var repairRequests = (activeDownloadManager ?? _downloadManager)?.RequestCentralFileRepair(exhaustedHashes, "download attempts exhausted") ?? 0;
+
                     Logger.LogWarning(
-                        "[BASE-{appBase}] Download attempts exhausted for {player}; keeping {count} unresolved hash(es) retryable instead of session-skipping them: {hashes}",
+                        "[BASE-{appBase}] Download attempts exhausted for {player}; keeping {count} unresolved hash(es) retryable instead of session-skipping them; repairRequests={repairRequests}: {hashes}",
                         applicationBase,
                         PlayerName,
                         exhaustedHashes.Count,
+                        repairRequests,
                         string.Join(", ", exhaustedHashes.Take(20)));
                 }
 
@@ -356,6 +359,8 @@ public sealed partial class PairHandler
 
                     if (lifecycleRedrawRequestedFromPlan)
                         MarkInitialApplyRequired();
+
+                    ScheduleMissingFileSelfHealRetry(charaData, toDownloadReplacements.Select(static r => r.Hash).Where(static h => !string.IsNullOrWhiteSpace(h)).ToList(), immediate: false);
 
                     return (PairSyncCommitResult.MissingFiles(
                         $"{toDownloadReplacements.Count} required files remained missing after download attempts",
@@ -542,7 +547,7 @@ public sealed partial class PairHandler
             {
                 ClearPairSyncDownloadStatus();
                 Logger.LogDebug(
-                    "[BASE-{appBase}] Pair upload flag is active for {player}, but Mesh ready was received for {hash}; continuing download/apply",
+                    "[BASE-{appBase}] Pair upload flag is active for {player}, but Mesh local-ready was proven for {hash}; continuing download/apply",
                     applicationBase,
                     PlayerName,
                     dataHash);
@@ -603,7 +608,7 @@ public sealed partial class PairHandler
                 {
                     ClearPairSyncDownloadStatus();
                     Logger.LogDebug(
-                        "[BASE-{appBase}] Pair upload flag is still active for {player}, but Mesh ready arrived after {elapsed}ms for {hash}; continuing download/apply",
+                        "[BASE-{appBase}] Pair upload flag is still active for {player}, but Mesh local-ready was proven after {elapsed}ms for {hash}; continuing download/apply",
                         applicationBase,
                         PlayerName,
                         unchecked(Environment.TickCount64 - startedTick),
@@ -810,7 +815,10 @@ public sealed partial class PairHandler
             bool lifecycleRedrawRequestedFromPlan,
             CancellationToken downloadToken)
         {
+                downloadToken.ThrowIfCancellationRequested();
+
                 await PaceRoomEntryCommitHandoffAsync(applicationBase, downloadedAny, lifecycleApplyRequestedFromPlan, lifecycleRedrawRequestedFromPlan, downloadToken).ConfigureAwait(false);
+                downloadToken.ThrowIfCancellationRequested();
 
                 var block = GetPairSyncExecutionBlockReason("application commit handoff");
                 if (block != null)
@@ -818,6 +826,8 @@ public sealed partial class PairHandler
 
                 if (_dalamudUtil.IsInGpose || _dalamudUtil.IsInCutscene || !_ipcManager.Penumbra.APIAvailable || !_ipcManager.Glamourer.APIAvailable)
                     return PairSyncCommitResult.PluginsUnavailable("GPose/cutscene or Penumbra/Glamourer unavailable before commit handoff");
+
+                downloadToken.ThrowIfCancellationRequested();
 
                 var newCts = new CancellationTokenSource();
                 var oldCts = Interlocked.Exchange(ref Owner._applicationCancellationTokenSource, newCts);

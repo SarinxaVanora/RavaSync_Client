@@ -168,19 +168,25 @@ public sealed class IpcCallerGlamourer : DisposableMediatorSubscriberBase, IIpcC
         }
     }
 
-    public async Task ApplyAllAsync(ILogger logger, GameObjectHandler handler, string? customization, Guid applicationId, CancellationToken token, bool fireAndForget = false, ApplyFlag? flags = null, bool waitForDrawSettle = true)
+    public async Task<bool> ApplyAllAsync(ILogger logger, GameObjectHandler handler, string? customization, Guid applicationId, CancellationToken token, bool fireAndForget = false, ApplyFlag? flags = null, bool waitForDrawSettle = true)
     {
-        if (!APIAvailable || string.IsNullOrEmpty(customization) || _dalamudUtil.IsZoning) return;
+        if (!APIAvailable || string.IsNullOrEmpty(customization) || _dalamudUtil.IsZoning || _glamourerApplyAll == null)
+            return false;
 
         CancelPendingNameRevertForVisibleApply(logger, handler, applicationId, "apply");
 
-        async Task ApplyCoreAsync()
+        async Task<bool> ApplyCoreAsync()
         {
+            var applied = false;
             await SafeIpc.TryRun(Logger, "Glamourer.ApplyAll", TimeSpan.FromSeconds(2), async ct =>
             {
                 var applyFlags = flags ?? ApplyFlagEx.StateDefault;
                 var isLightweightApply = applyFlags != ApplyFlagEx.StateDefault;
-                await RunPacedGlamourerFrameworkIpcAsync(logger, $"Glamourer.ApplyState({applyFlags})", () =>
+
+                await handler.RefreshStateOnFrameworkAsync().ConfigureAwait(false);
+                ct.ThrowIfCancellationRequested();
+
+                var invoked = await RunPacedGlamourerFrameworkIpcAsync(logger, $"Glamourer.ApplyState({applyFlags})", () =>
                 {
                     try
                     {
@@ -188,17 +194,25 @@ public sealed class IpcCallerGlamourer : DisposableMediatorSubscriberBase, IIpcC
 
                         var gameObj = handler.GetGameObject();
                         if (gameObj is not ICharacter chara)
-                            return 0;
+                        {
+                            logger.LogDebug("[{appid}] GlamourerApplyAll could not resolve a live ICharacter for {handler}; address={address:X}", applicationId, handler, handler.Address);
+                            return false;
+                        }
 
-                        _glamourerApplyAll!.Invoke(customization, chara.ObjectIndex, LockCode, applyFlags);
-                        return 0;
+                        _glamourerApplyAll.Invoke(customization, chara.ObjectIndex, LockCode, applyFlags);
+                        return true;
                     }
                     catch (Exception ex)
                     {
                         logger.LogWarning(ex, "[{appid}] Failed to apply Glamourer data", applicationId);
-                        return 0;
+                        return false;
                     }
                 }, ct).ConfigureAwait(false);
+
+                if (!invoked)
+                    return;
+
+                applied = true;
 
                 await _dalamudUtil.RunOnFrameworkThread(() => 0).ConfigureAwait(false);
 
@@ -211,15 +225,17 @@ public sealed class IpcCallerGlamourer : DisposableMediatorSubscriberBase, IIpcC
                     logger.LogTrace("[{appid}] Glamourer apply flags={flags} left {name} drawing; not blocking the RavaSync apply lane", applicationId, applyFlags, handler.Name);
                 }
             }).ConfigureAwait(false);
+
+            return applied;
         }
 
         if (fireAndForget)
         {
             _ = ApplyCoreAsync();
-            return;
+            return true;
         }
 
-        await ApplyCoreAsync().ConfigureAwait(false);
+        return await ApplyCoreAsync().ConfigureAwait(false);
     }
 
     public async Task ReapplyDirectAsync(ILogger logger, GameObjectHandler handler, Guid applicationId, CancellationToken token)

@@ -9,26 +9,41 @@ using RavaSync.Services.Mesh;
 using RavaSync.Services.Mediator;
 using RavaSync.WebAPI;
 using RavaSync.WebAPI.Files;
+using RavaSync.Utils;
+using System;
 using System.Collections.Concurrent;
+using System.Threading;
+using System.Threading.Tasks;
 using System.Text.Json;
+using RavaSync.PlayerData.Services;
 
 namespace RavaSync.Services;
 
 public sealed class MissingFileMeshService : DisposableMediatorSubscriberBase
 {
+    // RAVASYNC_VISIBILITY_DIAGNOSTICS: temporary Info-level RavaMesh character-data tracing. Search '[VIS-DIAG]' to remove later.
+    private const string VisibilityDiagnosticsPrefix = "[VIS-DIAG]";
+
+    private void LogVisibilityDiagnostic(string message, params object[] args)
+    {
+        Logger.LogInformation(VisibilityDiagnosticsPrefix + " " + message, args);
+    }
+
     private static readonly byte[] RepairMagic = new byte[] { (byte)'R', (byte)'A', (byte)'V', (byte)'A', (byte)'B', (byte)'2', (byte)'F', (byte)'I', (byte)'X', 0 };
     private static readonly byte[] PreflightMagic = new byte[] { (byte)'R', (byte)'A', (byte)'V', (byte)'A', (byte)'F', (byte)'I', (byte)'L', (byte)'E', (byte)'P', (byte)'R', (byte)'E', 0 };
     private static readonly byte[] LegacyCharacterDataMagic = new byte[] { (byte)'R', (byte)'A', (byte)'V', (byte)'A', (byte)'C', (byte)'H', (byte)'A', (byte)'R', (byte)'A', (byte)'D', (byte)'A', (byte)'T', (byte)'A', 0 };
     private static readonly byte[] CharacterPushMagic = new byte[] { (byte)'R', (byte)'A', (byte)'V', (byte)'A', (byte)'C', (byte)'H', (byte)'A', (byte)'R', (byte)'A', (byte)'P', (byte)'U', (byte)'S', (byte)'H', (byte)'2', 0 };
     private static readonly TimeSpan PreflightTimeout = TimeSpan.FromMilliseconds(650);
     private static readonly TimeSpan CharacterOfferTimeout = TimeSpan.FromMilliseconds(1200);
-    private static readonly TimeSpan CharacterReadyAckTimeout = TimeSpan.FromMilliseconds(650);
-    private const int CharacterReadyAckAttempts = 3;
+    private static readonly TimeSpan CharacterReadyAckTimeout = TimeSpan.FromMilliseconds(7000);
+    private const int CharacterReadyAckAttempts = 2;
     private static readonly TimeSpan PendingInboundCharacterPushNoMissingLifetime = TimeSpan.FromMinutes(2);
     private static readonly TimeSpan PendingInboundCharacterPushUploadBarrierLifetime = TimeSpan.FromMinutes(30);
     private static readonly TimeSpan RecentMeshReadyLifetime = TimeSpan.FromMinutes(3);
-    private static readonly TimeSpan OutboundDedupWindow = TimeSpan.FromMinutes(2);
-    private static readonly TimeSpan InboundDedupWindow = TimeSpan.FromMinutes(2);
+    // Missing-file repair is an active request/ack loop. Keep the dedupe short so a real
+    // retry can ask the sender to upload again if the CDN/server still was not ready.
+    private static readonly TimeSpan OutboundDedupWindow = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan InboundDedupWindow = TimeSpan.FromSeconds(5);
 
     [MessagePackObject]
     public sealed class MissingCentralFileRepairPayload
@@ -38,6 +53,8 @@ public sealed class MissingFileMeshService : DisposableMediatorSubscriberBase
         [Key(2)] public string DataHash { get; set; } = string.Empty;
         [Key(3)] public List<string> Hashes { get; set; } = [];
         [Key(4)] public string Reason { get; set; } = string.Empty;
+        [Key(5)] public bool IsResponse { get; set; }
+        [Key(6)] public List<string> FailedHashes { get; set; } = [];
     }
 
     [MessagePackObject]
@@ -168,7 +185,7 @@ public sealed class MissingFileMeshService : DisposableMediatorSubscriberBase
         if (hashes.Count == 0)
             return;
 
-        var dedupKey = string.Join('|', msg.TargetUid, msg.DataHash ?? string.Empty, string.Join(',', hashes));
+        var dedupKey = string.Join('|', msg.TargetUid, sessionId, msg.DataHash ?? string.Empty, string.Join(',', hashes));
         var now = DateTime.UtcNow;
 
         if (_lastOutboundByKey.TryGetValue(dedupKey, out var last) && now - last < OutboundDedupWindow)
@@ -178,7 +195,7 @@ public sealed class MissingFileMeshService : DisposableMediatorSubscriberBase
 
         var payload = BuildRepairPayload(_ownUid, msg.TargetUid, msg.DataHash, hashes, msg.Reason);
 
-        Logger.LogDebug("Requesting central B2 repair from {uid}/{session}: {count} hash(es), reason={reason}, hashes={hashes}",
+        Logger.LogInformation("Requesting mesh missing-hash repair from {uid}/{session}: {count} hash(es), reason={reason}, hashes={hashes}",
             msg.TargetUid,
             sessionId,
             hashes.Count,
@@ -214,7 +231,26 @@ public sealed class MissingFileMeshService : DisposableMediatorSubscriberBase
         if (hashes.Count == 0)
             return;
 
-        var dedupKey = string.Join('|', payload.RequesterUid ?? string.Empty, payload.DataHash ?? string.Empty, string.Join(',', hashes));
+        if (payload.IsResponse)
+        {
+            var failedHashes = NormalizeHashes(payload.FailedHashes).OrderBy(h => h, StringComparer.OrdinalIgnoreCase).ToList();
+            Logger.LogInformation(
+                "Received mesh missing-hash repair completion from {sender} for {count} hash(es), failed={failedCount}, dataHash={dataHash}",
+                payload.RequesterUid,
+                hashes.Count,
+                failedHashes.Count,
+                payload.DataHash);
+
+            Mediator.Publish(new MissingFileRepairCompletedMessage(
+                payload.RequesterUid ?? string.Empty,
+                payload.DataHash ?? string.Empty,
+                hashes,
+                failedHashes,
+                payload.Reason ?? string.Empty));
+            return;
+        }
+
+        var dedupKey = string.Join('|', payload.RequesterUid ?? string.Empty, msg.FromSessionId ?? string.Empty, payload.DataHash ?? string.Empty, string.Join(',', hashes));
         var now = DateTime.UtcNow;
 
         if (_lastInboundByKey.TryGetValue(dedupKey, out var last) && now - last < InboundDedupWindow)
@@ -222,20 +258,32 @@ public sealed class MissingFileMeshService : DisposableMediatorSubscriberBase
 
         _lastInboundByKey[dedupKey] = now;
 
-        Logger.LogDebug("Received central B2 repair request from {from} for {count} hash(es); force-uploading: {hashes}",
+        Logger.LogInformation("Received mesh missing-hash upload request from {from} for {count} hash(es); starting normal upload flow: {hashes}",
             string.IsNullOrWhiteSpace(payload.RequesterUid) ? msg.FromSessionId : payload.RequesterUid,
             hashes.Count,
             string.Join(", ", hashes.Take(20)));
 
         _ = Task.Run(async () =>
         {
+            var failed = new List<string>();
+            var reason = "mesh missing-hash upload completed";
+
             try
             {
-                var failed = await _fileUploadManager.ForceUploadMissingHashesAsync(hashes, $"mesh central B2 repair requested by {payload.RequesterUid}", CancellationToken.None).ConfigureAwait(false);
+                // This is a repair request for a specific receiver, not a generic metadata push.
+                // Run the normal FilesSend path with the requester UID so the server/CDN share state
+                // is refreshed for that receiver, and force fresh upload tickets so a stale B2/CDN
+                // claim cannot make the receiver loop the same missing hash forever.
+                var requesterUids = string.IsNullOrWhiteSpace(payload.RequesterUid)
+                    ? Array.Empty<string>()
+                    : new[] { payload.RequesterUid };
+
+                failed = await _fileUploadManager.UploadFiles(hashes, requesterUids, new Progress<string>(_ => { }), CancellationToken.None, forceUploadTickets: true).ConfigureAwait(false);
 
                 if (failed.Count > 0)
                 {
-                    Logger.LogWarning("Central B2 repair upload failed for {count}/{total} hash(es): {hashes}",
+                    reason = "mesh missing-hash upload completed with failures";
+                    Logger.LogWarning("Mesh missing-hash upload flow failed for {count}/{total} hash(es): {hashes}",
                         failed.Count,
                         hashes.Count,
                         string.Join(", ", failed.Take(20)));
@@ -243,7 +291,33 @@ public sealed class MissingFileMeshService : DisposableMediatorSubscriberBase
             }
             catch (Exception ex)
             {
-                Logger.LogWarning(ex, "Central B2 repair upload failed");
+                reason = "mesh missing-hash upload flow threw";
+                failed = hashes;
+                Logger.LogWarning(ex, "Mesh missing-hash upload flow failed");
+            }
+            finally
+            {
+                if (!string.IsNullOrWhiteSpace(payload.RequesterUid))
+                {
+                    var response = BuildRepairPayload(
+                        _ownUid,
+                        payload.RequesterUid,
+                        payload.DataHash,
+                        hashes,
+                        reason,
+                        isResponse: true,
+                        failedHashes: failed);
+
+                    Logger.LogInformation(
+                        "Sending mesh missing-hash repair completion to {uid}/{session}: requested={count}, failed={failed}, dataHash={dataHash}",
+                        payload.RequesterUid,
+                        msg.FromSessionId,
+                        hashes.Count,
+                        failed.Count,
+                        payload.DataHash);
+
+                    _ = _mesh.SendAsync(msg.FromSessionId, new RavaGame(string.Empty, response));
+                }
             }
         });
     }
@@ -290,11 +364,16 @@ public sealed class MissingFileMeshService : DisposableMediatorSubscriberBase
                     IsResponse = false
                 });
 
+                LogVisibilityDiagnostic("MESH preflight send request={request} target={target} session={session} hash={hash} hashes={hashes}",
+                    requestId, targetUid, targetSessionId, dataHash ?? string.Empty, hashList.Count);
                 _ = _mesh.SendAsync(targetSessionId, new RavaGame(string.Empty, payload));
             }
 
             if (pending.Count == 0)
+            {
+                LogVisibilityDiagnostic("MESH preflight abort request={request} reason=no-pending-targets", requestId);
                 return null;
+            }
 
             var allResponses = Task.WhenAll(pending.Select(p => p.Completion.Task));
             var timeoutTask = Task.Delay(PreflightTimeout, ct);
@@ -392,6 +471,8 @@ public sealed class MissingFileMeshService : DisposableMediatorSubscriberBase
 
         var requestId = Guid.NewGuid().ToString("N");
         var dataHash = characterData.DataHash.Value ?? string.Empty;
+        LogVisibilityDiagnostic("MESH offer start request={request} hash={hash} targets={targets} sessions={sessions} requiredHashes={hashes}",
+            requestId, dataHash, string.Join(", ", targetUids), targetSessionByUid.Count, requiredHashes?.Count ?? 0);
         var hashList = NormalizeHashes(requiredHashes).OrderBy(h => h, StringComparer.OrdinalIgnoreCase).ToList();
         var hashSizeHints = BuildLocalHashSizeHints(hashList);
         var pending = new List<(string Key, string TargetUid, TaskCompletionSource<CharacterDataMeshPayload> Completion)>();
@@ -403,7 +484,10 @@ public sealed class MissingFileMeshService : DisposableMediatorSubscriberBase
                 ct.ThrowIfCancellationRequested();
 
                 if (!targetSessionByUid.TryGetValue(targetUid, out var targetSessionId) || string.IsNullOrWhiteSpace(targetSessionId))
+                {
+                    LogVisibilityDiagnostic("MESH offer skip request={request} target={target} reason=no-session", requestId, targetUid);
                     continue;
+                }
 
                 var key = BuildPendingCharacterPushKey(requestId, targetUid);
                 var completion = new TaskCompletionSource<CharacterDataMeshPayload>(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -445,7 +529,10 @@ public sealed class MissingFileMeshService : DisposableMediatorSubscriberBase
             foreach (var item in pending)
             {
                 if (!item.Completion.Task.IsCompletedSuccessfully)
+                {
+                    LogVisibilityDiagnostic("MESH offer response missing request={request} target={target} reason=timeout-or-fault", requestId, item.TargetUid);
                     continue;
+                }
 
                 var response = item.Completion.Task.Result;
                 result.AcceptedUids.Add(item.TargetUid);
@@ -455,11 +542,15 @@ public sealed class MissingFileMeshService : DisposableMediatorSubscriberBase
                     .ToList();
 
                 result.MissingHashesByUid[item.TargetUid] = missingForUid;
+                LogVisibilityDiagnostic("MESH offer response request={request} target={target} missing={missing} missingHashes={hashes}",
+                    requestId, item.TargetUid, missingForUid.Count, string.Join(", ", missingForUid.Take(20)));
 
                 foreach (var hash in missingForUid)
                     result.MissingHashes.Add(hash);
             }
 
+            LogVisibilityDiagnostic("MESH offer complete request={request} accepted={accepted}/{targets} totalMissing={missing}",
+                requestId, result.AcceptedUids.Count, targetUids.Count, result.MissingHashes.Count);
             return result.AcceptedUids.Count > 0 ? result : null;
         }
         finally
@@ -469,11 +560,11 @@ public sealed class MissingFileMeshService : DisposableMediatorSubscriberBase
         }
     }
 
-    public async Task<HashSet<string>> SignalCharacterDataReadyAsync(IReadOnlyDictionary<string, string> targetSessionByUid, string requestId, IEnumerable<string> targetUids, CharacterData finalCharacterData, CancellationToken ct, IReadOnlyDictionary<string, CharacterData>? finalCharacterDataByUid = null)
+    public async Task<HashSet<string>> SignalCharacterDataReadyAsync(Func<IReadOnlyDictionary<string, string>> targetSessionResolver, string requestId, IEnumerable<string> targetUids, CharacterData finalCharacterData, CancellationToken ct, IReadOnlyDictionary<string, CharacterData>? finalCharacterDataByUid = null)
     {
         var acknowledged = new HashSet<string>(StringComparer.Ordinal);
 
-        if (!_apiController.IsConnected || string.IsNullOrWhiteSpace(_ownUid) || string.IsNullOrWhiteSpace(requestId) || targetSessionByUid == null || targetSessionByUid.Count == 0 || finalCharacterData == null)
+        if (!_apiController.IsConnected || string.IsNullOrWhiteSpace(_ownUid) || string.IsNullOrWhiteSpace(requestId) || targetSessionResolver == null || finalCharacterData == null)
             return acknowledged;
 
         var targetList = targetUids
@@ -485,6 +576,7 @@ public sealed class MissingFileMeshService : DisposableMediatorSubscriberBase
             return acknowledged;
 
         var finalDataHash = finalCharacterData.DataHash.Value ?? string.Empty;
+        LogVisibilityDiagnostic("MESH ready start request={request} hash={hash} targets={targets}", requestId, finalDataHash, string.Join(", ", targetList));
         var finalHashList = CollectCharacterDataHashes(finalCharacterData).OrderBy(h => h, StringComparer.OrdinalIgnoreCase).ToList();
         var finalHashSizeHints = BuildLocalHashSizeHints(finalHashList);
 
@@ -492,12 +584,22 @@ public sealed class MissingFileMeshService : DisposableMediatorSubscriberBase
 
         try
         {
+            var initialTargetSessionByUid = targetSessionResolver();
+            if (initialTargetSessionByUid == null || initialTargetSessionByUid.Count == 0)
+            {
+                LogVisibilityDiagnostic("MESH ready abort request={request} hash={hash} reason=no-initial-sessions", requestId, finalDataHash);
+                return acknowledged;
+            }
+
             foreach (var targetUid in targetList)
             {
                 ct.ThrowIfCancellationRequested();
 
-                if (!targetSessionByUid.TryGetValue(targetUid, out var targetSessionId) || string.IsNullOrWhiteSpace(targetSessionId))
+                if (!initialTargetSessionByUid.TryGetValue(targetUid, out var targetSessionId) || string.IsNullOrWhiteSpace(targetSessionId))
+                {
+                    LogVisibilityDiagnostic("MESH ready pending-skip request={request} target={target} reason=no-initial-session", requestId, targetUid);
                     continue;
+                }
 
                 var key = BuildPendingCharacterPushKey(requestId, targetUid);
                 var completion = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -509,7 +611,10 @@ public sealed class MissingFileMeshService : DisposableMediatorSubscriberBase
             }
 
             if (pending.Count == 0)
+            {
+                LogVisibilityDiagnostic("MESH ready abort request={request} hash={hash} reason=no-pending-acks", requestId, finalDataHash);
                 return acknowledged;
+            }
 
             for (var attempt = 1; attempt <= CharacterReadyAckAttempts; attempt++)
             {
@@ -520,12 +625,22 @@ public sealed class MissingFileMeshService : DisposableMediatorSubscriberBase
                 if (remaining.Count == 0)
                     break;
 
+                var currentTargetSessionByUid = targetSessionResolver();
+                if (currentTargetSessionByUid == null || currentTargetSessionByUid.Count == 0)
+                    currentTargetSessionByUid = new Dictionary<string, string>(StringComparer.Ordinal);
+
                 foreach (var item in remaining)
                 {
                     ct.ThrowIfCancellationRequested();
 
-                    if (!targetSessionByUid.TryGetValue(item.TargetUid, out var targetSessionId) || string.IsNullOrWhiteSpace(targetSessionId))
+                    if (!currentTargetSessionByUid.TryGetValue(item.TargetUid, out var targetSessionId) || string.IsNullOrWhiteSpace(targetSessionId))
+                    {
+                        LogVisibilityDiagnostic("MESH ready attempt-skip request={request} target={target} attempt={attempt}/{attempts} reason=no-current-session",
+                            requestId, item.TargetUid, attempt, CharacterReadyAckAttempts);
+                        if (Logger.IsEnabled(LogLevel.Debug))
+                            Logger.LogDebug("Mesh character-data ready attempt {attempt}/{attempts} has no current session for {target}; waiting for fallback/next retry", attempt, CharacterReadyAckAttempts, item.TargetUid);
                         continue;
+                    }
 
                     var dataForTarget = GetCharacterDataForTarget(finalCharacterDataByUid, item.TargetUid, finalCharacterData);
                     var payload = BuildCharacterDataPayload(new CharacterDataMeshPayload
@@ -544,12 +659,24 @@ public sealed class MissingFileMeshService : DisposableMediatorSubscriberBase
                         IsAck = false
                     });
 
+                    LogVisibilityDiagnostic("MESH ready send request={request} target={target} session={session} attempt={attempt}/{attempts} hash={hash} requiredHashes={hashes}",
+                        requestId, item.TargetUid, targetSessionId, attempt, CharacterReadyAckAttempts, dataForTarget.DataHash.Value ?? finalDataHash, finalHashList.Count);
                     _ = _mesh.SendAsync(targetSessionId, new RavaGame(string.Empty, payload));
                 }
 
                 var allRemaining = Task.WhenAll(remaining.Select(p => p.Completion.Task));
                 var timeoutTask = Task.Delay(CharacterReadyAckTimeout, ct);
-                await Task.WhenAny(allRemaining, timeoutTask).ConfigureAwait(false);
+                var completed = await Task.WhenAny(allRemaining, timeoutTask).ConfigureAwait(false);
+                if (completed == timeoutTask)
+                {
+                    LogVisibilityDiagnostic("MESH ready timeout request={request} attempt={attempt}/{attempts} waitingTargets={targets}",
+                        requestId, attempt, CharacterReadyAckAttempts, string.Join(", ", remaining.Select(k => k.TargetUid)));
+                }
+                else
+                {
+                    foreach (var item in remaining.Where(item => item.Completion.Task.IsCompletedSuccessfully && item.Completion.Task.Result))
+                        LogVisibilityDiagnostic("MESH ready ack request={request} target={target} attempt={attempt}/{attempts}", requestId, item.TargetUid, attempt, CharacterReadyAckAttempts);
+                }
             }
 
             foreach (var item in pending)
@@ -558,6 +685,7 @@ public sealed class MissingFileMeshService : DisposableMediatorSubscriberBase
                     acknowledged.Add(item.TargetUid);
             }
 
+            LogVisibilityDiagnostic("MESH ready complete request={request} hash={hash} acked={acked}/{targets}", requestId, finalDataHash, acknowledged.Count, targetList.Count);
             return acknowledged;
         }
         finally
@@ -580,6 +708,7 @@ public sealed class MissingFileMeshService : DisposableMediatorSubscriberBase
             if (string.IsNullOrWhiteSpace(_ownUid) || !string.Equals(payload.SenderUid, _ownUid, StringComparison.Ordinal))
                 return;
 
+            LogVisibilityDiagnostic("MESH ack inbound request={request} target={target} hash={hash}", payload.RequestId, payload.TargetUid, payload.DataHash ?? string.Empty);
             var key = BuildPendingCharacterPushKey(payload.RequestId, payload.TargetUid);
             if (_pendingCharacterReadyAckByKey.TryRemove(key, out var readyCompletion))
                 readyCompletion.TrySetResult(true);
@@ -592,6 +721,7 @@ public sealed class MissingFileMeshService : DisposableMediatorSubscriberBase
             if (string.IsNullOrWhiteSpace(_ownUid) || !string.Equals(payload.SenderUid, _ownUid, StringComparison.Ordinal))
                 return;
 
+            LogVisibilityDiagnostic("MESH response inbound request={request} target={target} missing={missing}", payload.RequestId, payload.TargetUid, payload.MissingHashes?.Count ?? 0);
             var key = BuildPendingCharacterPushKey(payload.RequestId, payload.TargetUid);
             if (_pendingCharacterOfferByKey.TryRemove(key, out var offerCompletion))
                 offerCompletion.TrySetResult(payload);
@@ -601,7 +731,17 @@ public sealed class MissingFileMeshService : DisposableMediatorSubscriberBase
 
         if (payload.IsReady)
         {
-            HandleCharacterDataReadyMessage(msg, payload);
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await HandleCharacterDataReadyMessageAsync(msg, payload).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    Logger.LogDebug(ex, "Mesh character data ready handling failed");
+                }
+            });
             return;
         }
 
@@ -654,7 +794,9 @@ public sealed class MissingFileMeshService : DisposableMediatorSubscriberBase
 
         FileDownloadManager.RegisterDirectCdnSizeHints(payload.HashSizeHints);
 
-        var missing = NormalizeHashes(payload.RequiredHashes).Where(h => !HasUsableLocalHash(h)).OrderBy(h => h, StringComparer.OrdinalIgnoreCase).ToList();
+        var missing = NormalizeHashes(payload.RequiredHashes).Where(h => !HasUsableLocalHash(h, verifyFile: true)).OrderBy(h => h, StringComparer.OrdinalIgnoreCase).ToList();
+        LogVisibilityDiagnostic("MESH offer inbound request={request} sender={sender} hash={hash} required={required} missing={missing} fromSession={session}",
+            payload.RequestId, payload.SenderUid, payload.DataHash ?? string.Empty, payload.RequiredHashes?.Count ?? 0, missing.Count, msg.FromSessionId);
         var key = BuildPendingCharacterPushKey(payload.RequestId, payload.SenderUid);
 
         RemoveOlderPendingInboundCharacterPushes(payload.SenderUid, payload.RequestId);
@@ -684,14 +826,17 @@ public sealed class MissingFileMeshService : DisposableMediatorSubscriberBase
             IsAck = false
         });
 
+        LogVisibilityDiagnostic("MESH offer response sent request={request} sender={sender} missing={missing}", payload.RequestId, payload.SenderUid, missing.Count);
         _ = _mesh.SendAsync(msg.FromSessionId, new RavaGame(string.Empty, response));
     }
 
-    private void HandleCharacterDataReadyMessage(SyncshellGameMeshMessage msg, CharacterDataMeshPayload payload)
+    private async Task HandleCharacterDataReadyMessageAsync(SyncshellGameMeshMessage msg, CharacterDataMeshPayload payload)
     {
         if (!_apiController.IsConnected || string.IsNullOrWhiteSpace(_ownUid) || !string.Equals(payload.TargetUid, _ownUid, StringComparison.Ordinal))
             return;
 
+        LogVisibilityDiagnostic("MESH ready inbound request={request} sender={sender} hash={hash} inline={inline} required={required} fromSession={session}",
+            payload.RequestId, payload.SenderUid, payload.DataHash ?? string.Empty, payload.CharacterDataJsonUtf8?.Length ?? 0, payload.RequiredHashes?.Count ?? 0, msg.FromSessionId);
         var key = BuildPendingCharacterPushKey(payload.RequestId, payload.SenderUid);
         var hadPendingOffer = _pendingInboundCharacterPushByKey.TryRemove(key, out var pending);
 
@@ -722,10 +867,40 @@ public sealed class MissingFileMeshService : DisposableMediatorSubscriberBase
             ? payload.DataHash
             : pending?.DataHash ?? string.Empty;
 
-        MarkRecentMeshReadyForCharacterData(payload.SenderUid, effectiveDataHash);
+        var requiredHashesAtReady = NormalizeHashes(payload.RequiredHashes).ToList();
+        var missingHashesAtReady = requiredHashesAtReady
+            .Where(h => !HasUsableLocalHash(h, verifyFile: true))
+            .OrderBy(h => h, StringComparer.OrdinalIgnoreCase)
+            .ToList();
 
-        if (!TryReceiveCharacterData(payload.SenderUid, characterJson))
+        if (missingHashesAtReady.Count == 0)
+        {
+            MarkRecentMeshReadyForCharacterData(payload.SenderUid, effectiveDataHash);
+            LogVisibilityDiagnostic("MESH ready local-files-ok request={request} sender={sender} hash={hash} required={required}", payload.RequestId, payload.SenderUid, effectiveDataHash, requiredHashesAtReady.Count);
+        }
+        else
+        {
+            LogVisibilityDiagnostic("MESH ready local-files-missing request={request} sender={sender} hash={hash} missing={missing}/{total} firstMissing={firstMissing}",
+                payload.RequestId, payload.SenderUid, effectiveDataHash, missingHashesAtReady.Count, requiredHashesAtReady.Count, string.Join(", ", missingHashesAtReady.Take(20)));
+            Logger.LogDebug(
+                "Mesh character data ready arrived for {sender}/{hash}, but {count}/{total} required hash(es) are still not local; accepting payload without marking local-ready. First missing: {missing}",
+                payload.SenderUid,
+                effectiveDataHash,
+                missingHashesAtReady.Count,
+                requiredHashesAtReady.Count,
+                string.Join(", ", missingHashesAtReady.Take(20)));
+        }
+
+        var acceptedIntoPairPipeline = TryReceiveCharacterData(payload.SenderUid, characterJson);
+        LogVisibilityDiagnostic("MESH ready pair-pipeline request={request} sender={sender} hash={hash} accepted={accepted}", payload.RequestId, payload.SenderUid, effectiveDataHash, acceptedIntoPairPipeline);
+        if (!acceptedIntoPairPipeline)
+        {
+            Logger.LogDebug(
+                "Mesh character data ready for {sender}/{hash} could not be accepted into the pair apply pipeline; not ACKing malformed/unroutable payload",
+                payload.SenderUid,
+                effectiveDataHash);
             return;
+        }
 
         var ack = BuildCharacterDataPayload(new CharacterDataMeshPayload
         {
@@ -747,6 +922,7 @@ public sealed class MissingFileMeshService : DisposableMediatorSubscriberBase
             ? pending!.FromSessionId
             : msg.FromSessionId;
 
+        LogVisibilityDiagnostic("MESH ready ack-sent request={request} sender={sender} hash={hash} ackSession={session}", payload.RequestId, payload.SenderUid, effectiveDataHash, ackSessionId);
         _ = _mesh.SendAsync(ackSessionId, new RavaGame(string.Empty, ack));
     }
 
@@ -758,6 +934,10 @@ public sealed class MissingFileMeshService : DisposableMediatorSubscriberBase
             if (characterData == null)
                 return false;
 
+            LogVisibilityDiagnostic("MESH receive deserialize-ok sender={sender} hash={hash} payload={payload}",
+                senderUid,
+                characterData.DataHash.Value ?? string.Empty,
+                PairApplyUtilities.ComputeCharacterDataPayloadFingerprint(characterData));
             _pairManager.ReceiveCharaData(new OnlineUserCharaDataDto(new UserData(senderUid), characterData));
             return true;
         }
@@ -767,6 +947,7 @@ public sealed class MissingFileMeshService : DisposableMediatorSubscriberBase
             return false;
         }
     }
+
 
     private void HandlePreflightMeshMessage(SyncshellGameMeshMessage msg, FilePresencePreflightPayload payload)
     {
@@ -789,7 +970,7 @@ public sealed class MissingFileMeshService : DisposableMediatorSubscriberBase
         if (hashes.Count == 0)
             return;
 
-        var missing = hashes.Where(h => !HasUsableLocalHash(h)).ToList();
+        var missing = hashes.Where(h => !HasUsableLocalHash(h, verifyFile: true)).ToList();
 
         var response = BuildPreflightPayload(new FilePresencePreflightPayload
         {
@@ -805,16 +986,23 @@ public sealed class MissingFileMeshService : DisposableMediatorSubscriberBase
         _ = _mesh.SendAsync(msg.FromSessionId, new RavaGame(string.Empty, response));
     }
 
-    private bool HasUsableLocalHash(string hash)
+    private bool HasUsableLocalHash(string hash, bool verifyFile = false)
     {
         try
         {
+            if (!verifyFile && FileDownloadManager.TryGetSessionKnownPresentHash(hash))
+                return true;
+
             var cache = _fileCacheManager.GetFileCacheByHash(hash);
             if (cache == null || string.IsNullOrWhiteSpace(cache.ResolvedFilepath))
                 return false;
 
             var fi = new FileInfo(cache.ResolvedFilepath);
-            return fi.Exists && fi.Length > 0;
+            var usable = fi.Exists && fi.Length > 0;
+            if (usable)
+                FileDownloadManager.RegisterSessionKnownPresentHash(hash);
+
+            return usable;
         }
         catch
         {
@@ -973,7 +1161,7 @@ public sealed class MissingFileMeshService : DisposableMediatorSubscriberBase
     private static bool TryParsePreflightPayload(byte[] payload, out FilePresencePreflightPayload? parsed)
         => TryParsePayloadWithMagic(payload, PreflightMagic, out parsed);
 
-    private static byte[] BuildRepairPayload(string requesterUid, string targetUid, string dataHash, IReadOnlyCollection<string> hashes, string reason)
+    private static byte[] BuildRepairPayload(string requesterUid, string targetUid, string dataHash, IReadOnlyCollection<string> hashes, string reason, bool isResponse = false, IReadOnlyCollection<string>? failedHashes = null)
     {
         var packed = MessagePackSerializer.Serialize(new MissingCentralFileRepairPayload
         {
@@ -982,6 +1170,8 @@ public sealed class MissingFileMeshService : DisposableMediatorSubscriberBase
             DataHash = dataHash ?? string.Empty,
             Hashes = NormalizeHashes(hashes).ToList(),
             Reason = reason ?? string.Empty,
+            IsResponse = isResponse,
+            FailedHashes = NormalizeHashes(failedHashes).ToList(),
         });
 
         var buffer = new byte[RepairMagic.Length + packed.Length];

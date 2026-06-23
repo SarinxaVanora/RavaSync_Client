@@ -82,7 +82,10 @@ public sealed partial class PairHandler
         public async Task<PairSyncCommitResult> ApplyCharacterDataAsync(Guid applicationBase, CharacterData charaData, Dictionary<ObjectKind, HashSet<PlayerChanges>> updatedData, bool updateModdedPaths, bool updateManip, bool requiresFileReadyGate, Dictionary<(string GamePath, string? Hash), string> moddedPaths, PairSyncAssetPlan assetPlan, bool downloadedAny, bool forceApplyModsForThisApply, bool lifecycleApplyRequestedFromPlan, bool lifecycleRedrawRequestedFromPlan, CancellationToken token, bool authoritativeCommit = true, bool suppressNonLifecycleRedraw = false)
         {
             if (!updatedData.Any())
+            {
+                LogVisibilityDiagnostic("APPLY skip pair={pair} reason=no-updated-data hash={hash}", Pair.UserData.AliasOrUID, charaData.DataHash.Value);
                 return PairSyncCommitResult.Succeeded();
+            }
 
             _applicationId = Guid.NewGuid();
             var applicationId = _applicationId;
@@ -121,6 +124,21 @@ public sealed partial class PairHandler
             }
 
             var applyTouchesPlayer = updatedData.ContainsKey(ObjectKind.Player);
+            LogVisibilityDiagnostic("APPLY start pair={pair} appBase={appBase} hash={hash} changes={changes} updateFiles={updateFiles} updateManip={updateManip} fileGate={fileGate} assets={assets} missing={missing} downloadedAny={downloadedAny} force={force} lifecycle={lifecycle} redraw={redraw} authoritative={authoritative}",
+                Pair.UserData.AliasOrUID,
+                applicationBase,
+                charaData.DataHash.Value,
+                string.Join("; ", updatedData.Select(kvp => $"{kvp.Key}:{string.Join("|", kvp.Value)}")),
+                updateModdedPaths,
+                updateManip,
+                requiresFileReadyGate,
+                assetPlan.Entries.Count,
+                assetPlan.MissingFiles.Count,
+                downloadedAny,
+                forceApplyModsForThisApply,
+                lifecycleApplyRequestedFromPlan,
+                lifecycleRedrawRequestedFromPlan,
+                authoritativeCommit);
             var acquireLane = false;
             var queuedLane = false;
             var acquireLifecycleLane = false;
@@ -133,9 +151,13 @@ public sealed partial class PairHandler
             {
                 var block = CaptureCommitBlockReason("commit start");
                 if (block != null)
+                {
+                    LogVisibilityDiagnostic("APPLY block pair={pair} app={app} stage=commit-start status={status} reason={reason}", Pair.UserData.AliasOrUID, applicationId, block.Status, block.Reason);
                     return block;
+                }
 
                 var initialTarget = await CaptureRemoteApplyTargetAsync(token).ConfigureAwait(false);
+                LogVisibilityDiagnostic("APPLY target initial pair={pair} app={app} valid={valid} reason={reason}", Pair.UserData.AliasOrUID, applicationId, initialTarget.Valid, initialTarget.Reason);
                 if (!initialTarget.Valid)
                     return PairSyncCommitResult.ActorChanged(initialTarget.Reason, retryImmediately: false);
 
@@ -145,6 +167,15 @@ public sealed partial class PairHandler
                     || _redrawOnNextApplication
                     || forceApplyModsForThisApply;
                 var runResolvedCacheReadyGate = ShouldRunResolvedCacheReadyGate(applicationId, requiresFileReadyGate, updateModdedPaths, downloadedAny, forceApplyModsForThisApply, lifecycleRedrawRequestedFromPlan, moddedPaths, assetPlan);
+                LogVisibilityDiagnostic("APPLY gates pair={pair} app={app} resolvedCacheGate={cacheGate} moddedPaths={paths} lifecycleCommit={lifecycleCommit}",
+                    Pair.UserData.AliasOrUID, applicationId, runResolvedCacheReadyGate, moddedPaths.Count, lifecycleReceiverCommit);
+                var fastCachedMeshApply = updateModdedPaths
+                    && !downloadedAny
+                    && !forceApplyModsForThisApply
+                    && !lifecycleReceiverCommit
+                    && !lifecycleApplyRequestedFromPlan
+                    && !lifecycleRedrawRequestedFromPlan
+                    && assetPlan.MissingFiles.Count == 0;
                 var resolvedCacheReadyGateCompletedBeforeLane = false;
 
                 if (IsWineRuntime && runResolvedCacheReadyGate)
@@ -187,7 +218,11 @@ public sealed partial class PairHandler
                     await WaitForLifecycleApplyDispatchSpacingAsync(token).ConfigureAwait(false);
                 }
 
-                await WaitForReceiverApplyDispatchSpacingAsync(lifecycleReceiverCommit, token).ConfigureAwait(false);
+                if (!fastCachedMeshApply)
+                    await WaitForReceiverApplyDispatchSpacingAsync(lifecycleReceiverCommit, token).ConfigureAwait(false);
+                else if (Logger.IsEnabled(LogLevel.Trace))
+                    Logger.LogTrace("[{applicationId}] Fast cached mesh apply for {pair}; skipping receiver dispatch spacing", applicationId, Pair.UserData.AliasOrUID);
+
                 await lane.WaitAsync(token).ConfigureAwait(false);
                 acquireLane = true;
                 queuedLane = false;
@@ -201,22 +236,11 @@ public sealed partial class PairHandler
                     return block;
 
                 var needsPenumbraBinding = updateModdedPaths || updateManip || lifecycleRedrawRequestedFromPlan || _redrawOnNextApplication || forceApplyModsForThisApply;
-                var hasPlayerHavokRiskAssetsInPlan = HasPlayerHavokRedrawRiskAsset(assetPlan)
-                    && (updateModdedPaths || downloadedAny || forceApplyModsForThisApply || lifecycleApplyRequestedFromPlan || lifecycleRedrawRequestedFromPlan);
-                var primePenumbraBeforeDrawSettle = needsPenumbraBinding
-                    && !hasPlayerHavokRiskAssetsInPlan
-                    && (updateModdedPaths || downloadedAny || forceApplyModsForThisApply || lifecycleApplyRequestedFromPlan || lifecycleRedrawRequestedFromPlan);
+                var primePenumbraBeforeDrawSettle = needsPenumbraBinding && (updateModdedPaths || downloadedAny || forceApplyModsForThisApply || lifecycleApplyRequestedFromPlan || lifecycleRedrawRequestedFromPlan);
                 if (!primePenumbraBeforeDrawSettle)
-                {
-                    if (hasPlayerHavokRiskAssetsInPlan)
-                        Logger.LogTrace("[{applicationId}] Using Havok-safe player animation lane for {pair}; temp files will not be primed before draw settle", applicationId, Pair.UserData.AliasOrUID);
-
-                    await WaitForTargetDrawSettleAsync(applicationId, lifecycleRedrawRequestedFromPlan || hasPlayerHavokRiskAssetsInPlan, token).ConfigureAwait(false);
-                }
+                    await WaitForTargetDrawSettleAsync(applicationId, lifecycleRedrawRequestedFromPlan, token).ConfigureAwait(false);
                 else if (_charaHandler?.CurrentDrawCondition != GameObjectHandler.DrawCondition.None)
-                {
                     Logger.LogTrace("[{applicationId}] Priming receiver temp files before draw settle for {pair}; draw state={draw}", applicationId, Pair.UserData.AliasOrUID, _charaHandler?.CurrentDrawCondition);
-                }
 
                 if (IsWineRuntime)
                     LogWineApplyPhase("receiver draw settle");
@@ -235,7 +259,9 @@ public sealed partial class PairHandler
                     }
 
                     bindingReassigned = bound.Reassigned;
-                    await YieldToFrameworkAsync(token, WineAwareFrameworkYieldMs(bindingReassigned ? 75 : 25)).ConfigureAwait(false);
+                    var bindingYieldMs = fastCachedMeshApply && !bindingReassigned ? 0 : WineAwareFrameworkYieldMs(bindingReassigned ? 75 : 25);
+                    if (bindingYieldMs > 0)
+                        await YieldToFrameworkAsync(token, bindingYieldMs).ConfigureAwait(false);
                     LogWineApplyPhase("Penumbra binding");
 
                     target = await CaptureRemoteApplyTargetAsync(token).ConfigureAwait(false);
@@ -245,7 +271,9 @@ public sealed partial class PairHandler
 
                 if (runResolvedCacheReadyGate && !resolvedCacheReadyGateCompletedBeforeLane)
                 {
+                    LogVisibilityDiagnostic("APPLY cache-gate start pair={pair} app={app} paths={paths}", Pair.UserData.AliasOrUID, applicationId, moddedPaths.Count);
                     var missingAtApply = await WaitForResolvedCachePathsReadyAsync(applicationId, moddedPaths, lifecycleRedrawRequestedFromPlan, token).ConfigureAwait(false);
+                    LogVisibilityDiagnostic("APPLY cache-gate result pair={pair} app={app} missing={missing}", Pair.UserData.AliasOrUID, applicationId, missingAtApply.Count);
                     if (missingAtApply.Count > 0)
                     {
                         if (lifecycleRedrawRequestedFromPlan)
@@ -282,8 +310,20 @@ public sealed partial class PairHandler
                 var mountMusicTempModsFingerprint = PairApplyUtilities.ComputeTempModsFingerprint(mountMusicTempMods);
                 var previousTempMods = _lastAppliedTempModsSnapshot;
                 var previousTransientSupportFingerprint = _lastAppliedTransientSupportFingerprint;
+                LogVisibilityDiagnostic("APPLY penumbra-temp plan pair={pair} app={app} tempMods={tempMods} mountMusic={mountMusic} tempChanged={tempChanged} mountChanged={mountChanged} activeMod={activeMod} force={force} bindingReassigned={bindingReassigned}",
+                    Pair.UserData.AliasOrUID,
+                    applicationId,
+                    tempMods.Count,
+                    mountMusicTempMods.Count,
+                    !string.Equals(tempModsFingerprint, _lastAppliedTempModsFingerprint, StringComparison.Ordinal),
+                    !string.Equals(mountMusicTempModsFingerprint, _lastAppliedMountMusicTempModsFingerprint, StringComparison.Ordinal),
+                    _activeTempFilesModName ?? string.Empty,
+                    forceApplyModsForThisApply,
+                    bindingReassigned);
                 var tempModsChanged = !string.Equals(tempModsFingerprint, _lastAppliedTempModsFingerprint, StringComparison.Ordinal);
                 var mountMusicTempModsChanged = !string.Equals(mountMusicTempModsFingerprint, _lastAppliedMountMusicTempModsFingerprint, StringComparison.Ordinal);
+
+                var reassertPlayerTempModsForPureFileUpdate = IsPurePlayerModFilesOnlyApply(updatedData) && updateModdedPaths;
 
                 if (updateModdedPaths || forceApplyModsForThisApply || bindingReassigned)
                 {
@@ -291,6 +331,7 @@ public sealed partial class PairHandler
                     {
                         if (!string.IsNullOrWhiteSpace(_lastAppliedTempModsFingerprint) && !string.Equals(_lastAppliedTempModsFingerprint, "EMPTY", StringComparison.Ordinal))
                         {
+                            LogVisibilityDiagnostic("APPLY penumbra-temp clear pair={pair} app={app} collection={collection} mod={mod}", Pair.UserData.AliasOrUID, applicationId, _penumbraCollection, TempFilesModName);
                             await _ipcManager.Penumbra.ClearNamedTemporaryModsAsync(Logger, applicationId, _penumbraCollection, TempFilesModName, TempFilesModPriority).ConfigureAwait(false);
                             penumbraChanged = true;
                         }
@@ -301,9 +342,11 @@ public sealed partial class PairHandler
                         _lastAppliedTempModsSnapshot = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
                         _lastAppliedTransientSupportFingerprint = "EMPTY";
                     }
-                    else if (tempModsChanged || forceApplyModsForThisApply || bindingReassigned || !string.Equals(_activeTempFilesModName, TempFilesModName, StringComparison.Ordinal))
+                    else if (tempModsChanged || forceApplyModsForThisApply || bindingReassigned || reassertPlayerTempModsForPureFileUpdate || !string.Equals(_activeTempFilesModName, TempFilesModName, StringComparison.Ordinal))
                     {
+                        LogVisibilityDiagnostic("APPLY penumbra-temp set pair={pair} app={app} collection={collection} mod={mod} entries={entries} fingerprint={fingerprint}", Pair.UserData.AliasOrUID, applicationId, _penumbraCollection, TempFilesModName, tempMods.Count, tempModsFingerprint);
                         var applied = await _ipcManager.Penumbra.SetNamedTemporaryModsAsync(Logger, applicationId, _penumbraCollection, TempFilesModName, tempMods, TempFilesModPriority).ConfigureAwait(false);
+                        LogVisibilityDiagnostic("APPLY penumbra-temp set-result pair={pair} app={app} applied={applied}", Pair.UserData.AliasOrUID, applicationId, applied);
                         if (!applied)
                         {
                             _forceApplyMods = true;
@@ -322,6 +365,7 @@ public sealed partial class PairHandler
                     if (mountMusicTempMods.Count == 0)
                     {
                         if (!string.IsNullOrWhiteSpace(_lastAppliedMountMusicTempModsFingerprint) && !string.Equals(_lastAppliedMountMusicTempModsFingerprint, "EMPTY", StringComparison.Ordinal))
+                            LogVisibilityDiagnostic("APPLY mount-music-temp clear pair={pair} app={app}", Pair.UserData.AliasOrUID, applicationId);
                             await _ipcManager.Penumbra.ClearMountMusicTemporaryModOnDefaultCollectionAsync(Logger, applicationId, MountMusicTempModPriority).ConfigureAwait(false);
 
                         _lastAppliedMountMusicTempModsFingerprint = "EMPTY";
@@ -329,7 +373,9 @@ public sealed partial class PairHandler
                     }
                     else if (mountMusicTempModsChanged || forceApplyModsForThisApply || bindingReassigned)
                     {
+                        LogVisibilityDiagnostic("APPLY mount-music-temp set pair={pair} app={app} entries={entries}", Pair.UserData.AliasOrUID, applicationId, mountMusicTempMods.Count);
                         var mountMusicApplied = await _ipcManager.Penumbra.SetMountMusicTemporaryModOnDefaultCollectionAsync(Logger, applicationId, mountMusicTempMods, MountMusicTempModPriority).ConfigureAwait(false);
+                        LogVisibilityDiagnostic("APPLY mount-music-temp set-result pair={pair} app={app} applied={applied}", Pair.UserData.AliasOrUID, applicationId, mountMusicApplied);
                         if (!mountMusicApplied)
                         {
                             _forceApplyMods = true;
@@ -358,8 +404,17 @@ public sealed partial class PairHandler
                 {
                     var effectiveManipulationData = Pair.GetEffectiveManipulationData(charaData.ManipulationData);
                     var manipulationFingerprint = PairApplyUtilities.ComputeManipulationFingerprint(effectiveManipulationData);
-                    if (!string.Equals(manipulationFingerprint, _lastAppliedManipulationFingerprint, StringComparison.Ordinal))
+                    var forceManipulationReassert = forceApplyModsForThisApply || bindingReassigned;
+                    if (forceManipulationReassert || !string.Equals(manipulationFingerprint, _lastAppliedManipulationFingerprint, StringComparison.Ordinal))
                     {
+                        LogVisibilityDiagnostic("APPLY manipulation commit pair={pair} app={app} collection={collection} empty={empty} fingerprint={fingerprint} force={force} bindingReassigned={bindingReassigned}",
+                            Pair.UserData.AliasOrUID,
+                            applicationId,
+                            _penumbraCollection,
+                            string.IsNullOrWhiteSpace(effectiveManipulationData),
+                            manipulationFingerprint,
+                            forceApplyModsForThisApply,
+                            bindingReassigned);
                         if (string.IsNullOrWhiteSpace(effectiveManipulationData))
                             await _ipcManager.Penumbra.ClearManipulationDataAsync(Logger, applicationId, _penumbraCollection).ConfigureAwait(false);
                         else
@@ -367,6 +422,16 @@ public sealed partial class PairHandler
 
                         _lastAppliedManipulationFingerprint = manipulationFingerprint;
                         manipulationChanged = true;
+
+                        if (forceManipulationReassert)
+                        {
+                            Logger.LogTrace(
+                                "[{applicationId}] Reasserted receiver Penumbra manipulation metadata for {pair}; forceApply={force}, bindingReassigned={bindingReassigned}",
+                                applicationId,
+                                Pair.UserData.AliasOrUID,
+                                forceApplyModsForThisApply,
+                                bindingReassigned);
+                        }
                     }
                 }
 
@@ -374,7 +439,9 @@ public sealed partial class PairHandler
 
                 if (penumbraChanged || manipulationChanged)
                 {
-                    await YieldToFrameworkAsync(token, WineAwareFrameworkYieldMs(lifecycleRedrawRequestedFromPlan ? 125 : 50)).ConfigureAwait(false);
+                    var tempMetaSettleMs = fastCachedMeshApply && penumbraChanged && !manipulationChanged ? 0 : WineAwareFrameworkYieldMs(lifecycleRedrawRequestedFromPlan ? 125 : 50);
+                    if (tempMetaSettleMs > 0)
+                        await YieldToFrameworkAsync(token, tempMetaSettleMs).ConfigureAwait(false);
                     LogWineApplyPhase("Penumbra temp/meta settle");
 
                     target = await CaptureRemoteApplyTargetAsync(token).ConfigureAwait(false);
@@ -383,36 +450,35 @@ public sealed partial class PairHandler
                 }
 
                 var playerWornEquipmentOrAccessoryOnlyApply = IsPlayerWornEquipmentOrAccessoryOnlyApply(assetPlan, updatedData, previousTempMods, tempMods);
-                var playerHavokRiskAssetChanged = HasPlayerHavokRedrawRiskAssetChanged(assetPlan, previousTempMods, tempMods);
                 var redrawRequired = ShouldRedrawForApply(lifecycleRedrawRequestedFromPlan, assetPlan, previousTempMods, tempMods, previousTransientSupportFingerprint, penumbraChanged, manipulationChanged, updatedData, playerWornEquipmentOrAccessoryOnlyApply);
-                if (playerHavokRiskAssetChanged)
-                    redrawRequired = true;
-                if (suppressNonLifecycleRedraw && !lifecycleRedrawRequestedFromPlan && !playerHavokRiskAssetChanged)
+                if (suppressNonLifecycleRedraw && !lifecycleRedrawRequestedFromPlan)
                     redrawRequired = false;
+                var playerCriticalRedrawAsset = HasPlayerCriticalRedrawAsset(assetPlan, updatedData, previousTempMods, tempMods);
                 var forceLightweightMetadataReapply = forceApplyModsForThisApply || bindingReassigned;
                 var playerGlamourerApplyRequested = updatedData.TryGetValue(ObjectKind.Player, out var playerApplyChanges)
                     && playerApplyChanges.Contains(PlayerChanges.Glamourer)
                     && HasPlayerGlamourerPayload(charaData);
-                var authoritativePlayerAppearanceApply = ShouldUseAuthoritativePlayerAppearanceApply(
-                    playerGlamourerApplyRequested,
-                    lifecycleApplyRequestedFromPlan,
-                    lifecycleRedrawRequestedFromPlan,
-                    redrawRequired,
+                var authoritativePlayerAppearanceApply = ShouldUseAuthoritativePlayerAppearanceApply(playerGlamourerApplyRequested, lifecycleRedrawRequestedFromPlan, redrawRequired);
+                var glamourerApplyFlags = SelectGlamourerApplyFlags(lifecycleApplyRequestedFromPlan, lifecycleRedrawRequestedFromPlan, redrawRequired, penumbraChanged, manipulationChanged, forceApplyModsForThisApply, bindingReassigned, updatedData, playerWornEquipmentOrAccessoryOnlyApply, authoritativePlayerAppearanceApply);
+                LogVisibilityDiagnostic("APPLY appearance-decision pair={pair} app={app} penumbraChanged={penumbraChanged} manipulationChanged={manipChanged} redrawRequired={redraw} playerGlamourer={playerGlamourer} authoritativePlayer={authoritativePlayer} equipmentOnly={equipmentOnly}",
+                    Pair.UserData.AliasOrUID,
+                    applicationId,
                     penumbraChanged,
                     manipulationChanged,
-                    forceApplyModsForThisApply,
-                    bindingReassigned,
-                    downloadedAny,
-                    updateModdedPaths,
-                    playerWornEquipmentOrAccessoryOnlyApply,
-                    previousTempMods,
-                    tempMods);
-                var glamourerApplyFlags = SelectGlamourerApplyFlags(lifecycleApplyRequestedFromPlan, lifecycleRedrawRequestedFromPlan, redrawRequired, penumbraChanged, manipulationChanged, forceApplyModsForThisApply, bindingReassigned, updatedData, playerWornEquipmentOrAccessoryOnlyApply, authoritativePlayerAppearanceApply);
-                var awaitGlamourer = authoritativePlayerAppearanceApply
+                    redrawRequired,
+                    playerGlamourerApplyRequested,
+                    authoritativePlayerAppearanceApply,
+                    playerWornEquipmentOrAccessoryOnlyApply);
+                var wineLightweightRedrawGlamourerApply = IsWineRuntime
+                    && playerGlamourerApplyRequested
+                    && redrawRequired
+                    && !lifecycleRedrawRequestedFromPlan
+                    && glamourerApplyFlags != ApplyFlagEx.StateDefault;
+                var awaitGlamourer = playerGlamourerApplyRequested
+                    || authoritativePlayerAppearanceApply
                     || redrawRequired
                     || (manipulationChanged && !playerWornEquipmentOrAccessoryOnlyApply)
-                    || (penumbraChanged && glamourerApplyFlags == ApplyFlagEx.StateDefault)
-                    || (playerGlamourerApplyRequested && (penumbraChanged || downloadedAny || updateModdedPaths || forceApplyModsForThisApply || bindingReassigned));
+                    || (penumbraChanged && glamourerApplyFlags == ApplyFlagEx.StateDefault);
 
                 if (playerWornEquipmentOrAccessoryOnlyApply && manipulationChanged)
                     Logger.LogTrace("[{applicationId}] Player worn equipment/accessory-only apply has manipulation metadata; keeping it on the non-redraw equipment path for {pair}", applicationId, Pair.UserData.AliasOrUID);
@@ -434,6 +500,22 @@ public sealed partial class PairHandler
                         || _redrawOnNextApplication
                         || forceApplyModsForThisApply
                         || bindingReassigned);
+                if (waitForAuthoritativePlayerAppearanceSettle
+                    && IsWineRuntime
+                    && !lifecycleApplyRequestedFromPlan
+                    && !lifecycleRedrawRequestedFromPlan
+                    && !(redrawRequired && playerCriticalRedrawAsset))
+                {
+                    // On Wine this full draw-settle wait is the 1.5s+ spike seen in receiver
+                    // applies.  The Glamourer state is still submitted synchronously below, then
+                    // the existing guarded post-draw snap verifies the final payload once the
+                    // actor has finished drawing, so the final visual state stays unchanged.
+                    waitForAuthoritativePlayerAppearanceSettle = false;
+                    Logger.LogTrace(
+                        "[{applicationId}] Linux/Wine authoritative player appearance will finish via guarded post-draw snap for {pair}",
+                        applicationId,
+                        Pair.UserData.AliasOrUID);
+                }
                 if (waitForAuthoritativePlayerAppearanceSettle)
                 {
                     Logger.LogTrace(
@@ -442,17 +524,12 @@ public sealed partial class PairHandler
                         Pair.UserData.AliasOrUID);
                 }
 
-                var deferPlayerGlamourerUntilAfterHavokRedraw = playerHavokRiskAssetChanged
-                    && playerGlamourerApplyRequested
-                    && redrawRequired;
-                if (deferPlayerGlamourerUntilAfterHavokRedraw)
-                    Logger.LogTrace("[{applicationId}] Deferring player Glamourer state until after Havok-safe redraw for {pair}", applicationId, Pair.UserData.AliasOrUID);
-
                 var queuePostDrawPlayerSnap = applyTouchesPlayer
                     && playerGlamourerApplyRequested
-                    && !redrawRequired
+                    && (!redrawRequired || wineLightweightRedrawGlamourerApply)
                     && !waitForAuthoritativePlayerAppearanceSettle
-                    && (authoritativePlayerAppearanceApply || lifecycleApplyRequestedFromPlan || forceApplyModsForThisApply || bindingReassigned || penumbraChanged || manipulationChanged);
+                    && (authoritativePlayerAppearanceApply || wineLightweightRedrawGlamourerApply || lifecycleApplyRequestedFromPlan || forceApplyModsForThisApply || bindingReassigned || penumbraChanged || manipulationChanged);
+                var postDrawGlamourerApplyFlags = wineLightweightRedrawGlamourerApply ? ApplyFlagEx.StateDefault : glamourerApplyFlags;
                 var expectedPostDrawPayloadFingerprint = queuePostDrawPlayerSnap
                     ? PairApplyUtilities.ComputeCharacterDataPayloadFingerprint(charaData)
                     : string.Empty;
@@ -465,7 +542,15 @@ public sealed partial class PairHandler
                     if (!target.Valid)
                         return PairSyncCommitResult.ActorChanged(target.Reason, retryImmediately: false);
 
-                    await ApplyCustomizationDataAsync(
+                    LogVisibilityDiagnostic("APPLY customization start pair={pair} app={app} kind={kind} changes={changes} redraw={redraw} awaitGlamourer={awaitGlamourer} flags={flags}",
+                        Pair.UserData.AliasOrUID,
+                        applicationId,
+                        changeSet.Key,
+                        string.Join("|", changeSet.Value),
+                        redrawRequired,
+                        awaitGlamourer && changeSet.Key == ObjectKind.Player,
+                        glamourerApplyFlags);
+                    var customizationApplied = await ApplyCustomizationDataAsync(
                         applicationId,
                         changeSet,
                         charaData,
@@ -474,8 +559,16 @@ public sealed partial class PairHandler
                         awaitGlamourer && changeSet.Key == ObjectKind.Player,
                         waitForAuthoritativePlayerAppearanceSettle && changeSet.Key == ObjectKind.Player,
                         glamourerApplyFlags,
-                        deferPlayerGlamourerUntilAfterHavokRedraw,
                         token).ConfigureAwait(false);
+
+                    LogVisibilityDiagnostic("APPLY customization result pair={pair} app={app} kind={kind} applied={applied}", Pair.UserData.AliasOrUID, applicationId, changeSet.Key, customizationApplied);
+
+                    if (!customizationApplied && changeSet.Key == ObjectKind.Player)
+                    {
+                        _forceApplyMods = true;
+                        MarkInitialApplyRequired();
+                        return PairSyncCommitResult.ApplyFailed("receiver player customization/Glamourer state was not accepted", retryImmediately: true);
+                    }
                 }
 
                 LogWineApplyPhase("Customization/Glamourer IPC");
@@ -486,17 +579,14 @@ public sealed partial class PairHandler
                     if (!target.Valid)
                         return PairSyncCommitResult.ActorChanged(target.Reason, retryImmediately: false);
 
-                    var playerCriticalRedrawAsset = HasPlayerCriticalRedrawAsset(assetPlan, updatedData, previousTempMods, tempMods);
-                    var criticalRedraw = lifecycleRedrawRequestedFromPlan || playerCriticalRedrawAsset || playerHavokRiskAssetChanged;
-                    var redrawFired = await OnePassRedrawAsync(applicationId, token, criticalRedraw: criticalRedraw).ConfigureAwait(false);
-                    if (criticalRedraw && !redrawFired)
+                    LogVisibilityDiagnostic("APPLY redraw start pair={pair} app={app} critical={critical}", Pair.UserData.AliasOrUID, applicationId, lifecycleRedrawRequestedFromPlan || playerCriticalRedrawAsset);
+                    var redrawFired = await OnePassRedrawAsync(applicationId, token, criticalRedraw: lifecycleRedrawRequestedFromPlan || playerCriticalRedrawAsset).ConfigureAwait(false);
+                    LogVisibilityDiagnostic("APPLY redraw result pair={pair} app={app} fired={fired}", Pair.UserData.AliasOrUID, applicationId, redrawFired);
+                    if ((lifecycleRedrawRequestedFromPlan || playerCriticalRedrawAsset) && !redrawFired)
                     {
                         MarkInitialApplyRequired();
                         return PairSyncCommitResult.Deferred("required receiver redraw did not acknowledge", retryImmediately: true);
                     }
-
-                    if (deferPlayerGlamourerUntilAfterHavokRedraw)
-                        await ApplyDeferredPlayerGlamourerAfterHavokRedrawAsync(applicationId, charaData, glamourerApplyFlags, token).ConfigureAwait(false);
                 }
                 else if (penumbraChanged && !playerWornEquipmentOrAccessoryOnlyApply && !playerGlamourerApplyRequested && HasPlayerGlamourerPayload(charaData) && _charaHandler != null && _charaHandler.Address != nint.Zero)
                 {
@@ -511,13 +601,71 @@ public sealed partial class PairHandler
                     return PairSyncCommitResult.Succeeded();
                 }
 
+                if (applyTouchesPlayer && HasPlayerFilePayload(charaData) && _penumbraCollection != Guid.Empty && _lastAssignedObjectIndex.HasValue)
+                {
+                    var liveBinding = await _ipcManager.Penumbra.TryGetObjectEffectiveCollectionMatchAsync(
+                        Logger,
+                        _penumbraCollection,
+                        _lastAssignedObjectIndex.Value,
+                        Pair.Ident,
+                        _lastAssignedPlayerAddress,
+                        PlayerName ?? Pair.UserData.AliasOrUID).ConfigureAwait(false);
+
+                    LogVisibilityDiagnostic("APPLY commit-verify binding pair={pair} app={app} checked={checked} matches={matches} effective={effective}/{name} expected={expected}",
+                        Pair.UserData.AliasOrUID,
+                        applicationId,
+                        liveBinding.Checked,
+                        liveBinding.Matches,
+                        liveBinding.EffectiveCollectionId,
+                        liveBinding.EffectiveCollectionName,
+                        _penumbraCollection);
+                    if (!liveBinding.Checked || !liveBinding.Matches)
+                    {
+                        Logger.LogDebug(
+                            "[{applicationId}] Refusing receiver commit for {pair}: Penumbra effective collection at idx {idx} is {effective}/{name}, expected {expected}; reasserting instead of caching vanilla state",
+                            applicationId,
+                            Pair.UserData.AliasOrUID,
+                            _lastAssignedObjectIndex.Value,
+                            liveBinding.EffectiveCollectionId,
+                            liveBinding.EffectiveCollectionName,
+                            _penumbraCollection);
+                        _forceApplyMods = true;
+                        MarkInitialApplyRequired();
+                        return PairSyncCommitResult.ApplyFailed("receiver player Penumbra temp collection binding was not live at commit", retryImmediately: true);
+                    }
+
+                    if (tempMods.Count > 0)
+                    {
+                        var tempModLive = await _ipcManager.Penumbra.HasTemporaryModOnCollectionAsync(Logger, _penumbraCollection, TempFilesModName, TempFilesModPriority).ConfigureAwait(false);
+                        LogVisibilityDiagnostic("APPLY commit-verify tempmod pair={pair} app={app} collection={collection} mod={mod} live={live}", Pair.UserData.AliasOrUID, applicationId, _penumbraCollection, TempFilesModName, tempModLive);
+                        if (!tempModLive)
+                        {
+                            Logger.LogDebug(
+                                "[{applicationId}] Refusing receiver commit for {pair}: Penumbra collection {collection} is assigned but {tempModName} is not live; reasserting temp mods instead of caching vanilla state",
+                                applicationId,
+                                Pair.UserData.AliasOrUID,
+                                _penumbraCollection,
+                                TempFilesModName);
+                            _forceApplyMods = true;
+                            MarkInitialApplyRequired();
+                            return PairSyncCommitResult.ApplyFailed("receiver player Penumbra temp files mod was not live at commit", retryImmediately: true);
+                        }
+                    }
+                }
+
+                LogVisibilityDiagnostic("APPLY commit-cache pair={pair} app={app} hash={hash} payload={payload} queuePostDraw={postDraw}",
+                    Pair.UserData.AliasOrUID,
+                    applicationId,
+                    charaData.DataHash.Value,
+                    PairApplyUtilities.ComputeCharacterDataPayloadFingerprint(charaData),
+                    queuePostDrawPlayerSnap);
                 _cachedData = charaData;
 
                 if (applyTouchesPlayer)
                     _redrawOnNextApplication = false;
 
                 if (queuePostDrawPlayerSnap)
-                    QueuePostDrawPlayerAppearanceSnap(applicationId, charaData, glamourerApplyFlags, expectedPostDrawPayloadFingerprint);
+                    QueuePostDrawPlayerAppearanceSnap(applicationId, charaData, postDrawGlamourerApplyFlags, expectedPostDrawPayloadFingerprint);
                 _lifecycleRedrawApplications.TryRemove(applicationBase, out _);
                 _forceApplyMods = false;
                 _hasRetriedAfterMissingAtApply = false;
@@ -534,6 +682,13 @@ public sealed partial class PairHandler
                     Logger.LogWarning("[{applicationId}] Linux/Wine receiver apply total took {elapsed}ms for {pair}; assets={assets}, hashes={hashes}, tempMods={tempMods}, redraw={redraw}, downloadedAny={downloadedAny}, pressure={pressure}", applicationId, applyTotalSw.ElapsedMilliseconds, Pair.UserData.AliasOrUID, assetPlan.Entries.Count, assetPlan.UniqueHashes.Count, tempMods.Count, redrawRequired, downloadedAny, LinuxSmoothMode.Pressure);
                 }
 
+                LogVisibilityDiagnostic("APPLY success pair={pair} app={app} elapsedMs={elapsed} assets={assets} tempMods={tempMods} redraw={redraw}",
+                    Pair.UserData.AliasOrUID,
+                    applicationId,
+                    applyTotalSw.ElapsedMilliseconds,
+                    assetPlan.Entries.Count,
+                    tempMods.Count,
+                    redrawRequired);
                 return PairSyncCommitResult.Succeeded();
             }
             catch (OperationCanceledException)
@@ -567,6 +722,7 @@ public sealed partial class PairHandler
                     GlobalLifecycleApplySemaphore.Release();
             }
         }
+
 
         private PairSyncCommitResult? CaptureCommitBlockReason(string phase)
         {
@@ -770,39 +926,6 @@ public sealed partial class PairHandler
                 .ToList();
         }
 
-        private async Task ApplyDeferredPlayerGlamourerAfterHavokRedrawAsync(Guid applicationId, CharacterData charaData, ApplyFlag glamourerApplyFlags, CancellationToken token)
-        {
-            if (!charaData.GlamourerData.TryGetValue(ObjectKind.Player, out var glamourerPayload)
-                || string.IsNullOrWhiteSpace(glamourerPayload))
-                return;
-
-            var handler = _charaHandler;
-            if (!IsVisible || handler == null || handler.Address == nint.Zero)
-                return;
-
-            var strictAddress = ResolveStrictVisiblePlayerAddress(handler.Address);
-            if (strictAddress == nint.Zero || !IsExpectedPlayerAddress(strictAddress))
-                return;
-
-            if (handler.CurrentDrawCondition != GameObjectHandler.DrawCondition.None)
-            {
-                Logger.LogTrace("[{applicationId}] Waiting for Havok-safe redraw to settle before deferred player Glamourer state for {pair}", applicationId, Pair.UserData.AliasOrUID);
-                await _dalamudUtil.WaitWhileCharacterIsDrawing(Logger, handler, applicationId, IsWineRuntime ? 3000 : 2000, token).ConfigureAwait(false);
-            }
-
-            token.ThrowIfCancellationRequested();
-            handler = _charaHandler;
-            if (!IsVisible || handler == null || handler.Address == nint.Zero)
-                return;
-
-            strictAddress = ResolveStrictVisiblePlayerAddress(handler.Address);
-            if (strictAddress == nint.Zero || !IsExpectedPlayerAddress(strictAddress))
-                return;
-
-            Logger.LogTrace("[{applicationId}] Applying deferred player Glamourer state after Havok-safe redraw for {pair}; flags={flags}", applicationId, Pair.UserData.AliasOrUID, glamourerApplyFlags);
-            await _ipcManager.Glamourer.ApplyAllAsync(Logger, handler, glamourerPayload, applicationId, token, fireAndForget: false, flags: glamourerApplyFlags, waitForDrawSettle: false).ConfigureAwait(false);
-        }
-
         private void QueuePostDrawPlayerAppearanceSnap(Guid applicationId, CharacterData charaData, ApplyFlag glamourerApplyFlags, string expectedPayloadFingerprint)
         {
             if (!charaData.GlamourerData.TryGetValue(ObjectKind.Player, out var glamourerPayload)
@@ -845,7 +968,12 @@ public sealed partial class PairHandler
                         return;
 
                     Logger.LogTrace("[{applicationId}] Fast post-draw player appearance snap for {pair} using Glamourer flags={flags}", applicationId, Pair.UserData.AliasOrUID, glamourerApplyFlags);
-                    await _ipcManager.Glamourer.ApplyAllAsync(Logger, handler, glamourerPayload, applicationId, token, fireAndForget: false, flags: glamourerApplyFlags, waitForDrawSettle: false).ConfigureAwait(false);
+                    var applied = await _ipcManager.Glamourer.ApplyAllAsync(Logger, handler, glamourerPayload, applicationId, token, fireAndForget: false, flags: glamourerApplyFlags, waitForDrawSettle: false).ConfigureAwait(false);
+                    if (!applied)
+                    {
+                        Logger.LogTrace("[{applicationId}] Fast post-draw player appearance snap did not resolve a live Glamourer target for {pair}; marking the next visible apply as initial", applicationId, Pair.UserData.AliasOrUID);
+                        MarkInitialApplyRequired(redrawOnNextApplication: false);
+                    }
                 }
                 catch (OperationCanceledException)
                 {
@@ -881,7 +1009,12 @@ public sealed partial class PairHandler
             }
 
             if (redrawRequired || lifecycleRedrawRequested)
+            {
+                if (IsWineRuntime && redrawRequired && !lifecycleRedrawRequested)
+                    return ApplyFlag.Once | ApplyFlag.Equipment | ApplyFlag.Customization;
+
                 return ApplyFlagEx.StateDefault;
+            }
 
             if (lifecycleApplyRequested || manipulationChanged || forceApplyMods || bindingReassigned || penumbraChanged)
                 return ApplyFlag.Once | ApplyFlag.Equipment | ApplyFlag.Customization;
@@ -940,31 +1073,18 @@ public sealed partial class PairHandler
             return paths.ToList();
         }
 
-        private static bool ShouldUseAuthoritativePlayerAppearanceApply(bool playerGlamourerApplyRequested, bool lifecycleApplyRequested, bool lifecycleRedrawRequested, bool redrawRequired, bool penumbraChanged, bool manipulationChanged, bool forceApplyMods, bool bindingReassigned, bool downloadedAny, bool updateModdedPaths, bool playerWornEquipmentOrAccessoryOnlyApply, IReadOnlyDictionary<string, string>? previousTempMods, IReadOnlyDictionary<string, string> currentTempMods)
+        private static bool ShouldUseAuthoritativePlayerAppearanceApply(bool playerGlamourerApplyRequested, bool lifecycleRedrawRequested, bool redrawRequired)
         {
             if (!playerGlamourerApplyRequested || redrawRequired || lifecycleRedrawRequested)
                 return false;
 
-            // A fast Once-only Glamourer apply is perfect for simple equipment swaps, but it
-            // does not replace Glamourer's locked state. During a class/job redraw the game can
-            // briefly rebuild the actor, Glamourer can restore the previous lock, and then our
-            // post-draw snap applies the new payload. That appears as vanilla -> old outfit ->
-            // new outfit. For full player appearance transitions, update the authoritative lock
-            // immediately, but still do not wait on draw-settle in the RavaSync apply lane.
-            if (lifecycleApplyRequested || forceApplyMods || bindingReassigned || downloadedAny || updateModdedPaths)
-                return !IsAccessoryOnlyTempModDelta(previousTempMods, currentTempMods);
-
-            if (penumbraChanged || manipulationChanged)
-                return !playerWornEquipmentOrAccessoryOnlyApply && !IsAccessoryOnlyTempModDelta(previousTempMods, currentTempMods);
-
-            return false;
-        }
-
-        private static bool IsAccessoryOnlyTempModDelta(IReadOnlyDictionary<string, string>? previousTempMods, IReadOnlyDictionary<string, string> currentTempMods)
-        {
-            var changedGamePaths = GetChangedTempModGamePaths(previousTempMods, currentTempMods);
-            return changedGamePaths.Count > 0
-                && changedGamePaths.All(PairApplyUtilities.IsWornAccessoryGamePath);
+            // RavaMesh/server character data is an authoritative visible-pair snapshot.  A
+            // lightweight Once-only apply can show the right equipment briefly, but it does not
+            // replace Glamourer's locked state; the next actor rebuild or stale lock restore can
+            // put the target back into vanilla/old gear even though every file is already local.
+            // Use StateDefault for every visible player Glamourer snapshot that reaches this lane.
+            // This still avoids redraw unless the normal redraw gate requested one.
+            return true;
         }
 
         private bool ShouldRedrawForApply(bool lifecycleRedrawRequested, PairSyncAssetPlan assetPlan, IReadOnlyDictionary<string, string>? previousTempMods, IReadOnlyDictionary<string, string> currentTempMods, string? previousTransientSupportFingerprint, bool penumbraChanged, bool manipulationChanged, Dictionary<ObjectKind, HashSet<PlayerChanges>> updatedData, bool playerWornEquipmentOrAccessoryOnlyApply)
@@ -989,54 +1109,6 @@ public sealed partial class PairHandler
                 return true;
 
             return HasPlayerCriticalRedrawAssetChanged(assetPlan, previousTempMods, currentTempMods);
-        }
-
-        private static bool HasPlayerHavokRedrawRiskAsset(PairSyncAssetPlan assetPlan)
-            => assetPlan.Entries.Any(static entry => IsPlayerHavokRedrawRiskAsset(entry));
-
-        private static bool HasPlayerHavokRedrawRiskAssetChanged(PairSyncAssetPlan assetPlan, IReadOnlyDictionary<string, string>? previousTempMods, IReadOnlyDictionary<string, string> currentTempMods)
-        {
-            if (!assetPlan.HasAssets && (previousTempMods == null || previousTempMods.Count == 0) && currentTempMods.Count == 0)
-                return false;
-
-            var changedGamePaths = GetChangedTempModGamePaths(previousTempMods, currentTempMods)
-                .ToHashSet(StringComparer.OrdinalIgnoreCase);
-
-            if (assetPlan.Entries.Any(entry => IsPlayerHavokRedrawRiskAsset(entry)
-                    && (previousTempMods == null || previousTempMods.Count == 0 || changedGamePaths.Contains(NormalizeGamePath(entry.GamePath)))))
-            {
-                return true;
-            }
-
-            // Removals are not present in the current asset plan, but switching a player
-            // animation/timeline/skeleton path back to vanilla still changes the live Havok
-            // resource set and should use the same safe redraw lane.
-            return changedGamePaths.Any(IsPlayerHavokRedrawRiskGamePath);
-        }
-
-        private static bool IsPlayerHavokRedrawRiskAsset(PairSyncAssetEntry entry)
-            => entry.ObjectKind == ObjectKind.Player
-                && IsPlayerHavokRedrawRiskGamePath(entry.GamePath);
-
-        private static bool IsPlayerHavokRedrawRiskGamePath(string gamePath)
-        {
-            gamePath = NormalizeGamePath(gamePath);
-            if (string.IsNullOrWhiteSpace(gamePath) || LooksLikeOwnedObjectAssetPath(gamePath))
-                return false;
-
-            if (gamePath.EndsWith(".pap", StringComparison.OrdinalIgnoreCase)
-                || gamePath.EndsWith(".tmb", StringComparison.OrdinalIgnoreCase)
-                || gamePath.EndsWith(".tmb2", StringComparison.OrdinalIgnoreCase)
-                || gamePath.EndsWith(".sklb", StringComparison.OrdinalIgnoreCase)
-                || gamePath.EndsWith(".atch", StringComparison.OrdinalIgnoreCase)
-                || gamePath.EndsWith(".phy", StringComparison.OrdinalIgnoreCase)
-                || gamePath.EndsWith(".phyb", StringComparison.OrdinalIgnoreCase)
-                || gamePath.EndsWith(".pbd", StringComparison.OrdinalIgnoreCase))
-            {
-                return true;
-            }
-
-            return false;
         }
 
         private static bool HasPlayerCriticalRedrawAsset(PairSyncAssetPlan assetPlan, Dictionary<ObjectKind, HashSet<PlayerChanges>> updatedData, IReadOnlyDictionary<string, string>? previousTempMods, IReadOnlyDictionary<string, string> currentTempMods)

@@ -162,21 +162,37 @@ public sealed partial class PairHandler
                 if (objectKind == ObjectKind.Player || retryChanges.Count == 0)
                     return false;
 
-                if (!IsVisible || _charaHandler == null || _charaHandler.Address == nint.Zero)
-                    return false;
-
-                var playerAddress = ResolveStablePlayerAddress();
-                if (playerAddress == nint.Zero || ResolveOwnedObjectAddressForRetry(playerAddress, objectKind) == nint.Zero)
+                if (!await IsOwnedObjectRetryApplyReadyAsync(objectKind, token).ConfigureAwait(false))
                     return false;
 
                 var bound = await EnsurePenumbraCollectionBindingAsync(applicationId).ConfigureAwait(false);
                 if (!bound.Bound)
                     return false;
 
+                if (!await IsOwnedObjectRetryApplyReadyAsync(objectKind, token).ConfigureAwait(false))
+                    return false;
+
                 var lightweightOwnedObjectFlags = ApplyFlag.Once | ApplyFlag.Equipment | ApplyFlag.Customization;
                 var changeSet = new KeyValuePair<ObjectKind, HashSet<PlayerChanges>>(objectKind, retryChanges);
-                await ApplyCustomizationDataAsync(applicationId, changeSet, charaData, false, false, false, false, lightweightOwnedObjectFlags, false, token).ConfigureAwait(false);
+                await ApplyCustomizationDataAsync(applicationId, changeSet, charaData, false, false, false, false, lightweightOwnedObjectFlags, token).ConfigureAwait(false);
                 return true;
+            }
+
+            private async Task<bool> IsOwnedObjectRetryApplyReadyAsync(ObjectKind objectKind, CancellationToken token)
+            {
+                if (objectKind == ObjectKind.Player)
+                    return false;
+
+                return await _dalamudUtil.RunOnFrameworkThread(() =>
+                {
+                    token.ThrowIfCancellationRequested();
+
+                    if (!IsVisible || _charaHandler == null || _charaHandler.Address == nint.Zero)
+                        return false;
+
+                    var playerAddress = ResolveStablePlayerAddress();
+                    return playerAddress != nint.Zero && ResolveOwnedObjectAddressForRetry(playerAddress, objectKind) != nint.Zero;
+                }).ConfigureAwait(false);
             }
 
             private static bool ShouldDeferFileBackedOwnedObjectApplyUntilDrawSettled(ObjectKind objectKind)
@@ -225,9 +241,32 @@ public sealed partial class PairHandler
                 return true;
             }
 
-            public async Task<bool> ApplyCustomizationDataAsync(Guid applicationId, KeyValuePair<ObjectKind, HashSet<PlayerChanges>> changes, CharacterData charaData, bool allowPlayerRedraw, bool forceLightweightMetadataReapply, bool awaitPlayerGlamourerApply, bool waitForPlayerGlamourerDrawSettle, ApplyFlag glamourerApplyFlags, bool deferPlayerGlamourerUntilAfterRedraw, CancellationToken token)
+
+            private async Task RunOptionalPluginApplyAsync(Guid applicationId, string pluginName, ObjectKind objectKind, Func<Task> action)
             {
-                if (PlayerCharacter == nint.Zero) return false;
+                try
+                {
+                    await action().ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    Logger.LogWarning(ex, "[{applicationId}] Optional plugin {pluginName} apply failed for {pair}/{objectKind}; continuing core visibility apply", applicationId, pluginName, Pair.UserData.AliasOrUID, objectKind);
+                }
+            }
+
+            public async Task<bool> ApplyCustomizationDataAsync(Guid applicationId, KeyValuePair<ObjectKind, HashSet<PlayerChanges>> changes, CharacterData charaData, bool allowPlayerRedraw, bool forceLightweightMetadataReapply, bool awaitPlayerGlamourerApply, bool waitForPlayerGlamourerDrawSettle, ApplyFlag glamourerApplyFlags, CancellationToken token)
+            {
+                if (PlayerCharacter == nint.Zero)
+                {
+                    LogVisibilityDiagnostic("CUSTOM skip pair={pair} app={app} kind={kind} reason=no-player-character", Pair.UserData.AliasOrUID, applicationId, changes.Key);
+                    if (changes.Key == ObjectKind.Player)
+                        Logger.LogDebug("[{applicationId}] Cannot apply player customization for {pair}: receiver player actor is unavailable", applicationId, Pair.UserData.AliasOrUID);
+                    return false;
+                }
                 var ptr = PlayerCharacter;
 
                 var handler = changes.Key switch
@@ -243,12 +282,22 @@ public sealed partial class PairHandler
                 {
                     if (handler.Address == nint.Zero)
                     {
+                        LogVisibilityDiagnostic("CUSTOM skip pair={pair} app={app} kind={kind} reason=handler-address-zero", Pair.UserData.AliasOrUID, applicationId, changes.Key);
                         if (changes.Key != ObjectKind.Player)
                             QueueOwnedObjectCustomizationRetry(changes.Key);
+                        else
+                            Logger.LogDebug("[{applicationId}] Cannot apply player customization for {pair}: handler address is unavailable", applicationId, Pair.UserData.AliasOrUID);
 
                         return false;
                     }
 
+                    LogVisibilityDiagnostic("CUSTOM start pair={pair} app={app} kind={kind} handler={handler} address={address} changes={changes}",
+                        Pair.UserData.AliasOrUID,
+                        applicationId,
+                        changes.Key,
+                        handler,
+                        handler.Address,
+                        string.Join("|", changes.Value));
                     Logger.LogDebug("[{applicationId}] Applying Customization Data for {handler}", applicationId, handler);
                     var isFileBackedOwnedObjectApply = changes.Key != ObjectKind.Player
                         && (changes.Value.Contains(PlayerChanges.ModFiles) || changes.Value.Contains(PlayerChanges.ForcedRedraw));
@@ -256,6 +305,12 @@ public sealed partial class PairHandler
                     {
                         if (isFileBackedOwnedObjectApply)
                         {
+                            if (!await EnsureOwnedObjectPenumbraCollectionBindingAsync(applicationId, handler, changes.Key).ConfigureAwait(false))
+                            {
+                                QueueOwnedObjectCustomizationRetry(changes.Key);
+                                return false;
+                            }
+
                             if (!await IsOwnedObjectReadyForFileBackedApplyAsync(applicationId, handler, changes.Key, token).ConfigureAwait(false))
                             {
                                 QueueOwnedObjectCustomizationRetry(changes.Key);
@@ -279,43 +334,51 @@ public sealed partial class PairHandler
 
                     foreach (var change in changes.Value.OrderBy(p => (int)p))
                     {
+                        LogVisibilityDiagnostic("CUSTOM step pair={pair} app={app} kind={kind} change={change} handler={handler} address={address}", Pair.UserData.AliasOrUID, applicationId, changes.Key, change, handler, handler.Address);
                         Logger.LogDebug("[{applicationId}] Processing {change} for {handler}", applicationId, change, handler);
 
                         switch (change)
                         {
                             case PlayerChanges.Customize:
-                                if (!Pair.IsCustomizePlusEnabled)
+                                await RunOptionalPluginApplyAsync(applicationId, "Customize+", changes.Key, async () =>
                                 {
-                                    if (_customizeIds.TryGetValue(changes.Key, out var appliedId) && appliedId.HasValue)
+                                    if (!Pair.IsCustomizePlusEnabled)
                                     {
-                                        await _ipcManager.CustomizePlus.RevertByIdAsync(appliedId.Value).ConfigureAwait(false);
+                                        LogVisibilityDiagnostic("CUSTOM Customize+ skip pair={pair} app={app} kind={kind} reason=disabled-by-pair", Pair.UserData.AliasOrUID, applicationId, changes.Key);
+                                        if (_customizeIds.TryGetValue(changes.Key, out var appliedId) && appliedId.HasValue)
+                                        {
+                                            await _ipcManager.CustomizePlus.RevertByIdAsync(appliedId.Value).ConfigureAwait(false);
+                                            _customizeIds.Remove(changes.Key);
+                                        }
+                                        return;
+                                    }
+
+                                    if (charaData.CustomizePlusData.TryGetValue(changes.Key, out var customizePlusData))
+                                    {
+                                        LogVisibilityDiagnostic("CUSTOM Customize+ apply pair={pair} app={app} kind={kind} payloadLength={length}", Pair.UserData.AliasOrUID, applicationId, changes.Key, customizePlusData?.Length ?? 0);
+                                        _customizeIds[changes.Key] = await _ipcManager.CustomizePlus
+                                            .SetBodyScaleAsync(handler.Address, customizePlusData)
+                                            .ConfigureAwait(false);
+                                        LogVisibilityDiagnostic("CUSTOM Customize+ applied pair={pair} app={app} kind={kind} tempId={id}", Pair.UserData.AliasOrUID, applicationId, changes.Key, _customizeIds[changes.Key]);
+                                    }
+                                    else if (_customizeIds.TryGetValue(changes.Key, out var customizeId) && customizeId.HasValue)
+                                    {
+                                        LogVisibilityDiagnostic("CUSTOM Customize+ revert pair={pair} app={app} kind={kind} tempId={id}", Pair.UserData.AliasOrUID, applicationId, changes.Key, customizeId.Value);
+                                        await _ipcManager.CustomizePlus.RevertByIdAsync(customizeId.Value).ConfigureAwait(false);
                                         _customizeIds.Remove(changes.Key);
                                     }
-                                    break;
-                                }
-
-                                if (charaData.CustomizePlusData.TryGetValue(changes.Key, out var customizePlusData))
-                                {
-                                    _customizeIds[changes.Key] = await _ipcManager.CustomizePlus
-                                        .SetBodyScaleAsync(handler.Address, customizePlusData)
-                                        .ConfigureAwait(false);
-                                }
-                                else if (_customizeIds.TryGetValue(changes.Key, out var customizeId) && customizeId.HasValue)
-                                {
-                                    await _ipcManager.CustomizePlus.RevertByIdAsync(customizeId.Value).ConfigureAwait(false);
-                                    _customizeIds.Remove(changes.Key);
-                                }
+                                }).ConfigureAwait(false);
                                 break;
 
                             case PlayerChanges.Heels:
-                                await _ipcManager.Heels.SetOffsetForPlayerAsync(handler.Address, charaData.HeelsData).ConfigureAwait(false);
+                                await RunOptionalPluginApplyAsync(applicationId, "SimpleHeels", changes.Key, () => _ipcManager.Heels.SetOffsetForPlayerAsync(handler.Address, charaData.HeelsData)).ConfigureAwait(false);
                                 break;
 
                             case PlayerChanges.Honorific:
                                 if (forceLightweightMetadataReapply || ShouldApplyLightweightMetadata(_lastAppliedHonorificData, changes.Key, charaData.HonorificData))
                                 {
                                     deferredMetadataTasks ??= [];
-                                    deferredMetadataTasks.Add(_ipcManager.Honorific.SetTitleAsync(handler.Address, charaData.HonorificData));
+                                    deferredMetadataTasks.Add(RunOptionalPluginApplyAsync(applicationId, "Honorific", changes.Key, () => _ipcManager.Honorific.SetTitleAsync(handler.Address, charaData.HonorificData)));
 
                                     if (forceLightweightMetadataReapply)
                                     {
@@ -327,18 +390,42 @@ public sealed partial class PairHandler
                                 break;
 
                             case PlayerChanges.Glamourer:
-                                if (deferPlayerGlamourerUntilAfterRedraw && changes.Key == ObjectKind.Player)
-                                {
-                                    Logger.LogTrace("[{applicationId}] Skipping pre-redraw player Glamourer apply for Havok-safe redraw lane", applicationId);
-                                    break;
-                                }
-
                                 if (charaData.GlamourerData.TryGetValue(changes.Key, out var glamourerData))
                                 {
+                                    LogVisibilityDiagnostic("CUSTOM Glamourer apply-start pair={pair} app={app} kind={kind} payloadLength={length} flags={flags} await={await} waitDraw={waitDraw}",
+                                        Pair.UserData.AliasOrUID,
+                                        applicationId,
+                                        changes.Key,
+                                        glamourerData?.Length ?? 0,
+                                        glamourerApplyFlags,
+                                        awaitPlayerGlamourerApply && changes.Key == ObjectKind.Player,
+                                        waitForPlayerGlamourerDrawSettle);
                                     var waitForThisGlamourerApply = awaitPlayerGlamourerApply && changes.Key == ObjectKind.Player;
-                                    await _ipcManager.Glamourer.ApplyAllAsync(Logger, handler, glamourerData, applicationId, token, fireAndForget: !waitForThisGlamourerApply, flags: glamourerApplyFlags, waitForDrawSettle: waitForThisGlamourerApply && waitForPlayerGlamourerDrawSettle).ConfigureAwait(false);
-                                    if (IsWineRuntime && changes.Key == ObjectKind.Player)
-                                        await Task.Delay(120, token).ConfigureAwait(false);
+                                    var glamourerApplied = await _ipcManager.Glamourer.ApplyAllAsync(Logger, handler, glamourerData, applicationId, token, fireAndForget: !waitForThisGlamourerApply, flags: glamourerApplyFlags, waitForDrawSettle: waitForThisGlamourerApply && waitForPlayerGlamourerDrawSettle).ConfigureAwait(false);
+                                    LogVisibilityDiagnostic("CUSTOM Glamourer apply-result pair={pair} app={app} kind={kind} applied={applied} fireAndForget={fireAndForget}",
+                                        Pair.UserData.AliasOrUID,
+                                        applicationId,
+                                        changes.Key,
+                                        glamourerApplied,
+                                        !waitForThisGlamourerApply);
+                                    if (!glamourerApplied)
+                                    {
+                                        if (changes.Key == ObjectKind.Player && waitForThisGlamourerApply)
+                                            throw new InvalidOperationException($"Glamourer did not accept/apply the receiver player state for {Pair.UserData.AliasOrUID}");
+
+                                        if (changes.Key != ObjectKind.Player)
+                                        {
+                                            QueueOwnedObjectCustomizationRetry(changes.Key);
+                                            return false;
+                                        }
+                                    }
+
+                                    if (IsWineRuntime && changes.Key == ObjectKind.Player && waitForThisGlamourerApply)
+                                        await Task.Delay(waitForPlayerGlamourerDrawSettle ? 120 : 25, token).ConfigureAwait(false);
+                                }
+                                else
+                                {
+                                    LogVisibilityDiagnostic("CUSTOM Glamourer skip pair={pair} app={app} kind={kind} reason=no-payload", Pair.UserData.AliasOrUID, applicationId, changes.Key);
                                 }
                                 break;
 
@@ -346,9 +433,9 @@ public sealed partial class PairHandler
                                 if (forceLightweightMetadataReapply || ShouldApplyLightweightMetadata(_lastAppliedMoodlesData, changes.Key, charaData.MoodlesData))
                                 {
                                     deferredMetadataTasks ??= [];
-                                    deferredMetadataTasks.Add(string.IsNullOrEmpty(charaData.MoodlesData)
+                                    deferredMetadataTasks.Add(RunOptionalPluginApplyAsync(applicationId, "Moodles", changes.Key, () => string.IsNullOrEmpty(charaData.MoodlesData)
                                         ? _ipcManager.Moodles.RevertStatusAsync(handler.Address)
-                                        : _ipcManager.Moodles.SetStatusAsync(handler.Address, charaData.MoodlesData));
+                                        : _ipcManager.Moodles.SetStatusAsync(handler.Address, charaData.MoodlesData)));
 
                                     if (forceLightweightMetadataReapply)
                                     {
@@ -363,7 +450,7 @@ public sealed partial class PairHandler
                                 if (forceLightweightMetadataReapply || ShouldApplyLightweightMetadata(_lastAppliedPetNamesData, changes.Key, charaData.PetNamesData))
                                 {
                                     deferredMetadataTasks ??= [];
-                                    deferredMetadataTasks.Add(_ipcManager.PetNames.SetPlayerData(handler.Address, charaData.PetNamesData));
+                                    deferredMetadataTasks.Add(RunOptionalPluginApplyAsync(applicationId, "PetNames", changes.Key, () => _ipcManager.PetNames.SetPlayerData(handler.Address, charaData.PetNamesData)));
 
                                     if (forceLightweightMetadataReapply)
                                     {
@@ -401,22 +488,38 @@ public sealed partial class PairHandler
 
                     if (needsRedraw)
                     {
+                        LogVisibilityDiagnostic("CUSTOM redraw-needed pair={pair} app={app} kind={kind} allowPlayerRedraw={allowPlayerRedraw} fileBackedOwned={fileBacked}", Pair.UserData.AliasOrUID, applicationId, changes.Key, allowPlayerRedraw, isFileBackedOwnedObjectApply);
                         if (changes.Key == ObjectKind.Player)
+                        {
+                            LogVisibilityDiagnostic("CUSTOM complete pair={pair} app={app} kind={kind} result=success redrawDeferredToMainApply=true", Pair.UserData.AliasOrUID, applicationId, changes.Key);
                             return true;
+                        }
 
                         if (isFileBackedOwnedObjectApply)
                         {
+                            LogVisibilityDiagnostic("CUSTOM redraw-direct start pair={pair} app={app} kind={kind}", Pair.UserData.AliasOrUID, applicationId, changes.Key);
                             var directFired = await _ipcManager.Penumbra.RedrawDirectAndWaitAsync(Logger, handler, applicationId, token).ConfigureAwait(false);
+                            LogVisibilityDiagnostic("CUSTOM redraw-direct result pair={pair} app={app} kind={kind} directFired={directFired}", Pair.UserData.AliasOrUID, applicationId, changes.Key, directFired);
                             if (!directFired)
+                            {
+                                LogVisibilityDiagnostic("CUSTOM redraw-fallback start pair={pair} app={app} kind={kind}", Pair.UserData.AliasOrUID, applicationId, changes.Key);
                                 await _ipcManager.Penumbra.RedrawAsync(Logger, handler, applicationId, token).ConfigureAwait(false);
+                            }
                         }
                         else
                         {
+                            LogVisibilityDiagnostic("CUSTOM redraw start pair={pair} app={app} kind={kind}", Pair.UserData.AliasOrUID, applicationId, changes.Key);
                             await _ipcManager.Penumbra.RedrawAsync(Logger, handler, applicationId, token).ConfigureAwait(false);
                         }
                     }
 
-                    return false;
+                    LogVisibilityDiagnostic("CUSTOM complete pair={pair} app={app} kind={kind} result=success needsRedraw={needsRedraw}", Pair.UserData.AliasOrUID, applicationId, changes.Key, needsRedraw);
+                    return true;
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    LogVisibilityDiagnostic("CUSTOM exception pair={pair} app={app} kind={kind} type={type} message={message}", Pair.UserData.AliasOrUID, applicationId, changes.Key, ex.GetType().Name, ex.Message);
+                    throw;
                 }
                 finally
                 {

@@ -107,11 +107,19 @@ public static class VariousExtensions
                             .OrderBy(g => string.IsNullOrEmpty(g.Hash) ? g.FileSwapPath : g.Hash, StringComparer.OrdinalIgnoreCase).ToList();
                         var existingTail = existingFileReplacements.Where(g => g.GamePaths.Any(p => p.Contains("/tail/", StringComparison.OrdinalIgnoreCase)))
                             .OrderBy(g => string.IsNullOrEmpty(g.Hash) ? g.FileSwapPath : g.Hash, StringComparer.OrdinalIgnoreCase).ToList();
+                        var existingEars = existingFileReplacements.Where(g => g.GamePaths.Any(IsPlayerEarReplacementPath))
+                            .OrderBy(g => string.IsNullOrEmpty(g.Hash) ? g.FileSwapPath : g.Hash, StringComparer.OrdinalIgnoreCase).ToList();
+                        var existingBody = existingFileReplacements.Where(g => g.GamePaths.Any(IsPlayerBodyReplacementPath))
+                            .OrderBy(g => string.IsNullOrEmpty(g.Hash) ? g.FileSwapPath : g.Hash, StringComparer.OrdinalIgnoreCase).ToList();
                         var newFace = newFileReplacements.Where(g => g.GamePaths.Any(p => p.Contains("/face/", StringComparison.OrdinalIgnoreCase)))
                             .OrderBy(g => string.IsNullOrEmpty(g.Hash) ? g.FileSwapPath : g.Hash, StringComparer.OrdinalIgnoreCase).ToList();
                         var newHair = newFileReplacements.Where(g => g.GamePaths.Any(p => p.Contains("/hair/", StringComparison.OrdinalIgnoreCase)))
                             .OrderBy(g => string.IsNullOrEmpty(g.Hash) ? g.FileSwapPath : g.Hash, StringComparer.OrdinalIgnoreCase).ToList();
                         var newTail = newFileReplacements.Where(g => g.GamePaths.Any(p => p.Contains("/tail/", StringComparison.OrdinalIgnoreCase)))
+                            .OrderBy(g => string.IsNullOrEmpty(g.Hash) ? g.FileSwapPath : g.Hash, StringComparer.OrdinalIgnoreCase).ToList();
+                        var newEars = newFileReplacements.Where(g => g.GamePaths.Any(IsPlayerEarReplacementPath))
+                            .OrderBy(g => string.IsNullOrEmpty(g.Hash) ? g.FileSwapPath : g.Hash, StringComparer.OrdinalIgnoreCase).ToList();
+                        var newBody = newFileReplacements.Where(g => g.GamePaths.Any(IsPlayerBodyReplacementPath))
                             .OrderBy(g => string.IsNullOrEmpty(g.Hash) ? g.FileSwapPath : g.Hash, StringComparer.OrdinalIgnoreCase).ToList();
                         var existingTransients = existingFileReplacements.Where(g => g.GamePaths.Any(IsPlayerAssociatedTransientOrSupportPath))
                             .OrderBy(g => string.IsNullOrEmpty(g.Hash) ? g.FileSwapPath : g.Hash, StringComparer.OrdinalIgnoreCase).ToList();
@@ -120,18 +128,21 @@ public static class VariousExtensions
                         var existingWornEquipment = SelectPlayerWornEquipmentOrAccessoryReplacements(existingFileReplacements);
                         var newWornEquipment = SelectPlayerWornEquipmentOrAccessoryReplacements(newFileReplacements);
 
-                        logger.LogTrace("[BASE-{appbase}] ExistingFace: {of}, NewFace: {fc}; ExistingHair: {eh}, NewHair: {nh}; ExistingTail: {et}, NewTail: {nt}; ExistingTransient: {etr}, NewTransient: {ntr}; ExistingWornGear: {ewg}, NewWornGear: {nwg}", applicationBase,
-                            existingFace.Count, newFace.Count, existingHair.Count, newHair.Count, existingTail.Count, newTail.Count, existingTransients.Count, newTransients.Count, existingWornEquipment.Count, newWornEquipment.Count);
+                        logger.LogTrace("[BASE-{appbase}] ExistingFace: {of}, NewFace: {fc}; ExistingHair: {eh}, NewHair: {nh}; ExistingTail: {et}, NewTail: {nt}; ExistingEars: {ee}, NewEars: {ne}; ExistingBody: {eb}, NewBody: {nb}; ExistingTransient: {etr}, NewTransient: {ntr}; ExistingWornGear: {ewg}, NewWornGear: {nwg}", applicationBase,
+                            existingFace.Count, newFace.Count, existingHair.Count, newHair.Count, existingTail.Count, newTail.Count, existingEars.Count, newEars.Count, existingBody.Count, newBody.Count, existingTransients.Count, newTransients.Count, existingWornEquipment.Count, newWornEquipment.Count);
                         var differentFace = !existingFace.SequenceEqual(newFace, PlayerData.Data.FileReplacementDataComparer.Instance);
                         var differentHair = !existingHair.SequenceEqual(newHair, PlayerData.Data.FileReplacementDataComparer.Instance);
                         var differentTail = !existingTail.SequenceEqual(newTail, PlayerData.Data.FileReplacementDataComparer.Instance);
+                        var differentEars = !existingEars.SequenceEqual(newEars, PlayerData.Data.FileReplacementDataComparer.Instance);
+                        var differentBody = !existingBody.SequenceEqual(newBody, PlayerData.Data.FileReplacementDataComparer.Instance);
                         var differentTransients = !existingTransients.SequenceEqual(newTransients, PlayerData.Data.FileReplacementDataComparer.Instance);
                         var differentWornEquipment = !existingWornEquipment.SequenceEqual(newWornEquipment, PlayerData.Data.FileReplacementDataComparer.Instance);
 
                         if (differentWornEquipment)
                         {
-                            logger.LogDebug("[BASE-{appbase}] Different worn equipment/accessory paths; applying receiver temp mod update without requesting a player redraw", applicationBase);
+                            logger.LogDebug("[BASE-{appbase}] Different worn equipment/accessory paths; applying receiver temp mod update plus Glamourer equipment refresh without requesting a player redraw", applicationBase);
                             charaDataToUpdate[objectKind].Add(PlayerChanges.ModFiles);
+                            charaDataToUpdate[objectKind].Add(PlayerChanges.Glamourer);
                         }
 
                         if (differentTransients)
@@ -141,9 +152,9 @@ public static class VariousExtensions
                             charaDataToUpdate[objectKind].Add(PlayerChanges.ModFiles);
                         }
 
-                        if (differentFace || differentHair || differentTail)
+                        if (differentFace || differentHair || differentTail || differentEars || differentBody)
                         {
-                            // Apply Glamourer and re-evaluate mod files so race swaps pull in the right textures.
+                            // Apply Glamourer and re-evaluate mod files so race/body/ear/tail swaps pull in the right textures.
                             charaDataToUpdate[objectKind].Add(PlayerChanges.Glamourer);
                             charaDataToUpdate[objectKind].Add(PlayerChanges.ModFiles);
                         }
@@ -199,6 +210,13 @@ public static class VariousExtensions
             {
                 logger.LogDebug("[BASE-{appBase}] Updating {object}/{kind} (Manip data changed={changed}, forced={forced}) => {change}", applicationBase, cachedPlayer, objectKind, manipDataDifferent, forceApplyMods, PlayerChanges.ModManip);
                 charaDataToUpdate[objectKind].Add(PlayerChanges.ModManip);
+
+                if (newData.GlamourerData.TryGetValue(ObjectKind.Player, out var playerGlamourerPayload)
+                    && !string.IsNullOrWhiteSpace(playerGlamourerPayload))
+                {
+                    logger.LogDebug("[BASE-{appBase}] Updating {object}/{kind} (Player manipulation changed; pairing with Glamourer apply so outfit toggles visually settle) => {change}", applicationBase, cachedPlayer, objectKind, PlayerChanges.Glamourer);
+                    charaDataToUpdate[objectKind].Add(PlayerChanges.Glamourer);
+                }
 
                 if (manipDataDifferent)
                     charaDataToUpdate[objectKind].Add(PlayerChanges.ForcedRedraw);
@@ -257,6 +275,21 @@ public static class VariousExtensions
 
     private static bool IsPlayerWornEquipmentOrAccessoryGamePath(string gamePath)
         => PairApplyUtilities.IsWornEquipmentOrAccessoryGamePath(gamePath);
+
+    private static bool IsPlayerEarReplacementPath(string gamePath)
+    {
+        gamePath = PairApplyUtilities.NormalizeGamePath(gamePath);
+        return gamePath.Contains("/ear/", StringComparison.OrdinalIgnoreCase)
+            || gamePath.Contains("/ears/", StringComparison.OrdinalIgnoreCase)
+            || gamePath.Contains("/zear/", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsPlayerBodyReplacementPath(string gamePath)
+    {
+        gamePath = PairApplyUtilities.NormalizeGamePath(gamePath);
+        return gamePath.Contains("/body/", StringComparison.OrdinalIgnoreCase)
+            || gamePath.Contains("/skin/", StringComparison.OrdinalIgnoreCase);
+    }
 
     private static bool IsPlayerAssociatedTransientOrSupportPath(string gamePath)
         => PairApplyUtilities.IsTransientRedrawCriticalGamePath(gamePath)

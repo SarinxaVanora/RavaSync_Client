@@ -110,11 +110,42 @@ public static partial class CharacterDataPushSanitizer
         => string.IsNullOrEmpty(hash) || ServerHashRegex().IsMatch(hash);
 
     public static string[] GetServerAcceptedGamePaths(IEnumerable<string>? gamePaths)
-        => (gamePaths ?? Array.Empty<string>())
+        => GetServerAcceptedModdedGamePaths(gamePaths, resolvedPath: null);
+
+    public static string[] GetServerAcceptedModdedGamePaths(IEnumerable<string>? gamePaths, string? resolvedPath)
+    {
+        var normalizedResolvedPath = NormalizeGamePathForPush(resolvedPath);
+        var resolvedPathLooksLikeGamePath = !string.IsNullOrWhiteSpace(normalizedResolvedPath)
+            && IsServerAcceptedFileSwapPath(normalizedResolvedPath);
+
+        if (resolvedPathLooksLikeGamePath && IsUiOrInterfaceGamePath(normalizedResolvedPath))
+            return [];
+
+        return (gamePaths ?? Array.Empty<string>())
             .Select(NormalizeGamePathForPush)
             .Where(IsServerAcceptedGamePath)
+            .Where(path => !resolvedPathLooksLikeGamePath || !string.Equals(path, normalizedResolvedPath, StringComparison.OrdinalIgnoreCase))
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToArray();
+    }
+
+    public static bool IsUiOrInterfaceGamePath(string? gamePath)
+    {
+        var normalized = NormalizeGamePathForPush(gamePath);
+        if (string.IsNullOrWhiteSpace(normalized))
+            return false;
+
+        // Penumbra can expose UI/icon resources through the same resolved-path APIs as real
+        // character files. RavaSync should never advertise HUD/interface files as syncable
+        // character state; those paths cannot be applied meaningfully to another actor and can
+        // leave hashes in the upload/share barrier that are not part of the real appearance.
+        return normalized.StartsWith("ui/", StringComparison.OrdinalIgnoreCase)
+            || normalized.StartsWith("addon/", StringComparison.OrdinalIgnoreCase)
+            || normalized.StartsWith("font/", StringComparison.OrdinalIgnoreCase)
+            || normalized.Contains("/ui/", StringComparison.OrdinalIgnoreCase)
+            || normalized.Contains("/addon/", StringComparison.OrdinalIgnoreCase)
+            || normalized.Contains("/font/", StringComparison.OrdinalIgnoreCase);
+    }
 
     public static string NormalizeGamePathForPush(string? value)
     {
@@ -166,7 +197,7 @@ public static partial class CharacterDataPushSanitizer
             return false;
 
         replacement.FileSwapPath = fileSwapPath;
-        gamePaths = GetServerAcceptedGamePaths(replacement.GamePaths);
+        gamePaths = GetServerAcceptedModdedGamePaths(replacement.GamePaths, fileSwapPath);
         return gamePaths.Length > 0;
     }
 
@@ -174,6 +205,9 @@ public static partial class CharacterDataPushSanitizer
     {
         var normalized = NormalizeGamePathForPush(gamePath);
         if (string.IsNullOrWhiteSpace(normalized) || !ServerGamePathRegex().IsMatch(normalized))
+            return false;
+
+        if (IsUiOrInterfaceGamePath(normalized))
             return false;
 
         return !requireKnownTransferExtension

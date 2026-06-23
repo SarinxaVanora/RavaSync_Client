@@ -13,7 +13,7 @@ public sealed partial class PairHandler
 {
     private ApplyFrameworkSnapshot CaptureApplyFrameworkSnapshot()
     {
-        var cachedData = _cachedData ?? new CharacterData();
+        var cachedData = _cachedData is CharacterData cachedSnapshotData ? cachedSnapshotData : new CharacterData();
         var cachedHash = _cachedData?.DataHash.Value ?? "NODATA";
         var cachedPayloadFingerprint = PairApplyUtilities.ComputeCharacterDataPayloadFingerprint(_cachedData);
         var resolvedPlayerAddress = ResolveStablePlayerAddress();
@@ -26,19 +26,30 @@ public sealed partial class PairHandler
         var newHash = characterData.DataHash.Value;
         var oldHash = snapshot.CachedHash;
         var newPayloadFingerprint = PairApplyUtilities.ComputeCharacterDataPayloadFingerprint(characterData);
-        var updatedData = characterData.CheckUpdatedData(applicationBase, snapshot.CachedData, Logger, this, forceApplyCustomization, snapshot.ForceApplyMods);
+        var forceCoreApply = forceApplyCustomization || snapshot.ForceApplyMods;
+        var updatedData = characterData.CheckUpdatedData(applicationBase, snapshot.CachedData, Logger, this, forceApplyCustomization, forceCoreApply);
 
-        PruneUnchangedForcedManipulationReapply(applicationBase, characterData, updatedData, snapshot.ForceApplyMods);
+        var preserveForcedManipulationReassert = snapshot.ForceApplyMods && HasAuthoritativePlayerAppearancePayload(characterData);
+        PruneUnchangedForcedManipulationReapply(applicationBase, characterData, updatedData, forceCoreApply, preserveForcedManipulationReassert);
 
         var hasDiffMods = updatedData.Any(p => p.Value.Contains(PlayerChanges.ModManip) || p.Value.Contains(PlayerChanges.ModFiles));
 
         return new ApplyPreparation(newHash, oldHash, string.Equals(newHash, oldHash, StringComparison.Ordinal), string.Equals(newPayloadFingerprint, snapshot.CachedPayloadFingerprint, StringComparison.Ordinal), hasDiffMods, updatedData);
     }
 
-    private void PruneUnchangedForcedManipulationReapply(Guid applicationBase, CharacterData characterData, Dictionary<ObjectKind, HashSet<PlayerChanges>> updatedData, bool forceApplyMods)
+    private void PruneUnchangedForcedManipulationReapply(Guid applicationBase, CharacterData characterData, Dictionary<ObjectKind, HashSet<PlayerChanges>> updatedData, bool forceApplyMods, bool preserveForcedManipulationReassert)
     {
         if (!forceApplyMods)
             return;
+
+        if (preserveForcedManipulationReassert)
+        {
+            Logger.LogTrace(
+                "[BASE-{appBase}] Keeping forced ModManip reassert for {pair}; visible authoritative reassert must refresh live Penumbra manipulation metadata even when the payload fingerprint is unchanged",
+                applicationBase,
+                Pair.UserData.AliasOrUID);
+            return;
+        }
 
         if (!updatedData.TryGetValue(ObjectKind.Player, out var playerChanges))
             return;

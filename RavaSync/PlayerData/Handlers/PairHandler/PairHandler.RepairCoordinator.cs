@@ -60,6 +60,9 @@ public sealed partial class PairHandler
                                 if (FileDownloadManager.HasSessionDownloadFailedHash(hash))
                                     continue;
 
+                                if (FileDownloadManager.TryGetSessionKnownPresentHash(hash))
+                                    continue;
+
                                 if (!seenHashes.Add(hash))
                                     continue;
 
@@ -94,6 +97,8 @@ public sealed partial class PairHandler
 
                                         return true;
                                     }
+
+                                    FileDownloadManager.RegisterSessionKnownPresentHash(hash);
                                 }
                                 catch (IOException)
                                 {

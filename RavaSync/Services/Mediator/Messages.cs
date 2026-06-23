@@ -134,6 +134,7 @@ public record ContextMenuPairRequestMessage(string TargetIdent, string charName)
 public record DirectPairRequestMessage(string TargetIdent, string TargetName) : MessageBase;
 public record SyncshellGameMeshMessage(string LocalSessionId, string FromSessionId, byte[] Payload) : MessageBase;
 public record RemoteMissingFileMessage(string TargetUid, string TargetIdent, string DataHash, IReadOnlyCollection<string> Hashes, string Reason) : MessageBase;
+public record MissingFileRepairCompletedMessage(string SenderUid, string DataHash, IReadOnlyCollection<string> Hashes, IReadOnlyCollection<string> FailedHashes, string Reason) : MessageBase;
 public record LocalOtherSyncYieldStateChangedMessage(string AffectedUid, bool YieldToOtherSync, string Owner) : MessageBase;
 public record OtherSyncCurrentStateChangedMessage(string Reason) : MessageBase;
 public record PrimeTransientPathsMessage(IntPtr Address, ObjectKind Kind, IReadOnlyCollection<string> GamePaths) : SameThreadMessage;

@@ -1161,69 +1161,74 @@ public sealed partial class CharaDataManager : DisposableMediatorSubscriberBase
             if (reverted)
                 await Task.Delay(TimeSpan.FromSeconds(3), token).ConfigureAwait(false);
 
-            Logger.LogTrace("[{appId}] Applying data in Penumbra", applicationId);
+            var needsRedraw = false;
 
-            DataApplicationProgress = "Applying Penumbra information";
-            penumbraCollection = await _ipcManager.Penumbra
-                .CreateTemporaryCollectionAsync(Logger, metaInfo.Uploader.UID + metaInfo.Id)
-                .ConfigureAwait(false);
+            if (isSelf)
+            {
+                Logger.LogInformation("[{appId}] Applying CharaData to local player without Penumbra temporary collection/temp mods; local sender state must only use the player's real local collection", applicationId);
+                DataApplicationProgress = "Applying local player data";
+            }
+            else
+            {
+                Logger.LogTrace("[{appId}] Applying data in Penumbra", applicationId);
 
-            var (idx, expectedAddress) = await _dalamudUtilService
-                .RunOnFrameworkThread(() =>
-                {
-                    var obj = tempHandler.GetGameObject();
-                    return (obj?.ObjectIndex ?? -1, obj?.Address ?? nint.Zero);
-                })
-                .ConfigureAwait(false);
+                DataApplicationProgress = "Applying Penumbra information";
+                penumbraCollection = await _ipcManager.Penumbra
+                    .CreateTemporaryCollectionAsync(Logger, metaInfo.Uploader.UID + metaInfo.Id)
+                    .ConfigureAwait(false);
 
-            if (idx < 0 || expectedAddress == nint.Zero)
-                throw new InvalidOperationException($"Unable to resolve target actor for chara data application {metaInfo.Id}");
+                var (idx, expectedAddress) = await _dalamudUtilService
+                    .RunOnFrameworkThread(() =>
+                    {
+                        var obj = tempHandler.GetGameObject();
+                        return (obj?.ObjectIndex ?? -1, obj?.Address ?? nint.Zero);
+                    })
+                    .ConfigureAwait(false);
 
-            var assigned = isSelf
-                ? await _ipcManager.Penumbra
-                    .AssignTemporaryCollectionAsync(Logger, penumbraCollection, idx)
-                    .ConfigureAwait(false)
-                : await _ipcManager.Penumbra
+                if (idx < 0 || expectedAddress == nint.Zero)
+                    throw new InvalidOperationException($"Unable to resolve target actor for chara data application {metaInfo.Id}");
+
+                var assigned = await _ipcManager.Penumbra
                     .AssignTemporaryCollectionToVerifiedCharacterAsync(Logger, penumbraCollection, idx, string.Empty, expectedAddress, tempHandler.Name)
                     .ConfigureAwait(false);
 
-            if (!assigned)
-                throw new InvalidOperationException($"Penumbra refused to assign temporary collection for chara data application {metaInfo.Id}");
+                if (!assigned)
+                    throw new InvalidOperationException($"Penumbra refused to assign temporary collection for chara data application {metaInfo.Id}");
 
-            await _ipcManager.Penumbra
-                .SetTemporaryModsAsync(Logger, applicationId, penumbraCollection, modPaths)
-                .ConfigureAwait(false);
+                await _ipcManager.Penumbra
+                    .SetTemporaryModsAsync(Logger, applicationId, penumbraCollection, modPaths)
+                    .ConfigureAwait(false);
 
-            await _ipcManager.Penumbra
-                .SetManipulationDataAsync(Logger, applicationId, penumbraCollection, manipData ?? string.Empty)
-                .ConfigureAwait(false);
+                await _ipcManager.Penumbra
+                    .SetManipulationDataAsync(Logger, applicationId, penumbraCollection, manipData ?? string.Empty)
+                    .ConfigureAwait(false);
 
-            var needsRedraw = !string.IsNullOrEmpty(manipData);
+                needsRedraw = !string.IsNullOrEmpty(manipData);
 
-            if (!needsRedraw)
-            {
-                foreach (var gp in modPaths.Keys)
+                if (!needsRedraw)
                 {
-                    var ext = System.IO.Path.GetExtension(gp);
-                    if (string.IsNullOrEmpty(ext)) continue;
-
-                    if (ext.Equals(".tmb", StringComparison.OrdinalIgnoreCase)
-                        || ext.Equals(".pap", StringComparison.OrdinalIgnoreCase)
-                        || ext.Equals(".avfx", StringComparison.OrdinalIgnoreCase)
-                        || ext.Equals(".atex", StringComparison.OrdinalIgnoreCase)
-                        || ext.Equals(".sklb", StringComparison.OrdinalIgnoreCase)
-                        || ext.Equals(".eid", StringComparison.OrdinalIgnoreCase)
-                        || ext.Equals(".phyb", StringComparison.OrdinalIgnoreCase)
-                        || ext.Equals(".scd", StringComparison.OrdinalIgnoreCase)
-                        || ext.Equals(".skp", StringComparison.OrdinalIgnoreCase)
-                        || ext.Equals(".shpk", StringComparison.OrdinalIgnoreCase))
+                    foreach (var gp in modPaths.Keys)
                     {
-                        needsRedraw = true;
-                        break;
+                        var ext = System.IO.Path.GetExtension(gp);
+                        if (string.IsNullOrEmpty(ext)) continue;
+
+                        if (ext.Equals(".tmb", StringComparison.OrdinalIgnoreCase)
+                            || ext.Equals(".pap", StringComparison.OrdinalIgnoreCase)
+                            || ext.Equals(".avfx", StringComparison.OrdinalIgnoreCase)
+                            || ext.Equals(".atex", StringComparison.OrdinalIgnoreCase)
+                            || ext.Equals(".sklb", StringComparison.OrdinalIgnoreCase)
+                            || ext.Equals(".eid", StringComparison.OrdinalIgnoreCase)
+                            || ext.Equals(".phyb", StringComparison.OrdinalIgnoreCase)
+                            || ext.Equals(".scd", StringComparison.OrdinalIgnoreCase)
+                            || ext.Equals(".skp", StringComparison.OrdinalIgnoreCase)
+                            || ext.Equals(".shpk", StringComparison.OrdinalIgnoreCase))
+                        {
+                            needsRedraw = true;
+                            break;
+                        }
                     }
                 }
             }
-
 
             Logger.LogTrace("[{appId}] Applying Glamourer data{redraw}", applicationId, needsRedraw ? " and redrawing" : string.Empty);
             DataApplicationProgress = needsRedraw ? "Applying Glamourer and redrawing Character" : "Applying Glamourer";
@@ -1243,7 +1248,7 @@ public sealed partial class CharaDataManager : DisposableMediatorSubscriberBase
                 .WaitWhileCharacterIsDrawing(Logger, tempHandler, applicationId, ct: token)
                 .ConfigureAwait(false);
 
-            if (autoRevert)
+            if (autoRevert && penumbraCollection != Guid.Empty)
             {
                 Logger.LogTrace("[{appId}] Removing collection (autoRevert)", applicationId);
                 await _ipcManager.Penumbra
@@ -1285,7 +1290,7 @@ public sealed partial class CharaDataManager : DisposableMediatorSubscriberBase
                 Logger.LogTrace("[{appId}] Adding {name} to handled objects", applicationId, tempHandler.Name);
 
                 _characterHandler.AddHandledChara(
-                    new HandledCharaDataEntry(tempHandler.Name, isSelf, cPlusId, metaInfo, penumbraCollection));
+                    new HandledCharaDataEntry(tempHandler.Name, isSelf, cPlusId, metaInfo, penumbraCollection == Guid.Empty ? null : penumbraCollection));
             }
         }
         finally

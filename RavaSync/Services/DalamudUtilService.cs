@@ -1,4 +1,4 @@
-﻿using Dalamud.Game;
+
 using Dalamud.Game.ClientState.Conditions;
 using Dalamud.Game.ClientState.Objects.SubKinds;
 using Dalamud.Game.ClientState.Objects.Types;
@@ -8,13 +8,13 @@ using FFXIVClientStructs.FFXIV.Client.Game;
 using FFXIVClientStructs.FFXIV.Client.Game.Character;
 using FFXIVClientStructs.FFXIV.Client.Game.Control;
 using FFXIVClientStructs.FFXIV.Client.Game.Object;
-using FFXIVClientStructs.FFXIV.Client.Graphics.Scene;
 using FFXIVClientStructs.FFXIV.Client.UI.Agent;
-using FFXIVClientStructs.FFXIV.Component.GUI;
 using Lumina.Excel.Sheets;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using RavaSync.API.Dto.CharaData;
+using RavaObjectKind = RavaSync.API.Data.Enum.ObjectKind;
+using DalamudObjectKind = Dalamud.Game.ClientState.Objects.Enums.ObjectKind;
 using RavaSync.MareConfiguration;
 using RavaSync.PlayerData.Handlers;
 using RavaSync.Services.Mediator;
@@ -25,6 +25,7 @@ using System.Text;
 using GameObject = FFXIVClientStructs.FFXIV.Client.Game.Object.GameObject;
 
 
+
 namespace RavaSync.Services;
 
 public class DalamudUtilService : IHostedService, IMediatorSubscriber
@@ -32,9 +33,11 @@ public class DalamudUtilService : IHostedService, IMediatorSubscriber
     // Some jobs expose actor-like combat helpers through the pet pointer.
     // Ninja shadow clone is intentionally ignored as a pet pointer entirely.
     private readonly List<uint> _classJobIdsIgnoredForPets = [30];
-    // Dark Knight Living Shadow is still a real spawned actor, but it is short-lived and must not
-    // be treated like a persistent Summoner pet for static->transient promotion.
-    private readonly HashSet<uint> _classJobIdsWithShortLivedCombatPets = [32];
+    private readonly HashSet<uint> _classJobIdsWithShortLivedCombatPets = [31, 32];
+    // Arcanist/Summoner/Scholar plus MCH/DRK owned helpers can churn the pet pointer during
+    // summon/dismiss/combat-helper casts. Their files are delivered through the player job
+    // transient scope, so live pet-pointer churn should not force heavyweight Pet builds.
+    private readonly HashSet<uint> _classJobIdsWithPlayerScopedSummonPetChurn = [26, 27, 28, 31, 32];
     private readonly IClientState _clientState;
     private readonly ICondition _condition;
     private readonly IDataManager _gameData;
@@ -107,6 +110,17 @@ public class DalamudUtilService : IHostedService, IMediatorSubscriber
 
     private readonly Dictionary<ulong, string> _cidHashCache = new();
     private const int _cidHashCacheMax = 512;
+
+    private enum SummonedActorCatalogKind : byte
+    {
+        Unknown = 0,
+        Mount = 1,
+        Minion = 2,
+        Ambiguous = 3,
+    }
+
+    private readonly object _summonedActorCatalogLock = new();
+    private Dictionary<uint, SummonedActorCatalogKind>? _summonedActorCatalogByModelId;
 
     private int _playerCharaScanId = 0;
     private DateTime _nextPlayerCharaScan = DateTime.MinValue;
@@ -295,6 +309,7 @@ public class DalamudUtilService : IHostedService, IMediatorSubscriber
     public bool IsRoleplaying => _condition[ConditionFlag.RolePlaying];
     public bool ShouldIgnorePetForCurrentJob => _classJobIdsIgnoredForPets.Contains(_classJobId ?? 0);
     public bool ShouldTreatPetAsShortLivedCombatSummonForCurrentJob => _classJobIdsWithShortLivedCombatPets.Contains(_classJobId ?? 0);
+    public bool ShouldRoutePetChurnThroughPlayerScopedSummonsForCurrentJob => _classJobIdsWithPlayerScopedSummonPetChurn.Contains(_classJobId ?? 0);
     public uint CurrentTerritoryId { get; private set; } = 0;
 
     public IGameObject? CreateGameObject(IntPtr reference)
@@ -313,11 +328,26 @@ public class DalamudUtilService : IHostedService, IMediatorSubscriber
         if (!_framework.IsInFrameworkUpdateThread) throw new InvalidOperationException("Can only be run on Framework");
     }
 
+    public IGameObject? GetObjectFromObjectTableByIndex(int index)
+    {
+        EnsureIsOnFramework();
+        if (index < 0) return null;
+
+        try
+        {
+            return _objectTable[index];
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
     public ICharacter? GetCharacterFromObjectTableByIndex(int index)
     {
         EnsureIsOnFramework();
-        var objTableObj = _objectTable[index];
-        if (objTableObj!.ObjectKind != Dalamud.Game.ClientState.Objects.Enums.ObjectKind.Pc) return null;
+        var objTableObj = GetObjectFromObjectTableByIndex(index);
+        if (objTableObj == null || objTableObj.ObjectKind != Dalamud.Game.ClientState.Objects.Enums.ObjectKind.Pc) return null;
         return (ICharacter)objTableObj;
     }
 
@@ -329,6 +359,61 @@ public class DalamudUtilService : IHostedService, IMediatorSubscriber
         if (playerPointer == IntPtr.Zero || (IntPtr)mgr == IntPtr.Zero) return IntPtr.Zero;
         return (IntPtr)mgr->LookupBuddyByOwnerObject((BattleChara*)playerPointer);
     }
+
+
+    public unsafe bool TryResolveOwnedActorKindForPlayer(IntPtr playerPointer, IntPtr actorPointer, out RavaObjectKind objectKind)
+    {
+        EnsureIsOnFramework();
+        objectKind = RavaObjectKind.Player;
+
+        if (playerPointer == IntPtr.Zero || actorPointer == IntPtr.Zero || actorPointer == playerPointer)
+            return false;
+
+        try
+        {
+            var mgr = CharacterManager.Instance();
+            if ((IntPtr)mgr != IntPtr.Zero)
+            {
+                var pet = (IntPtr)mgr->LookupPetByOwnerObject((BattleChara*)playerPointer);
+                if (pet != IntPtr.Zero && pet == actorPointer)
+                {
+                    objectKind = RavaObjectKind.Pet;
+                    return true;
+                }
+
+                var companion = (IntPtr)mgr->LookupBuddyByOwnerObject((BattleChara*)playerPointer);
+                if (companion != IntPtr.Zero && companion == actorPointer)
+                {
+                    objectKind = RavaObjectKind.Companion;
+                    return true;
+                }
+            }
+        }
+        catch
+        {
+            // Fall through to the parent-character relationship check below.
+        }
+
+        try
+        {
+            var candidateCharacter = (Character*)actorPointer;
+            var parent = candidateCharacter->GetParentCharacter();
+            if ((IntPtr)parent == playerPointer)
+            {
+                objectKind = RavaObjectKind.MinionOrMount;
+                return true;
+            }
+        }
+        catch
+        {
+            return false;
+        }
+
+        return false;
+    }
+
+    public bool IsOwnedActorOfPlayer(IntPtr playerPointer, IntPtr actorPointer)
+        => TryResolveOwnedActorKindForPlayer(playerPointer, actorPointer, out _);
 
     public async Task<IntPtr> GetCompanionAsync(IntPtr? playerPointer = null)
     {
@@ -384,6 +469,110 @@ public class DalamudUtilService : IHostedService, IMediatorSubscriber
     public async Task<bool> GetIsPlayerPresentAsync()
     {
         return await RunOnFrameworkThread(GetIsPlayerPresent).ConfigureAwait(false);
+    }
+
+    public bool TryIsKnownMountActorId(string? actorId, out bool isMount)
+    {
+        isMount = false;
+
+        if (!TryParseSummonedActorModelId(actorId, out var modelId))
+            return false;
+
+        var catalog = GetSummonedActorCatalogByModelId();
+        if (!catalog.TryGetValue(modelId, out var kind))
+            return false;
+
+        if (kind == SummonedActorCatalogKind.Mount)
+        {
+            isMount = true;
+            return true;
+        }
+
+        if (kind == SummonedActorCatalogKind.Minion)
+        {
+            isMount = false;
+            return true;
+        }
+
+        return false;
+    }
+
+    private Dictionary<uint, SummonedActorCatalogKind> GetSummonedActorCatalogByModelId()
+    {
+        lock (_summonedActorCatalogLock)
+        {
+            if (_summonedActorCatalogByModelId != null)
+                return _summonedActorCatalogByModelId;
+
+            var mountModelIds = new HashSet<uint>();
+            var minionModelIds = new HashSet<uint>();
+
+            try
+            {
+                foreach (var mount in _gameData.GetExcelSheet<Mount>()!)
+                {
+                    var modelChara = mount.ModelChara.ValueNullable;
+                    if (modelChara.HasValue && TryGetModelCharaModelId(modelChara.Value, out var modelId))
+                        mountModelIds.Add(modelId);
+                }
+
+                foreach (var companion in _gameData.GetExcelSheet<Lumina.Excel.Sheets.Companion>()!)
+                {
+                    var modelChara = companion.Model.ValueNullable;
+                    if (modelChara.HasValue && TryGetModelCharaModelId(modelChara.Value, out var modelId))
+                        minionModelIds.Add(modelId);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Unable to build Lumina mount/minion actor model catalogue; mount/minion build path will stay conservative");
+                _summonedActorCatalogByModelId = new Dictionary<uint, SummonedActorCatalogKind>();
+                return _summonedActorCatalogByModelId;
+            }
+
+            var catalog = new Dictionary<uint, SummonedActorCatalogKind>();
+            foreach (var modelId in mountModelIds)
+            {
+                catalog[modelId] = minionModelIds.Contains(modelId)
+                    ? SummonedActorCatalogKind.Ambiguous
+                    : SummonedActorCatalogKind.Mount;
+            }
+
+            foreach (var modelId in minionModelIds)
+            {
+                if (catalog.ContainsKey(modelId))
+                    catalog[modelId] = SummonedActorCatalogKind.Ambiguous;
+                else
+                    catalog[modelId] = SummonedActorCatalogKind.Minion;
+            }
+
+            _summonedActorCatalogByModelId = catalog;
+            _logger.LogDebug("Built Lumina summoned actor catalogue with {mounts} mount model(s), {minions} minion model(s), {total} classified model id(s)", mountModelIds.Count, minionModelIds.Count, catalog.Count);
+            return catalog;
+        }
+    }
+
+    private static bool TryGetModelCharaModelId(ModelChara modelChara, out uint modelId)
+    {
+        modelId = Convert.ToUInt32(modelChara.Model);
+        return modelId != 0;
+    }
+
+    private static bool TryParseSummonedActorModelId(string? actorId, out uint modelId)
+    {
+        modelId = 0;
+        if (string.IsNullOrWhiteSpace(actorId))
+            return false;
+
+        var normalized = actorId.Trim().Replace('\\', '/').Trim('/').ToLowerInvariant();
+        var slash = normalized.LastIndexOf('/');
+        if (slash >= 0 && slash + 1 < normalized.Length)
+            normalized = normalized[(slash + 1)..];
+
+        if (normalized.Length < 2 || (normalized[0] != 'm' && normalized[0] != 'd'))
+            return false;
+
+        return uint.TryParse(normalized[1..], out modelId) && modelId != 0;
     }
 
     public unsafe IntPtr GetMinionOrMountPtr(IntPtr? playerPointer = null)
@@ -474,12 +663,6 @@ public class DalamudUtilService : IHostedService, IMediatorSubscriber
         if (address == nint.Zero)
             return null;
 
-        // Never dereference an arbitrary address here. Pair handlers can hold an
-        // address for a character that has just despawned, changed object slot, or
-        // been freed by the game. Reading ObjectKind/ContentId directly from that
-        // stale pointer can raise an uncatchable AccessViolation and take the game
-        // down. Only trust an address after confirming it is still present in
-        // Dalamud's live object table on the framework thread.
         if (!TryGetLivePlayerRefByAddress(address, out var livePlayer))
             return null;
 

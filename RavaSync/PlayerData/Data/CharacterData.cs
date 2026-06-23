@@ -44,20 +44,30 @@ public class CharacterData
     public API.Data.CharacterData ToAPI()
     {
         Dictionary<ObjectKind, List<FileReplacementData>> fileReplacements =
-            FileReplacements.ToDictionary(k => k.Key, k => k.Value.Where(f => f.HasFileReplacement && !f.IsFileSwap)
+            FileReplacements.ToDictionary(k => k.Key, k => k.Value
+            .Where(f => f.HasFileReplacement && !f.IsFileSwap && !string.IsNullOrWhiteSpace(f.Hash))
+            .Select(f => new
+            {
+                f.Hash,
+                GamePaths = CharacterDataPushSanitizer.GetServerAcceptedModdedGamePaths(f.GamePaths, f.ResolvedPath),
+            })
+            .Where(f => f.GamePaths.Length > 0)
             .GroupBy(f => f.Hash, StringComparer.OrdinalIgnoreCase)
             .Select(g =>
         {
             return new FileReplacementData()
             {
                 GamePaths = g.SelectMany(f => f.GamePaths).Distinct(StringComparer.OrdinalIgnoreCase).ToArray(),
-                Hash = g.First().Hash,
+                Hash = g.Key,
             };
         }).ToList());
 
         foreach (var item in FileReplacements)
         {
-            var fileSwapsToAdd = item.Value.Where(f => f.IsFileSwap).Select(f => f.ToFileReplacementDto());
+            var fileSwapsToAdd = item.Value
+                .Where(f => f.HasFileReplacement && f.IsFileSwap)
+                .Select(f => f.ToFileReplacementDto())
+                .Where(f => f.GamePaths.Length > 0);
             fileReplacements[item.Key].AddRange(fileSwapsToAdd);
         }
 

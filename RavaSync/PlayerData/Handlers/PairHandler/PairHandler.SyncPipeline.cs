@@ -13,6 +13,7 @@ using RavaSync.PlayerData.Services;
 using RavaSync.Services.Events;
 using RavaSync.Services.Mediator;
 using RavaSync.Utils;
+using RavaSync.WebAPI.Files;
 using RavaSync.WebAPI.Files.Models;
 
 namespace RavaSync.PlayerData.Handlers;
@@ -25,6 +26,12 @@ public sealed partial class PairHandler
     }
 
     public PairSyncDiagnosticsSnapshot SyncDiagnostics => _syncWorker?.GetDiagnostics() ?? PairSyncDiagnosticsSnapshot.Empty(Pair.UserData.UID);
+
+    internal bool HasCommittedPairSyncPayload(string payloadFingerprint)
+        => !string.IsNullOrWhiteSpace(payloadFingerprint) && _syncWorker?.IsAppliedPayload(payloadFingerprint) == true;
+
+    internal bool HasPairSyncWorkPendingForPayload(string payloadFingerprint)
+        => !string.IsNullOrWhiteSpace(payloadFingerprint) && _syncWorker?.IsPendingOrActiveForPayload(payloadFingerprint) == true;
 
     private enum PairSyncReason
     {
@@ -171,6 +178,8 @@ public sealed partial class PairHandler
 
     private sealed record PairSyncAssetEntry(ObjectKind ObjectKind, string GamePath, string? Hash, string ResolvedPath, PairSyncAssetKind Kind, PairSyncAssetCriticality Criticality);
 
+    private sealed record PairSyncReplacementLookupEntry(ObjectKind ObjectKind, string GamePath, string? Hash, string? FileSwapPath);
+
     private sealed record PairSyncAssetPlan(Dictionary<(string GamePath, string? Hash), string> ModdedPaths, List<FileReplacementData> MissingFiles, List<PairSyncAssetEntry> Entries, HashSet<string> UniqueHashes, List<string> PrimeTransientPaths, Dictionary<ObjectKind, List<string>> PrimeTransientPathsByKind, List<string> TransientSupportPaths, bool ContainsAnimationCritical, bool ContainsVfxCritical, bool ContainsVfxPropSupport, string TempModsFingerprint, string TransientSupportFingerprint)
     {
         public static PairSyncAssetPlan Empty { get; } = new([], [], [], new(StringComparer.OrdinalIgnoreCase), [], new(), [], false, false, false, "EMPTY", "EMPTY");
@@ -253,6 +262,16 @@ public sealed partial class PairHandler
                 DateTime.UtcNow);
 
             var payloadFingerprint = PairApplyUtilities.ComputeCharacterDataPayloadFingerprint(characterData);
+            _owner.LogVisibilityDiagnostic("PIPE submit pair={pair} app={app} version={version} reason={reason} forced={forced} visible={visible} hash={hash} payload={payload}",
+                _owner.Pair.UserData.AliasOrUID,
+                request.ApplicationBase,
+                request.Version,
+                reason,
+                forceApplyCustomization,
+                _owner.IsVisible,
+                characterData.DataHash.Value,
+                payloadFingerprint);
+
             _owner.Logger.LogDebug(
                 "[BASE-{appBase}] Pair sync submit for {pair}: reason={reason}, forced={forced}, visible={visible}, hash={hash}, payload={payload}, version={version}",
                 request.ApplicationBase,
@@ -272,6 +291,12 @@ public sealed partial class PairHandler
                     && !string.IsNullOrEmpty(_activePayloadFingerprint)
                     && string.Equals(_activePayloadFingerprint, payloadFingerprint, StringComparison.Ordinal))
                 {
+                    _owner.LogVisibilityDiagnostic("PIPE submit coalesced pair={pair} app={app} version={version} stage={stage} payload={payload}",
+                        _owner.Pair.UserData.AliasOrUID,
+                        request.ApplicationBase,
+                        request.Version,
+                        _stage,
+                        payloadFingerprint);
                     _owner.Logger.LogTrace(
                         "Coalescing duplicate active payload for {pair}: stage={stage}, payload={payload}",
                         _owner.Pair.UserData.AliasOrUID,
@@ -295,28 +320,26 @@ public sealed partial class PairHandler
                 hasLatest = _latestRequest != null;
             }
 
+            _owner.LogVisibilityDiagnostic("PIPE signal pair={pair} reason={reason} hasLatest={hasLatest} visible={visible} hasLastReceived={hasLastReceived} stage={stage}",
+                _owner.Pair.UserData.AliasOrUID,
+                reason,
+                hasLatest,
+                _owner.IsVisible,
+                _owner.Pair.LastReceivedCharacterData is CharacterData,
+                _stage);
+
             _owner.Logger.LogDebug(
                 "Pair sync signal for {pair}: reason={reason}, hasLatest={hasLatest}, visible={visible}, hasLastReceived={hasLastReceived}, stage={stage}",
                 _owner.Pair.UserData.AliasOrUID,
                 reason,
                 hasLatest,
                 _owner.IsVisible,
-                _owner.Pair.LastReceivedCharacterData != null,
+                _owner.Pair.LastReceivedCharacterData is CharacterData,
                 _stage);
 
-            if (!hasLatest && _owner.IsVisible && _owner.Pair.LastReceivedCharacterData != null)
+            if (!hasLatest && _owner.IsVisible && _owner.Pair.LastReceivedCharacterData is CharacterData)
             {
-                _ = Task.Run(() =>
-                {
-                    try
-                    {
-                        _owner.Pair.ApplyLastReceivedData(forced: true);
-                    }
-                    catch (Exception ex)
-                    {
-                        _owner.Logger.LogWarning(ex, "Failed to submit latest received data for {pair} after {reason}", _owner.Pair.UserData.AliasOrUID, reason);
-                    }
-                });
+                _ = Task.Run(() => _owner.TrySubmitLastReceivedVisibleAuthoritativeApply(reason.ToString(), reason, skipIfBusy: false));
             }
 
             Wake();
@@ -363,6 +386,24 @@ public sealed partial class PairHandler
                 {
                     // best effort
                 }
+            }
+        }
+
+        private bool IsRequestStillLatestOrEquivalent(PairSyncRequest request, string payloadFingerprint)
+        {
+            lock (_gate)
+            {
+                if (_latestRequest == null)
+                    return false;
+
+                if (_latestRequest.Version == request.Version)
+                    return true;
+
+                if (_latestRequest.ForceApplyCustomization || request.ForceApplyCustomization)
+                    return false;
+
+                var latestPayloadFingerprint = PairApplyUtilities.ComputeCharacterDataPayloadFingerprint(_latestRequest.CharacterData);
+                return string.Equals(latestPayloadFingerprint, payloadFingerprint, StringComparison.Ordinal);
             }
         }
 
@@ -438,6 +479,36 @@ public sealed partial class PairHandler
 
                 return string.IsNullOrEmpty(payloadFingerprint)
                     || string.Equals(_activePayloadFingerprint, payloadFingerprint, StringComparison.Ordinal);
+            }
+        }
+
+        public bool IsPendingOrActiveForPayload(string payloadFingerprint)
+        {
+            if (string.IsNullOrWhiteSpace(payloadFingerprint))
+                return false;
+
+            lock (_gate)
+            {
+                if (!string.IsNullOrEmpty(_activePayloadFingerprint)
+                    && string.Equals(_activePayloadFingerprint, payloadFingerprint, StringComparison.Ordinal))
+                    return true;
+
+                if (_latestRequest == null)
+                    return false;
+
+                var latestPayloadFingerprint = PairApplyUtilities.ComputeCharacterDataPayloadFingerprint(_latestRequest.CharacterData);
+                return string.Equals(latestPayloadFingerprint, payloadFingerprint, StringComparison.Ordinal);
+            }
+        }
+
+        public bool IsAppliedPayload(string payloadFingerprint)
+        {
+            if (string.IsNullOrWhiteSpace(payloadFingerprint))
+                return false;
+
+            lock (_gate)
+            {
+                return string.Equals(_applied.PayloadFingerprint, payloadFingerprint, StringComparison.Ordinal);
             }
         }
 
@@ -562,6 +633,13 @@ public sealed partial class PairHandler
 
                 if (!readiness.Ready)
                 {
+                    _owner.LogVisibilityDiagnostic("PIPE readiness not-ready pair={pair} app={app} version={version} reason={reason} retry={retry} visible={visible}",
+                        _owner.Pair.UserData.AliasOrUID,
+                        request.ApplicationBase,
+                        request.Version,
+                        readiness.Reason,
+                        readiness.RetryImmediately,
+                        _owner.IsVisible);
                     var result = PairSyncCommitResult.Deferred(readiness.Reason, readiness.RetryImmediately);
                     RecordCommitResult(result);
                     RecordDiagnostics(request, null, result, readinessMs, planMs, executeMs, totalStopwatch.ElapsedMilliseconds);
@@ -579,6 +657,13 @@ public sealed partial class PairHandler
 
                 if (build.Disposition == PairSyncPlanDisposition.NoOp)
                 {
+                    _owner.LogVisibilityDiagnostic("PIPE plan no-op pair={pair} app={app} version={version} reason={reason} hash={hash} payload={payload}",
+                        _owner.Pair.UserData.AliasOrUID,
+                        request.ApplicationBase,
+                        request.Version,
+                        build.Reason,
+                        request.CharacterData.DataHash.Value,
+                        requestPayloadFingerprint);
                     var result = PairSyncCommitResult.NoWork(build.Reason);
                     RecordCommitResult(result);
                     RecordDiagnostics(request, null, result, readinessMs, planMs, executeMs, totalStopwatch.ElapsedMilliseconds);
@@ -589,6 +674,12 @@ public sealed partial class PairHandler
 
                 if (build.Disposition == PairSyncPlanDisposition.Deferred || build.Plan == null)
                 {
+                    _owner.LogVisibilityDiagnostic("PIPE plan deferred pair={pair} app={app} version={version} reason={reason} retry={retry}",
+                        _owner.Pair.UserData.AliasOrUID,
+                        request.ApplicationBase,
+                        request.Version,
+                        build.Reason,
+                        build.RetryImmediately);
                     var result = PairSyncCommitResult.Deferred(build.Reason, build.RetryImmediately);
                     RecordCommitResult(result);
                     RecordDiagnostics(request, null, result, readinessMs, planMs, executeMs, totalStopwatch.ElapsedMilliseconds);
@@ -601,10 +692,44 @@ public sealed partial class PairHandler
 
                 var plan = build.Plan;
                 diagnosticPlan = plan;
+                _owner.LogVisibilityDiagnostic("PIPE plan execute pair={pair} app={app} version={version} changes={changes} assets={assets} missing={missing} updateFiles={updateFiles} updateManip={updateManip} force={force} fileGate={fileGate} lifecycle={lifecycle} redraw={redraw}",
+                    _owner.Pair.UserData.AliasOrUID,
+                    plan.Request.ApplicationBase,
+                    plan.Request.Version,
+                    DescribeUpdatedChanges(plan.UpdatedData),
+                    plan.AssetPlan.Entries.Count,
+                    plan.AssetPlan.MissingFiles.Count,
+                    plan.UpdateModdedPaths,
+                    plan.UpdateManipulation,
+                    plan.ForceApplyModsForThisApply,
+                    plan.RequiresFileReadyGate,
+                    plan.LifecycleApplyRequested,
+                    plan.LifecycleRedrawRequested);
                 _prepared = new PreparedPairState(plan.Request.Version, plan.PayloadFingerprint, DateTime.UtcNow);
+
+                if (!IsRequestStillLatestOrEquivalent(plan.Request, plan.PayloadFingerprint))
+                {
+                    var result = PairSyncCommitResult.StalePlan("newer pair payload superseded this plan before download/apply handoff", retryImmediately: true);
+                    RecordCommitResult(result);
+                    RecordDiagnostics(request, diagnosticPlan, result, readinessMs, planMs, executeMs, totalStopwatch.ElapsedMilliseconds);
+                    LogDiagnostics(GetDiagnostics());
+                    _owner.Logger.LogTrace(
+                        "[BASE-{appBase}] Pair sync skipped stale plan for {pair}: planned version={plannedVersion}",
+                        request.ApplicationBase,
+                        _owner.Pair.UserData.AliasOrUID,
+                        plan.Request.Version);
+                    Wake();
+                    return;
+                }
 
                 SetStage(PairSyncStage.Downloading, activeCts, plan.PayloadFingerprint);
                 var executeStopwatch = Stopwatch.StartNew();
+                _owner.LogVisibilityDiagnostic("PIPE execute start pair={pair} app={app} version={version} hash={hash} payload={payload}",
+                    _owner.Pair.UserData.AliasOrUID,
+                    plan.Request.ApplicationBase,
+                    plan.Request.Version,
+                    plan.Request.CharacterData.DataHash.Value,
+                    plan.PayloadFingerprint);
                 var commitResult = await _owner.ExecutePairSyncPlanAsync(plan, token).ConfigureAwait(false);
                 executeStopwatch.Stop();
                 executeMs = executeStopwatch.ElapsedMilliseconds;
@@ -613,6 +738,13 @@ public sealed partial class PairHandler
 
                 if (!commitResult.Success)
                 {
+                    _owner.LogVisibilityDiagnostic("PIPE execute result pair={pair} app={app} version={version} status={status} reason={reason} retry={retry}",
+                        _owner.Pair.UserData.AliasOrUID,
+                        plan.Request.ApplicationBase,
+                        plan.Request.Version,
+                        commitResult.Status,
+                        commitResult.Reason,
+                        commitResult.RetryImmediately);
                     RecordCommitResult(commitResult);
                     RecordDiagnostics(request, diagnosticPlan, commitResult, readinessMs, planMs, executeMs, totalStopwatch.ElapsedMilliseconds);
                     LogDiagnostics(GetDiagnostics());
@@ -630,14 +762,29 @@ public sealed partial class PairHandler
                     return;
                 }
 
+                _owner.LogVisibilityDiagnostic("PIPE execute committed pair={pair} app={app} version={version} hash={hash} payload={payload}",
+                    _owner.Pair.UserData.AliasOrUID,
+                    plan.Request.ApplicationBase,
+                    plan.Request.Version,
+                    plan.Request.CharacterData.DataHash.Value,
+                    plan.PayloadFingerprint);
                 RecordCommitResult(commitResult);
+                _owner.RememberAppliedPairSyncAssetPlan(plan);
 
                 lock (_gate)
                 {
-                    if (_latestRequest?.Version == plan.Request.Version)
+                    var shouldRecordApplied = _latestRequest?.Version == plan.Request.Version;
+                    if (!shouldRecordApplied && _latestRequest != null)
+                    {
+                        var latestPayloadFingerprint = PairApplyUtilities.ComputeCharacterDataPayloadFingerprint(_latestRequest.CharacterData);
+                        shouldRecordApplied = string.Equals(latestPayloadFingerprint, plan.PayloadFingerprint, StringComparison.Ordinal)
+                            && (!_latestRequest.ForceApplyCustomization || plan.Request.ForceApplyCustomization);
+                    }
+
+                    if (shouldRecordApplied)
                     {
                         _applied = new AppliedPairState(
-                            plan.Request.Version,
+                            _latestRequest?.Version ?? plan.Request.Version,
                             plan.Request.CharacterData.DataHash.Value,
                             plan.PayloadFingerprint,
                             DateTime.UtcNow);
@@ -719,16 +866,28 @@ public sealed partial class PairHandler
     private PairSyncReadiness CaptureVisiblePairSyncReadiness(PairSyncRequest request)
     {
         if (_lifetime.ApplicationStopping.IsCancellationRequested)
+        {
+            LogVisibilityDiagnostic("PIPE readiness pair={pair} ready=false reason=application-stopping", Pair.UserData.AliasOrUID);
             return PairSyncReadiness.NotReady("application stopping");
+        }
 
         if (!IsVisible)
+        {
+            LogVisibilityDiagnostic("PIPE readiness pair={pair} ready=false reason=not-visible", Pair.UserData.AliasOrUID);
             return PairSyncReadiness.NotReady("pair is not visible");
+        }
 
         if (Pair.IsPaused)
+        {
+            LogVisibilityDiagnostic("PIPE readiness pair={pair} ready=false reason=paused", Pair.UserData.AliasOrUID);
             return PairSyncReadiness.NotReady("pair is paused");
+        }
 
         if (Pair.AutoPausedByOtherSync && !Pair.EffectiveOverrideOtherSync)
+        {
+            LogVisibilityDiagnostic("PIPE readiness pair={pair} ready=false reason=other-sync owner={owner}", Pair.UserData.AliasOrUID, Pair.RemoteOtherSyncOwner);
             return PairSyncReadiness.NotReady("yielded to OtherSync");
+        }
 
         if (_dalamudUtil.IsInCombatOrPerforming)
         {
@@ -736,17 +895,23 @@ public sealed partial class PairHandler
                 "Cannot apply character data: you are in combat or performing music, deferring application")));
             _dataReceivedInDowntime = new(request.ApplicationBase, request.CharacterData, request.ForceApplyCustomization);
             SetUploading(isUploading: false);
+            LogVisibilityDiagnostic("PIPE readiness pair={pair} ready=false reason=combat-performance", Pair.UserData.AliasOrUID);
             return PairSyncReadiness.NotReady("combat/performance");
         }
 
         if (_charaHandler == null)
+        {
+            MarkInitialApplyRequired(signalWorker: false);
+            LogVisibilityDiagnostic("PIPE readiness pair={pair} ready=false reason=no-character-handler", Pair.UserData.AliasOrUID);
             return PairSyncReadiness.NotReady("no character handler");
+        }
 
         var strictAddress = ResolveStrictVisiblePlayerAddress(_charaHandler.Address);
         if (strictAddress == nint.Zero || !IsExpectedPlayerAddress(strictAddress))
         {
             ResetVisibilityTracking();
             MarkInitialApplyRequired();
+            LogVisibilityDiagnostic("PIPE readiness pair={pair} ready=false reason=unstable-address strictAddress={address} expected={expected}", Pair.UserData.AliasOrUID, strictAddress, _lastAssignedPlayerAddress);
             return PairSyncReadiness.NotReady("visible actor address is not stable", retryImmediately: false);
         }
 
@@ -754,14 +919,33 @@ public sealed partial class PairHandler
         {
             Mediator.Publish(new EventMessage(new Event(PlayerName, Pair.UserData, nameof(PairHandler), EventSeverity.Warning,
                 "Cannot apply character data: you are in GPose, a cutscene, or Penumbra/Glamourer is not available")));
+            MarkInitialApplyRequired(signalWorker: false);
+            LogVisibilityDiagnostic("PIPE readiness pair={pair} ready=false reason=framework-plugins gpose={gpose} cutscene={cutscene} penumbra={penumbra} glamourer={glamourer}",
+                Pair.UserData.AliasOrUID,
+                _dalamudUtil.IsInGpose,
+                _dalamudUtil.IsInCutscene,
+                _ipcManager.Penumbra.APIAvailable,
+                _ipcManager.Glamourer.APIAvailable);
             return PairSyncReadiness.NotReady("framework/plugins unavailable");
         }
 
         var snapshot = CaptureApplyFrameworkSnapshot();
         if (!snapshot.HasCharaHandler || snapshot.ResolvedPlayerAddress == nint.Zero)
+        {
+            MarkInitialApplyRequired(signalWorker: false);
+            LogVisibilityDiagnostic("PIPE readiness pair={pair} ready=false reason=snapshot-not-ready hasHandler={hasHandler} resolvedAddress={address}", Pair.UserData.AliasOrUID, snapshot.HasCharaHandler, snapshot.ResolvedPlayerAddress);
             return PairSyncReadiness.NotReady("framework snapshot is not apply-ready");
+        }
 
         var binding = new ActorBinding(Pair.Ident, PlayerName, strictAddress, _lastAssignedObjectIndex);
+        LogVisibilityDiagnostic("PIPE readiness pair={pair} ready=true ident={ident} objectIndex={idx} address={address} cachedHash={hash} cachedPayload={payload} force={force}",
+            Pair.UserData.AliasOrUID,
+            Pair.Ident,
+            _lastAssignedObjectIndex,
+            strictAddress,
+            snapshot.CachedHash,
+            snapshot.CachedPayloadFingerprint,
+            snapshot.ForceApplyMods);
         return PairSyncReadiness.ReadyNow(binding, snapshot);
     }
 
@@ -776,7 +960,21 @@ public sealed partial class PairHandler
         var incomingHash = request.CharacterData.DataHash.Value;
         var incomingPayloadFingerprint = PairApplyUtilities.ComputeCharacterDataPayloadFingerprint(request.CharacterData);
 
-        if (!request.ForceApplyCustomization
+        LogVisibilityDiagnostic("PLAN build start pair={pair} app={app} version={version} reason={reason} hash={hash} payload={payload} cachedHash={cachedHash} cachedPayload={cachedPayload} forceReq={forceReq} forceMods={forceMods} redrawNext={redrawNext}",
+            Pair.UserData.AliasOrUID,
+            request.ApplicationBase,
+            request.Version,
+            request.Reason,
+            incomingHash,
+            incomingPayloadFingerprint,
+            snapshot.CachedHash,
+            snapshot.CachedPayloadFingerprint,
+            request.ForceApplyCustomization,
+            _forceApplyMods,
+            _redrawOnNextApplication);
+
+        if (request.Reason != PairSyncReason.BecameVisible
+            && !request.ForceApplyCustomization
             && !_redrawOnNextApplication
             && !_forceApplyMods
             && !string.IsNullOrEmpty(incomingHash)
@@ -785,8 +983,13 @@ public sealed partial class PairHandler
         {
             if (TryGetRecentMissingCheck(incomingHash, out var hadMissing))
             {
-                if (!hadMissing)
+                if (!hadMissing && await CanTreatSameVisiblePayloadAsNoOpAsync(request, readiness, "recent cache check passed", token).ConfigureAwait(false))
                     return PairSyncPlanBuildResult.NoOp("same payload and recent cache check passed");
+            }
+            else if (AllPayloadHashesSessionKnownPresent(request.CharacterData))
+            {
+                if (await CanTreatSameVisiblePayloadAsNoOpAsync(request, readiness, "all hashes are session-known present", token).ConfigureAwait(false))
+                    return PairSyncPlanBuildResult.NoOp("same payload and all hashes are session-known present");
             }
             else
             {
@@ -796,6 +999,13 @@ public sealed partial class PairHandler
         }
 
         var preparation = await Task.Run(() => PrepareApplyData(request.ApplicationBase, request.CharacterData, request.ForceApplyCustomization, snapshot), token).ConfigureAwait(false);
+        LogVisibilityDiagnostic("PLAN preparation pair={pair} app={app} sameHash={sameHash} samePayload={samePayload} hasDiffMods={diff} changes={changes}",
+            Pair.UserData.AliasOrUID,
+            request.ApplicationBase,
+            preparation.SameHash,
+            preparation.SamePayload,
+            preparation.HasDiffMods,
+            DescribeUpdatedChanges(preparation.UpdatedData));
 
         token.ThrowIfCancellationRequested();
 
@@ -805,8 +1015,18 @@ public sealed partial class PairHandler
             || snapshot.ForceApplyMods;
 
         var assetPlan = requiresFileReadyGate
-            ? await Task.Run(() => BuildPairSyncAssetPlan(request.ApplicationBase, request.CharacterData, token), token).ConfigureAwait(false)
+            ? await Task.Run(() => BuildPairSyncAssetPlan(request.ApplicationBase, snapshot.CachedData, request.CharacterData, preparation.UpdatedData, snapshot.CachedPayloadFingerprint, incomingPayloadFingerprint, token), token).ConfigureAwait(false)
             : PairSyncAssetPlan.Empty;
+        LogVisibilityDiagnostic("PLAN asset-plan pair={pair} app={app} requiresFileGate={fileGate} assets={assets} hashes={hashes} missing={missing} criticalAnim={anim} criticalVfx={vfx} support={support}",
+            Pair.UserData.AliasOrUID,
+            request.ApplicationBase,
+            requiresFileReadyGate,
+            assetPlan.Entries.Count,
+            assetPlan.UniqueHashes.Count,
+            assetPlan.MissingFiles.Count,
+            assetPlan.ContainsAnimationCritical,
+            assetPlan.ContainsVfxCritical,
+            assetPlan.ContainsVfxPropSupport);
 
         token.ThrowIfCancellationRequested();
 
@@ -816,13 +1036,22 @@ public sealed partial class PairHandler
     private PairSyncPlanBuildResult FinalizePairSyncPlan(PairSyncRequest request, ActorBinding binding, ApplyFrameworkSnapshot snapshot, ApplyPreparation preparation, PairSyncAssetPlan assetPlan)
     {
         if (!IsVisible)
+        {
+            LogVisibilityDiagnostic("PLAN finalize deferred pair={pair} app={app} reason=hidden-before-finalize", Pair.UserData.AliasOrUID, request.ApplicationBase);
             return PairSyncPlanBuildResult.Deferred("pair became hidden before plan finalized");
+        }
 
         if (Pair.AutoPausedByOtherSync && !Pair.EffectiveOverrideOtherSync)
+        {
+            LogVisibilityDiagnostic("PLAN finalize deferred pair={pair} app={app} reason=other-sync owner={owner}", Pair.UserData.AliasOrUID, request.ApplicationBase, Pair.RemoteOtherSyncOwner);
             return PairSyncPlanBuildResult.Deferred("OtherSync acquired actor before plan finalized");
+        }
 
         if (!IsApplyPreparationStillValid(snapshot))
+        {
+            LogVisibilityDiagnostic("PLAN finalize deferred pair={pair} app={app} reason=state-changed-while-planning", Pair.UserData.AliasOrUID, request.ApplicationBase);
             return PairSyncPlanBuildResult.Deferred("applied state changed while planning", retryImmediately: true);
+        }
 
         if (!string.Equals(preparation.NewHash, _lastAttemptedDataHash, StringComparison.Ordinal))
         {
@@ -831,12 +1060,25 @@ public sealed partial class PairHandler
             _hasRetriedAfterMissingAtApply = false;
         }
 
-        if (preparation.SameHash && preparation.SamePayload && !request.ForceApplyCustomization && !_redrawOnNextApplication)
+        if (preparation.SameHash && preparation.SamePayload && request.Reason != PairSyncReason.BecameVisible && !request.ForceApplyCustomization && !_redrawOnNextApplication && !_forceApplyMods)
         {
-            if (TryGetRecentMissingCheck(preparation.NewHash, out var hadMissing))
+            if (HasAuthoritativePlayerAppearancePayload(request.CharacterData))
+            {
+                Logger.LogDebug(
+                    "[BASE-{appBase}] Refusing final same-payload no-op for {pair}: payload contains authoritative player appearance state and the live actor was not reasserted on this framework snapshot; forcing authoritative reassert",
+                    request.ApplicationBase,
+                    Pair.UserData.AliasOrUID);
+                _forceApplyMods = true;
+                _initialApplyPending = true;
+            }
+            else if (TryGetRecentMissingCheck(preparation.NewHash, out var hadMissing))
             {
                 if (!hadMissing)
                     return PairSyncPlanBuildResult.NoOp("same hash/payload and recent missing-cache check passed");
+            }
+            else if (AllPayloadHashesSessionKnownPresent(request.CharacterData))
+            {
+                return PairSyncPlanBuildResult.NoOp("same hash/payload and all hashes are session-known present");
             }
             else
             {
@@ -848,6 +1090,9 @@ public sealed partial class PairHandler
         var updatedData = preparation.UpdatedData.ToDictionary(
             k => k.Key,
             v => new HashSet<PlayerChanges>(v.Value));
+
+        if (_forceApplyMods && HasAuthoritativePlayerAppearancePayload(request.CharacterData))
+            EnsureAuthoritativePlayerReassertChanges(request.CharacterData, updatedData);
 
         var lifecycleApplyRequested = _redrawOnNextApplication;
         var nonPlayerOnlyDetectedChange = updatedData.Count > 0 && updatedData.Keys.All(static kind => kind != ObjectKind.Player);
@@ -897,10 +1142,26 @@ public sealed partial class PairHandler
         if (!lifecycleRedrawRequested)
             SuppressNonLifecyclePlayerForcedRedraw(updatedData, request.ApplicationBase);
 
+        PromotePlayerManipulationToGlamourerApply(request.ApplicationBase, request.CharacterData, updatedData);
+
         EnsureNonPlayerRedrawChangesForCriticalAssets(updatedData, assetPlan);
 
+        if (!updatedData.Any() && HasAuthoritativePlayerAppearancePayload(request.CharacterData))
+        {
+            Logger.LogDebug(
+                "[BASE-{appBase}] Pair sync plan for {pair} had no diff changes, but the payload carries authoritative player appearance state; forcing visible reassert instead of cache-only NoOp",
+                request.ApplicationBase,
+                Pair.UserData.AliasOrUID);
+            _forceApplyMods = true;
+            _initialApplyPending = true;
+            EnsureAuthoritativePlayerReassertChanges(request.CharacterData, updatedData);
+        }
+
         if (!updatedData.Any())
+        {
+            LogVisibilityDiagnostic("PLAN finalize no-op pair={pair} app={app} reason=no-player-changes hash={hash} payload={payload}", Pair.UserData.AliasOrUID, request.ApplicationBase, preparation.NewHash, PairApplyUtilities.ComputeCharacterDataPayloadFingerprint(request.CharacterData));
             return PairSyncPlanBuildResult.NoOp("no player changes detected");
+        }
 
         Mediator.Publish(new EventMessage(new Event(PlayerName, Pair.UserData, nameof(PairHandler), EventSeverity.Informational,
             "Applying Character Data")));
@@ -908,16 +1169,28 @@ public sealed partial class PairHandler
         _forceApplyMods |= request.ForceApplyCustomization;
         var forceApplyModsForThisApply = _forceApplyMods;
 
-        if (_charaHandler != null && _forceApplyMods)
-            _forceApplyMods = false;
-
         if (updatedData.TryGetValue(ObjectKind.Player, out var playerChanges))
             _pluginWarningNotificationManager.NotifyForMissingPlugins(Pair.UserData, PlayerName!, playerChanges);
 
         var updateModdedPaths = updatedData.Values.Any(v => v.Contains(PlayerChanges.ModFiles));
         var updateManip = updatedData.Values.Any(v => v.Contains(PlayerChanges.ModManip));
         var requiresFileReadyGate = RequiresAppearanceFileReadyGate(updatedData);
+        if (requiresFileReadyGate && CanBypassFileReadyGateForKnownReadyDelta(updatedData, assetPlan, forceApplyModsForThisApply, lifecycleRedrawRequested))
+            requiresFileReadyGate = false;
         var payloadFingerprint = PairApplyUtilities.ComputeCharacterDataPayloadFingerprint(request.CharacterData);
+
+        LogVisibilityDiagnostic("PLAN finalize execute pair={pair} app={app} reason={reason} lifecycleRedraw={lifecycle} forceMods={force} updateFiles={files} updateManip={manip} fileReadyGate={fileGate} changes={changes} assets={assets} missing={missing}",
+            Pair.UserData.AliasOrUID,
+            request.ApplicationBase,
+            request.Reason,
+            lifecycleRedrawRequested,
+            forceApplyModsForThisApply,
+            updateModdedPaths,
+            updateManip,
+            requiresFileReadyGate,
+            DescribeUpdatedChanges(updatedData),
+            assetPlan.Entries.Count,
+            assetPlan.MissingFiles.Count);
 
         Logger.LogDebug(
             "[BASE-{appBase}] Pair sync plan for {pair}: reason={reason}, lifecycleRedraw={lifecycle}, forceMods={force}, updateFiles={files}, updateManip={manip}, fileReadyGate={fileGate}, changes={changes}, assets={assetCount}, missing={missing}, animCritical={anim}, vfxCritical={vfx}",
@@ -938,10 +1211,199 @@ public sealed partial class PairHandler
         return PairSyncPlanBuildResult.Execute(new PairSyncPlan(request, binding, snapshot, preparation, assetPlan, updatedData, updateModdedPaths, updateManip, requiresFileReadyGate, forceApplyModsForThisApply, allowLifecyclePlayerApply, lifecycleRedrawRequested, payloadFingerprint));
     }
 
+    private bool CanBypassFileReadyGateForKnownReadyDelta(Dictionary<ObjectKind, HashSet<PlayerChanges>> updatedData, PairSyncAssetPlan assetPlan, bool forceApplyModsForThisApply, bool lifecycleRedrawRequested)
+    {
+        if (forceApplyModsForThisApply || lifecycleRedrawRequested || assetPlan == null)
+            return false;
+
+        if (assetPlan.MissingFiles.Count != 0
+            || assetPlan.ContainsAnimationCritical
+            || assetPlan.ContainsVfxCritical
+            || assetPlan.ContainsVfxPropSupport)
+        {
+            return false;
+        }
+
+        if (updatedData.Count != 1 || !updatedData.TryGetValue(ObjectKind.Player, out var playerChanges))
+            return false;
+
+        if (!playerChanges.Contains(PlayerChanges.ModFiles))
+            return false;
+
+        foreach (var change in playerChanges)
+        {
+            if (change is not (PlayerChanges.ModFiles or PlayerChanges.Glamourer or PlayerChanges.Customize or PlayerChanges.ModManip or PlayerChanges.Heels or PlayerChanges.Honorific or PlayerChanges.Moodles or PlayerChanges.PetNames))
+                return false;
+        }
+
+        return assetPlan.UniqueHashes.Count == 0
+            || assetPlan.UniqueHashes.All(hash => HasUsableCachedFileForHash(hash));
+    }
+
+    private void PromotePlayerManipulationToGlamourerApply(Guid applicationBase, CharacterData characterData, Dictionary<ObjectKind, HashSet<PlayerChanges>> updatedData)
+    {
+        if (!updatedData.TryGetValue(ObjectKind.Player, out var playerChanges))
+            return;
+
+        if (!playerChanges.Contains(PlayerChanges.ModManip) || playerChanges.Contains(PlayerChanges.Glamourer))
+            return;
+
+        if (!HasPlayerGlamourerPayload(characterData))
+            return;
+
+        playerChanges.Add(PlayerChanges.Glamourer);
+        Logger.LogDebug("[BASE-{appBase}] Promoting player manipulation update to Glamourer apply for {pair}; outfit metadata toggles need both Penumbra meta and Glamourer state to settle", applicationBase, Pair.UserData.AliasOrUID);
+    }
+
+    private async Task<bool> CanTreatSameVisiblePayloadAsNoOpAsync(PairSyncRequest request, PairSyncReadiness readiness, string reason, CancellationToken token)
+    {
+        if (!HasAuthoritativePlayerAppearancePayload(request.CharacterData))
+            return true;
+
+        if (!HasPlayerFilePayload(request.CharacterData))
+        {
+            ForceVisiblePlayerReassertForUnverifiedBinding(
+                request.ApplicationBase,
+                reason,
+                "payload contains player Glamourer/Customize/manipulation appearance state without file-map proof; same-payload no-op would bless a potentially vanilla live actor");
+            return false;
+        }
+
+        if (readiness.Binding == null || !readiness.Binding.ObjectIndex.HasValue || readiness.Binding.ObjectIndex.Value < 0)
+        {
+            ForceVisiblePlayerReassertForUnverifiedBinding(request.ApplicationBase, reason, "no object index in readiness binding");
+            return false;
+        }
+
+        if (_penumbraCollection == Guid.Empty)
+        {
+            ForceVisiblePlayerReassertForUnverifiedBinding(request.ApplicationBase, reason, "no receiver temp collection exists yet");
+            return false;
+        }
+
+        var match = await _ipcManager.Penumbra.TryGetObjectEffectiveCollectionMatchAsync(
+            Logger,
+            _penumbraCollection,
+            readiness.Binding.ObjectIndex.Value,
+            Pair.Ident,
+            readiness.Binding.Address,
+            PlayerName ?? Pair.UserData.AliasOrUID).ConfigureAwait(false);
+
+        token.ThrowIfCancellationRequested();
+
+        if (match.Checked && match.Matches)
+        {
+            ForceVisiblePlayerReassertForUnverifiedBinding(
+                request.ApplicationBase,
+                reason,
+                "live collection binding matches, but same-payload player appearance data still needs authoritative reassertion rather than cache-only NoOp");
+            return false;
+        }
+
+        ForceVisiblePlayerReassertForUnverifiedBinding(
+            request.ApplicationBase,
+            reason,
+            $"effective collection {match.EffectiveCollectionId}/{match.EffectiveCollectionName} did not match expected {_penumbraCollection}");
+
+        return false;
+    }
+
+    private void ForceVisiblePlayerReassertForUnverifiedBinding(Guid applicationBase, string reason, string detail)
+    {
+        Logger.LogDebug(
+            "[BASE-{appBase}] Refusing same-payload no-op for {pair}: authoritative player appearance payload requires live apply proof ({reason}; {detail}); forcing authoritative reassert",
+            applicationBase,
+            Pair.UserData.AliasOrUID,
+            reason,
+            detail);
+
+        _forceApplyMods = true;
+        _initialApplyPending = true;
+        _lastAttemptedDataHash = null;
+    }
+
+    private static bool HasPlayerFilePayload(CharacterData? charaData)
+        => charaData?.FileReplacements != null
+            && charaData.FileReplacements.TryGetValue(ObjectKind.Player, out var playerFiles)
+            && playerFiles != null
+            && playerFiles.Any(static item => item != null
+                && (!string.IsNullOrWhiteSpace(item.Hash)
+                    || !string.IsNullOrWhiteSpace(item.FileSwapPath)
+                    || (item.GamePaths?.Any(static path => !string.IsNullOrWhiteSpace(path)) ?? false)));
+
+    private static bool HasPlayerCustomizePayload(CharacterData charaData)
+        => charaData?.CustomizePlusData != null
+            && charaData.CustomizePlusData.TryGetValue(ObjectKind.Player, out var customizePayload)
+            && !string.IsNullOrWhiteSpace(customizePayload);
+
+    private static bool HasPlayerManipulationPayload(Pair pair, CharacterData charaData)
+        => !string.IsNullOrWhiteSpace(pair.GetEffectiveManipulationData(charaData.ManipulationData));
+
+    private bool HasAuthoritativePlayerAppearancePayload(CharacterData? charaData)
+        => charaData != null
+            && (HasPlayerFilePayload(charaData)
+                || HasPlayerGlamourerPayload(charaData)
+                || HasPlayerCustomizePayload(charaData)
+                || HasPlayerManipulationPayload(Pair, charaData));
+
+    private void EnsureAuthoritativePlayerReassertChanges(CharacterData charaData, Dictionary<ObjectKind, HashSet<PlayerChanges>> updatedData)
+    {
+        if (!updatedData.TryGetValue(ObjectKind.Player, out var player))
+        {
+            player = [];
+            updatedData[ObjectKind.Player] = player;
+        }
+
+        if (HasPlayerFilePayload(charaData))
+            player.Add(PlayerChanges.ModFiles);
+
+        if (HasPlayerGlamourerPayload(charaData))
+            player.Add(PlayerChanges.Glamourer);
+
+        if (Pair.IsCustomizePlusEnabled && HasPlayerCustomizePayload(charaData))
+            player.Add(PlayerChanges.Customize);
+
+        if (HasPlayerManipulationPayload(Pair, charaData))
+            player.Add(PlayerChanges.ModManip);
+
+        if (!string.IsNullOrWhiteSpace(charaData.HeelsData))
+            player.Add(PlayerChanges.Heels);
+
+        if (!string.IsNullOrWhiteSpace(charaData.HonorificData))
+            player.Add(PlayerChanges.Honorific);
+
+        if (!string.IsNullOrWhiteSpace(charaData.MoodlesData))
+            player.Add(PlayerChanges.Moodles);
+
+        if (!string.IsNullOrWhiteSpace(charaData.PetNamesData))
+            player.Add(PlayerChanges.PetNames);
+    }
+
+    private static bool HasPlayerGlamourerPayload(CharacterData charaData)
+        => charaData?.GlamourerData != null
+            && charaData.GlamourerData.TryGetValue(ObjectKind.Player, out var glamourerPayload)
+            && !string.IsNullOrWhiteSpace(glamourerPayload);
+
     private static bool RequiresAppearanceFileReadyGate(Dictionary<ObjectKind, HashSet<PlayerChanges>> updatedData)
         => updatedData.Values.Any(v => v.Contains(PlayerChanges.ModFiles)
             || v.Contains(PlayerChanges.Customize)
             || v.Contains(PlayerChanges.ModManip));
+
+    private bool AllPayloadHashesSessionKnownPresent(CharacterData data)
+    {
+        if (data?.FileReplacements == null || data.FileReplacements.Count == 0)
+            return false;
+
+        var hashes = data.FileReplacements.Values
+            .Where(static list => list != null)
+            .SelectMany(static list => list)
+            .Where(static item => item != null && string.IsNullOrWhiteSpace(item.FileSwapPath) && !string.IsNullOrWhiteSpace(item.Hash))
+            .Select(static item => item.Hash)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+        return hashes.Length > 0 && hashes.All(hash => HasUsableCachedFileForHash(hash));
+    }
 
     private static bool RequiresLifecyclePlayerRedraw(PairSyncAssetPlan assetPlan)
     {
@@ -1021,25 +1483,123 @@ public sealed partial class PairHandler
         return string.Join(";", updatedData.OrderBy(k => (int)k.Key).Select(k => $"{k.Key}:{string.Join('|', k.Value.OrderBy(v => v.ToString()))}"));
     }
 
-    private PairSyncAssetPlan BuildPairSyncAssetPlan(Guid applicationBase, CharacterData charaData, CancellationToken token)
+    private PairSyncAssetPlan BuildPairSyncAssetPlan(Guid applicationBase, CharacterData previousData, CharacterData charaData, Dictionary<ObjectKind, HashSet<PlayerChanges>> updatedData, string previousPayloadFingerprint, string incomingPayloadFingerprint, CancellationToken token)
     {
+        if (TryBuildPairSyncDeltaAssetPlan(applicationBase, previousData, charaData, updatedData, previousPayloadFingerprint, incomingPayloadFingerprint, token, out var deltaPlan))
+            return deltaPlan;
+
         var missingFiles = _modPathResolver.Calculate(applicationBase, charaData, out var moddedPaths, token, Pair.EffectiveScreenShakeEnabled);
         return BuildPairSyncAssetPlanFromResolvedPaths(moddedPaths, missingFiles, charaData);
     }
 
-    private static PairSyncAssetPlan BuildPairSyncAssetPlanFromResolvedPaths(Dictionary<(string GamePath, string? Hash), string> moddedPaths, List<FileReplacementData>? missingFiles = null, CharacterData? charaData = null)
+    private bool TryBuildPairSyncDeltaAssetPlan(Guid applicationBase, CharacterData previousData, CharacterData charaData, Dictionary<ObjectKind, HashSet<PlayerChanges>> updatedData, string previousPayloadFingerprint, string incomingPayloadFingerprint, CancellationToken token, out PairSyncAssetPlan deltaPlan)
     {
-        if (moddedPaths.Count == 0 && (missingFiles == null || missingFiles.Count == 0))
+        deltaPlan = PairSyncAssetPlan.Empty;
+
+        if (!CanUseReceiverDeltaAssetPlan(updatedData, previousPayloadFingerprint, incomingPayloadFingerprint))
+            return false;
+
+        PairSyncAssetPlan? previousPlan;
+        lock (_pairSyncAssetPlanCacheGate)
+        {
+            if (string.IsNullOrWhiteSpace(_lastResolvedPairSyncPayloadFingerprint)
+                || !string.Equals(_lastResolvedPairSyncPayloadFingerprint, previousPayloadFingerprint, StringComparison.Ordinal)
+                || _lastResolvedPairSyncAssetPlan == null)
+            {
+                return false;
+            }
+
+            previousPlan = _lastResolvedPairSyncAssetPlan;
+        }
+
+        if (!TryBuildDeltaReplacementData(previousData, charaData, out var deltaData, out var touchedGamePaths, out var removedGamePaths))
+            return false;
+
+        if (touchedGamePaths.Count == 0)
+            return false;
+
+        var missingFiles = _modPathResolver.Calculate(applicationBase, deltaData, out var deltaModdedPaths, token, Pair.EffectiveScreenShakeEnabled);
+        var fullModdedPaths = previousPlan.ModdedPaths.ToDictionary(kvp => kvp.Key, kvp => kvp.Value);
+        var deltaEntryPaths = new Dictionary<(string GamePath, string? Hash), string>();
+
+        foreach (var existing in previousPlan.ModdedPaths)
+        {
+            if (!touchedGamePaths.Contains(NormalizePairSyncDeltaGamePath(existing.Key.GamePath)))
+                continue;
+
+            deltaEntryPaths[existing.Key] = existing.Value;
+        }
+
+        foreach (var path in touchedGamePaths)
+            RemoveModdedPathEntriesForGamePath(fullModdedPaths, path);
+
+        foreach (var item in deltaModdedPaths)
+        {
+            fullModdedPaths[item.Key] = item.Value;
+            deltaEntryPaths[item.Key] = item.Value;
+        }
+
+        deltaPlan = BuildPairSyncAssetPlanFromResolvedPaths(fullModdedPaths, missingFiles, charaData, deltaEntryPaths);
+
+        if (Logger.IsEnabled(LogLevel.Debug))
+        {
+            Logger.LogDebug(
+                "[BASE-{appBase}] Receiver delta asset plan for {pair}: touched={touched}, removed={removed}, deltaResolved={deltaResolved}, missing={missing}, fullResolved={fullResolved}, previousPayload={previousPayload}, incomingPayload={incomingPayload}",
+                applicationBase,
+                Pair.UserData.AliasOrUID,
+                touchedGamePaths.Count,
+                removedGamePaths.Count,
+                deltaModdedPaths.Count,
+                missingFiles.Count,
+                fullModdedPaths.Count,
+                previousPayloadFingerprint,
+                incomingPayloadFingerprint);
+        }
+
+        return true;
+    }
+
+    private bool CanUseReceiverDeltaAssetPlan(Dictionary<ObjectKind, HashSet<PlayerChanges>> updatedData, string previousPayloadFingerprint, string incomingPayloadFingerprint)
+    {
+        if (string.IsNullOrWhiteSpace(previousPayloadFingerprint)
+            || string.Equals(previousPayloadFingerprint, "EMPTY", StringComparison.Ordinal)
+            || string.Equals(previousPayloadFingerprint, incomingPayloadFingerprint, StringComparison.Ordinal)
+            || _forceApplyMods
+            || _redrawOnNextApplication
+            || _initialApplyPending)
+        {
+            return false;
+        }
+
+        if (updatedData.Count != 1 || !updatedData.TryGetValue(ObjectKind.Player, out var playerChanges))
+            return false;
+
+        if (!playerChanges.Contains(PlayerChanges.ModFiles) || playerChanges.Contains(PlayerChanges.ForcedRedraw))
+            return false;
+
+        foreach (var change in playerChanges)
+        {
+            if (change is not (PlayerChanges.ModFiles or PlayerChanges.Glamourer or PlayerChanges.Customize or PlayerChanges.ModManip or PlayerChanges.Heels or PlayerChanges.Honorific or PlayerChanges.Moodles or PlayerChanges.PetNames))
+                return false;
+        }
+
+        return true;
+    }
+
+    private static PairSyncAssetPlan BuildPairSyncAssetPlanFromResolvedPaths(Dictionary<(string GamePath, string? Hash), string> moddedPaths, List<FileReplacementData>? missingFiles = null, CharacterData? charaData = null, Dictionary<(string GamePath, string? Hash), string>? entryModdedPaths = null)
+    {
+        var entrySource = entryModdedPaths ?? moddedPaths;
+        if (moddedPaths.Count == 0 && entrySource.Count == 0 && (missingFiles == null || missingFiles.Count == 0))
             return PairSyncAssetPlan.Empty;
 
         var objectKindByGamePath = charaData == null ? null : BuildPairSyncObjectKindLookup(charaData);
-        var entries = new List<PairSyncAssetEntry>(moddedPaths.Count);
+        var entries = new List<PairSyncAssetEntry>(entrySource.Count);
         var uniqueHashes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var containsAnimationCritical = false;
         var containsVfxCritical = false;
         var containsVfxPropSupport = false;
 
-        foreach (var item in moddedPaths)
+        foreach (var item in entrySource)
         {
             var gamePath = item.Key.GamePath?.Replace('\\', '/').Trim();
             if (string.IsNullOrWhiteSpace(gamePath))
@@ -1112,6 +1672,95 @@ public sealed partial class PairHandler
 
         return new PairSyncAssetPlan(moddedPaths, missingFiles?.ToList() ?? [], entries, uniqueHashes, primeTransientPaths, finalizedPrimeTransientPathsByKind, transientSupportPaths, containsAnimationCritical, containsVfxCritical, containsVfxPropSupport, tempModsFingerprint, transientSupportFingerprint);
     }
+
+    private static bool TryBuildDeltaReplacementData(CharacterData previousData, CharacterData charaData, out CharacterData deltaData, out HashSet<string> touchedGamePaths, out HashSet<string> removedGamePaths)
+    {
+        deltaData = new CharacterData();
+        touchedGamePaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        removedGamePaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        var previous = BuildPairSyncReplacementLookup(previousData);
+        var current = BuildPairSyncReplacementLookup(charaData);
+
+        foreach (var previousItem in previous)
+        {
+            if (current.ContainsKey(previousItem.Key))
+                continue;
+
+            touchedGamePaths.Add(previousItem.Key);
+            removedGamePaths.Add(previousItem.Key);
+        }
+
+        foreach (var currentItem in current)
+        {
+            var changed = !previous.TryGetValue(currentItem.Key, out var previousItem)
+                || !string.Equals(previousItem.Hash ?? string.Empty, currentItem.Value.Hash ?? string.Empty, StringComparison.OrdinalIgnoreCase)
+                || !string.Equals(previousItem.FileSwapPath ?? string.Empty, currentItem.Value.FileSwapPath ?? string.Empty, StringComparison.OrdinalIgnoreCase);
+
+            if (!changed)
+                continue;
+
+            touchedGamePaths.Add(currentItem.Key);
+            AddDeltaReplacement(deltaData, currentItem.Value);
+        }
+
+        return touchedGamePaths.Count > 0;
+    }
+
+    private static Dictionary<string, PairSyncReplacementLookupEntry> BuildPairSyncReplacementLookup(CharacterData? data)
+    {
+        var lookup = new Dictionary<string, PairSyncReplacementLookupEntry>(StringComparer.OrdinalIgnoreCase);
+        if (data?.FileReplacements == null)
+            return lookup;
+
+        foreach (var objectFiles in data.FileReplacements)
+        {
+            foreach (var replacement in objectFiles.Value ?? [])
+            {
+                if (replacement?.GamePaths == null)
+                    continue;
+
+                foreach (var gamePath in replacement.GamePaths)
+                {
+                    var normalized = NormalizePairSyncDeltaGamePath(gamePath);
+                    if (string.IsNullOrWhiteSpace(normalized))
+                        continue;
+
+                    lookup[normalized] = new PairSyncReplacementLookupEntry(objectFiles.Key, normalized, replacement.Hash, replacement.FileSwapPath);
+                }
+            }
+        }
+
+        return lookup;
+    }
+
+    private static void AddDeltaReplacement(CharacterData deltaData, PairSyncReplacementLookupEntry entry)
+    {
+        if (!deltaData.FileReplacements.TryGetValue(entry.ObjectKind, out var replacements) || replacements == null)
+        {
+            replacements = [];
+            deltaData.FileReplacements[entry.ObjectKind] = replacements;
+        }
+
+        replacements.Add(new FileReplacementData
+        {
+            GamePaths = [entry.GamePath],
+            Hash = entry.Hash,
+            FileSwapPath = entry.FileSwapPath ?? string.Empty,
+        });
+    }
+
+    private static void RemoveModdedPathEntriesForGamePath(Dictionary<(string GamePath, string? Hash), string> moddedPaths, string gamePath)
+    {
+        if (moddedPaths.Count == 0 || string.IsNullOrWhiteSpace(gamePath))
+            return;
+
+        foreach (var key in moddedPaths.Keys.Where(key => string.Equals(NormalizePairSyncDeltaGamePath(key.GamePath), gamePath, StringComparison.OrdinalIgnoreCase)).ToArray())
+            moddedPaths.Remove(key);
+    }
+
+    private static string NormalizePairSyncDeltaGamePath(string? value)
+        => string.IsNullOrWhiteSpace(value) ? string.Empty : value.Replace('\\', '/').Trim();
 
     private static ObjectKind GuessPairSyncObjectKindFromGamePath(string gamePath)
     {
@@ -1207,26 +1856,77 @@ public sealed partial class PairHandler
             : PairSyncAssetCriticality.Normal;
     }
 
+    private void RememberAppliedPairSyncAssetPlan(PairSyncPlan plan)
+    {
+        if (plan == null || string.IsNullOrWhiteSpace(plan.PayloadFingerprint))
+            return;
+
+        lock (_pairSyncAssetPlanCacheGate)
+        {
+            if (plan.UpdateModdedPaths || plan.AssetPlan.HasAssets || _lastResolvedPairSyncAssetPlan == null)
+            {
+                _lastResolvedPairSyncAssetPlan = plan.AssetPlan;
+            }
+
+            _lastResolvedPairSyncPayloadFingerprint = plan.PayloadFingerprint;
+        }
+    }
+
+    private void ClearPairSyncAssetPlanCache()
+    {
+        lock (_pairSyncAssetPlanCacheGate)
+        {
+            _lastResolvedPairSyncAssetPlan = null;
+            _lastResolvedPairSyncPayloadFingerprint = null;
+        }
+    }
+
     private async Task<PairSyncCommitResult> ExecutePairSyncPlanAsync(PairSyncPlan plan, CancellationToken token)
     {
         if (!plan.HasWork)
+        {
+            LogVisibilityDiagnostic("EXEC skip pair={pair} app={app} reason=no-work", Pair.UserData.AliasOrUID, plan.Request.ApplicationBase);
             return PairSyncCommitResult.Succeeded();
+        }
 
         if (!IsVisible || _charaHandler == null || ResolveStrictVisiblePlayerAddress(_charaHandler.Address) == nint.Zero)
+        {
+            LogVisibilityDiagnostic("EXEC hidden pair={pair} app={app} visible={visible} hasHandler={handler}", Pair.UserData.AliasOrUID, plan.Request.ApplicationBase, IsVisible, _charaHandler != null);
             return PairSyncCommitResult.Hidden("pair became hidden or lost actor before execution");
+        }
 
         if (Pair.IsPaused)
+        {
+            LogVisibilityDiagnostic("EXEC paused pair={pair} app={app}", Pair.UserData.AliasOrUID, plan.Request.ApplicationBase);
             return PairSyncCommitResult.Paused("pair became paused before execution");
+        }
 
         if (Pair.AutoPausedByOtherSync && !Pair.EffectiveOverrideOtherSync)
+        {
+            LogVisibilityDiagnostic("EXEC other-sync pair={pair} app={app} owner={owner}", Pair.UserData.AliasOrUID, plan.Request.ApplicationBase, Pair.RemoteOtherSyncOwner);
             return PairSyncCommitResult.YieldedToOtherSync("yielded to OtherSync before execution");
+        }
 
         var startedTick = Environment.TickCount64;
 
         PairSyncCommitResult handoffResult;
         try
         {
+            LogVisibilityDiagnostic("EXEC handoff start pair={pair} app={app} hash={hash} changes={changes} files={files} manip={manip} fileGate={fileGate}",
+                Pair.UserData.AliasOrUID,
+                plan.Request.ApplicationBase,
+                plan.Request.CharacterData.DataHash.Value,
+                DescribeUpdatedChanges(plan.UpdatedData),
+                plan.UpdateModdedPaths,
+                plan.UpdateManipulation,
+                plan.RequiresFileReadyGate);
             handoffResult = await DownloadAndApplyCharacterAsync(plan.Request.ApplicationBase, plan.Request.CharacterData, plan.UpdatedData, plan.UpdateModdedPaths, plan.UpdateManipulation, plan.RequiresFileReadyGate, plan.AssetPlan, plan.ForceApplyModsForThisApply, plan.LifecycleApplyRequested, plan.LifecycleRedrawRequested, token).ConfigureAwait(false);
+            LogVisibilityDiagnostic("EXEC handoff result pair={pair} app={app} status={status} reason={reason} commitStarted={commitStarted}",
+                Pair.UserData.AliasOrUID,
+                plan.Request.ApplicationBase,
+                handoffResult.Status,
+                handoffResult.Reason,
+                handoffResult.CommitStarted);
         }
         catch (OperationCanceledException)
         {
@@ -1253,6 +1953,12 @@ public sealed partial class PairHandler
             var applicationResult = await applicationTask.ConfigureAwait(false);
             token.ThrowIfCancellationRequested();
 
+            LogVisibilityDiagnostic("EXEC application-task result pair={pair} app={app} status={status} reason={reason}",
+                Pair.UserData.AliasOrUID,
+                plan.Request.ApplicationBase,
+                applicationResult.Status,
+                applicationResult.Reason);
+
             if (!applicationResult.Success)
                 return applicationResult;
         }
@@ -1268,7 +1974,10 @@ public sealed partial class PairHandler
         }
 
         if (WasPairSyncPlanCommitted(plan, startedTick))
+        {
+            LogVisibilityDiagnostic("EXEC commit-observed pair={pair} app={app} hash={hash} payload={payload}", Pair.UserData.AliasOrUID, plan.Request.ApplicationBase, plan.Request.CharacterData.DataHash.Value, plan.PayloadFingerprint);
             return PairSyncCommitResult.Succeeded();
+        }
 
         if (!IsVisible || _charaHandler == null || ResolveStrictVisiblePlayerAddress(_charaHandler.Address) == nint.Zero)
             return PairSyncCommitResult.Hidden("actor was lost before commit was observed");
@@ -1279,6 +1988,12 @@ public sealed partial class PairHandler
         if (Pair.AutoPausedByOtherSync && !Pair.EffectiveOverrideOtherSync)
             return PairSyncCommitResult.YieldedToOtherSync("yielded to OtherSync before commit was observed");
 
+        LogVisibilityDiagnostic("EXEC verification-failed pair={pair} app={app} hash={hash} payload={payload} cachedHash={cachedHash}",
+            Pair.UserData.AliasOrUID,
+            plan.Request.ApplicationBase,
+            plan.Request.CharacterData.DataHash.Value,
+            plan.PayloadFingerprint,
+            _cachedData?.DataHash.Value ?? string.Empty);
         return PairSyncCommitResult.VerificationFailed("commit was not observed; desired state remains pending", retryImmediately: true);
     }
 

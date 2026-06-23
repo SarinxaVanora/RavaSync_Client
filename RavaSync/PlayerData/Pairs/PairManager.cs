@@ -12,6 +12,7 @@ using RavaSync.Interop.Ipc;
 using RavaSync.MareConfiguration;
 using RavaSync.MareConfiguration.Models;
 using RavaSync.PlayerData.Factories;
+using RavaSync.PlayerData.Services;
 using RavaSync.Services;
 using RavaSync.Services.Discovery;
 using RavaSync.Services.Events;
@@ -21,11 +22,21 @@ using RavaSync.WebAPI;
 using RavaSync.WebAPI.Files;
 using System.Collections.Concurrent;
 using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
 
 namespace RavaSync.PlayerData.Pairs;
 
 public sealed class PairManager : DisposableMediatorSubscriberBase
 {
+    // RAVASYNC_VISIBILITY_DIAGNOSTICS: temporary Info-level receiver acceptance tracing. Search '[VIS-DIAG]' to remove later.
+    private const string VisibilityDiagnosticsPrefix = "[VIS-DIAG]";
+
+    private void LogVisibilityDiagnostic(string message, params object[] args)
+    {
+        Logger.LogInformation(VisibilityDiagnosticsPrefix + " " + message, args);
+    }
+
     private readonly ConcurrentDictionary<UserData, Pair> _allClientPairs = new(UserDataComparer.Instance);
     private readonly ConcurrentDictionary<GroupData, GroupFullInfoDto> _allGroups = new(GroupDataComparer.Instance);
     private readonly MareConfigService _configurationService;
@@ -64,6 +75,7 @@ public sealed class PairManager : DisposableMediatorSubscriberBase
         Mediator.Subscribe<ConnectedMessage>(this, msg =>
         {
             _ownUid = msg.Connection.User?.UID ?? string.Empty;
+            RemoveOwnUserPairIfPresent("connected");
         });
         Mediator.Subscribe<DisconnectedMessage>(this, (_) =>
         {
@@ -104,6 +116,58 @@ public sealed class PairManager : DisposableMediatorSubscriberBase
     public Pair? LastAddedUser { get; internal set; }
     public Dictionary<Pair, List<GroupFullInfoDto>> PairsWithGroups => _pairsWithGroupsInternal.Value;
 
+    private bool IsOwnUid(string? uid)
+        => !string.IsNullOrWhiteSpace(uid)
+            && !string.IsNullOrWhiteSpace(_ownUid)
+            && string.Equals(uid, _ownUid, StringComparison.Ordinal);
+
+    private bool IsOwnUser(UserData? user)
+        => user != null && IsOwnUid(user.UID);
+
+    private bool RejectOwnPairUser(UserData? user, string source)
+    {
+        if (!IsOwnUser(user))
+            return false;
+
+        Logger.LogWarning("Ignoring {source} for own UID {uid}; local sender state must never be represented as a receiver Pair/temp collection", source, user?.UID ?? string.Empty);
+        RemoveOwnUserPairIfPresent(source);
+        return true;
+    }
+
+    private void RemoveOwnUserPairIfPresent(string reason)
+    {
+        if (string.IsNullOrWhiteSpace(_ownUid))
+            return;
+
+        var removedAny = false;
+        foreach (var kvp in _allClientPairs.ToArray())
+        {
+            if (!IsOwnUser(kvp.Key))
+                continue;
+
+            if (!_allClientPairs.TryRemove(kvp.Key, out var pair))
+                continue;
+
+            removedAny = true;
+            UnindexPair(kvp.Key);
+
+            try
+            {
+                pair.MarkOffline(wait: false, queuePerPairTeardown: false);
+            }
+            catch (Exception ex)
+            {
+                Logger.LogDebug(ex, "Failed removing accidental self pair for own UID {uid} during {reason}", _ownUid, reason);
+            }
+        }
+
+        if (removedAny)
+        {
+            Logger.LogWarning("Removed accidental self pair for own UID {uid} during {reason}; self/local state must stay on the local Penumbra collection only", _ownUid, reason);
+            RecreateLazy();
+        }
+    }
+
     public void AddGroup(GroupFullInfoDto dto)
     {
         _allGroups[dto.Group] = dto;
@@ -112,6 +176,9 @@ public sealed class PairManager : DisposableMediatorSubscriberBase
 
     public void AddGroupPair(GroupPairFullInfoDto dto)
     {
+        if (RejectOwnPairUser(dto.User, "group pair add"))
+            return;
+
         if (!_allClientPairs.ContainsKey(dto.User))
         {
             var created = _pairFactory.Create(new UserFullPairDto(dto.User, API.Data.Enum.IndividualPairStatus.None,
@@ -279,6 +346,9 @@ public sealed class PairManager : DisposableMediatorSubscriberBase
 
     public void AddUserPair(UserFullPairDto dto)
     {
+        if (RejectOwnPairUser(dto.User, "direct pair add"))
+            return;
+
         if (!_allClientPairs.ContainsKey(dto.User))
         {
             var created = _pairFactory.Create(dto);
@@ -299,6 +369,9 @@ public sealed class PairManager : DisposableMediatorSubscriberBase
 
     public void AddUserPair(UserPairDto dto, bool addToLastAddedUser = true)
     {
+        if (RejectOwnPairUser(dto.User, "pair update"))
+            return;
+
         if (!_allClientPairs.ContainsKey(dto.User))
         {
             var created = _pairFactory.Create(dto);
@@ -586,6 +659,9 @@ public sealed class PairManager : DisposableMediatorSubscriberBase
 
     public void MarkPairOffline(UserData user)
     {
+        if (RejectOwnPairUser(user, "pair offline"))
+            return;
+
         if (_allClientPairs.TryGetValue(user, out var pair))
         {
             Mediator.Publish(new ClearProfileDataMessage(pair.UserData));
@@ -597,6 +673,9 @@ public sealed class PairManager : DisposableMediatorSubscriberBase
 
     public void MarkPairOnline(OnlineUserIdentDto dto, bool sendNotif = true)
     {
+        if (RejectOwnPairUser(dto.User, "pair online"))
+            return;
+
         if (!_allClientPairs.ContainsKey(dto.User)) throw new InvalidOperationException("No user found for " + dto);
 
         Mediator.Publish(new ClearProfileDataMessage(dto.User));
@@ -632,8 +711,37 @@ public sealed class PairManager : DisposableMediatorSubscriberBase
 
     public void ReceiveCharaData(OnlineUserCharaDataDto dto)
     {
+        ReceiveCharaDataCore(dto, ensureVisibleCommit: true);
+    }
+
+    public async Task<bool> ReceiveCharaDataAndWaitForVisibleCommitAsync(OnlineUserCharaDataDto dto, TimeSpan timeout, CancellationToken token)
+    {
+        var pair = ReceiveCharaDataCore(dto, ensureVisibleCommit: false);
+        if (pair == null || dto?.CharaData == null)
+            return false;
+
+        return await pair.WaitForVisibleReceivedPayloadCommitAsync(dto.CharaData, timeout, token).ConfigureAwait(false);
+    }
+
+    private Pair? ReceiveCharaDataCore(OnlineUserCharaDataDto dto, bool ensureVisibleCommit)
+    {
+        if (RejectOwnPairUser(dto.User, "incoming character data"))
+            return null;
+
         if (!_allClientPairs.TryGetValue(dto.User, out var pair))
+        {
+            LogVisibilityDiagnostic("RECV manager rejected uid={uid} reason=no-pair hash={hash}", dto.User.UID, dto.CharaData?.DataHash.Value ?? string.Empty);
             throw new InvalidOperationException("No user found for " + dto.User);
+        }
+
+        LogVisibilityDiagnostic("RECV manager accepted uid={uid} alias={alias} hash={hash} payload={payload} visible={visible} paused={paused} ensureCommit={ensure}",
+            dto.User.UID,
+            pair.UserData.AliasOrUID,
+            dto.CharaData?.DataHash.Value ?? string.Empty,
+            PairApplyUtilities.ComputeCharacterDataPayloadFingerprint(dto.CharaData),
+            pair.IsVisible,
+            pair.IsPaused,
+            ensureVisibleCommit);
 
         var previousManifestFingerprint = pair.LastReceivedSyncManifest?.mf ?? string.Empty;
         var hasSyncManifest = _characterRavaSidecarUtility.TryExtractSyncManifest(dto.CharaData, out var syncManifest);
@@ -657,9 +765,10 @@ public sealed class PairManager : DisposableMediatorSubscriberBase
 
         var currentManifestFingerprint = hasSyncManifest ? syncManifest?.mf ?? string.Empty : previousManifestFingerprint;
         var manifestUnchanged = string.Equals(previousManifestFingerprint, currentManifestFingerprint, StringComparison.Ordinal);
-
         if (pair.IsDuplicateIncomingPayload(dto.CharaData) && manifestUnchanged)
         {
+            LogVisibilityDiagnostic("RECV manager duplicate uid={uid} visible={visible} manifest={manifest} merged={merged}; willForceVisible={forceVisible}",
+                dto.User.UID, pair.IsVisible, currentManifestFingerprint, merged, pair.IsVisible);
             var clearedUpload = pair.ClearRemoteUploadStatus();
             if (Logger.IsEnabled(LogLevel.Trace))
             {
@@ -673,15 +782,25 @@ public sealed class PairManager : DisposableMediatorSubscriberBase
                     clearedUpload);
             }
 
-            // A duplicate payload can still be the sender's final post-upload push.
-            // Use that as the clean end-of-upload signal and as a lightweight self-heal
-            // for cases where the visible actor missed its first apply and would
-            // otherwise need a pause/unpause cycle.
-            if (clearedUpload && pair.IsVisible)
+            // A duplicate payload can still be the sender's final post-upload push,
+            // or a fresh-session repair replay after the handler/visibility path missed
+            // the first authoritative apply. Do not swallow visible duplicate payloads
+            // here; Pair.ApplyLastReceivedData has its own short forced-apply throttle.
+            if (pair.IsVisible)
+            {
+                Logger.LogTrace(
+                    "Forcing visible duplicate/sidecar repair apply for {uid}; clearedUpload={clearedUpload}",
+                    dto.User.UID,
+                    clearedUpload);
+                LogVisibilityDiagnostic("RECV manager duplicate forcing apply uid={uid} hash={hash}", dto.User.UID, dto.CharaData?.DataHash.Value ?? string.Empty);
                 pair.ApplyLastReceivedData(forced: true);
 
+                if (ensureVisibleCommit)
+                    pair.EnsureVisibleReceivedPayloadCommits(dto.CharaData, "duplicate incoming character data");
+            }
+
             RecreateLazy();
-            return;
+            return pair;
         }
 
         if (!hasSyncManifest)
@@ -699,7 +818,22 @@ public sealed class PairManager : DisposableMediatorSubscriberBase
         }
 
         Mediator.Publish(new EventMessage(new Event(pair.UserData, nameof(PairManager), EventSeverity.Informational, "Received Character Data")));
+        LogVisibilityDiagnostic("RECV manager forwarding-to-pair uid={uid} hash={hash} visible={visible} paused={paused} manifest={manifest} merged={merged}",
+            dto.User.UID,
+            dto.CharaData?.DataHash.Value ?? string.Empty,
+            pair.IsVisible,
+            pair.IsPaused,
+            currentManifestFingerprint,
+            merged);
         pair.ApplyData(dto);
+
+        if (ensureVisibleCommit)
+        {
+            LogVisibilityDiagnostic("RECV manager ensure-visible-commit uid={uid} hash={hash}", dto.User.UID, dto.CharaData?.DataHash.Value ?? string.Empty);
+            pair.EnsureVisibleReceivedPayloadCommits(dto.CharaData, "incoming character data");
+        }
+
+        return pair;
     }
 
     public void RemoveGroup(GroupData data)

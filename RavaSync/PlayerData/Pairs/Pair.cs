@@ -2,6 +2,7 @@ using Dalamud.Game.Gui.ContextMenu;
 using Dalamud.Game.Text.SeStringHandling;
 using Microsoft.Extensions.Logging;
 using RavaSync.API.Data;
+using ApiCharacterData = RavaSync.API.Data.CharacterData;
 using RavaSync.API.Data.Enum;
 using RavaSync.API.Data.Extensions;
 using RavaSync.API.Dto.User;
@@ -15,11 +16,13 @@ using RavaSync.Services.ServerConfiguration;
 using RavaSync.Utils;
 using RavaSync.WebAPI.Files.Models;
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.IO.Compression;
 using System.Linq;
 using System.Text;
 using System.Threading;
+using System.Threading.Tasks;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using System.Reflection;
@@ -28,11 +31,20 @@ using System.Text.RegularExpressions;
 using System.Text.Json.Nodes;
 using RavaSync.PlayerData.Services;
 using MenuItem = Dalamud.Game.Gui.ContextMenu.MenuItem;
+using RavaSync.PlayerData.Data;
 
 namespace RavaSync.PlayerData.Pairs;
 
 public class Pair
 {
+    // RAVASYNC_VISIBILITY_DIAGNOSTICS: temporary Info-level per-pair apply queue tracing. Search '[VIS-DIAG]' to remove later.
+    private const string VisibilityDiagnosticsPrefix = "[VIS-DIAG]";
+
+    private void LogVisibilityDiagnostic(string message, params object[] args)
+    {
+        _logger.LogInformation(VisibilityDiagnosticsPrefix + " " + message, args);
+    }
+
     private readonly PairHandlerFactory _cachedPlayerFactory;
     private readonly SemaphoreSlim _creationSemaphore = new(1);
     private readonly ILogger<Pair> _logger;
@@ -45,6 +57,7 @@ public class Pair
     private CancellationTokenSource _applicationCts = new();
     private OnlineUserIdentDto? _onlineUserIdentDto = null;
     private CancellationTokenSource? _pendingEmptyApplyCts;
+    private CancellationTokenSource? _visibleCommitWatchCts;
     private const int PendingEmptyFileListApplyDebounceMs = 500;
     private const int PendingUploadingEmptyFileListApplyDebounceMs = 900;
     private const int ForcedApplyDuplicateWindowMs = 1500;
@@ -88,7 +101,7 @@ public class Pair
     public bool EffectiveScreenShakeEnabled => IsScreenShakeEnabled && _mareConfigService.Current.GlobalSyncScreenShake;
     public bool EffectiveHeightEditsEnabled => IsMetadataEnabled && _mareConfigService.Current.GlobalSyncHeightEdits;
 
-    public CharacterData? LastReceivedCharacterData { get; set; }
+    public ApiCharacterData? LastReceivedCharacterData { get; set; }
     public CharacterRavaSidecarUtility.SyncManifestPayload? LastReceivedSyncManifest { get; private set; }
     public string? PlayerName => CachedPlayer?.PlayerName ?? string.Empty;
     public string LastKnownPlayerName => CachedPlayer?.LastKnownVanillaTeardownPlayerName ?? string.Empty;
@@ -212,20 +225,35 @@ public class Pair
         // only if another SCD was observed for this pair since the previous payload.
         ReconcileActiveSyncIndicatorsOnIncomingUserData();
 
+        incoming = PreservePreviousPlayerPayloadForNonPlayerOnlyIncoming(incoming);
+
         var incomingHash = incoming?.DataHash.Value ?? string.Empty;
+        LogVisibilityDiagnostic("PAIR apply-data receive uid={uid} hash={hash} visible={visible} paused={paused} cachedPlayer={cachedPlayer} lastReceived={lastHash}",
+            data.User.UID,
+            incomingHash,
+            IsVisible,
+            IsPaused,
+            CachedPlayer != null,
+            LastReceivedCharacterData?.DataHash.Value ?? string.Empty);
         var incomingPayloadFingerprint = PairApplyUtilities.ComputeCharacterDataPayloadFingerprint(incoming);
         if (!string.IsNullOrWhiteSpace(incomingHash)
             && string.Equals(incomingHash, _lastAcceptedIncomingDataHash, StringComparison.Ordinal)
             && string.Equals(incomingPayloadFingerprint, _lastAcceptedIncomingPayloadFingerprint, StringComparison.Ordinal))
         {
             var clearedUpload = ClearRemoteUploadStatus();
+            LogVisibilityDiagnostic("PAIR apply-data duplicate uid={uid} hash={hash} payload={payload} visible={visible} paused={paused} cachedPlayer={cachedPlayer} clearedUpload={clearedUpload}",
+                data.User.UID, incomingHash, incomingPayloadFingerprint, IsVisible, IsPaused, CachedPlayer != null, clearedUpload);
             _logger.LogTrace("Ignoring duplicate incoming character data {hash}/{payload} for {uid}; clearedUpload={clearedUpload}", incomingHash, incomingPayloadFingerprint, data.User.UID, clearedUpload);
 
-            // If this duplicate payload is the server's final post-upload push, use it
-            // as a cheap self-heal point. A missed initial/lifecycle apply should not
-            // require the user to pause/unpause the pair to force a reapply.
-            if (clearedUpload && IsVisible && CachedPlayer != null && LastReceivedCharacterData != null && !IsPaused)
+            // Duplicate payloads can still be useful repair/replay signals: the sender may
+            // have force-pushed because a Mesh ready ACK was missed, or because visibility/pair
+            // state needed a reassert without changing the payload fingerprint. The forced path
+            // has its own short duplicate throttle, so let visible pairs self-heal here.
+            if (IsVisible && CachedPlayer != null && LastReceivedCharacterData is ApiCharacterData && !IsPaused)
+            {
+                LogVisibilityDiagnostic("PAIR apply-data duplicate forcing last-received apply uid={uid} hash={hash}", data.User.UID, incomingHash);
                 ApplyLastReceivedData(forced: true);
+            }
 
             return;
         }
@@ -235,6 +263,7 @@ public class Pair
 
         if (IsPaused)
         {
+            LogVisibilityDiagnostic("PAIR apply-data stored uid={uid} hash={hash} reason=paused visible={visible}", data.User.UID, incomingHash, IsVisible);
             // While manually paused, cap-paused, scope-paused, or yielded to another sync,
             // receiver data should still be remembered for the eventual unpause/reclaim,
             // but no deferred empty-file-list apply must be allowed to fire later and
@@ -247,10 +276,35 @@ public class Pair
             return;
         }
 
-        if (incoming != null && LastReceivedCharacterData != null && IsVisible)
+        if (incoming is ApiCharacterData incomingData && LastReceivedCharacterData is ApiCharacterData previousData && IsVisible)
         {
-            bool incomingHasFiles = incoming.FileReplacements?.Any(k => k.Value?.Any() ?? false) ?? false;
-            bool previousHasFiles = LastReceivedCharacterData.FileReplacements?.Any(k => k.Value?.Any() ?? false) ?? false;
+            bool incomingHasFiles = incomingData.FileReplacements?.Any(k => k.Value?.Any() ?? false) ?? false;
+            bool previousHasFiles = previousData.FileReplacements?.Any(k => k.Value?.Any() ?? false) ?? false;
+
+            // The sync manifest is the sender's authoritative file-map contract.
+            // Without it, an empty FileReplacements payload is ambiguous: it can mean
+            // either "the sender genuinely has no file mods" or "the file map was stripped /
+            // delayed while metadata was still delivered".  Never let an ambiguous empty
+            // player payload clear a previously modded visible player.
+            if (!incomingHasFiles && previousHasFiles && !IncomingEmptyFileListIsAuthoritativeClear())
+            {
+                var preserved = incomingData.DeepClone();
+                preserved.FileReplacements = previousData.FileReplacements?
+                    .ToDictionary(k => k.Key, v => v.Value?.ToList() ?? []) ?? [];
+
+                _applicationCts = _applicationCts.CancelRecreate();
+                LastReceivedCharacterData = preserved;
+                _lastAcceptedIncomingDataHash = preserved.DataHash.Value ?? string.Empty;
+                _lastAcceptedIncomingPayloadFingerprint = PairApplyUtilities.ComputeCharacterDataPayloadFingerprint(preserved);
+
+                LogVisibilityDiagnostic("PAIR apply-data preserve-files uid={uid} hash={hash} reason=ambiguous-empty-file-list previousHash={previousHash}",
+                    data.User.UID, incomingHash, previousData.DataHash.Value ?? string.Empty);
+                _logger.LogWarning(
+                    "Refusing ambiguous empty file-list clear for {uid}; preserving previous visible player files until an authoritative zero-asset manifest or non-empty manifest-backed payload arrives",
+                    UserData.UID);
+                ApplyLastReceivedData(forced: true);
+                return;
+            }
 
             // During a sender-side item swap the remote can briefly publish an empty
             // file list before the replacement file map arrives. Applying that empty
@@ -261,14 +315,14 @@ public class Pair
                 _pendingEmptyApplyCts?.Cancel();
                 _pendingEmptyApplyCts = new CancellationTokenSource();
                 var token = _pendingEmptyApplyCts.Token;
-                var pending = incoming;
+                var pending = incomingData;
                 var delayMs = wasUploadingAtDataArrival ? PendingUploadingEmptyFileListApplyDebounceMs : PendingEmptyFileListApplyDebounceMs;
 
-                var immediate = incoming.DeepClone();
-                immediate.FileReplacements = LastReceivedCharacterData.FileReplacements?
+                var immediate = incomingData.DeepClone();
+                immediate.FileReplacements = previousData.FileReplacements?
                     .ToDictionary(k => k.Key, v => v.Value?.ToList() ?? []) ?? [];
 
-                var previousPayloadFingerprint = PairApplyUtilities.ComputeCharacterDataPayloadFingerprint(LastReceivedCharacterData);
+                var previousPayloadFingerprint = PairApplyUtilities.ComputeCharacterDataPayloadFingerprint(previousData);
                 var immediatePayloadFingerprint = PairApplyUtilities.ComputeCharacterDataPayloadFingerprint(immediate);
                 if (!string.Equals(previousPayloadFingerprint, immediatePayloadFingerprint, StringComparison.Ordinal))
                 {
@@ -278,10 +332,12 @@ public class Pair
                     _lastAcceptedIncomingDataHash = immediate.DataHash.Value ?? string.Empty;
                     _lastAcceptedIncomingPayloadFingerprint = immediatePayloadFingerprint;
 
+                    LogVisibilityDiagnostic("PAIR apply-data prompt-non-file-state uid={uid} hash={hash} delayEmptyMs={delayMs}", UserData.UID, immediate.DataHash.Value ?? string.Empty, delayMs);
                     _logger.LogDebug("Applying prompt non-file receiver state for {uid} while deferring empty file-list clear for {delayMs}ms", UserData.UID, delayMs);
                     ApplyLastReceivedData();
                 }
 
+                LogVisibilityDiagnostic("PAIR apply-data defer-empty-file-list uid={uid} hash={hash} delayMs={delayMs}", UserData.UID, incomingHash, delayMs);
                 _logger.LogDebug("Deferring empty file list for {uid} for {delayMs}ms to avoid sender item-swap vanilla flicker", UserData.UID, delayMs);
 
                 _ = Task.Run(async () =>
@@ -303,6 +359,7 @@ public class Pair
                             return;
                         }
 
+                        LogVisibilityDiagnostic("PAIR apply-data deferred-empty-now-applying uid={uid} hash={hash}", UserData.UID, pending?.DataHash.Value ?? string.Empty);
                         _logger.LogDebug("Applying deferred empty file list for {uid} after confirmation window", UserData.UID);
                         ApplyLastReceivedData();
                     }
@@ -326,6 +383,7 @@ public class Pair
         _lastAcceptedIncomingPayloadFingerprint = incomingPayloadFingerprint;
         if (CachedPlayer == null)
         {
+            LogVisibilityDiagnostic("PAIR apply-data waiting-for-cached-player uid={uid} hash={hash} visible={visible}", data.User.UID, incomingHash, IsVisible);
             _logger.LogDebug("Received Data for {uid} but CachedPlayer does not exist, waiting", data.User.UID);
             _ = Task.Run(async () =>
             {
@@ -340,6 +398,7 @@ public class Pair
 
                 if (!combined.IsCancellationRequested)
                 {
+                    LogVisibilityDiagnostic("PAIR apply-data delayed-cached-player-ready uid={uid} hash={hash}", data.User.UID, LastReceivedCharacterData?.DataHash.Value ?? string.Empty);
                     _logger.LogDebug("Applying delayed data for {uid}", data.User.UID);
                     ApplyLastReceivedData();
                 }
@@ -347,12 +406,147 @@ public class Pair
             return;
         }
 
+        LogVisibilityDiagnostic("PAIR apply-data forwarding-immediate uid={uid} hash={hash} visible={visible} forced=false", data.User.UID, incomingHash, IsVisible);
         ApplyLastReceivedData();
     }
 
     public void SetLastReceivedSyncManifest(CharacterRavaSidecarUtility.SyncManifestPayload? manifest) => LastReceivedSyncManifest = manifest;
 
-    internal bool IsDuplicateIncomingPayload(CharacterData? incoming)
+    private bool IncomingEmptyFileListIsAuthoritativeClear()
+    {
+        // New senders always attach a manifest, including zero-file payloads.  A manifest
+        // with zero assets is therefore an intentional full file clear.  A manifest with only
+        // non-player assets is not allowed to clear the visible player's file bucket here; owned
+        // object/minion payloads must remain additive to the player appearance.  No manifest is
+        // not proof of a clear; it is an old/stripped/metadata-only payload and must not wipe a
+        // visible pair's previously asserted player files.
+        return CharacterRavaSidecarUtility.ManifestRepresentsAuthoritativeEmptyFileSet(LastReceivedSyncManifest);
+    }
+
+    private ApiCharacterData? PreservePreviousPlayerPayloadForNonPlayerOnlyIncoming(ApiCharacterData? incoming)
+    {
+        if (incoming is not ApiCharacterData incomingData)
+            return incoming;
+
+        if (LastReceivedCharacterData is not ApiCharacterData previous)
+            return incoming;
+
+        if (!HasAnyNonPlayerFilePayload(incomingData) || !HasObjectKindFilePayload(previous, ObjectKind.Player))
+            return incoming;
+
+        // Owned-object/minion payloads can still carry a small/stale Player file bucket while the
+        // sender is settling a DRK pet/summon.  Metadata/plugin values may legitimately change in
+        // the same payload, but the file bucket must remain additive here; otherwise a minion VFX
+        // update can replace the active DRK Player temp-mod file set with a partial owned-object
+        // view and knock job skills back to vanilla on the receiver.
+        var incomingCarriesPlayerFiles = HasObjectKindFilePayload(incomingData, ObjectKind.Player);
+        var incomingCarriesPlayerGlamourer = incomingData.GlamourerData != null
+            && incomingData.GlamourerData.TryGetValue(ObjectKind.Player, out var incomingPlayerGlamourer)
+            && !string.IsNullOrWhiteSpace(incomingPlayerGlamourer);
+        var incomingCarriesPlayerCustomize = incomingData.CustomizePlusData != null
+            && incomingData.CustomizePlusData.TryGetValue(ObjectKind.Player, out var incomingPlayerCustomize)
+            && !string.IsNullOrWhiteSpace(incomingPlayerCustomize);
+        var incomingCarriesExplicitPlayerAppearance = incomingCarriesPlayerFiles || incomingCarriesPlayerGlamourer || incomingCarriesPlayerCustomize;
+
+        var clone = incomingData.DeepClone();
+        clone.FileReplacements ??= [];
+        clone.GlamourerData ??= [];
+        clone.CustomizePlusData ??= [];
+
+        var mergedPlayerFiles = new List<FileReplacementData>();
+        if (previous.FileReplacements != null
+            && previous.FileReplacements.TryGetValue(ObjectKind.Player, out var previousPlayerFiles)
+            && previousPlayerFiles != null)
+        {
+            mergedPlayerFiles.AddRange(previousPlayerFiles.DeepClone() ?? []);
+        }
+
+        if (clone.FileReplacements.TryGetValue(ObjectKind.Player, out var incomingPlayerFiles)
+            && incomingPlayerFiles != null)
+        {
+            mergedPlayerFiles.AddRange(incomingPlayerFiles.DeepClone() ?? []);
+        }
+
+        clone.FileReplacements[ObjectKind.Player] = mergedPlayerFiles
+            .Where(item => item != null)
+            .Distinct(FileReplacementDataComparer.Instance)
+            .ToList();
+
+        if (previous.GlamourerData != null
+            && previous.GlamourerData.TryGetValue(ObjectKind.Player, out var previousGlamourer)
+            && !clone.GlamourerData.ContainsKey(ObjectKind.Player))
+        {
+            clone.GlamourerData[ObjectKind.Player] = previousGlamourer;
+        }
+
+        if (previous.CustomizePlusData != null
+            && previous.CustomizePlusData.TryGetValue(ObjectKind.Player, out var previousCustomize)
+            && !clone.CustomizePlusData.ContainsKey(ObjectKind.Player))
+        {
+            clone.CustomizePlusData[ObjectKind.Player] = previousCustomize;
+        }
+
+        if (!incomingCarriesExplicitPlayerAppearance)
+        {
+            if (string.IsNullOrWhiteSpace(clone.ManipulationData) && !string.IsNullOrWhiteSpace(previous.ManipulationData))
+                clone.ManipulationData = previous.ManipulationData;
+
+            if (string.IsNullOrWhiteSpace(clone.HeelsData) && !string.IsNullOrWhiteSpace(previous.HeelsData))
+                clone.HeelsData = previous.HeelsData;
+
+            if (string.IsNullOrWhiteSpace(clone.HonorificData) && !string.IsNullOrWhiteSpace(previous.HonorificData))
+                clone.HonorificData = previous.HonorificData;
+
+            if (string.IsNullOrWhiteSpace(clone.MoodlesData) && !string.IsNullOrWhiteSpace(previous.MoodlesData))
+                clone.MoodlesData = previous.MoodlesData;
+
+            if (string.IsNullOrWhiteSpace(clone.PetNamesData) && !string.IsNullOrWhiteSpace(previous.PetNamesData))
+                clone.PetNamesData = previous.PetNamesData;
+        }
+
+        _logger.LogTrace("Preserved/merged previous Player payload while accepting non-player incoming data for {uid}; owned-object/minion updates will not drop active player temp mods", UserData.UID);
+        return clone;
+    }
+
+    private static bool HasMeaningfulPlayerAppearanceChange(ApiCharacterData incoming, ApiCharacterData previous)
+    {
+        return HasChangedPlayerMapValue(incoming.GlamourerData, previous.GlamourerData)
+            || HasChangedPlayerMapValue(incoming.CustomizePlusData, previous.CustomizePlusData)
+            || HasChangedPlayerString(incoming.ManipulationData, previous.ManipulationData)
+            || HasChangedPlayerString(incoming.HeelsData, previous.HeelsData)
+            || HasChangedPlayerString(incoming.HonorificData, previous.HonorificData)
+            || HasChangedPlayerString(incoming.MoodlesData, previous.MoodlesData)
+            || HasChangedPlayerString(incoming.PetNamesData, previous.PetNamesData);
+    }
+
+    private static bool HasChangedPlayerMapValue(Dictionary<ObjectKind, string>? incomingMap, Dictionary<ObjectKind, string>? previousMap)
+    {
+        if (incomingMap == null
+            || !incomingMap.TryGetValue(ObjectKind.Player, out var incomingValue)
+            || string.IsNullOrWhiteSpace(incomingValue))
+        {
+            return false;
+        }
+
+        var previousValue = string.Empty;
+        previousMap?.TryGetValue(ObjectKind.Player, out previousValue);
+        return !string.Equals(incomingValue, previousValue ?? string.Empty, StringComparison.Ordinal);
+    }
+
+    private static bool HasChangedPlayerString(string? incomingValue, string? previousValue)
+        => !string.Equals(incomingValue ?? string.Empty, previousValue ?? string.Empty, StringComparison.Ordinal);
+
+    private static bool HasObjectKindFilePayload(ApiCharacterData data, ObjectKind kind)
+        => data.FileReplacements != null
+            && data.FileReplacements.TryGetValue(kind, out var replacements)
+            && replacements != null
+            && replacements.Any();
+
+    private static bool HasAnyNonPlayerFilePayload(ApiCharacterData data)
+        => data.FileReplacements != null
+            && data.FileReplacements.Any(kvp => kvp.Key != ObjectKind.Player && (kvp.Value?.Any() ?? false));
+
+    internal bool IsDuplicateIncomingPayload(ApiCharacterData? incoming)
     {
         var incomingHash = incoming?.DataHash.Value ?? string.Empty;
         if (string.IsNullOrWhiteSpace(incomingHash))
@@ -364,51 +558,213 @@ public class Pair
             && string.Equals(incomingPayloadFingerprint, _lastAcceptedIncomingPayloadFingerprint, StringComparison.Ordinal);
     }
 
-    internal CharacterData? PrepareCharacterDataForLocalApply(CharacterData? data)
+    internal ApiCharacterData? PrepareCharacterDataForLocalApply(ApiCharacterData? data)
     {
         return RemoveNotSyncedFiles(data);
     }
 
     public void ApplyLastReceivedData(bool forced = false)
     {
-        if (IsPaused) return;
-        if (AutoPausedByOtherSync && !EffectiveOverrideOtherSync) return;
-        if (CachedPlayer == null) return;
-        if (LastReceivedCharacterData == null) return;
-
-        var preparedData = PrepareCharacterDataForLocalApply(LastReceivedCharacterData.DeepClone());
-        if (preparedData == null)
+        if (IsPaused)
+        {
+            LogVisibilityDiagnostic("PAIR apply-last skip uid={uid} forced={forced} reason=paused", UserData.UID, forced);
             return;
+        }
+
+        if (AutoPausedByOtherSync && !EffectiveOverrideOtherSync)
+        {
+            LogVisibilityDiagnostic("PAIR apply-last skip uid={uid} forced={forced} reason=other-sync owner={owner}", UserData.UID, forced, RemoteOtherSyncOwner);
+            return;
+        }
+
+        if (CachedPlayer == null)
+        {
+            LogVisibilityDiagnostic("PAIR apply-last skip uid={uid} forced={forced} reason=no-cached-player visible={visible}", UserData.UID, forced, IsVisible);
+            return;
+        }
+
+        if (LastReceivedCharacterData is not ApiCharacterData sourceData)
+        {
+            LogVisibilityDiagnostic("PAIR apply-last skip uid={uid} forced={forced} reason=no-last-character-data visible={visible}", UserData.UID, forced, IsVisible);
+            return;
+        }
+
+        var preparedDataMaybe = PrepareCharacterDataForLocalApply(sourceData.DeepClone());
+        if (preparedDataMaybe is not ApiCharacterData preparedData)
+        {
+            LogVisibilityDiagnostic("PAIR apply-last skip uid={uid} forced={forced} reason=prepare-returned-null hash={hash}", UserData.UID, forced, sourceData.DataHash.Value ?? string.Empty);
+            return;
+        }
+
+        LogVisibilityDiagnostic("PAIR apply-last submit uid={uid} hash={hash} payload={payload} forced={forced} visible={visible}",
+            UserData.UID,
+            preparedData.DataHash.Value ?? string.Empty,
+            PairApplyUtilities.ComputeCharacterDataPayloadFingerprint(preparedData),
+            forced,
+            IsVisible);
+        SubmitPreparedCharacterData(preparedData, forced);
+    }
+
+    private bool SubmitPreparedCharacterData(ApiCharacterData preparedData, bool forced)
+    {
+        if (IsPaused)
+        {
+            LogVisibilityDiagnostic("PAIR submit skip uid={uid} forced={forced} reason=paused", UserData.UID, forced);
+            return false;
+        }
+
+        if (AutoPausedByOtherSync && !EffectiveOverrideOtherSync)
+        {
+            LogVisibilityDiagnostic("PAIR submit skip uid={uid} forced={forced} reason=other-sync owner={owner}", UserData.UID, forced, RemoteOtherSyncOwner);
+            return false;
+        }
+
+        if (CachedPlayer == null)
+        {
+            LogVisibilityDiagnostic("PAIR submit skip uid={uid} forced={forced} reason=no-cached-player", UserData.UID, forced);
+            return false;
+        }
+
+        var payloadFingerprint = PairApplyUtilities.ComputeCharacterDataPayloadFingerprint(preparedData);
 
         if (forced)
         {
-            var payloadFingerprint = PairApplyUtilities.ComputeCharacterDataPayloadFingerprint(preparedData);
             var now = Environment.TickCount64;
 
             if (CachedPlayer.IsPairSyncBusyForPayload(payloadFingerprint))
             {
+                LogVisibilityDiagnostic("PAIR submit forced-skip uid={uid} payload={payload} reason=busy-for-payload", UserData.UID, payloadFingerprint);
                 _logger.LogTrace("Skipping duplicate forced reapply for {uid}; payload {payload} is already queued/active", UserData.UID, payloadFingerprint);
-                return;
+                return true;
             }
 
             if (string.Equals(payloadFingerprint, _lastForcedApplyPayloadFingerprint, StringComparison.Ordinal)
                 && unchecked(now - _lastForcedApplyTick) >= 0
                 && unchecked(now - _lastForcedApplyTick) < ForcedApplyDuplicateWindowMs)
             {
+                LogVisibilityDiagnostic("PAIR submit forced-skip uid={uid} payload={payload} reason=duplicate-window elapsedMs={elapsed}", UserData.UID, payloadFingerprint, unchecked(now - _lastForcedApplyTick));
                 _logger.LogTrace("Skipping duplicate forced reapply for {uid}; payload {payload} was requested {elapsed}ms ago", UserData.UID, payloadFingerprint, unchecked(now - _lastForcedApplyTick));
-                return;
+                return true;
             }
 
             _lastForcedApplyPayloadFingerprint = payloadFingerprint;
             _lastForcedApplyTick = now;
         }
 
-        CachedPlayer.ApplyCharacterData(Guid.NewGuid(), preparedData, forced);
+        var applicationId = Guid.NewGuid();
+        LogVisibilityDiagnostic("PAIR submit accepted uid={uid} app={app} hash={hash} payload={payload} forced={forced}",
+            UserData.UID,
+            applicationId,
+            preparedData.DataHash.Value ?? string.Empty,
+            payloadFingerprint,
+            forced);
+        CachedPlayer.ApplyCharacterData(applicationId, preparedData, forced);
+        return true;
+    }
+
+    internal void EnsureVisibleReceivedPayloadCommits(ApiCharacterData? expectedData, string reason)
+    {
+        if (expectedData == null)
+            return;
+
+        CancellationTokenSource? previous;
+        var cts = new CancellationTokenSource();
+        previous = Interlocked.Exchange(ref _visibleCommitWatchCts, cts);
+        previous?.CancelDispose();
+
+        _ = Task.Run(() => EnsureVisibleReceivedPayloadCommitsAsync(expectedData.DeepClone(), reason, cts.Token), cts.Token);
+    }
+
+    internal async Task<bool> WaitForVisibleReceivedPayloadCommitAsync(ApiCharacterData? expectedData, TimeSpan timeout, CancellationToken token)
+    {
+        if (expectedData == null)
+            return false;
+
+        using var timeoutCts = new CancellationTokenSource(timeout);
+        using var combined = CancellationTokenSource.CreateLinkedTokenSource(timeoutCts.Token, token);
+        return await EnsureVisibleReceivedPayloadCommitsAsync(expectedData.DeepClone(), "mesh ready acknowledgement", combined.Token).ConfigureAwait(false);
+    }
+
+    private async Task<bool> EnsureVisibleReceivedPayloadCommitsAsync(ApiCharacterData expectedData, string reason, CancellationToken token)
+    {
+        var preparedDataMaybe = PrepareCharacterDataForLocalApply(expectedData.DeepClone());
+        if (preparedDataMaybe is not ApiCharacterData preparedData)
+        {
+            LogVisibilityDiagnostic("PAIR commit-watch abort uid={uid} reason=prepare-null hash={hash} sourceReason={sourceReason}", UserData.UID, expectedData.DataHash.Value ?? string.Empty, reason);
+            return false;
+        }
+
+        var expectedPayloadFingerprint = PairApplyUtilities.ComputeCharacterDataPayloadFingerprint(preparedData);
+        LogVisibilityDiagnostic("PAIR commit-watch start uid={uid} hash={hash} payload={payload} reason={reason}", UserData.UID, preparedData.DataHash.Value ?? string.Empty, expectedPayloadFingerprint, reason);
+        var firstLog = true;
+
+        while (!token.IsCancellationRequested)
+        {
+            if (IsPaused || AutoPausedByOtherSync && !EffectiveOverrideOtherSync)
+                return false;
+
+            if (LastReceivedCharacterData is ApiCharacterData latest)
+            {
+                var latestPreparedMaybe = PrepareCharacterDataForLocalApply(latest.DeepClone());
+                if (latestPreparedMaybe is ApiCharacterData latestPrepared)
+                {
+                    var latestFingerprint = PairApplyUtilities.ComputeCharacterDataPayloadFingerprint(latestPrepared);
+                    if (!string.Equals(latestFingerprint, expectedPayloadFingerprint, StringComparison.Ordinal))
+                    {
+                        _logger.LogTrace("Stopping visible commit watch for {uid}; newer payload superseded {payload} during {reason}", UserData.UID, expectedPayloadFingerprint, reason);
+                        return false;
+                    }
+                }
+            }
+
+            if (CachedPlayer != null && IsVisible)
+            {
+                if (CachedPlayer.HasCommittedPairSyncPayload(expectedPayloadFingerprint))
+                {
+                    LogVisibilityDiagnostic("PAIR commit-watch committed uid={uid} payload={payload} reason={reason}", UserData.UID, expectedPayloadFingerprint, reason);
+                    return true;
+                }
+
+                if (!CachedPlayer.HasPairSyncWorkPendingForPayload(expectedPayloadFingerprint))
+                {
+                    if (firstLog)
+                    {
+                        LogVisibilityDiagnostic("PAIR commit-watch resubmit uid={uid} payload={payload} reason={reason} visible={visible}", UserData.UID, expectedPayloadFingerprint, reason, IsVisible);
+                        _logger.LogDebug("Visible payload {payload} for {uid} has not committed yet after {reason}; re-submitting authoritative receiver apply", expectedPayloadFingerprint, UserData.UID, reason);
+                        firstLog = false;
+                    }
+
+                    SubmitPreparedCharacterData(preparedData.DeepClone(), forced: true);
+                }
+            }
+
+            try
+            {
+                await Task.Delay(75, token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+        }
+
+        var finalCommitted = CachedPlayer != null && CachedPlayer.HasCommittedPairSyncPayload(expectedPayloadFingerprint);
+        LogVisibilityDiagnostic("PAIR commit-watch end uid={uid} payload={payload} reason={reason} committed={committed}", UserData.UID, expectedPayloadFingerprint, reason, finalCommitted);
+        return finalCommitted;
     }
 
     public void GoBackToVanillaState()
     {
         CancelPendingEmptyFileListApply();
+        try
+        {
+            _visibleCommitWatchCts?.Cancel();
+        }
+        catch
+        {
+            // best effort
+        }
+
         CachedPlayer?.GoBackToVanillaState(revertLiveCustomizationState: true, waitForCompletion: false);
     }
 
@@ -638,6 +994,8 @@ public class Pair
             _applicationCts = _applicationCts.CancelRecreate();
             _pendingEmptyApplyCts?.Cancel();
             _pendingEmptyApplyCts = null;
+            _visibleCommitWatchCts?.Cancel();
+            _visibleCommitWatchCts = null;
             LastReceivedCharacterData = null;
             LastReceivedSyncManifest = null;
             _lastAcceptedIncomingDataHash = string.Empty;
@@ -1005,10 +1363,10 @@ public class Pair
         _mareConfigService.Save();
     }
 
-    private CharacterData? RemoveNotSyncedFiles(CharacterData? data)
+    private ApiCharacterData? RemoveNotSyncedFiles(ApiCharacterData? data)
     {
         _logger.LogTrace("Removing not synced files");
-        if (data == null)
+        if (data is not ApiCharacterData dataValue)
         {
             _logger.LogTrace("Nothing to remove");
             return data;
@@ -1019,7 +1377,7 @@ public class Pair
         bool disableIndividualSounds = (UserPair.OtherPermissions.IsDisableSounds() || UserPair.OwnPermissions.IsDisableSounds() || !_mareConfigService.Current.GlobalSyncSounds);
         bool disableIndividualCustomizePlus = !IsCustomizePlusEnabled || !_mareConfigService.Current.GlobalSyncCustomizePlus;
         bool disableIndividualMetadata = !EffectiveHeightEditsEnabled;
-        bool disableHonorific = !_mareConfigService.Current.GlobalSyncHonorific || ShouldHideHonorificTitle(data.HonorificData);
+        bool disableHonorific = !_mareConfigService.Current.GlobalSyncHonorific || ShouldHideHonorificTitle(dataValue.HonorificData);
         bool disableMoodles = !_mareConfigService.Current.GlobalSyncMoodles;
         bool disablePetNames = !_mareConfigService.Current.GlobalSyncPetNames;
         bool disableScreenShake = !EffectiveScreenShakeEnabled;
@@ -1027,65 +1385,105 @@ public class Pair
         _logger.LogTrace("Disable: Sounds: {disableIndividualSounds}, Anims: {disableIndividualAnims}; VFX: {disableIndividualVFX}, Customize+: {disableIndividualCustomizePlus}, HeightEdits: {disableIndividualMetadata}, Honorific: {disableHonorific}, Moodles: {disableMoodles}, PetNames: {disablePetNames}, ScreenShake: {disableScreenShake}",
             disableIndividualSounds, disableIndividualAnimations, disableIndividualVFX, disableIndividualCustomizePlus, disableIndividualMetadata, disableHonorific, disableMoodles, disablePetNames, disableScreenShake);
 
-        if (disableIndividualAnimations || disableIndividualSounds || disableIndividualVFX)
+        if ((disableIndividualAnimations || disableIndividualSounds || disableIndividualVFX)
+            && dataValue.FileReplacements != null
+            && dataValue.FileReplacements.Count > 0)
         {
             _logger.LogTrace("Data cleaned up: Animations disabled: {disableAnimations}, Sounds disabled: {disableSounds}, VFX disabled: {disableVFX}",
                 disableIndividualAnimations, disableIndividualSounds, disableIndividualVFX);
 
-            foreach (var objectKind in data.FileReplacements.Keys)
+            foreach (var objectKind in dataValue.FileReplacements.Keys)
             {
                 if (disableIndividualSounds)
-                    data.FileReplacements[objectKind] = data.FileReplacements[objectKind]
-                        .Where(f => !f.GamePaths.Any(p => p.EndsWith("scd", StringComparison.OrdinalIgnoreCase)))
+                    dataValue.FileReplacements[objectKind] = dataValue.FileReplacements[objectKind]
+                        .Where(static f => !ReplacementHasAnyGamePathEnding(f, ".scd"))
                         .ToList();
 
                 if (disableIndividualAnimations)
-                    data.FileReplacements[objectKind] = data.FileReplacements[objectKind]
-                        .Where(f => !f.GamePaths.Any(p =>
-                            p.EndsWith("tmb", StringComparison.OrdinalIgnoreCase) ||
-                            p.EndsWith("tmb2", StringComparison.OrdinalIgnoreCase) ||
-                            p.EndsWith("pap", StringComparison.OrdinalIgnoreCase)))
+                    dataValue.FileReplacements[objectKind] = dataValue.FileReplacements[objectKind]
+                        .Where(static f => !ReplacementHasAnyGamePathEnding(f, ".tmb", ".tmb2", ".pap"))
                         .ToList();
 
                 if (disableIndividualVFX)
-                    data.FileReplacements[objectKind] = data.FileReplacements[objectKind]
-                        .Where(f => !f.GamePaths.Any(p =>
-                            p.EndsWith("atex", StringComparison.OrdinalIgnoreCase) ||
-                            p.EndsWith("avfx", StringComparison.OrdinalIgnoreCase) ||
-                            p.EndsWith("eid", StringComparison.OrdinalIgnoreCase) ||
-                            p.EndsWith("skp", StringComparison.OrdinalIgnoreCase) ||
-                            p.EndsWith("shpk", StringComparison.OrdinalIgnoreCase)))
+                    dataValue.FileReplacements[objectKind] = dataValue.FileReplacements[objectKind]
+                        .Where(static f => !ReplacementHasAnyGamePathEnding(f, ".atex", ".avfx", ".eid", ".skp", ".shpk"))
                         .ToList();
             }
         }
 
+        PruneEmptyFilteredFileReplacementBuckets(dataValue);
+
         // Handle Customize+ data separately since it's not in FileReplacements
         if (disableIndividualCustomizePlus)
         {
-            data.CustomizePlusData.Clear();
+            dataValue.CustomizePlusData.Clear();
         }
 
         if (disableIndividualMetadata)
         {
-            data.ManipulationData = GetEffectiveManipulationData(data.ManipulationData);
+            dataValue.ManipulationData = GetEffectiveManipulationData(dataValue.ManipulationData);
         }
 
         if (disableHonorific)
         {
-            data.HonorificData = string.Empty;
+            dataValue.HonorificData = string.Empty;
         }
 
         if (disableMoodles)
         {
-            data.MoodlesData = string.Empty;
+            dataValue.MoodlesData = string.Empty;
         }
 
         if (disablePetNames)
         {
-            data.PetNamesData = string.Empty;
+            dataValue.PetNamesData = string.Empty;
         }
 
-        return data;
+        return dataValue;
+    }
+
+    private static void PruneEmptyFilteredFileReplacementBuckets(ApiCharacterData data)
+    {
+        if (data.FileReplacements == null || data.FileReplacements.Count == 0)
+            return;
+
+        foreach (var objectKind in data.FileReplacements.Keys.ToArray())
+        {
+            var replacements = data.FileReplacements[objectKind];
+            if (replacements == null || replacements.Count == 0)
+            {
+                data.FileReplacements.Remove(objectKind);
+                continue;
+            }
+
+            var cleaned = replacements
+                .Where(static replacement => replacement != null && HasUsableFilteredReplacement(replacement))
+                .ToList();
+
+            if (cleaned.Count == 0)
+                data.FileReplacements.Remove(objectKind);
+            else if (cleaned.Count != replacements.Count)
+                data.FileReplacements[objectKind] = cleaned;
+        }
+    }
+
+    private static bool HasUsableFilteredReplacement(FileReplacementData replacement)
+    {
+        var hasGamePath = replacement.GamePaths?.Any(static path => !string.IsNullOrWhiteSpace(path)) ?? false;
+        if (!hasGamePath)
+            return false;
+
+        return !string.IsNullOrWhiteSpace(replacement.Hash)
+            || !string.IsNullOrWhiteSpace(replacement.FileSwapPath);
+    }
+
+    private static bool ReplacementHasAnyGamePathEnding(FileReplacementData replacement, params string[] suffixes)
+    {
+        if (replacement.GamePaths == null || replacement.GamePaths.Count() == 0 || suffixes.Length == 0)
+            return false;
+
+        return replacement.GamePaths.Any(path => !string.IsNullOrWhiteSpace(path)
+            && suffixes.Any(suffix => path.EndsWith(suffix, StringComparison.OrdinalIgnoreCase)));
     }
 
 

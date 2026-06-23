@@ -130,7 +130,7 @@ public sealed class CharaDataCharacterHandler : DisposableMediatorSubscriberBase
 
         if (handled.IsSelf)
         {
-            await _ipcManager.Penumbra.AssignEmptyCollectionToSelfAsync(Logger, idx, address, handled.Name).ConfigureAwait(false);
+            Logger.LogDebug("Skipping Penumbra temporary slot clear for local player {name}; local sender state must not use RavaSync temporary collections", handled.Name);
             return;
         }
 

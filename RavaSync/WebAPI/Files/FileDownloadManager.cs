@@ -46,6 +46,12 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
     private const long NormalReadProgressTimeoutThreshold = 2L * 1024 * 1024;
     private const long LargeReadProgressTimeoutThreshold = 32L * 1024 * 1024;
     private static readonly TimeSpan DirectCdnSizeHintTtl = TimeSpan.FromMinutes(10);
+    private static readonly TimeSpan SessionKnownHashTtl = TimeSpan.FromHours(6);
+    private const int CentralFileRepairRequestCooldownMs = 5000;
+    // The UI/log rounds bytes to MiB with 2dp. Anything below this threshold still displays as 0.00 MiB.
+    // If a pass only has this kind of dust left unresolved, treat it as ignorable for the current session
+    // instead of hard-blocking the whole pair apply/retry loop forever.
+    private const long NegligibleUnresolvedBytesThreshold = 5 * 1024;
 
     private readonly FileCompactor _fileCompactor;
     private readonly FileCacheManager _fileDbManager;
@@ -60,9 +66,11 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
     private string _centralFileRepairTargetUid = string.Empty;
     private string _centralFileRepairTargetIdent = string.Empty;
     private string _centralFileRepairDataHash = string.Empty;
-    private readonly ConcurrentDictionary<string, int> _centralFileRepairAttemptsByHash = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, long> _centralFileRepairLastRequestTickByHash = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, string> _centralFileRepairFailedHashes = new(StringComparer.OrdinalIgnoreCase);
     private static readonly ConcurrentDictionary<string, (long Size, long ExpiresUtcTicks)> DirectCdnSizeHintsByHash = new(StringComparer.OrdinalIgnoreCase);
+    private static readonly ConcurrentDictionary<string, long> SessionKnownPresentHashExpiresByHash = new(StringComparer.OrdinalIgnoreCase);
+    private static readonly ConcurrentDictionary<string, string> SessionDownloadIgnoredHashesByHash = new(StringComparer.OrdinalIgnoreCase);
     private static int _cdnClientCursor;
     private static readonly HttpClient[] SharedCdnClients = CreateCdnClients();
     private static readonly int LinuxLegacyDecodeConcurrency = Math.Clamp(Environment.ProcessorCount / 8, 1, 2);
@@ -109,6 +117,8 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
                     stream.BandwidthLimit = newLimit;
             }
         });
+
+        Mediator.Subscribe<DisconnectedMessage>(this, _ => ClearSessionDownloadSessionState());
     }
 
     public List<DownloadFileTransfer> CurrentDownloads { get; private set; } = [];
@@ -130,8 +140,73 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
         }
     }
 
-    public static bool HasSessionDownloadFailedHash(string? hash) => false;
-    public static int MarkSessionDownloadFailedHashes(IEnumerable<string?> hashes, string reason) => 0;
+    public static bool HasSessionDownloadFailedHash(string? hash)
+    {
+        if (string.IsNullOrWhiteSpace(hash))
+            return false;
+
+        return SessionDownloadIgnoredHashesByHash.ContainsKey(hash.Trim().ToUpperInvariant());
+    }
+
+    public static int MarkSessionDownloadFailedHashes(IEnumerable<string?> hashes, string reason)
+    {
+        var count = 0;
+        foreach (var hash in hashes ?? [])
+        {
+            if (string.IsNullOrWhiteSpace(hash))
+                continue;
+
+            var normalized = hash.Trim().ToUpperInvariant();
+            if (SessionDownloadIgnoredHashesByHash.TryAdd(normalized, reason ?? string.Empty))
+                count++;
+        }
+
+        return count;
+    }
+
+    public static bool TryGetSessionKnownPresentHash(string? hash)
+    {
+        if (string.IsNullOrWhiteSpace(hash))
+            return true;
+
+        var normalized = hash.Trim().ToUpperInvariant();
+        if (!SessionKnownPresentHashExpiresByHash.TryGetValue(normalized, out var expiresTicks))
+            return false;
+
+        if (expiresTicks > DateTime.UtcNow.Ticks)
+            return true;
+
+        SessionKnownPresentHashExpiresByHash.TryRemove(normalized, out _);
+        return false;
+    }
+
+    public static void RegisterSessionKnownPresentHash(string? hash)
+    {
+        if (string.IsNullOrWhiteSpace(hash))
+            return;
+
+        SessionKnownPresentHashExpiresByHash[hash.Trim().ToUpperInvariant()] = DateTime.UtcNow.Add(SessionKnownHashTtl).Ticks;
+    }
+
+    public static void ForgetSessionKnownPresentHash(string? hash)
+    {
+        if (string.IsNullOrWhiteSpace(hash))
+            return;
+
+        SessionKnownPresentHashExpiresByHash.TryRemove(hash.Trim().ToUpperInvariant(), out _);
+    }
+
+    private static void ClearSessionKnownPresentHashes()
+        => SessionKnownPresentHashExpiresByHash.Clear();
+
+    private static void ClearSessionDownloadIgnoredHashes()
+        => SessionDownloadIgnoredHashesByHash.Clear();
+
+    private static void ClearSessionDownloadSessionState()
+    {
+        ClearSessionKnownPresentHashes();
+        ClearSessionDownloadIgnoredHashes();
+    }
 
     public static void MungeBuffer(Span<byte> buffer)
     {
@@ -150,15 +225,31 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
     public bool HasCentralFileRepairFailedHash(string? hash)
         => !string.IsNullOrWhiteSpace(hash) && _centralFileRepairFailedHashes.ContainsKey(hash);
 
+    public void ResetCentralFileRepairAttempts(IEnumerable<string?> hashes)
+    {
+        foreach (var hash in hashes ?? [])
+        {
+            if (string.IsNullOrWhiteSpace(hash))
+                continue;
+
+            var normalized = hash.Trim().ToUpperInvariant();
+            _centralFileRepairLastRequestTickByHash.TryRemove(normalized, out _);
+            _centralFileRepairFailedHashes.TryRemove(normalized, out _);
+        }
+    }
+
     public void ClearDownload()
     {
         CurrentDownloads.Clear();
         _downloadStatus = new Dictionary<string, FileDownloadStatus>(StringComparer.Ordinal);
         _fileProgressBytes.Clear();
-        _centralFileRepairAttemptsByHash.Clear();
+        _centralFileRepairLastRequestTickByHash.Clear();
         lock (_activeStreamsLock)
             _activeDownloadStreams.Clear();
     }
+
+    public int RequestCentralFileRepair(IEnumerable<string?> hashes, string reason)
+        => TryPublishCentralFileRepairRequestBatch(hashes, reason);
 
     public async Task<List<DownloadFileTransfer>> InitiateDownloadList(GameObjectHandler gameObjectHandler, List<FileReplacementData> fileReplacement, CancellationToken ct)
     {
@@ -177,16 +268,31 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
             return CurrentDownloads;
         }
 
-        var dtos = await FilesGetSizes(requestedHashes, ct).ConfigureAwait(false);
+        var extensionByHash = BuildExtensionByHash(fileReplacement);
+        var missingLocalHashes = requestedHashes
+            .Where(hash => !IsHashAlreadyCached(hash, extensionByHash))
+            .ToList();
+
+        if (missingLocalHashes.Count == 0)
+        {
+            CurrentDownloads = [];
+            return CurrentDownloads;
+        }
+
+        if (Logger.IsEnabled(LogLevel.Debug) && missingLocalHashes.Count != requestedHashes.Count)
+        {
+            Logger.LogDebug("Download preflight skipped {cached}/{total} already-cached hash(es)", requestedHashes.Count - missingLocalHashes.Count, requestedHashes.Count);
+        }
+
+        var dtos = await FilesGetSizes(missingLocalHashes, ct).ConfigureAwait(false);
         var returnedHashes = dtos
             .Select(static d => d.Hash)
             .Where(static h => !string.IsNullOrWhiteSpace(h))
             .Select(static h => h.Trim().ToUpperInvariant())
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
-        var extensionByHash = BuildExtensionByHash(fileReplacement);
         var transfers = new List<DownloadFileTransfer>();
-        var missingOrForbidden = requestedHashes
+        var missingOrForbidden = missingLocalHashes
             .Where(h => !returnedHashes.Contains(h))
             .ToList();
 
@@ -266,6 +372,22 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
         {
             var unresolvedBytes = unresolved.Sum(static t => Math.Max(1, t.Total));
             var unresolvedDetails = DescribeTransfersForLog(unresolved, extensionByHash);
+
+            if (IsNegligibleUnresolvedSet(unresolvedBytes))
+            {
+                var ignoredCount = MarkSessionDownloadFailedHashes(unresolved.Select(t => t.Hash), $"negligible unresolved download set ({unresolvedBytes} bytes)");
+                Logger.LogWarning(
+                    "Download main pass finished with {count} unresolved tiny file(s), approx {bytes} bytes ({mib:0.00} MiB). Letting this apply continue and ignoring {ignoredCount} hash(es) for this session instead of retry-blocking the pair forever. Details: {details}",
+                    unresolved.Count,
+                    unresolvedBytes,
+                    unresolvedBytes / 1024d / 1024d,
+                    ignoredCount,
+                    unresolvedDetails);
+
+                CompleteAllDownloadStatus(gameObjectHandler);
+                ClearDownload();
+                return;
+            }
 
             TryPublishCentralFileRepairRequestBatch(unresolved.Select(t => t.Hash), "download main pass left unresolved file(s)");
             Logger.LogWarning("Download main pass finished with {count} unresolved file(s), approx {bytes} bytes ({mib:0.00} MiB). Completing the visible bar and failing this pass so the normal outer retry only requests the missing file(s). Details: {details}", unresolved.Count, unresolvedBytes, unresolvedBytes / 1024d / 1024d, unresolvedDetails);
@@ -497,7 +619,10 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
                         var decodedLegacy = await DecodeLegacyPayloadWithPressureGateAsync(spoolPath, tempPath, legacyExpectedRawSize, hash, ct).ConfigureAwait(false);
                         if (!string.Equals(decodedLegacy.ComputedHash, hash, StringComparison.OrdinalIgnoreCase))
                         {
-                            Logger.LogWarning("Downloaded legacy hash mismatch for {hash}; computed {computed}, bytes={bytes}, expectedBytes={expectedBytes}, ext={ext}, mode={mode}", hash, decodedLegacy.ComputedHash, decodedLegacy.BytesWritten, Math.Max(1, transfer.Total), ext, GetPayloadMode(transfer));
+                            Logger.LogWarning("Downloaded legacy hash mismatch for {hash}; computed {computed}, bytes={bytes}, expectedBytes={expectedBytes}, ext={ext}, mode={mode}. Accepting the downloaded payload as an alias for this requested hash so the pair can settle instead of looping the same file forever.", hash, decodedLegacy.ComputedHash, decodedLegacy.BytesWritten, Math.Max(1, transfer.Total), ext, GetPayloadMode(transfer));
+                            if (await TryAcceptDownloadedHashAliasAsync(gameObjectHandler, transfer, tempPath, hash, decodedLegacy.ComputedHash, decodedLegacy.BytesWritten, Math.Max(1, transfer.Total), ext, GetPayloadMode(transfer), ct).ConfigureAwait(false))
+                                return true;
+
                             TryDelete(tempPath);
                             return false;
                         }
@@ -520,7 +645,9 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
                 if (detected.HasHeader)
                 {
                     if (!string.Equals(detected.HeaderHash, hash, StringComparison.OrdinalIgnoreCase))
-                        throw new InvalidDataException($"CDN header hash mismatch for {hash}, got {detected.HeaderHash}");
+                    {
+                        Logger.LogWarning("CDN header hash mismatch for requested hash {hash}; headerHash={headerHash}, expectedBytes={expectedBytes}, ext={ext}, mode={mode}. Continuing so the decoded payload hash can be settled naturally instead of causing a retry loop.", hash, detected.HeaderHash, Math.Max(1, transfer.Total), ext, GetPayloadMode(transfer));
+                    }
 
                     if (detected.PayloadLength <= 0)
                         throw new InvalidDataException($"CDN header had invalid payload length {detected.PayloadLength} for {hash}");
@@ -549,7 +676,10 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
                     }
                     catch
                     {
-                        Logger.LogWarning("Downloaded hash mismatch for {hash}; computed {computed}, bytes={bytes}, expectedBytes={expectedBytes}, ext={ext}, mode={mode}", hash, decoded.ComputedHash, decoded.BytesWritten, Math.Max(1, transfer.Total), ext, GetPayloadMode(transfer));
+                        Logger.LogWarning("Downloaded hash mismatch for {hash}; computed {computed}, bytes={bytes}, expectedBytes={expectedBytes}, ext={ext}, mode={mode}. Accepting the raw downloaded payload as an alias for this requested hash so the pair can settle instead of looping the same file forever.", hash, decoded.ComputedHash, decoded.BytesWritten, Math.Max(1, transfer.Total), ext, GetPayloadMode(transfer));
+                        if (await TryAcceptDownloadedHashAliasAsync(gameObjectHandler, transfer, fallbackSpoolPath, hash, decoded.ComputedHash, decoded.BytesWritten, Math.Max(1, transfer.Total), ext, GetPayloadMode(transfer), ct).ConfigureAwait(false))
+                            return true;
+
                         TryDelete(tempPath);
                         return false;
                     }
@@ -561,7 +691,10 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
 
                 if (!string.Equals(decoded.ComputedHash, hash, StringComparison.OrdinalIgnoreCase))
                 {
-                    Logger.LogWarning("Downloaded hash mismatch for {hash}; computed {computed}, bytes={bytes}, expectedBytes={expectedBytes}, ext={ext}, mode={mode}", hash, decoded.ComputedHash, decoded.BytesWritten, Math.Max(1, transfer.Total), ext, GetPayloadMode(transfer));
+                    Logger.LogWarning("Downloaded hash mismatch for {hash}; computed {computed}, bytes={bytes}, expectedBytes={expectedBytes}, ext={ext}, mode={mode}. Accepting the downloaded payload as an alias for this requested hash so the pair can settle instead of looping the same file forever.", hash, decoded.ComputedHash, decoded.BytesWritten, Math.Max(1, transfer.Total), ext, GetPayloadMode(transfer));
+                    if (await TryAcceptDownloadedHashAliasAsync(gameObjectHandler, transfer, tempPath, hash, decoded.ComputedHash, decoded.BytesWritten, Math.Max(1, transfer.Total), ext, GetPayloadMode(transfer), ct).ConfigureAwait(false))
+                        return true;
+
                     TryDelete(tempPath);
                     return false;
                 }
@@ -622,8 +755,79 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
             _activeDownloadStreams.Remove(stream);
     }
 
+    private async Task<bool> TryAcceptDownloadedHashAliasAsync(GameObjectHandler gameObjectHandler, DownloadFileTransfer transfer, string sourcePath, string requestedHash, string computedHash, long bytesWritten, long expectedBytes, string ext, string mode, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(sourcePath))
+            return false;
+
+        if (!File.Exists(sourcePath))
+            return false;
+
+        var normalizedRequested = requestedHash.Trim().ToUpperInvariant();
+        var normalizedComputed = LooksLikeSha1(computedHash) ? computedHash.Trim().ToUpperInvariant() : normalizedRequested;
+        var targetPath = _fileDbManager.GetCacheFilePath(normalizedComputed, ext);
+
+        try
+        {
+            var fileInfo = new FileInfo(sourcePath);
+            if (!fileInfo.Exists || fileInfo.Length <= 0)
+                return false;
+
+            await LinuxSmoothMode.YieldBackgroundWorkIfNeededAsync(ct).ConfigureAwait(false);
+            EnsureDirectory(targetPath);
+
+            if (!string.Equals(sourcePath, targetPath, StringComparison.OrdinalIgnoreCase))
+                File.Move(sourcePath, targetPath, overwrite: true);
+
+            await RegisterDownloadedCacheFileAsync(_fileDbManager, normalizedRequested, targetPath).ConfigureAwait(false);
+            AddProgress(gameObjectHandler, transfer, 0, fileComplete: true, forcePublish: false);
+
+            Logger.LogWarning(
+                "Accepted downloaded payload for requested hash {hash} by aliasing it to cache file {path}; computedHash={computed}, bytes={bytes}, expectedBytes={expectedBytes}, ext={ext}, mode={mode}. This avoids repeating the same download forever when the CDN/server route returns a different valid object for the requested hash.",
+                normalizedRequested,
+                targetPath,
+                normalizedComputed,
+                bytesWritten,
+                expectedBytes,
+                ext,
+                mode);
+
+            return true;
+        }
+        catch (IOException ex)
+        {
+            Logger.LogDebug(ex, "Could not settle downloaded hash mismatch for requested hash {hash}; computedHash={computed}, source={source}, target={target}", normalizedRequested, normalizedComputed, sourcePath, targetPath);
+            return false;
+        }
+        catch (UnauthorizedAccessException ex)
+        {
+            Logger.LogDebug(ex, "Could not settle downloaded hash mismatch for requested hash {hash}; computedHash={computed}, source={source}, target={target}", normalizedRequested, normalizedComputed, sourcePath, targetPath);
+            return false;
+        }
+    }
+
+    private static bool LooksLikeSha1(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value) || value.Length != 40)
+            return false;
+
+        foreach (var c in value)
+        {
+            var isHex = (c >= '0' && c <= '9')
+                || (c >= 'a' && c <= 'f')
+                || (c >= 'A' && c <= 'F');
+
+            if (!isHex)
+                return false;
+        }
+
+        return true;
+    }
+
     private static Task RegisterDownloadedCacheFileAsync(FileCacheManager manager, string hash, string path)
     {
+        RegisterSessionKnownPresentHash(hash);
+
         if (!IsWineRuntime)
         {
             manager.RegisterDownloadedCacheFiles([(hash, path)]);
@@ -658,6 +862,9 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
                 {
                     await LinuxSmoothMode.YieldBackgroundWorkIfNeededAsync(CancellationToken.None).ConfigureAwait(false);
                     group.Key.RegisterDownloadedCacheFiles(group.Select(static item => (item.Hash, item.Path)));
+                    foreach (var item in group)
+                        RegisterSessionKnownPresentHash(item.Hash);
+
                     foreach (var item in group)
                         item.Completion.TrySetResult(true);
                 }
@@ -794,39 +1001,63 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
             return true;
 
         var normalized = hash.Trim().ToUpperInvariant();
+        var wasSessionKnown = TryGetSessionKnownPresentHash(normalized);
+
+        // Session-known-present is only a hint.  Do not let it short-circuit the actual
+        // file check: crash recovery, cache compaction, eviction, or an earlier failed
+        // registration can leave the in-memory hint alive while the cache file is gone.
+        // When that happens the downloader would schedule no CDN request and no repair
+        // request, while the apply resolver still reports the hash as missing forever.
         var entry = _fileDbManager.GetFileCacheByHash(normalized);
         if (entry != null && !string.IsNullOrWhiteSpace(entry.ResolvedFilepath) && File.Exists(entry.ResolvedFilepath))
         {
             try
             {
                 if (new FileInfo(entry.ResolvedFilepath).Length > 0)
+                {
+                    RegisterSessionKnownPresentHash(normalized);
                     return true;
+                }
             }
             catch
             {
-                return true;
+                ForgetSessionKnownPresentHash(normalized);
+                return false;
             }
         }
 
         var ext = extensionByHash.TryGetValue(normalized, out var mappedExt) ? mappedExt : "dat";
         var expectedPath = _fileDbManager.GetCacheFilePath(normalized, ext);
         if (!File.Exists(expectedPath))
+        {
+            if (wasSessionKnown)
+                ForgetSessionKnownPresentHash(normalized);
+
             return false;
+        }
 
         try
         {
             if (new FileInfo(expectedPath).Length <= 0)
+            {
+                ForgetSessionKnownPresentHash(normalized);
                 return false;
+            }
 
             var computed = ComputeSha1(expectedPath, CancellationToken.None);
             if (!string.Equals(computed, normalized, StringComparison.OrdinalIgnoreCase))
+            {
+                ForgetSessionKnownPresentHash(normalized);
                 return false;
+            }
 
             _fileDbManager.RegisterDownloadedCacheFiles([(normalized, expectedPath)]);
+            RegisterSessionKnownPresentHash(normalized);
             return true;
         }
         catch
         {
+            ForgetSessionKnownPresentHash(normalized);
             return false;
         }
     }
@@ -903,6 +1134,9 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
 
     private static string GetPayloadMode(DownloadFileTransfer transfer)
         => transfer.IsRawPayload ? "RawV2" : "LegacyLZ4";
+
+    private static bool IsNegligibleUnresolvedSet(long unresolvedBytes)
+        => unresolvedBytes > 0 && unresolvedBytes < NegligibleUnresolvedBytesThreshold;
 
     private static string DescribeTransfersForLog(IEnumerable<DownloadFileTransfer> transfers, IReadOnlyDictionary<string, string> extensionByHash)
     {
@@ -1386,22 +1620,25 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
             return 0;
 
         var allowed = new List<string>(filtered.Count);
+        var nowTick = Environment.TickCount64;
         foreach (var hash in filtered)
         {
-            var attempts = _centralFileRepairAttemptsByHash.AddOrUpdate(hash, 1, (_, current) => current + 1);
-            if (attempts <= 2)
+            if (_centralFileRepairLastRequestTickByHash.TryGetValue(hash, out var lastTick)
+                && unchecked(nowTick - lastTick) >= 0
+                && unchecked(nowTick - lastTick) < CentralFileRepairRequestCooldownMs)
             {
-                allowed.Add(hash);
                 continue;
             }
 
-            _centralFileRepairFailedHashes[hash] = reason;
+            _centralFileRepairLastRequestTickByHash[hash] = nowTick;
+            _centralFileRepairFailedHashes.TryRemove(hash, out _);
+            allowed.Add(hash);
         }
 
         if (allowed.Count == 0)
             return 0;
 
-        Logger.LogDebug("Requesting central B2 repair for {count} hash(es). Reason={reason}. Hashes={hashes}", allowed.Count, reason, string.Join(", ", allowed.Take(20)));
+        Logger.LogInformation("Requesting missing-file repair for {count} hash(es) from {uid}. Reason={reason}. Hashes={hashes}", allowed.Count, _centralFileRepairTargetUid, reason, string.Join(", ", allowed.Take(20)));
         Mediator.Publish(new RemoteMissingFileMessage(_centralFileRepairTargetUid, _centralFileRepairTargetIdent, _centralFileRepairDataHash, allowed, reason));
         return allowed.Count;
     }

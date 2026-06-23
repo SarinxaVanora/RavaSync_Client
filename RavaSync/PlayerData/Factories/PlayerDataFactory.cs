@@ -41,7 +41,14 @@ public class PlayerDataFactory : IMediatorSubscriber
     }
 
     private sealed record StaticSupportDependencyExpansionCacheEntry(string Signature, FileReplacement[] Replacements);
+    private sealed record EmbeddedVfxSupportCacheEntry(long Length, DateTime LastWriteUtc, string[] GamePaths)
+    {
+        public bool Matches(long length, DateTime lastWriteUtc)
+            => Length == length && LastWriteUtc == lastWriteUtc;
+    }
     private sealed record StaticBuildSnapshot(ObjectKind ObjectKind, FileReplacement[] Replacements, DateTimeOffset UpdatedUtc);
+    private sealed record RollingPlayerBuildResult(CharacterDataFragmentPlayer Fragment, int PreservedReplacementCount, int StaticReplacementCount);
+    private sealed record PenumbraPlayerOptionSnapshot(Dictionary<string, HashSet<string>> ResolvedPaths, string GlamourerString, string ManipulationString, string Signature);
     private sealed record BuildHashCacheEntry(string Hash, long Length, DateTime LastWriteUtc);
     private sealed record StaticResolvedBuildCacheEntry(string Signature, FileReplacement[] Replacements, DateTimeOffset UpdatedUtc);
     private sealed record TransientResolvedBuildCacheEntry(ObjectKind ObjectKind, string Signature, FileReplacement[] Replacements, DateTimeOffset UpdatedUtc);
@@ -50,16 +57,22 @@ public class PlayerDataFactory : IMediatorSubscriber
     private readonly ConcurrentDictionary<string, PapRewriteResult> _playerPapTargetIndependentDecisionsByHash = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, StaticSupportDependencyCacheEntry> _staticSupportDependencyCacheByResolvedPath = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, StaticSupportDependencyExpansionCacheEntry> _staticSupportExpansionCacheBySignature = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, EmbeddedVfxSupportCacheEntry> _embeddedVfxSupportCacheByResolvedPath = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<ObjectKind, StaticBuildSnapshot> _lastStaticBuildSnapshotByKind = new();
     private readonly ConcurrentDictionary<ObjectKind, StaticResolvedBuildCacheEntry> _staticResolvedBuildCacheByKind = new();
     private readonly ConcurrentDictionary<ObjectKind, TransientResolvedBuildCacheEntry> _transientResolvedBuildCacheByKind = new();
     private readonly ConcurrentDictionary<string, BuildHashCacheEntry> _buildHashCacheByResolvedPath = new(StringComparer.OrdinalIgnoreCase);
     private static readonly HashSet<string> AllowedBuildGamePathExtensions = new(CacheMonitor.AllowedFileExtensions, StringComparer.OrdinalIgnoreCase);
     private static readonly Regex HumanModelPathRegex = new(@"(?:^|/)chara/human/(c\d{4})/", RegexOptions.IgnoreCase | RegexOptions.Compiled | RegexOptions.ECMAScript);
+    private static readonly Regex MountActorGamePathRegex = new(@"(?:^|/)chara/monster/((?:m|d)\d{4})(?:/|$)", RegexOptions.IgnoreCase | RegexOptions.Compiled | RegexOptions.CultureInvariant | RegexOptions.ECMAScript);
+    private static readonly Regex EmbeddedVfxSupportGamePathRegex = new(@"(?:^|[^a-z0-9_/])((?:vfx/[a-z0-9_.-]+|bgcommon/vfx/[a-z0-9_./-]+)\.(?:atex|avfx|tex))", RegexOptions.IgnoreCase | RegexOptions.Compiled | RegexOptions.ECMAScript);
     private const int ReverseResolveBatchSize = 192;
     private const int CharacterBuildYieldEvery = 128;
+    private const int PenumbraOptionToggleStabilityAttempts = 4;
+    private const int PenumbraOptionToggleStabilityProbeDelayMs = 120;
     private const int StaticSupportDependencyCacheSoftLimit = 2048;
     private const int HumanRaceFamilyCollapseMinimumVariants = 3;
+    private const int EmbeddedVfxSupportCacheSoftLimit = 1024;
     private static readonly TimeSpan SupportSweepBreatherDelay = TimeSpan.FromMilliseconds(1);
 
 
@@ -79,10 +92,15 @@ public class PlayerDataFactory : IMediatorSubscriber
         _mareMediator = mareMediator;
 
         _mareMediator.Subscribe<PenumbraFileCacheChangedMessage>(this, _ => InvalidateLiveBuildSnapshots());
-        _mareMediator.Subscribe<PenumbraModSettingChangedMessage>(this, _ => InvalidateLiveBuildSnapshots());
+        // Keep the previous static snapshot across Penumbra option changes.
+        // Rolling option builds need that old snapshot so they can surgically remove old game paths
+        // and add the newly selected toggle paths instead of falling back to a full cascade.
+        _mareMediator.Subscribe<PenumbraModSettingChangedMessage>(this, _ => InvalidateTransientResolveCaches());
         _mareMediator.Subscribe<PenumbraDirectoryChangedMessage>(this, _ => InvalidateVolatilePlayerDataCaches());
         _mareMediator.Subscribe<ClassJobChangedMessage>(this, _ => InvalidateLiveBuildSnapshots());
-        _mareMediator.Subscribe<PenumbraResourceLoadMessage>(this, _ => InvalidateTransientResolveCaches());
+        // Do not clear transient resolve caches on every resource-load callback. Summon/pet actors can emit
+        // a burst of resource loads while they appear; the cache signature already changes when the actual
+        // transient path set changes, and TransientResourceChangedMessage still invalidates authoritative state.
         _mareMediator.Subscribe<ObservedSupportResourceMessage>(this, _ => InvalidateTransientResolveCaches());
         _mareMediator.Subscribe<TransientResourceChangedMessage>(this, _ => InvalidateTransientResolveCaches());
         _mareMediator.Subscribe<PenumbraStartRedrawMessage>(this, _ => InvalidateTransientResolveCaches());
@@ -118,9 +136,167 @@ public class PlayerDataFactory : IMediatorSubscriber
     }
 
 
+    private void LogBuildTime(ObjectKind objectKind, DateTime start)
+    {
+        var label = objectKind switch
+        {
+            ObjectKind.Player => "your character data",
+            ObjectKind.MinionOrMount => "your mount/minion data",
+            ObjectKind.Pet => "your pet data",
+            ObjectKind.Companion => "your companion data",
+            _ => "your character data",
+        };
+
+        _logger.LogInformation("Building {label} took {time}ms", label, TimeSpan.FromTicks(DateTime.UtcNow.Ticks - start.Ticks).TotalMilliseconds);
+    }
+
     public Task<CharacterDataFragment?> BuildCharacterData(GameObjectHandler playerRelatedObject, CancellationToken token)
     {
         return BuildCharacterData(playerRelatedObject, token, null);
+    }
+
+    public async Task<CharacterDataFragmentPlayer?> TryBuildPluginOnlyPlayerFragmentFromCurrentStateAsync(GameObjectHandler playerRelatedObject, CharacterDataFragmentPlayer currentFragment, CancellationToken token, string? reason)
+    {
+        if (!_ipcManager.Initialized)
+            throw new InvalidOperationException("Penumbra or Glamourer is not connected");
+
+        if (playerRelatedObject == null || currentFragment == null || playerRelatedObject.ObjectKind != ObjectKind.Player)
+            return null;
+
+        if (playerRelatedObject.Address == IntPtr.Zero || currentFragment.FileReplacements.Count == 0)
+            return null;
+
+        try
+        {
+            var start = DateTime.UtcNow;
+
+            var refreshCustomizePlus = ShouldRefreshPlayerPluginField(reason, "CustomizePlus:");
+            var refreshHeels = ShouldRefreshPlayerPluginField(reason, "Heels:");
+            var refreshHonorific = ShouldRefreshPlayerPluginField(reason, "Honorific:");
+            var refreshMoodles = ShouldRefreshPlayerPluginField(reason, "Moodles:");
+            var refreshPetNames = ShouldRefreshPlayerPluginField(reason, "PetNames:");
+
+            Task<string?>? getCustomizeData = refreshCustomizePlus ? _ipcManager.CustomizePlus.GetScaleAsync(playerRelatedObject.Address) : null;
+            Task<string>? getHeelsOffset = refreshHeels ? _ipcManager.Heels.GetOffsetAsync() : null;
+            Task<string>? getHonorificTitle = refreshHonorific ? _ipcManager.Honorific.GetTitle() : null;
+            Task<string?>? getMoodles = refreshMoodles ? _ipcManager.Moodles.GetStatusAsync(playerRelatedObject.Address) : null;
+
+            token.ThrowIfCancellationRequested();
+
+            var fragment = new CharacterDataFragmentPlayer
+            {
+                FileReplacements = new HashSet<FileReplacement>(currentFragment.FileReplacements.Select(CloneFileReplacementWithHash), FileReplacementComparer.Instance),
+                GlamourerString = currentFragment.GlamourerString ?? string.Empty,
+                ManipulationString = currentFragment.ManipulationString ?? string.Empty,
+                CustomizePlusScale = getCustomizeData != null ? await getCustomizeData.ConfigureAwait(false) ?? string.Empty : currentFragment.CustomizePlusScale ?? string.Empty,
+                HeelsData = getHeelsOffset != null ? await getHeelsOffset.ConfigureAwait(false) : currentFragment.HeelsData ?? string.Empty,
+                HonorificData = getHonorificTitle != null ? await getHonorificTitle.ConfigureAwait(false) : currentFragment.HonorificData ?? string.Empty,
+                MoodlesData = getMoodles != null ? await getMoodles.ConfigureAwait(false) ?? string.Empty : currentFragment.MoodlesData ?? string.Empty,
+                PetNamesData = refreshPetNames ? _ipcManager.PetNames.GetLocalNames() : currentFragment.PetNamesData ?? string.Empty,
+            };
+
+            LogBuildTime(ObjectKind.Player, start);
+            return fragment;
+        }
+        catch (OperationCanceledException)
+        {
+            _logger.LogDebug("Cancelled plugin-only player Character data build for {object}", playerRelatedObject);
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogTrace(ex, "Failed plugin-only player Character data build for {reason}; falling back to rolling/full build", reason ?? "<none>");
+            return null;
+        }
+    }
+
+    public async Task<CharacterDataFragmentPlayer?> TryBuildPenumbraOptionToggleFragmentFromCurrentStateAsync(GameObjectHandler playerRelatedObject, CharacterDataFragmentPlayer currentFragment, CancellationToken token, string? reason)
+    {
+        if (!_ipcManager.Initialized)
+            throw new InvalidOperationException("Penumbra or Glamourer is not connected");
+
+        if (!IsSafePenumbraOptionToggleDeltaBuildReasonSet(reason))
+            return null;
+
+        if (playerRelatedObject == null || currentFragment == null || playerRelatedObject.ObjectKind != ObjectKind.Player)
+            return null;
+
+        if (playerRelatedObject.Address == IntPtr.Zero)
+            return null;
+
+        if (!_lastStaticBuildSnapshotByKind.TryGetValue(ObjectKind.Player, out var previousStaticSnapshot)
+            || previousStaticSnapshot.Replacements.Length == 0
+            || currentFragment.FileReplacements.Count == 0)
+        {
+            return null;
+        }
+
+        try
+        {
+            if (_performanceCollector.Enabled)
+            {
+                return await _performanceCollector.LogPerformance(this, $"CreateCharacterData>Player>PenumbraOptionToggleDelta", async () =>
+                {
+                    return await TryCreatePenumbraOptionToggleDeltaFragmentAsync(playerRelatedObject, currentFragment, previousStaticSnapshot, token, reason).ConfigureAwait(false);
+                }).ConfigureAwait(true);
+            }
+
+            return await TryCreatePenumbraOptionToggleDeltaFragmentAsync(playerRelatedObject, currentFragment, previousStaticSnapshot, token, reason).ConfigureAwait(true);
+        }
+        catch (OperationCanceledException)
+        {
+            _logger.LogDebug("Cancelled Penumbra option-toggle delta player Character data build for {object}", playerRelatedObject);
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogTrace(ex, "Failed Penumbra option-toggle delta player Character data build for {reason}; falling back to rolling/full build", reason ?? "<none>");
+            return null;
+        }
+    }
+
+    public async Task<CharacterDataFragmentPlayer?> TryBuildRollingPlayerFragmentFromCurrentStateAsync(GameObjectHandler playerRelatedObject, CharacterDataFragmentPlayer currentFragment, CancellationToken token, string? reason)
+    {
+        if (!_ipcManager.Initialized)
+            throw new InvalidOperationException("Penumbra or Glamourer is not connected");
+
+        if (playerRelatedObject == null || currentFragment == null || playerRelatedObject.ObjectKind != ObjectKind.Player)
+            return null;
+
+        if (playerRelatedObject.Address == IntPtr.Zero)
+            return null;
+
+        if (!_lastStaticBuildSnapshotByKind.TryGetValue(ObjectKind.Player, out var previousStaticSnapshot)
+            || previousStaticSnapshot.Replacements.Length == 0
+            || currentFragment.FileReplacements.Count == 0)
+        {
+            return null;
+        }
+
+        try
+        {
+            if (_performanceCollector.Enabled)
+            {
+                return await _performanceCollector.LogPerformance(this, $"CreateCharacterData>Player>Rolling", async () =>
+                {
+                    var result = await TryCreateRollingPlayerFragmentAsync(playerRelatedObject, currentFragment, previousStaticSnapshot, token, reason).ConfigureAwait(false);
+                    return result?.Fragment;
+                }).ConfigureAwait(true);
+            }
+
+            var rolling = await TryCreateRollingPlayerFragmentAsync(playerRelatedObject, currentFragment, previousStaticSnapshot, token, reason).ConfigureAwait(true);
+            return rolling?.Fragment;
+        }
+        catch (OperationCanceledException)
+        {
+            _logger.LogDebug("Cancelled rolling player Character data build for {object}", playerRelatedObject);
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogTrace(ex, "Failed rolling player Character data build for {reason}; falling back to full build", reason ?? "<none>");
+            return null;
+        }
     }
 
     public async Task<CharacterDataFragment?> BuildCharacterData(GameObjectHandler playerRelatedObject, CancellationToken token, string? reason)
@@ -162,13 +338,191 @@ public class PlayerDataFactory : IMediatorSubscriber
         return null;
     }
 
+    private async Task<CharacterDataFragmentPlayer?> TryCreatePenumbraOptionToggleDeltaFragmentAsync(GameObjectHandler playerRelatedObject, CharacterDataFragmentPlayer currentFragment, StaticBuildSnapshot previousStaticSnapshot, CancellationToken ct, string? reason)
+    {
+        var start = DateTime.UtcNow;
+        _logger.LogDebug("Building Penumbra option-toggle delta player character data for {obj}", playerRelatedObject);
+
+        await _dalamudUtil.WaitWhileCharacterIsDrawing(_logger, playerRelatedObject, Guid.NewGuid(), 250, ct: ct).ConfigureAwait(false);
+        ct.ThrowIfCancellationRequested();
+
+        var optionSnapshot = await CaptureStablePenumbraPlayerOptionSnapshotAsync(playerRelatedObject, ct, reason).ConfigureAwait(false);
+        if (optionSnapshot == null)
+            return null;
+
+        if (TryGetCachedStaticResolvedBuildReplacements(ObjectKind.Player, optionSnapshot.ResolvedPaths, out var cachedStaticReplacements)
+            && AreFileReplacementArraysEqual(previousStaticSnapshot.Replacements, cachedStaticReplacements))
+        {
+            var metadataOnlyFragment = new CharacterDataFragmentPlayer
+            {
+                FileReplacements = new HashSet<FileReplacement>(currentFragment.FileReplacements.Select(CloneFileReplacementWithHash), FileReplacementComparer.Instance),
+                GlamourerString = optionSnapshot.GlamourerString ?? string.Empty,
+                ManipulationString = optionSnapshot.ManipulationString ?? string.Empty,
+                CustomizePlusScale = currentFragment.CustomizePlusScale ?? string.Empty,
+                HeelsData = currentFragment.HeelsData ?? string.Empty,
+                HonorificData = currentFragment.HonorificData ?? string.Empty,
+                MoodlesData = currentFragment.MoodlesData ?? string.Empty,
+                PetNamesData = currentFragment.PetNamesData ?? string.Empty,
+            };
+
+            LogBuildTime(ObjectKind.Player, start);
+            return metadataOnlyFragment;
+        }
+
+        var rolling = await TryCreateRollingPlayerFragmentAsync(playerRelatedObject, currentFragment, previousStaticSnapshot, ct, reason, optionSnapshot).ConfigureAwait(false);
+        return rolling?.Fragment;
+    }
+
+    private async Task<RollingPlayerBuildResult?> TryCreateRollingPlayerFragmentAsync(GameObjectHandler playerRelatedObject, CharacterDataFragmentPlayer currentFragment, StaticBuildSnapshot previousStaticSnapshot, CancellationToken ct, string? reason, PenumbraPlayerOptionSnapshot? preCapturedOptionSnapshot = null)
+    {
+        var start = DateTime.UtcNow;
+        _logger.LogDebug("Building rolling player character data for {obj}", playerRelatedObject);
+
+        var drawingWaitMs = IsUltraFastRollingPlayerBuildReasonSet(reason) ? 250 : 1500;
+        await _dalamudUtil.WaitWhileCharacterIsDrawing(_logger, playerRelatedObject, Guid.NewGuid(), drawingWaitMs, ct: ct).ConfigureAwait(false);
+        ct.ThrowIfCancellationRequested();
+
+        var refreshCustomizePlus = ShouldRefreshPlayerPluginField(reason, "CustomizePlus:");
+        var refreshHeels = ShouldRefreshPlayerPluginField(reason, "Heels:");
+        var refreshHonorific = ShouldRefreshPlayerPluginField(reason, "Honorific:");
+        var refreshMoodles = ShouldRefreshPlayerPluginField(reason, "Moodles:");
+        var refreshPetNames = ShouldRefreshPlayerPluginField(reason, "PetNames:");
+
+        var penumbraOptionToggleBuild = IsPenumbraOptionToggleBuildReasonSet(reason);
+        Task<string>? getGlamourerData = penumbraOptionToggleBuild ? null : _ipcManager.Glamourer.GetCharacterCustomizationAsync(playerRelatedObject.Address);
+        Task<string?>? getCustomizeData = refreshCustomizePlus ? _ipcManager.CustomizePlus.GetScaleAsync(playerRelatedObject.Address) : null;
+        Task<string>? getHeelsOffset = refreshHeels ? _ipcManager.Heels.GetOffsetAsync() : null;
+        Task<string>? getHonorificTitle = refreshHonorific ? _ipcManager.Honorific.GetTitle() : null;
+        Task<string?>? getMoodles = refreshMoodles ? _ipcManager.Moodles.GetStatusAsync(playerRelatedObject.Address) : null;
+
+        var optionSnapshot = preCapturedOptionSnapshot ?? (penumbraOptionToggleBuild
+            ? await CaptureStablePenumbraPlayerOptionSnapshotAsync(playerRelatedObject, ct, reason).ConfigureAwait(false)
+            : null);
+        var resolvedPaths = optionSnapshot?.ResolvedPaths
+            ?? await ResolvePenumbraCharacterDataWithRetriesAsync(playerRelatedObject, ObjectKind.Player, ct, reason).ConfigureAwait(false);
+        if (resolvedPaths == null)
+            return null;
+
+        ct.ThrowIfCancellationRequested();
+
+        var usedCachedStaticReplacements = TryGetCachedStaticResolvedBuildReplacements(ObjectKind.Player, resolvedPaths, out var cachedStaticReplacements);
+        var staticReplacements = usedCachedStaticReplacements
+            ? new HashSet<FileReplacement>(cachedStaticReplacements.Select(CloneFileReplacementWithHash), FileReplacementComparer.Instance)
+            : BuildStaticFileReplacements(resolvedPaths);
+
+        if (!usedCachedStaticReplacements)
+        {
+            var staticFragment = new CharacterDataFragment { FileReplacements = staticReplacements };
+            await AddStaticSupportDependencyReplacementsAsync(staticFragment, ct).ConfigureAwait(false);
+            staticReplacements = staticFragment.FileReplacements;
+        }
+
+        staticReplacements = new HashSet<FileReplacement>(
+            staticReplacements.Where(static v => v.HasFileReplacement).OrderBy(static v => v.ResolvedPath, StringComparer.Ordinal),
+            FileReplacementComparer.Instance);
+
+        var toCompute = staticReplacements.Where(static f => !f.IsFileSwap && string.IsNullOrWhiteSpace(f.Hash)).ToArray();
+        await PopulateReplacementHashesAsync(toCompute, ct).ConfigureAwait(false);
+        staticReplacements.RemoveWhere(static f => !f.IsFileSwap && string.IsNullOrEmpty(f.Hash));
+
+        var previousStaticGamePaths = BuildGamePathSet(previousStaticSnapshot.Replacements);
+        var newStaticGamePaths = BuildGamePathSet(staticReplacements);
+        var merged = new HashSet<FileReplacement>(FileReplacementComparer.Instance);
+        var preservedCount = 0;
+
+        foreach (var existing in currentFragment.FileReplacements)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            if (existing == null || existing.GamePaths.Count == 0)
+                continue;
+
+            if (ReplacementTouchesAnyGamePath(existing, previousStaticGamePaths)
+                || ReplacementTouchesAnyGamePath(existing, newStaticGamePaths))
+            {
+                continue;
+            }
+
+            if (merged.Add(CloneFileReplacementWithHash(existing)))
+                preservedCount++;
+        }
+
+        foreach (var replacement in staticReplacements)
+            merged.Add(CloneFileReplacementWithHash(replacement));
+
+        var fragment = new CharacterDataFragmentPlayer
+        {
+            FileReplacements = merged,
+            GlamourerString = optionSnapshot?.GlamourerString ?? (getGlamourerData != null ? await getGlamourerData.ConfigureAwait(false) : string.Empty),
+            CustomizePlusScale = getCustomizeData != null ? await getCustomizeData.ConfigureAwait(false) ?? string.Empty : currentFragment.CustomizePlusScale ?? string.Empty,
+            ManipulationString = optionSnapshot?.ManipulationString ?? _ipcManager.Penumbra.GetMetaManipulations(),
+            HonorificData = getHonorificTitle != null ? await getHonorificTitle.ConfigureAwait(false) : currentFragment.HonorificData ?? string.Empty,
+            HeelsData = getHeelsOffset != null ? await getHeelsOffset.ConfigureAwait(false) : currentFragment.HeelsData ?? string.Empty,
+            MoodlesData = getMoodles != null ? await getMoodles.ConfigureAwait(false) ?? string.Empty : currentFragment.MoodlesData ?? string.Empty,
+            PetNamesData = refreshPetNames ? _ipcManager.PetNames.GetLocalNames() : currentFragment.PetNamesData ?? string.Empty,
+        };
+
+        RememberStaticBuildSnapshot(ObjectKind.Player, staticReplacements.ToArray());
+        RememberStaticResolvedBuildCache(ObjectKind.Player, resolvedPaths, staticReplacements.ToArray());
+
+        LogBuildTime(ObjectKind.Player, start);
+
+        return new RollingPlayerBuildResult(fragment, preservedCount, staticReplacements.Count);
+    }
+
+    private static bool AreFileReplacementArraysEqual(IEnumerable<FileReplacement> left, IEnumerable<FileReplacement> right)
+    {
+        var leftSet = new HashSet<FileReplacement>(left?.Select(CloneFileReplacementWithHash) ?? Enumerable.Empty<FileReplacement>(), FileReplacementComparer.Instance);
+        var rightSet = new HashSet<FileReplacement>(right?.Select(CloneFileReplacementWithHash) ?? Enumerable.Empty<FileReplacement>(), FileReplacementComparer.Instance);
+        return leftSet.SetEquals(rightSet);
+    }
+
+    private static HashSet<string> BuildGamePathSet(IEnumerable<FileReplacement> replacements)
+    {
+        var output = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (replacements == null)
+            return output;
+
+        foreach (var replacement in replacements)
+        {
+            if (replacement?.GamePaths == null)
+                continue;
+
+            foreach (var path in replacement.GamePaths)
+            {
+                var normalized = NormalizeStaticSupportGamePath(path);
+                if (!string.IsNullOrWhiteSpace(normalized))
+                    output.Add(normalized);
+            }
+        }
+
+        return output;
+    }
+
+    private static bool ReplacementTouchesAnyGamePath(FileReplacement replacement, HashSet<string> gamePaths)
+    {
+        if (replacement?.GamePaths == null || gamePaths == null || gamePaths.Count == 0)
+            return false;
+
+        foreach (var path in replacement.GamePaths)
+        {
+            var normalized = NormalizeStaticSupportGamePath(path);
+            if (!string.IsNullOrWhiteSpace(normalized) && gamePaths.Contains(normalized))
+                return true;
+        }
+
+        return false;
+    }
+
     private async Task<CharacterDataFragment> CreateCharacterData(GameObjectHandler playerRelatedObject, CancellationToken ct, string? reason = null)
     {
         var objectKind = playerRelatedObject.ObjectKind;
+
+        if (objectKind == ObjectKind.Pet)
+            return await CreatePetCharacterDataLightweight(playerRelatedObject, ct, reason).ConfigureAwait(false);
+
         CharacterDataFragment fragment = objectKind == ObjectKind.Player ? new CharacterDataFragmentPlayer() : new();
-        _logger.LogDebug("Building character data for {obj}, reason={reason}",
-            playerRelatedObject,
-            string.IsNullOrWhiteSpace(reason) ? "<none>" : reason);
+        _logger.LogDebug("Building character data for {obj}", playerRelatedObject);
 
         var lightweightBuild = IsLightweightBuildReasonSet(reason);
         var drawingWaitMs = lightweightBuild ? 1500 : 5000;
@@ -209,17 +563,25 @@ public class PlayerDataFactory : IMediatorSubscriber
 
         ct.ThrowIfCancellationRequested();
 
-        // Start IPC tasks early so they overlap with resolving + hashing
-        Task<string> getHeelsOffset = _ipcManager.Heels.GetOffsetAsync();
-        Task<string> getGlamourerData = _ipcManager.Glamourer.GetCharacterCustomizationAsync(playerRelatedObject.Address);
-        Task<string?> getCustomizeData = _ipcManager.CustomizePlus.GetScaleAsync(playerRelatedObject.Address);
-        Task<string> getHonorificTitle = _ipcManager.Honorific.GetTitle();
+        var penumbraOptionToggleBuild = objectKind == ObjectKind.Player && IsPenumbraOptionToggleBuildReasonSet(reason);
+
+        // Start IPC tasks early so they overlap with resolving + hashing. For Penumbra option toggles,
+        // Glamourer + meta manipulations are sampled together with the resolved file map below so raw
+        // file toggles and IMC/EQP manipulation toggles cannot be captured from different settle phases.
+        Task<string>? getHeelsOffset = objectKind == ObjectKind.Player ? _ipcManager.Heels.GetOffsetAsync() : null;
+        Task<string>? getGlamourerData = objectKind == ObjectKind.Player && !penumbraOptionToggleBuild ? _ipcManager.Glamourer.GetCharacterCustomizationAsync(playerRelatedObject.Address) : null;
+        Task<string?> getCustomizeData = objectKind == ObjectKind.Player ? _ipcManager.CustomizePlus.GetScaleAsync(playerRelatedObject.Address) : Task.FromResult<string?>(null);
+        Task<string>? getHonorificTitle = objectKind == ObjectKind.Player ? _ipcManager.Honorific.GetTitle() : null;
 
         Task<string?> getMoodles = objectKind == ObjectKind.Player ? _ipcManager.Moodles.GetStatusAsync(playerRelatedObject.Address) : Task.FromResult<string?>(null);
 
         DateTime start = DateTime.UtcNow;
 
-        var resolvedPaths = await ResolvePenumbraCharacterDataWithRetriesAsync(playerRelatedObject, objectKind, ct, reason).ConfigureAwait(false);
+        var optionSnapshot = penumbraOptionToggleBuild
+            ? await CaptureStablePenumbraPlayerOptionSnapshotAsync(playerRelatedObject, ct, reason).ConfigureAwait(false)
+            : null;
+        var resolvedPaths = optionSnapshot?.ResolvedPaths
+            ?? await ResolvePenumbraCharacterDataWithRetriesAsync(playerRelatedObject, objectKind, ct, reason).ConfigureAwait(false);
         if (resolvedPaths == null) throw new InvalidOperationException("Penumbra returned null data after retry");
 
         ct.ThrowIfCancellationRequested();
@@ -254,31 +616,6 @@ public class PlayerDataFactory : IMediatorSubscriber
         await _transientResourceManager.WaitForRecording(ct).ConfigureAwait(false);
         ct.ThrowIfCancellationRequested();
 
-        // Persistent Summoner-style pets need their static replacements kept alive as transients,
-        // otherwise every minor pet change can turn into redraw city. Short-lived combat summons
-        // such as DRK Living Shadow are different: promoting every spawned-actor replacement into
-        // the persistent Pet transient bucket during summon creation can stall the local client.
-        if (objectKind == ObjectKind.Pet)
-        {
-            if (_dalamudUtil.ShouldTreatPetAsShortLivedCombatSummonForCurrentJob)
-            {
-                _logger.LogTrace("Keeping {count} Pet static replacements static for short-lived combat summon; skipping persistent Pet transient promotion", fragment.FileReplacements.Count);
-            }
-            else
-            {
-                foreach (var item in fragment.FileReplacements.Where(i => i.HasFileReplacement).SelectMany(p => p.GamePaths))
-                {
-                    if (_transientResourceManager.AddTransientResource(objectKind, item))
-                    {
-                        _logger.LogDebug("Marking static {item} for Pet as transient", item);
-                    }
-                }
-
-                _logger.LogTrace("Clearing {count} Static Replacements for Pet", fragment.FileReplacements.Count);
-                fragment.FileReplacements.Clear();
-            }
-        }
-
         ct.ThrowIfCancellationRequested();
 
         _logger.LogDebug("Handling transient update for {obj}", playerRelatedObject);
@@ -302,6 +639,35 @@ public class PlayerDataFactory : IMediatorSubscriber
         var staticResolvedGamePaths = fragment.FileReplacements.SelectMany(c => c.GamePaths).ToList();
         _transientResourceManager.ClearTransientPaths(objectKind, staticResolvedGamePaths);
 
+        // Persistent Summoner/Scholar-style pets need their current static replacements sent on the
+        // first build and remembered as transients for later builds. Register them after clearing
+        // static paths; registering before ClearTransientPaths immediately removed them again.
+        if (objectKind == ObjectKind.Pet)
+        {
+            if (_dalamudUtil.ShouldTreatPetAsShortLivedCombatSummonForCurrentJob)
+            {
+                _logger.LogTrace("Keeping {count} Pet static replacements static for short-lived combat summon; skipping persistent Pet transient promotion", fragment.FileReplacements.Count);
+            }
+            else
+            {
+                var remembered = 0;
+                foreach (var replacement in fragment.FileReplacements.Where(i => i.HasFileReplacement))
+                {
+                    foreach (var item in replacement.GamePaths)
+                    {
+                        _transientResourceManager.RegisterKnownTransientFilePath(item, replacement.ResolvedPath);
+                        if (_transientResourceManager.AddTransientResource(objectKind, item))
+                        {
+                            remembered++;
+                            _logger.LogDebug("Marking static {item} for Pet as transient", item);
+                        }
+                    }
+                }
+
+                _logger.LogTrace("Remembered {count} current Pet static replacement path(s) as transient without clearing the first-send payload", remembered);
+            }
+        }
+
         // get all remaining paths and resolve them
         var transientPaths = ManageSemiTransientData(objectKind, staticResolvedGamePaths, playerRelatedObject, staticReplacementReferences);
         var transientReplacements = await ResolveTransientFileReplacementsForBuildAsync(objectKind, transientPaths, reason, ct).ConfigureAwait(false);
@@ -321,8 +687,17 @@ public class PlayerDataFactory : IMediatorSubscriber
                 fragment.FileReplacements.Add(replacement);
         }
 
-        await AddSenderSelectedFullMountModReplacementsAsync(fragment, objectKind, playerRelatedObject, ct).ConfigureAwait(false);
-        await AddSenderDefaultCollectionMountMusicReplacementsAsync(fragment, objectKind, ct).ConfigureAwait(false);
+        await AddSummonedObjectEmbeddedVfxSupportReplacementsAsync(fragment, objectKind, ct).ConfigureAwait(false);
+
+        if (ShouldRunSenderMountOnlyExpansion(fragment, objectKind))
+        {
+            await AddSenderSelectedFullMountModReplacementsAsync(fragment, objectKind, playerRelatedObject, ct).ConfigureAwait(false);
+            await AddSenderDefaultCollectionMountMusicReplacementsAsync(fragment, objectKind, ct).ConfigureAwait(false);
+        }
+        else if (_logger.IsEnabled(LogLevel.Trace))
+        {
+            _logger.LogTrace("Skipping mount-only selected-mod/music sweep for known minion actor payload");
+        }
 
         // clean up all semi transient resources that don't have any file replacement (aka null resolve)
         _transientResourceManager.CleanUpSemiTransientResources(objectKind, [.. fragment.FileReplacements]);
@@ -333,7 +708,7 @@ public class PlayerDataFactory : IMediatorSubscriber
         fragment.FileReplacements = new HashSet<FileReplacement>(fragment.FileReplacements.Where(v => v.HasFileReplacement).OrderBy(v => v.ResolvedPath, StringComparer.Ordinal), FileReplacementComparer.Instance);
 
         // gather up data from ipc
-        fragment.GlamourerString = await getGlamourerData.ConfigureAwait(false);
+        fragment.GlamourerString = optionSnapshot?.GlamourerString ?? (getGlamourerData != null ? await getGlamourerData.ConfigureAwait(false) : string.Empty);
         _logger.LogDebug("Glamourer is now: {data}", fragment.GlamourerString);
 
         var customizeScale = await getCustomizeData.ConfigureAwait(false);
@@ -343,12 +718,12 @@ public class PlayerDataFactory : IMediatorSubscriber
         if (objectKind == ObjectKind.Player)
         {
             var playerFragment = (fragment as CharacterDataFragmentPlayer)!;
-            playerFragment.ManipulationString = _ipcManager.Penumbra.GetMetaManipulations();
+            playerFragment.ManipulationString = optionSnapshot?.ManipulationString ?? _ipcManager.Penumbra.GetMetaManipulations();
 
-            playerFragment!.HonorificData = await getHonorificTitle.ConfigureAwait(false);
+            playerFragment!.HonorificData = getHonorificTitle != null ? await getHonorificTitle.ConfigureAwait(false) : string.Empty;
             _logger.LogDebug("Honorific is now: {data}", playerFragment!.HonorificData);
 
-            playerFragment!.HeelsData = await getHeelsOffset.ConfigureAwait(false);
+            playerFragment!.HeelsData = getHeelsOffset != null ? await getHeelsOffset.ConfigureAwait(false) : string.Empty;
             _logger.LogDebug("Heels is now: {heels}", playerFragment!.HeelsData);
 
             playerFragment!.MoodlesData = await getMoodles.ConfigureAwait(false) ?? string.Empty;
@@ -376,11 +751,185 @@ public class PlayerDataFactory : IMediatorSubscriber
 
         ct.ThrowIfCancellationRequested();
 
-        _logger.LogInformation("Building character data for {obj} took {time}ms (reason={reason})", objectKind, TimeSpan.FromTicks(DateTime.UtcNow.Ticks - start.Ticks).TotalMilliseconds, string.IsNullOrWhiteSpace(reason) ? "<none>" : reason);
+        LogBuildTime(objectKind, start);
 
         return fragment;
     }
 
+
+    private async Task<CharacterDataFragment> CreatePetCharacterDataLightweight(GameObjectHandler playerRelatedObject, CancellationToken ct, string? reason = null)
+    {
+        var objectKind = ObjectKind.Pet;
+        var fragment = new CharacterDataFragment();
+        _logger.LogDebug("Building lightweight pet character data for {obj}", playerRelatedObject);
+
+        await _dalamudUtil.WaitWhileCharacterIsDrawing(_logger, playerRelatedObject, Guid.NewGuid(), 250, ct: ct).ConfigureAwait(false);
+        ct.ThrowIfCancellationRequested();
+
+        var gameObj = await _dalamudUtil.CreateGameObjectAsync(playerRelatedObject.Address).ConfigureAwait(false);
+        if (!await _dalamudUtil.IsObjectPresentAsync(gameObj).ConfigureAwait(false))
+        {
+            _logger.LogTrace("Skipping lightweight Pet build because the actor is no longer present");
+            return fragment;
+        }
+
+        var start = DateTime.UtcNow;
+
+        var waitRecordingTask = _transientResourceManager.WaitForRecording(ct);
+        var resolvedPaths = await _ipcManager.Penumbra.GetCharacterData(_logger, playerRelatedObject).ConfigureAwait(false);
+        if (resolvedPaths == null)
+            throw new InvalidOperationException("Penumbra returned null Pet data");
+
+        ct.ThrowIfCancellationRequested();
+
+        var usedCachedStaticReplacements = TryGetCachedStaticResolvedBuildReplacements(objectKind, resolvedPaths, out var cachedStaticReplacements);
+        var staticReplacements = usedCachedStaticReplacements
+            ? new HashSet<FileReplacement>(cachedStaticReplacements, FileReplacementComparer.Instance)
+            : BuildStaticFileReplacements(resolvedPaths);
+        var staticReplacementReferences = staticReplacements.ToArray();
+        var staticResolvedGamePaths = staticReplacementReferences.SelectMany(static replacement => replacement.GamePaths).ToList();
+        var routePetThroughPlayerScopedSummons = _dalamudUtil.ShouldRoutePetChurnThroughPlayerScopedSummonsForCurrentJob;
+
+        await waitRecordingTask.ConfigureAwait(false);
+        ct.ThrowIfCancellationRequested();
+
+        _transientResourceManager.ClearTransientPaths(objectKind, []);
+
+        var remembered = 0;
+        foreach (var replacement in staticReplacementReferences.Where(static replacement => replacement.HasFileReplacement))
+        {
+            foreach (var gamePath in replacement.GamePaths)
+            {
+                ct.ThrowIfCancellationRequested();
+                _transientResourceManager.RegisterKnownTransientFilePath(gamePath, replacement.ResolvedPath);
+
+                var targetKind = routePetThroughPlayerScopedSummons ? ObjectKind.Player : objectKind;
+                if (_transientResourceManager.AddTransientResource(targetKind, gamePath))
+                    remembered++;
+            }
+        }
+
+        if (remembered > 0 && _logger.IsEnabled(LogLevel.Trace))
+        {
+            _logger.LogTrace(
+                "Remembered {count} current Pet static replacement path(s) as {scope} transient during lightweight build",
+                remembered,
+                routePetThroughPlayerScopedSummons ? "player-scoped summoned actor" : "Pet");
+        }
+
+        if (routePetThroughPlayerScopedSummons)
+        {
+            foreach (var replacement in staticReplacementReferences)
+            {
+                ct.ThrowIfCancellationRequested();
+                if (replacement.HasFileReplacement)
+                    fragment.FileReplacements.Add(replacement);
+            }
+        }
+        else
+        {
+            var transientPaths = ManageSemiTransientData(objectKind, staticResolvedGamePaths, playerRelatedObject, staticReplacementReferences);
+            var transientReplacements = await ResolveTransientFileReplacementsForBuildAsync(objectKind, transientPaths, reason, ct).ConfigureAwait(false);
+            var transientReplacementReferences = transientReplacements.ToArray();
+
+            foreach (var replacement in transientReplacements)
+            {
+                ct.ThrowIfCancellationRequested();
+                if (replacement.HasFileReplacement)
+                    fragment.FileReplacements.Add(replacement);
+            }
+
+            if (fragment.FileReplacements.Count == 0)
+            {
+                foreach (var replacement in staticReplacementReferences)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    if (replacement.HasFileReplacement)
+                        fragment.FileReplacements.Add(replacement);
+                }
+            }
+
+            await AddSummonedObjectEmbeddedVfxSupportReplacementsAsync(fragment, objectKind, ct).ConfigureAwait(false);
+            RememberTransientResolvedBuildCache(objectKind, transientPaths, transientReplacementReferences);
+        }
+
+        _transientResourceManager.CleanUpSemiTransientResources(objectKind, [.. fragment.FileReplacements]);
+
+        fragment.FileReplacements = new HashSet<FileReplacement>(
+            fragment.FileReplacements.Where(static replacement => replacement.HasFileReplacement).OrderBy(static replacement => replacement.ResolvedPath, StringComparer.Ordinal),
+            FileReplacementComparer.Instance);
+
+        var toCompute = fragment.FileReplacements.Where(static replacement => !replacement.IsFileSwap).ToArray();
+        _logger.LogDebug("Getting Hashes for {amount} Pet Files", toCompute.Length);
+        await PopulateReplacementHashesAsync(toCompute, ct).ConfigureAwait(false);
+        var removed = fragment.FileReplacements.RemoveWhere(static replacement => !replacement.IsFileSwap && string.IsNullOrEmpty(replacement.Hash));
+        if (removed > 0)
+            _logger.LogDebug("Removed {amount} invalid lightweight Pet file(s)", removed);
+
+        RememberStaticBuildSnapshot(objectKind, staticReplacementReferences);
+        RememberStaticResolvedBuildCache(objectKind, resolvedPaths, staticReplacementReferences);
+
+        ct.ThrowIfCancellationRequested();
+        LogBuildTime(objectKind, start);
+        return fragment;
+    }
+
+
+    private static bool IsUiOrInterfaceResolvedPath(string? path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+            return false;
+
+        var normalized = path.Replace('\\', '/').Trim();
+        return normalized.StartsWith("ui/", StringComparison.OrdinalIgnoreCase)
+            || normalized.StartsWith("addon/", StringComparison.OrdinalIgnoreCase)
+            || normalized.StartsWith("font/", StringComparison.OrdinalIgnoreCase)
+            || normalized.Contains("/ui/", StringComparison.OrdinalIgnoreCase)
+            || normalized.Contains("/addon/", StringComparison.OrdinalIgnoreCase)
+            || normalized.Contains("/font/", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private bool ShouldRunSenderMountOnlyExpansion(CharacterDataFragment fragment, ObjectKind objectKind)
+    {
+        if (objectKind != ObjectKind.MinionOrMount)
+            return false;
+
+        // Mounts and minions share ObjectKind.MinionOrMount and both commonly sit under chara/monster/m####.
+        // The mount-selected/mod-music sweep is intentionally expensive, so only pay it when Lumina says the
+        // active actor model is actually a mount. Unknown/ambiguous actors stay conservative to preserve mount music.
+        var activeActorIds = ExtractActiveMountActorIdsFromFragment(fragment);
+        if (activeActorIds.Count == 0)
+            return false;
+
+        var hadKnownActor = false;
+        var hadUnknownActor = false;
+        foreach (var actorId in activeActorIds)
+        {
+            if (_dalamudUtil.TryIsKnownMountActorId(actorId, out var isMount))
+            {
+                hadKnownActor = true;
+                if (isMount)
+                    return true;
+
+                continue;
+            }
+
+            hadUnknownActor = true;
+        }
+
+        if (hadUnknownActor)
+        {
+            if (_logger.IsEnabled(LogLevel.Trace))
+                _logger.LogTrace("Running conservative mount-only selected-mod/music sweep for unknown summoned actor id(s) {actors}", string.Join(",", activeActorIds.OrderBy(static id => id, StringComparer.OrdinalIgnoreCase)));
+
+            return true;
+        }
+
+        if (hadKnownActor && _logger.IsEnabled(LogLevel.Trace))
+            _logger.LogTrace("Skipping mount-only selected-mod/music sweep for Lumina-classified minion actor id(s) {actors}", string.Join(",", activeActorIds.OrderBy(static id => id, StringComparer.OrdinalIgnoreCase)));
+
+        return false;
+    }
 
     private async Task AddSenderSelectedFullMountModReplacementsAsync(CharacterDataFragment fragment, ObjectKind objectKind, GameObjectHandler playerRelatedObject, CancellationToken ct)
     {
@@ -471,7 +1020,7 @@ public class PlayerDataFactory : IMediatorSubscriber
         if (string.IsNullOrWhiteSpace(normalized))
             return false;
 
-        var match = Regex.Match(normalized, @"(?:^|/)chara/monster/((?:m|d)\d{4})(?:/|$)", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        var match = MountActorGamePathRegex.Match(normalized);
         if (!match.Success)
             return false;
 
@@ -485,6 +1034,10 @@ public class PlayerDataFactory : IMediatorSubscriber
             return;
 
         if (!_ipcManager.Penumbra.APIAvailable)
+            return;
+
+        var activeMountIds = ExtractActiveMountActorIdsFromFragment(fragment);
+        if (activeMountIds.Count == 0)
             return;
 
         var defaultCollectionState = await _ipcManager.Penumbra.GetDefaultCollectionModSettingsAsync(_logger).ConfigureAwait(false);
@@ -563,7 +1116,7 @@ public class PlayerDataFactory : IMediatorSubscriber
 
         RememberTransientResolvedBuildCache(ObjectKind.Player, transientPaths, transientReplacementReferences);
 
-        _logger.LogInformation("Building transient-only character data for Player took {time}ms", TimeSpan.FromTicks(DateTime.UtcNow.Ticks - start.Ticks).TotalMilliseconds);
+        LogBuildTime(ObjectKind.Player, start);
         return true;
     }
 
@@ -572,8 +1125,11 @@ public class PlayerDataFactory : IMediatorSubscriber
         var replacements = new HashSet<FileReplacement>(FileReplacementComparer.Instance);
         foreach (var resolvedPath in resolvedPaths)
         {
+            if (IsUiOrInterfaceResolvedPath(resolvedPath.Key))
+                continue;
+
             var replacement = new FileReplacement([.. resolvedPath.Value], resolvedPath.Key);
-            if (replacement.HasFileReplacement && replacement.GamePaths.All(IsAllowedBuildGamePath))
+            if (replacement.HasFileReplacement && replacement.GamePaths.All(path => IsAllowedModdedBuildGamePath(path, resolvedPath.Key)))
                 replacements.Add(replacement);
         }
 
@@ -637,14 +1193,30 @@ public class PlayerDataFactory : IMediatorSubscriber
         if (!ShouldBypassTransientResolvedBuildCache(objectKind, reason)
             && TryGetCachedTransientResolvedBuildReplacements(objectKind, transientPaths, out var cachedReplacements))
         {
+            if (ShouldOverlayKnownTransientResolvedWinnersForBuild(objectKind, reason))
+            {
+                var overlaidReplacements = await TryOverlayKnownTransientResolvedWinnersAsync(objectKind, transientPaths, cachedReplacements, ct).ConfigureAwait(false);
+                if (overlaidReplacements is { Length: > 0 })
+                {
+                    RememberTransientResolvedBuildCache(objectKind, transientPaths, overlaidReplacements);
+                    return overlaidReplacements.ToList();
+                }
+            }
+
             return cachedReplacements.ToList();
         }
 
         var resolvedTransientPaths = await ResolveTransientReplacementsForBuildAsync(objectKind, transientPaths, reason, ct).ConfigureAwait(false);
+        if (IsSummonedObjectKind(objectKind) || ContainsPlayerScopedSummonedActorPath(transientPaths))
+            resolvedTransientPaths = await ExpandResolvedSummonedObjectEmbeddedVfxSupportAsync(objectKind, resolvedTransientPaths, ct).ConfigureAwait(false);
+
         var transientReplacements = new List<FileReplacement>(resolvedTransientPaths.Count);
         foreach (var resolvedTransientPath in resolvedTransientPaths)
         {
             ct.ThrowIfCancellationRequested();
+            if (IsUiOrInterfaceResolvedPath(resolvedTransientPath.Key))
+                continue;
+
             var replacement = new FileReplacement([.. resolvedTransientPath.Value], resolvedTransientPath.Key);
             if (replacement.HasFileReplacement)
                 transientReplacements.Add(replacement);
@@ -674,6 +1246,114 @@ public class PlayerDataFactory : IMediatorSubscriber
         }
 
         return true;
+    }
+
+    private async Task<FileReplacement[]?> TryOverlayKnownTransientResolvedWinnersAsync(ObjectKind objectKind, HashSet<string> transientPaths, FileReplacement[] cachedReplacements, CancellationToken ct)
+    {
+        if (cachedReplacements == null || cachedReplacements.Length == 0 || transientPaths.Count == 0)
+            return null;
+
+        var knownResolvedByGamePath = _transientResourceManager.GetKnownResolvedFilePaths(objectKind, transientPaths, validateExists: true);
+        if (knownResolvedByGamePath.Count == 0)
+            return null;
+
+        var cachedResolvedByGamePath = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var replacement in cachedReplacements)
+        {
+            if (replacement == null || !replacement.HasFileReplacement)
+                continue;
+
+            foreach (var gamePath in replacement.GamePaths)
+            {
+                var normalizedGamePath = NormalizeTransientGamePathForBuild(gamePath);
+                if (!string.IsNullOrWhiteSpace(normalizedGamePath))
+                    cachedResolvedByGamePath[normalizedGamePath] = replacement.ResolvedPath;
+            }
+        }
+
+        var updatedWinners = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var item in knownResolvedByGamePath)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            var gamePath = NormalizeTransientGamePathForBuild(item.Key);
+            var resolvedPath = NormalizeStaticSupportResolvedPath(item.Value);
+            if (!IsAllowedModdedBuildGamePath(gamePath, resolvedPath))
+                continue;
+
+            if (cachedResolvedByGamePath.TryGetValue(gamePath, out var cachedResolved)
+                && string.Equals(NormalizeStaticSupportResolvedPath(cachedResolved), resolvedPath, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            updatedWinners[gamePath] = resolvedPath;
+        }
+
+        if (updatedWinners.Count == 0)
+            return null;
+
+        var rebuiltByResolvedPath = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
+        foreach (var replacement in cachedReplacements)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            if (replacement == null || !replacement.HasFileReplacement)
+                continue;
+
+            var resolvedPath = NormalizeStaticSupportResolvedPath(replacement.ResolvedPath);
+            if (string.IsNullOrWhiteSpace(resolvedPath) || IsUiOrInterfaceResolvedPath(resolvedPath))
+                continue;
+
+            foreach (var originalGamePath in replacement.GamePaths)
+            {
+                var gamePath = NormalizeTransientGamePathForBuild(originalGamePath);
+                if (string.IsNullOrWhiteSpace(gamePath) || updatedWinners.ContainsKey(gamePath))
+                    continue;
+
+                if (!IsAllowedModdedBuildGamePath(gamePath, resolvedPath))
+                    continue;
+
+                AddOverlayResolvedPath(rebuiltByResolvedPath, resolvedPath, gamePath);
+            }
+        }
+
+        foreach (var item in updatedWinners)
+        {
+            ct.ThrowIfCancellationRequested();
+            AddOverlayResolvedPath(rebuiltByResolvedPath, item.Value, item.Key);
+        }
+
+        var rebuilt = new List<FileReplacement>(rebuiltByResolvedPath.Count);
+        foreach (var item in rebuiltByResolvedPath.OrderBy(static kvp => kvp.Key, StringComparer.OrdinalIgnoreCase))
+        {
+            var replacement = new FileReplacement(item.Value.ToArray(), item.Key);
+            if (replacement.HasFileReplacement)
+                rebuilt.Add(replacement);
+        }
+
+        if (rebuilt.Count == 0)
+            return null;
+
+        await PopulateReplacementHashesAsync(rebuilt.Where(static replacement => !replacement.IsFileSwap).ToArray(), ct).ConfigureAwait(false);
+        rebuilt.RemoveAll(static replacement => !replacement.IsFileSwap && string.IsNullOrWhiteSpace(replacement.Hash));
+
+        if (rebuilt.Count == 0)
+            return null;
+
+        _logger.LogDebug("Updated cached transient resolved build map in-place for {count} targeted manifest winner(s); reused the rest of the primed transient cache", updatedWinners.Count);
+        return rebuilt.ToArray();
+    }
+
+    private static void AddOverlayResolvedPath(Dictionary<string, HashSet<string>> byResolvedPath, string resolvedPath, string gamePath)
+    {
+        if (!byResolvedPath.TryGetValue(resolvedPath, out var gamePaths))
+        {
+            gamePaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            byResolvedPath[resolvedPath] = gamePaths;
+        }
+
+        gamePaths.Add(gamePath);
     }
 
     private void RememberTransientResolvedBuildCache(ObjectKind objectKind, HashSet<string> transientPaths, FileReplacement[] transientReplacementReferences)
@@ -745,18 +1425,21 @@ public class PlayerDataFactory : IMediatorSubscriber
         foreach (var kvp in resolvedPaths.OrderBy(static kvp => NormalizeStaticSupportResolvedPath(kvp.Key), StringComparer.OrdinalIgnoreCase))
         {
             var resolvedPath = NormalizeStaticSupportResolvedPath(kvp.Key);
-            if (string.IsNullOrWhiteSpace(resolvedPath))
+            if (string.IsNullOrWhiteSpace(resolvedPath) || IsUiOrInterfaceResolvedPath(resolvedPath))
+                continue;
+
+            var moddedGamePaths = kvp.Value
+                .Select(NormalizeStaticSupportGamePath)
+                .Where(path => IsAllowedModdedBuildGamePath(path, resolvedPath))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .OrderBy(static path => path, StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+            if (moddedGamePaths.Length == 0)
                 continue;
 
             sb.Append("r:").Append(resolvedPath).Append('|');
-            foreach (var gamePath in kvp.Value
-                         .Select(NormalizeStaticSupportGamePath)
-                         .Where(static path => !string.IsNullOrWhiteSpace(path))
-                         .Distinct(StringComparer.OrdinalIgnoreCase)
-                         .OrderBy(static path => path, StringComparer.OrdinalIgnoreCase))
-            {
+            foreach (var gamePath in moddedGamePaths)
                 sb.Append("g:").Append(gamePath).Append('|');
-            }
         }
 
         signature = sb.ToString();
@@ -773,7 +1456,7 @@ public class PlayerDataFactory : IMediatorSubscriber
         sb.Append("transient-resolved-v1|");
         foreach (var path in transientPaths
                      .Select(NormalizeTransientGamePathForBuild)
-                     .Where(static path => !string.IsNullOrWhiteSpace(path))
+                     .Where(IsAllowedBuildGamePath)
                      .Distinct(StringComparer.OrdinalIgnoreCase)
                      .OrderBy(static path => path, StringComparer.OrdinalIgnoreCase))
         {
@@ -784,15 +1467,40 @@ public class PlayerDataFactory : IMediatorSubscriber
         return signature.Length > "transient-resolved-v1|".Length;
     }
 
+    private static bool ShouldOverlayKnownTransientResolvedWinnersForBuild(ObjectKind objectKind, string? reason)
+    {
+        if (objectKind != ObjectKind.Player || string.IsNullOrWhiteSpace(reason))
+            return false;
+
+        var reasons = reason.Split('|', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        return reasons.Any(IsTargetedTransientManifestCacheOverlayReason);
+    }
+
+    private static bool IsTargetedTransientManifestCacheOverlayReason(string? reason)
+    {
+        if (string.IsNullOrWhiteSpace(reason))
+            return false;
+
+        const string followUpPrefix = "ImmediateFollowUp:";
+        while (reason.StartsWith(followUpPrefix, StringComparison.Ordinal))
+            reason = reason[followUpPrefix.Length..];
+
+        return string.Equals(reason, "PenumbraModSettingChanged:TransientManifest", StringComparison.Ordinal);
+    }
+
     private static bool ShouldBypassTransientResolvedBuildCache(ObjectKind objectKind, string? reason)
     {
         if (ShouldForceFullLiveTransientResolveForBuild(reason))
+            return true;
+
+        if (ShouldForceLiveSummonedObjectTransientResolve(objectKind, reason))
             return true;
 
         if (string.IsNullOrWhiteSpace(reason))
             return false;
 
         var reasons = reason.Split('|', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        var hasTargetedManifestOverlay = reasons.Any(IsTargetedTransientManifestCacheOverlayReason);
         foreach (var item in reasons)
         {
             if (item.Contains("TransientResourceChanged", StringComparison.Ordinal)
@@ -801,7 +1509,11 @@ public class PlayerDataFactory : IMediatorSubscriber
                 || item.StartsWith("Connected:", StringComparison.Ordinal)
                 || item.StartsWith("ImmediateFollowUp:Connected:", StringComparison.Ordinal)
                 || item.StartsWith("PenumbraFileCacheChanged", StringComparison.Ordinal)
-                || item.StartsWith("PenumbraModSettingChanged", StringComparison.Ordinal)
+                || (item.StartsWith("PenumbraModSettingChanged:Animation", StringComparison.Ordinal))
+                || (item.StartsWith("PenumbraModSettingChanged", StringComparison.Ordinal)
+                    && !IsTargetedTransientManifestCacheOverlayReason(item)
+                    && !(hasTargetedManifestOverlay && item.StartsWith("PenumbraModSettingChanged:PlayerState", StringComparison.Ordinal)))
+                || (item.Contains("TransientManifest", StringComparison.Ordinal) && !IsTargetedTransientManifestCacheOverlayReason(item))
                 || item.StartsWith("ClassJobChanged:", StringComparison.Ordinal))
             {
                 return true;
@@ -809,6 +1521,39 @@ public class PlayerDataFactory : IMediatorSubscriber
         }
 
         return false;
+    }
+
+
+    private static bool ShouldForceLiveSummonedObjectTransientResolve(ObjectKind objectKind, string? reason)
+    {
+        if (!IsSummonedObjectKind(objectKind) || string.IsNullOrWhiteSpace(reason))
+            return false;
+
+        var reasons = reason.Split('|', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        foreach (var item in reasons)
+        {
+            var normalized = NormalizeImmediateFollowUpReasonForBuild(item);
+            if (normalized.StartsWith("GameObject:StructuralDiff", StringComparison.Ordinal)
+                || normalized.StartsWith("GameObject:SemanticDiff", StringComparison.Ordinal)
+                || normalized.Equals("GameObject:TransientResourceChanged", StringComparison.Ordinal)
+                || normalized.StartsWith("Glamourer:", StringComparison.Ordinal)
+                || normalized.StartsWith("ClearCache:", StringComparison.Ordinal)
+                || normalized.StartsWith("Connected:", StringComparison.Ordinal))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static string NormalizeImmediateFollowUpReasonForBuild(string reason)
+    {
+        const string prefix = "ImmediateFollowUp:";
+        while (reason.StartsWith(prefix, StringComparison.Ordinal))
+            reason = reason[prefix.Length..];
+
+        return reason;
     }
 
     private void RememberStaticBuildSnapshot(ObjectKind objectKind, FileReplacement[] staticReplacementReferences)
@@ -961,10 +1706,118 @@ public class PlayerDataFactory : IMediatorSubscriber
         }
     }
 
+    private async Task<PenumbraPlayerOptionSnapshot?> CaptureStablePenumbraPlayerOptionSnapshotAsync(GameObjectHandler playerRelatedObject, CancellationToken ct, string? reason)
+    {
+        PenumbraPlayerOptionSnapshot? lastSnapshot = null;
+        var lastSignature = string.Empty;
+
+        for (var attempt = 1; attempt <= PenumbraOptionToggleStabilityAttempts; attempt++)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            var resolvedPaths = await ResolvePenumbraCharacterDataWithRetriesAsync(playerRelatedObject, ObjectKind.Player, ct, reason).ConfigureAwait(false);
+            if (resolvedPaths == null)
+                return lastSnapshot;
+
+            var glamourerData = await _ipcManager.Glamourer.GetCharacterCustomizationAsync(playerRelatedObject.Address).ConfigureAwait(false);
+            var manipulationData = _ipcManager.Penumbra.GetMetaManipulations();
+            var signature = ComputePenumbraPlayerOptionSnapshotSignature(resolvedPaths, glamourerData, manipulationData);
+            var snapshot = new PenumbraPlayerOptionSnapshot(resolvedPaths, glamourerData ?? string.Empty, manipulationData ?? string.Empty, signature);
+
+            if (attempt > 1 && string.Equals(signature, lastSignature, StringComparison.Ordinal))
+            {
+                if (_logger.IsEnabled(LogLevel.Trace))
+                    _logger.LogTrace("Penumbra option snapshot settled for {reason} after {attempt} probe(s)", reason ?? "<none>", attempt);
+
+                return snapshot;
+            }
+
+            lastSnapshot = snapshot;
+            lastSignature = signature;
+
+            if (attempt < PenumbraOptionToggleStabilityAttempts)
+            {
+                await Task.Delay(PenumbraOptionToggleStabilityProbeDelayMs, ct).ConfigureAwait(false);
+                await _dalamudUtil.RunOnFrameworkThread(() => { }).ConfigureAwait(false);
+            }
+        }
+
+        if (_logger.IsEnabled(LogLevel.Trace))
+            _logger.LogTrace("Penumbra option snapshot did not fully settle for {reason}; using latest captured snapshot", reason ?? "<none>");
+
+        return lastSnapshot;
+    }
+
+    private static string ComputePenumbraPlayerOptionSnapshotSignature(Dictionary<string, HashSet<string>> resolvedPaths, string? glamourerData, string? manipulationData)
+    {
+        var builder = new StringBuilder();
+        foreach (var item in resolvedPaths.OrderBy(kvp => NormalizeStaticSupportResolvedPath(kvp.Key), StringComparer.OrdinalIgnoreCase))
+        {
+            var resolvedPath = NormalizeStaticSupportResolvedPath(item.Key);
+            if (string.IsNullOrWhiteSpace(resolvedPath))
+                continue;
+
+            builder.Append(resolvedPath).Append('=');
+            foreach (var gamePath in (item.Value ?? []).Select(NormalizeStaticSupportGamePath).Where(static path => !string.IsNullOrWhiteSpace(path)).OrderBy(static path => path, StringComparer.OrdinalIgnoreCase))
+                builder.Append(gamePath).Append(';');
+            builder.Append('|');
+        }
+
+        builder.Append("G=").Append(glamourerData ?? string.Empty).Append("|M=").Append(manipulationData ?? string.Empty);
+        return builder.ToString();
+    }
+
+    private static bool IsSafePenumbraOptionToggleDeltaBuildReasonSet(string? reason)
+    {
+        if (string.IsNullOrWhiteSpace(reason))
+            return false;
+
+        var reasons = reason.Split('|', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        return reasons.Length > 0 && reasons.All(IsSafePenumbraOptionToggleDeltaBuildReason);
+    }
+
+    private static bool IsSafePenumbraOptionToggleDeltaBuildReason(string reason)
+    {
+        while (reason.StartsWith("ImmediateFollowUp:", StringComparison.Ordinal))
+            reason = reason["ImmediateFollowUp:".Length..];
+
+        if (reason.StartsWith("PenumbraModSettingChanged:Animation", StringComparison.Ordinal))
+            return false;
+
+        if (string.Equals(reason, "PenumbraModSettingChanged:TransientManifest", StringComparison.Ordinal)
+            || string.Equals(reason, "StartupTransientManifestPrime:TransientManifest", StringComparison.Ordinal))
+            return false;
+
+        return reason.StartsWith("PenumbraModSettingChanged:PlayerState", StringComparison.Ordinal);
+    }
+
+    private static bool IsPenumbraOptionToggleBuildReasonSet(string? reason)
+    {
+        if (string.IsNullOrWhiteSpace(reason))
+            return false;
+
+        var reasons = reason.Split('|', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        return reasons.Any(IsPenumbraOptionToggleBuildReason);
+    }
+
+    private static bool IsPenumbraOptionToggleBuildReason(string reason)
+    {
+        while (reason.StartsWith("ImmediateFollowUp:", StringComparison.Ordinal))
+            reason = reason["ImmediateFollowUp:".Length..];
+
+        return reason.StartsWith("PenumbraModSettingChanged", StringComparison.Ordinal)
+            && !string.Equals(reason, "PenumbraModSettingChanged:TransientManifest", StringComparison.Ordinal)
+            && !string.Equals(reason, "StartupTransientManifestPrime:TransientManifest", StringComparison.Ordinal);
+    }
+
     private async Task<Dictionary<string, HashSet<string>>?> ResolvePenumbraCharacterDataWithRetriesAsync(GameObjectHandler playerRelatedObject, ObjectKind objectKind, CancellationToken ct, string? reason)
     {
-        var maxAttempts = objectKind == ObjectKind.Player ? 5 : 2;
-        var retryDelayMs = objectKind == ObjectKind.Player ? 80 : 50;
+        var isSummonedObject = IsSummonedObjectKind(objectKind);
+        var maxAttempts = objectKind == ObjectKind.Player ? 5 : isSummonedObject ? 3 : 2;
+        var retryDelayMs = objectKind == ObjectKind.Player ? 80 : isSummonedObject ? 35 : 50;
+        Dictionary<string, HashSet<string>>? bestSummonedResult = null;
+        string bestSummonedSignature = string.Empty;
+        var bestSummonedPathCount = -1;
 
         for (var attempt = 1; attempt <= maxAttempts; attempt++)
         {
@@ -975,23 +1828,88 @@ public class PlayerDataFactory : IMediatorSubscriber
 
             var resolvedPaths = await _ipcManager.Penumbra.GetCharacterData(_logger, playerRelatedObject).ConfigureAwait(false);
             if (resolvedPaths != null)
-                return resolvedPaths;
+            {
+                if (!isSummonedObject)
+                    return resolvedPaths;
 
-            if (attempt == maxAttempts)
+                var signature = BuildSummonedObjectResolvedPathSignature(resolvedPaths);
+                var pathCount = CountResolvedGamePaths(resolvedPaths);
+
+                if (bestSummonedResult == null)
+                {
+                    bestSummonedResult = resolvedPaths;
+                    bestSummonedSignature = signature;
+                    bestSummonedPathCount = pathCount;
+                }
+                else if (string.Equals(bestSummonedSignature, signature, StringComparison.Ordinal))
+                {
+                    return bestSummonedResult;
+                }
+                else if (pathCount >= bestSummonedPathCount)
+                {
+                    bestSummonedResult = resolvedPaths;
+                    bestSummonedSignature = signature;
+                    bestSummonedPathCount = pathCount;
+                }
+
+                if (attempt == maxAttempts)
+                    return bestSummonedResult;
+
+                _logger.LogTrace(
+                    "Penumbra returned {count} resolved {objectKind} path(s) on attempt {attempt}/{maxAttempts}, reason={reason}; sampling one more framework tick for first-spawn settle",
+                    pathCount,
+                    objectKind,
+                    attempt,
+                    maxAttempts,
+                    string.IsNullOrWhiteSpace(reason) ? "<none>" : reason);
+            }
+            else if (attempt == maxAttempts)
+            {
                 break;
-
-            _logger.LogTrace(
-                "Penumbra returned null data for {obj} on attempt {attempt}/{maxAttempts}, reason={reason}; retrying after a framework tick",
-                playerRelatedObject,
-                attempt,
-                maxAttempts,
-                string.IsNullOrWhiteSpace(reason) ? "<none>" : reason);
+            }
+            else
+            {
+                _logger.LogTrace(
+                    "Penumbra returned null data for {obj} on attempt {attempt}/{maxAttempts}, reason={reason}; retrying after a framework tick",
+                    playerRelatedObject,
+                    attempt,
+                    maxAttempts,
+                    string.IsNullOrWhiteSpace(reason) ? "<none>" : reason);
+            }
 
             await Task.Delay(retryDelayMs, ct).ConfigureAwait(false);
             await _dalamudUtil.RunOnFrameworkThread(() => { }).ConfigureAwait(false);
         }
 
-        return null;
+        return bestSummonedResult;
+    }
+
+    private static int CountResolvedGamePaths(IReadOnlyDictionary<string, HashSet<string>> resolvedPaths)
+    {
+        var count = 0;
+        foreach (var item in resolvedPaths)
+            count += item.Value?.Count ?? 0;
+
+        return count;
+    }
+
+    private static string BuildSummonedObjectResolvedPathSignature(IReadOnlyDictionary<string, HashSet<string>> resolvedPaths)
+    {
+        if (resolvedPaths == null || resolvedPaths.Count == 0)
+            return string.Empty;
+
+        var rows = new List<string>(resolvedPaths.Count);
+        foreach (var item in resolvedPaths.OrderBy(static item => item.Key, StringComparer.OrdinalIgnoreCase))
+        {
+            var resolved = item.Key?.Replace('\\', '/').Trim() ?? string.Empty;
+            var gamePaths = item.Value == null
+                ? string.Empty
+                : string.Join(',', item.Value.Select(static path => path?.Replace('\\', '/').Trim() ?? string.Empty).Where(static path => !string.IsNullOrWhiteSpace(path)).OrderBy(static path => path, StringComparer.OrdinalIgnoreCase));
+
+            rows.Add(resolved + "=>" + gamePaths);
+        }
+
+        return string.Join('\n', rows);
     }
 
     private Task AddStaticSupportDependencyReplacementsAsync(CharacterDataFragment fragment, CancellationToken ct)
@@ -1300,10 +2218,10 @@ public class PlayerDataFactory : IMediatorSubscriber
 
     private static bool IsStaticSupportDependencyPath(string? gamePath)
     {
-        if (string.IsNullOrWhiteSpace(gamePath))
+        if (!IsAllowedBuildGamePath(gamePath))
             return false;
 
-        return gamePath.EndsWith(".mtrl", StringComparison.OrdinalIgnoreCase)
+        return gamePath!.EndsWith(".mtrl", StringComparison.OrdinalIgnoreCase)
             || gamePath.EndsWith(".tex", StringComparison.OrdinalIgnoreCase);
     }
 
@@ -1326,10 +2244,26 @@ public class PlayerDataFactory : IMediatorSubscriber
 
     private static bool IsAllowedBuildGamePath(string? gamePath)
     {
-        if (string.IsNullOrWhiteSpace(gamePath))
+        var normalized = NormalizeStaticSupportGamePath(gamePath);
+        if (string.IsNullOrWhiteSpace(normalized))
             return false;
 
-        return AllowedBuildGamePathExtensions.Contains(Path.GetExtension(gamePath.Replace('\\', '/')));
+        return CharacterDataPushSanitizer.IsServerAcceptedGamePath(normalized)
+            && AllowedBuildGamePathExtensions.Contains(Path.GetExtension(normalized));
+    }
+
+    private static bool IsAllowedModdedBuildGamePath(string? gamePath, string? resolvedPath)
+    {
+        var normalizedGamePath = NormalizeStaticSupportGamePath(gamePath);
+        if (!IsAllowedBuildGamePath(normalizedGamePath))
+            return false;
+
+        var normalizedResolvedPath = NormalizeStaticSupportGamePath(resolvedPath);
+        var resolvedPathLooksLikeGamePath = !string.IsNullOrWhiteSpace(normalizedResolvedPath)
+            && CharacterDataPushSanitizer.IsServerAcceptedFileSwapPath(normalizedResolvedPath);
+
+        return !resolvedPathLooksLikeGamePath
+            || !string.Equals(normalizedGamePath, normalizedResolvedPath, StringComparison.OrdinalIgnoreCase);
     }
 
 
@@ -1354,11 +2288,57 @@ public class PlayerDataFactory : IMediatorSubscriber
             || reason.StartsWith("Connected:", StringComparison.Ordinal)
             || reason.StartsWith("PenumbraModSettingChanged", StringComparison.Ordinal)
             || reason.StartsWith("GameObject:SemanticDiff", StringComparison.Ordinal)
-            || reason.StartsWith("CustomizePlus:", StringComparison.Ordinal)
+            || IsPluginOnlyPlayerBuildReason(reason)
             || reason.StartsWith("ClassJobChanged:", StringComparison.Ordinal);
     }
 
 
+
+    private static bool IsUltraFastRollingPlayerBuildReasonSet(string? reason)
+    {
+        if (string.IsNullOrWhiteSpace(reason))
+            return false;
+
+        var reasons = reason.Split('|', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        return reasons.Length > 0 && reasons.All(IsUltraFastRollingPlayerBuildReason);
+    }
+
+    private static bool IsUltraFastRollingPlayerBuildReason(string reason)
+    {
+        if (string.IsNullOrWhiteSpace(reason))
+            return false;
+
+        if (reason.StartsWith("PenumbraModSettingChanged:Animation", StringComparison.Ordinal)
+            || reason.StartsWith("ClassJobChanged:", StringComparison.Ordinal)
+            || string.Equals(reason, "GameObject:PenumbraRedraw", StringComparison.Ordinal)
+            || string.Equals(reason, "GameObject:PenumbraEndRedraw", StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        return reason.StartsWith("Glamourer:", StringComparison.Ordinal)
+            || reason.StartsWith("GameObject:SemanticDiff", StringComparison.Ordinal)
+            || reason.StartsWith("PenumbraModSettingChanged:PlayerState", StringComparison.Ordinal)
+            || IsPluginOnlyPlayerBuildReason(reason);
+    }
+
+    private static bool ShouldRefreshPlayerPluginField(string? reason, string prefix)
+    {
+        if (string.IsNullOrWhiteSpace(reason))
+            return true;
+
+        var reasons = reason.Split('|', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        return reasons.Length == 0 || reasons.Any(item => item.StartsWith(prefix, StringComparison.Ordinal));
+    }
+
+    private static bool IsPluginOnlyPlayerBuildReason(string reason)
+    {
+        return reason.StartsWith("CustomizePlus:", StringComparison.Ordinal)
+            || reason.StartsWith("Heels:", StringComparison.Ordinal)
+            || reason.StartsWith("Honorific:", StringComparison.Ordinal)
+            || reason.StartsWith("Moodles:", StringComparison.Ordinal)
+            || reason.StartsWith("PetNames:", StringComparison.Ordinal);
+    }
 
     private static bool ShouldForceFullLiveTransientResolveForBuild(string? reason)
     {
@@ -1378,6 +2358,18 @@ public class PlayerDataFactory : IMediatorSubscriber
         // Do not live-resolve the full transient set during the player build; that is exactly the
         // expensive path that makes emote/VFX option changes feel sluggish. The manifest path is
         // event-invalidated rather than TTL-based, so accuracy still comes from the mod-setting event.
+
+        // Class/job swaps change which scoped transient bucket is valid for the player. Do not reuse the
+        // previous job-resolved map here; the authoritative class-change publish must live-resolve the
+        // current job-scoped support paths so receivers download the correct transient set on the first swap.
+        if (reason.StartsWith("ClassJobChanged:", StringComparison.Ordinal))
+            return true;
+
+        // Animation option changes are the exception to the generic targeted-manifest rule. PAP/TMB/AVFX/SCD
+        // support can move together, so the authoritative post-runtime-refresh build must live-resolve the
+        // current transient set instead of preserving a stale known-resolved animation bucket.
+        if (reason.StartsWith("PenumbraModSettingChanged:Animation", StringComparison.Ordinal))
+            return true;
 
         // Directory changes can invalidate the physical resolved-file map. Startup/targeted manifest prime will
         // reseed transient.json afterwards, but the immediate build should be conservative.
@@ -1874,6 +2866,37 @@ public class PlayerDataFactory : IMediatorSubscriber
 
     private async Task<IReadOnlyDictionary<string, string[]>> ResolvePlayerTransientReplacementsForBuildAsync(HashSet<string> transientPaths, string? reason, CancellationToken ct)
     {
+        if (ShouldUseKnownResolvedPlayerTransientMapForBuild(reason))
+        {
+            var knownResolved = _transientResourceManager.GetKnownResolvedFilePaths(ObjectKind.Player, transientPaths, validateExists: true);
+            if (knownResolved.Count > 0)
+            {
+                var pathsNeedingLiveResolve = transientPaths
+                    .Where(path => !knownResolved.ContainsKey(path))
+                    .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+                var knownOutput = BuildResolvedFilePathMapFromKnownTransientPaths(knownResolved);
+                if (pathsNeedingLiveResolve.Count > 0)
+                {
+                    var liveMissingResolved = await GetFileReplacementsFromPaths(pathsNeedingLiveResolve, new HashSet<string>(StringComparer.Ordinal), ct).ConfigureAwait(false);
+                    RegisterKnownPlayerTransientResolvedPaths(liveMissingResolved);
+                    MergeResolvedFilePathMap(knownOutput, liveMissingResolved);
+                }
+
+                if (_logger.IsEnabled(LogLevel.Debug))
+                {
+                    _logger.LogDebug(
+                        "Reused known player transient resolve map for {known}/{total} path(s); live-resolved {live} missing path(s) for reason {reason}",
+                        knownResolved.Count,
+                        transientPaths.Count,
+                        pathsNeedingLiveResolve.Count,
+                        reason ?? "<none>");
+                }
+
+                return knownOutput.ToDictionary(kvp => kvp.Key, kvp => kvp.Value.Distinct(StringComparer.OrdinalIgnoreCase).ToArray(), StringComparer.OrdinalIgnoreCase).AsReadOnly();
+            }
+        }
+
         var liveResolved = await GetFileReplacementsFromPaths(transientPaths, new HashSet<string>(StringComparer.Ordinal), ct).ConfigureAwait(false);
         var output = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
         var seenGamePathsByResolvedPath = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
@@ -1883,21 +2906,17 @@ public class PlayerDataFactory : IMediatorSubscriber
             var resolvedPath = NormalizeTransientResolvedPathForBuild(kvp.Key);
             if (string.IsNullOrWhiteSpace(resolvedPath)
                 || resolvedPath.StartsWith("fileswap|", StringComparison.OrdinalIgnoreCase)
+                || IsUiOrInterfaceResolvedPath(resolvedPath)
                 || !File.Exists(resolvedPath))
             {
                 continue;
             }
 
-            var normalizedResolvedAsGamePath = NormalizeTransientGamePathForBuild(resolvedPath);
-
             foreach (var gamePath in kvp.Value)
             {
                 var normalizedGamePath = NormalizeTransientGamePathForBuild(gamePath);
-                if (string.IsNullOrWhiteSpace(normalizedGamePath)
-                    || string.Equals(normalizedGamePath, normalizedResolvedAsGamePath, StringComparison.OrdinalIgnoreCase))
-                {
+                if (!IsAllowedModdedBuildGamePath(normalizedGamePath, resolvedPath))
                     continue;
-                }
 
                 if (!output.TryGetValue(resolvedPath, out var gamePaths))
                 {
@@ -1934,6 +2953,60 @@ public class PlayerDataFactory : IMediatorSubscriber
         return output.ToDictionary(kvp => kvp.Key, kvp => kvp.Value.ToArray(), StringComparer.OrdinalIgnoreCase).AsReadOnly();
     }
 
+    private void RegisterKnownPlayerTransientResolvedPaths(IReadOnlyDictionary<string, string[]> resolvedPaths)
+    {
+        if (resolvedPaths == null || resolvedPaths.Count == 0)
+            return;
+
+        foreach (var kvp in resolvedPaths)
+        {
+            var resolvedPath = NormalizeTransientResolvedPathForBuild(kvp.Key);
+            if (string.IsNullOrWhiteSpace(resolvedPath)
+                || resolvedPath.StartsWith("fileswap|", StringComparison.OrdinalIgnoreCase)
+                || IsUiOrInterfaceResolvedPath(resolvedPath)
+                || !File.Exists(resolvedPath))
+            {
+                continue;
+            }
+
+            foreach (var gamePath in kvp.Value ?? Array.Empty<string>())
+            {
+                var normalizedGamePath = NormalizeTransientGamePathForBuild(gamePath);
+                if (!IsAllowedModdedBuildGamePath(normalizedGamePath, resolvedPath))
+                    continue;
+
+                _transientResourceManager.RegisterKnownTransientFilePath(normalizedGamePath, resolvedPath);
+            }
+        }
+    }
+
+    private static bool ShouldUseKnownResolvedPlayerTransientMapForBuild(string? reason)
+    {
+        if (ShouldForceFullLiveTransientResolveForBuild(reason))
+            return false;
+
+        if (string.IsNullOrWhiteSpace(reason))
+            return true;
+
+        var reasons = reason.Split('|', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        foreach (var item in reasons)
+        {
+            if (item.StartsWith("ClassJobChanged:", StringComparison.Ordinal)
+                || item.StartsWith("Connected:", StringComparison.Ordinal)
+                || item.StartsWith("ImmediateFollowUp:Connected:", StringComparison.Ordinal)
+                || item.StartsWith("Startup:", StringComparison.Ordinal)
+                || item.StartsWith("PenumbraDirectoryChanged", StringComparison.Ordinal)
+                || item.StartsWith("PenumbraModSettingChanged:Animation", StringComparison.Ordinal)
+                || string.Equals(item, "GameObject:PenumbraRedraw", StringComparison.Ordinal)
+                || string.Equals(item, "GameObject:PenumbraEndRedraw", StringComparison.Ordinal))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
     private static Dictionary<string, List<string>> BuildResolvedFilePathMapFromKnownTransientPaths(IReadOnlyDictionary<string, string> knownResolved)
     {
         var output = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
@@ -1942,8 +3015,12 @@ public class PlayerDataFactory : IMediatorSubscriber
         {
             var gamePath = NormalizeTransientGamePathForBuild(kvp.Key);
             var resolvedFilePath = NormalizeTransientResolvedPathForBuild(kvp.Value);
-            if (string.IsNullOrWhiteSpace(gamePath) || string.IsNullOrWhiteSpace(resolvedFilePath))
+            if (string.IsNullOrWhiteSpace(resolvedFilePath)
+                || IsUiOrInterfaceResolvedPath(resolvedFilePath)
+                || !IsAllowedModdedBuildGamePath(gamePath, resolvedFilePath))
+            {
                 continue;
+            }
 
             if (!output.TryGetValue(resolvedFilePath, out var gamePaths))
                 output[resolvedFilePath] = gamePaths = [];
@@ -1959,17 +3036,19 @@ public class PlayerDataFactory : IMediatorSubscriber
         foreach (var kvp in resolved)
         {
             var resolvedFilePath = NormalizeTransientResolvedPathForBuild(kvp.Key);
-            if (string.IsNullOrWhiteSpace(resolvedFilePath))
+            if (string.IsNullOrWhiteSpace(resolvedFilePath) || IsUiOrInterfaceResolvedPath(resolvedFilePath))
                 continue;
-
-            if (!output.TryGetValue(resolvedFilePath, out var gamePaths))
-                output[resolvedFilePath] = gamePaths = [];
 
             foreach (var gamePath in kvp.Value)
             {
                 var normalizedGamePath = NormalizeTransientGamePathForBuild(gamePath);
-                if (!string.IsNullOrWhiteSpace(normalizedGamePath))
-                    gamePaths.Add(normalizedGamePath);
+                if (!IsAllowedModdedBuildGamePath(normalizedGamePath, resolvedFilePath))
+                    continue;
+
+                if (!output.TryGetValue(resolvedFilePath, out var gamePaths))
+                    output[resolvedFilePath] = gamePaths = [];
+
+                gamePaths.Add(normalizedGamePath);
             }
         }
     }
@@ -1990,10 +3069,21 @@ public class PlayerDataFactory : IMediatorSubscriber
         if (knownResolvedPaths.Count == 0)
             return resolvedTransientPaths;
 
-        var output = resolvedTransientPaths.ToDictionary(
-            kvp => kvp.Key,
-            kvp => kvp.Value.ToList(),
-            StringComparer.OrdinalIgnoreCase);
+        var output = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+        foreach (var kvp in resolvedTransientPaths)
+        {
+            var resolvedFilePath = NormalizeTransientResolvedPathForBuild(kvp.Key);
+            if (string.IsNullOrWhiteSpace(resolvedFilePath) || IsUiOrInterfaceResolvedPath(resolvedFilePath))
+                continue;
+
+            var filteredGamePaths = (kvp.Value ?? Array.Empty<string>())
+                .Select(NormalizeTransientGamePathForBuild)
+                .Where(path => IsAllowedModdedBuildGamePath(path, resolvedFilePath))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+            if (filteredGamePaths.Count > 0)
+                output[resolvedFilePath] = filteredGamePaths;
+        }
 
         var canonicalOutputKeyByResolvedPath = output.Keys.ToDictionary(static key => key, static key => key, StringComparer.OrdinalIgnoreCase);
         var owningResolvedPathByGamePath = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
@@ -2015,8 +3105,9 @@ public class PlayerDataFactory : IMediatorSubscriber
             var gamePath = NormalizeTransientGamePathForBuild(kvp.Key);
             var resolvedFilePath = NormalizeTransientResolvedPathForBuild(kvp.Value);
 
-            if (string.IsNullOrWhiteSpace(gamePath)
-                || string.IsNullOrWhiteSpace(resolvedFilePath)
+            if (string.IsNullOrWhiteSpace(resolvedFilePath)
+                || IsUiOrInterfaceResolvedPath(resolvedFilePath)
+                || !IsAllowedModdedBuildGamePath(gamePath, resolvedFilePath)
                 || !File.Exists(resolvedFilePath))
             {
                 continue;
@@ -2114,9 +3205,25 @@ public class PlayerDataFactory : IMediatorSubscriber
             pathsToResolve = FilterPlayerTransientsToCurrentHumanRaceFamilies(pathsToResolve, staticResolvedGamePaths, liveObservedPlayerTransients, playerRelatedObject);
 
         if (IsSummonedObjectKind(objectKind))
+        {
             pathsToResolve = FilterSummonedObjectTransientsToCurrentActor(objectKind, pathsToResolve, pendingObjectTransients, staticResolvedGamePaths, staticReplacementReferences);
+            RemoveAlreadyStaticSummonedObjectPaths(pathsToResolve, staticResolvedGamePaths);
+        }
 
         return pathsToResolve;
+    }
+
+    private static void RemoveAlreadyStaticSummonedObjectPaths(HashSet<string> pathsToResolve, IReadOnlyCollection<string>? staticResolvedGamePaths)
+    {
+        if (pathsToResolve.Count == 0 || staticResolvedGamePaths == null || staticResolvedGamePaths.Count == 0)
+            return;
+
+        foreach (var staticPath in staticResolvedGamePaths)
+        {
+            var normalized = NormalizeTransientGamePathForBuild(staticPath);
+            if (!string.IsNullOrWhiteSpace(normalized))
+                pathsToResolve.Remove(normalized);
+        }
     }
 
     private HashSet<string> FilterPlayerTransientsToCurrentHumanRaceFamilies(HashSet<string> pathsToResolve, IReadOnlyCollection<string>? staticResolvedGamePaths, HashSet<string> liveObservedPlayerTransients, GameObjectHandler? playerRelatedObject)
@@ -2317,21 +3424,31 @@ public class PlayerDataFactory : IMediatorSubscriber
 
         if (activeResolvedRoots.Count == 0)
         {
-            if (scopedPendingObjectTransients.Count == 0)
+            var scopedActiveTransients = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var path in pathsToResolve)
+            {
+                if (BelongsToActiveSummonedObjectScope(path, activeScopes)
+                    || (pendingObjectTransients.Contains(path) && IsEmbeddedVfxSupportGamePath(path)))
+                {
+                    scopedActiveTransients.Add(path);
+                }
+            }
+
+            if (scopedActiveTransients.Count == 0)
             {
                 _logger.LogTrace(
-                    "Suppressing {count} persisted {objectKind} transient path(s) because only the active actor scope was known and no pending transient matched it",
+                    "Suppressing {count} persisted {objectKind} transient path(s) because only the active actor scope was known and no transient matched it",
                     pathsToResolve.Count,
                     objectKind);
                 return new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             }
 
             _logger.LogDebug(
-                "Using {count}/{pendingTotal} pending {objectKind} transient path(s) matching the current summoned actor scope only; no active resolved root was provable",
-                scopedPendingObjectTransients.Count,
-                pendingObjectTransients.Count,
+                "Using {count}/{total} {objectKind} transient path(s) matching the current summoned actor scope; no active resolved root was provable",
+                scopedActiveTransients.Count,
+                pathsToResolve.Count,
                 objectKind);
-            return scopedPendingObjectTransients;
+            return scopedActiveTransients;
         }
 
         var knownResolvedPaths = _transientResourceManager.GetKnownResolvedFilePaths(objectKind, pathsToResolve, validateExists: false);
@@ -2340,7 +3457,7 @@ public class PlayerDataFactory : IMediatorSubscriber
         {
             if (pendingObjectTransients.Contains(path))
             {
-                if (activeScopes.Count == 0 || scopedPendingObjectTransients.Contains(path))
+                if (activeScopes.Count == 0 || scopedPendingObjectTransients.Contains(path) || IsEmbeddedVfxSupportGamePath(path))
                     filtered.Add(path);
                 continue;
             }
@@ -2348,12 +3465,19 @@ public class PlayerDataFactory : IMediatorSubscriber
             if (!knownResolvedPaths.TryGetValue(path, out var resolvedPath))
                 continue;
 
+            if (BelongsToActiveSummonedObjectScope(path, activeScopes) && IsSummonedObjectScopedVfxPayloadPath(path))
+            {
+                filtered.Add(path);
+                continue;
+            }
+
             if (!ResolvedPathBelongsToActiveRoot(resolvedPath, activeResolvedRoots))
                 continue;
 
             if (activeScopes.Count == 0
                 || BelongsToActiveSummonedObjectScope(path, activeScopes)
-                || ResolvedPathContainsActiveSummonedObjectScope(resolvedPath, activeScopes))
+                || ResolvedPathContainsActiveSummonedObjectScope(resolvedPath, activeScopes)
+                || IsEmbeddedVfxSupportGamePath(path))
             {
                 filtered.Add(path);
             }
@@ -2453,6 +3577,300 @@ public class PlayerDataFactory : IMediatorSubscriber
         }
 
         return false;
+    }
+
+    private async Task<IReadOnlyDictionary<string, string[]>> ResolveEmbeddedVfxSupportReplacementsForBuildAsync(ObjectKind objectKind, HashSet<string> supportGamePaths, CancellationToken ct)
+    {
+        if (supportGamePaths.Count == 0)
+            return new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase).AsReadOnly();
+
+        var liveResolved = await GetFileReplacementsFromPaths(supportGamePaths, new HashSet<string>(StringComparer.Ordinal), ct).ConfigureAwait(false);
+        return MergeKnownTransientResolvedPathFallbacks(objectKind, supportGamePaths, liveResolved);
+    }
+
+    private async Task AddSummonedObjectEmbeddedVfxSupportReplacementsAsync(CharacterDataFragment fragment, ObjectKind objectKind, CancellationToken ct)
+    {
+        if ((!IsSummonedObjectKind(objectKind) && !FragmentContainsPlayerScopedSummonedActorPath(fragment)) || fragment?.FileReplacements == null || fragment.FileReplacements.Count == 0)
+            return;
+
+        var existingGamePaths = fragment.FileReplacements
+            .SelectMany(static replacement => replacement.GamePaths)
+            .Select(NormalizeTransientGamePathForBuild)
+            .Where(static path => !string.IsNullOrWhiteSpace(path))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        var supportGamePaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var replacement in fragment.FileReplacements.ToArray())
+        {
+            ct.ThrowIfCancellationRequested();
+
+            if (replacement == null || !replacement.HasFileReplacement || replacement.IsFileSwap)
+                continue;
+
+            if (!replacement.GamePaths.Any(IsSummonedObjectVfxAvfxGamePath))
+                continue;
+
+            var resolvedPath = NormalizeTransientResolvedPathForBuild(replacement.ResolvedPath);
+            if (!TryGetEmbeddedVfxSupportFileIdentity(resolvedPath, out var length, out var lastWriteUtc))
+                continue;
+
+            if (!_embeddedVfxSupportCacheByResolvedPath.TryGetValue(resolvedPath, out var cacheEntry)
+                || !cacheEntry.Matches(length, lastWriteUtc))
+            {
+                cacheEntry = new EmbeddedVfxSupportCacheEntry(length, lastWriteUtc, ExtractEmbeddedVfxSupportGamePaths(resolvedPath));
+                _embeddedVfxSupportCacheByResolvedPath[resolvedPath] = cacheEntry;
+                TrimEmbeddedVfxSupportCacheIfNeeded();
+            }
+
+            foreach (var gamePath in cacheEntry.GamePaths)
+            {
+                var normalized = NormalizeTransientGamePathForBuild(gamePath);
+                if (!string.IsNullOrWhiteSpace(normalized) && !existingGamePaths.Contains(normalized))
+                    supportGamePaths.Add(normalized);
+            }
+        }
+
+        if (supportGamePaths.Count == 0)
+            return;
+
+        var supportResolved = await ResolveEmbeddedVfxSupportReplacementsForBuildAsync(objectKind, supportGamePaths, ct).ConfigureAwait(false);
+        var added = 0;
+        foreach (var kvp in supportResolved)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            var resolvedPath = NormalizeTransientResolvedPathForBuild(kvp.Key);
+            if (string.IsNullOrWhiteSpace(resolvedPath) || IsUiOrInterfaceResolvedPath(resolvedPath) || !File.Exists(resolvedPath))
+                continue;
+
+            var gamePaths = kvp.Value
+                .Select(NormalizeTransientGamePathForBuild)
+                .Where(path => IsEmbeddedVfxSupportGamePath(path) && supportGamePaths.Contains(path) && !existingGamePaths.Contains(path))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+
+            if (gamePaths.Length == 0)
+                continue;
+
+            var replacement = new FileReplacement(gamePaths, resolvedPath);
+            if (!replacement.HasFileReplacement || !fragment.FileReplacements.Add(replacement))
+                continue;
+
+            foreach (var gamePath in gamePaths)
+                existingGamePaths.Add(gamePath);
+            added++;
+        }
+
+        if (added > 0 && _logger.IsEnabled(LogLevel.Debug))
+        {
+            _logger.LogDebug(
+                "Added {count} embedded VFX support file replacement(s) from active summoned-object AVFX replacement(s)",
+                added);
+        }
+    }
+
+    private async Task<IReadOnlyDictionary<string, string[]>> ExpandResolvedSummonedObjectEmbeddedVfxSupportAsync(ObjectKind objectKind, IReadOnlyDictionary<string, string[]> resolvedTransientPaths, CancellationToken ct)
+    {
+        if (resolvedTransientPaths.Count == 0)
+            return resolvedTransientPaths;
+
+        var supportGamePaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var existingGamePaths = resolvedTransientPaths
+            .SelectMany(static kvp => kvp.Value ?? [])
+            .Select(NormalizeTransientGamePathForBuild)
+            .Where(static path => !string.IsNullOrWhiteSpace(path))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var kvp in resolvedTransientPaths)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            if (!kvp.Value.Any(IsSummonedObjectVfxAvfxGamePath))
+                continue;
+
+            var resolvedPath = NormalizeTransientResolvedPathForBuild(kvp.Key);
+            if (!TryGetEmbeddedVfxSupportFileIdentity(resolvedPath, out var length, out var lastWriteUtc))
+                continue;
+
+            if (!_embeddedVfxSupportCacheByResolvedPath.TryGetValue(resolvedPath, out var cacheEntry)
+                || !cacheEntry.Matches(length, lastWriteUtc))
+            {
+                cacheEntry = new EmbeddedVfxSupportCacheEntry(length, lastWriteUtc, ExtractEmbeddedVfxSupportGamePaths(resolvedPath));
+                _embeddedVfxSupportCacheByResolvedPath[resolvedPath] = cacheEntry;
+                TrimEmbeddedVfxSupportCacheIfNeeded();
+            }
+
+            foreach (var gamePath in cacheEntry.GamePaths)
+            {
+                var normalized = NormalizeTransientGamePathForBuild(gamePath);
+                if (!string.IsNullOrWhiteSpace(normalized) && !existingGamePaths.Contains(normalized))
+                    supportGamePaths.Add(normalized);
+            }
+        }
+
+        if (supportGamePaths.Count == 0)
+            return resolvedTransientPaths;
+
+        var supportResolved = await ResolveEmbeddedVfxSupportReplacementsForBuildAsync(objectKind, supportGamePaths, ct).ConfigureAwait(false);
+        var localSupportResolved = supportResolved
+            .Where(static kvp => !string.IsNullOrWhiteSpace(kvp.Key) && File.Exists(kvp.Key))
+            .ToDictionary(
+                static kvp => kvp.Key,
+                static kvp => kvp.Value
+                    .Select(NormalizeTransientGamePathForBuild)
+                    .Where(IsEmbeddedVfxSupportGamePath)
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .ToArray(),
+                StringComparer.OrdinalIgnoreCase)
+            .Where(static kvp => kvp.Value.Length > 0)
+            .ToDictionary(static kvp => kvp.Key, static kvp => kvp.Value, StringComparer.OrdinalIgnoreCase);
+
+        if (localSupportResolved.Count == 0)
+            return resolvedTransientPaths;
+
+        var output = resolvedTransientPaths.ToDictionary(
+            static kvp => kvp.Key,
+            static kvp => kvp.Value.Select(NormalizeTransientGamePathForBuild).Where(static path => !string.IsNullOrWhiteSpace(path)).Distinct(StringComparer.OrdinalIgnoreCase).ToList(),
+            StringComparer.OrdinalIgnoreCase);
+
+        MergeResolvedFilePathMap(output, localSupportResolved);
+
+        if (_logger.IsEnabled(LogLevel.Debug))
+        {
+            var addedSupportPaths = localSupportResolved.Values.SelectMany(static paths => paths).Distinct(StringComparer.OrdinalIgnoreCase).Count();
+            _logger.LogDebug("Added {count} embedded VFX support file replacement(s) from resolved active summoned-object AVFX payload(s)", addedSupportPaths);
+        }
+
+        return output.ToDictionary(kvp => kvp.Key, kvp => kvp.Value.Distinct(StringComparer.OrdinalIgnoreCase).ToArray(), StringComparer.OrdinalIgnoreCase).AsReadOnly();
+    }
+
+    private static bool IsSummonedObjectScopedVfxPayloadPath(string? gamePath)
+    {
+        var normalized = NormalizeTransientGamePathForBuild(gamePath);
+        if (string.IsNullOrWhiteSpace(normalized) || !GetSummonedObjectPathScopes(normalized).Any())
+            return false;
+
+        return normalized.EndsWith(".avfx", StringComparison.OrdinalIgnoreCase)
+            || (normalized.Contains("/vfx/", StringComparison.OrdinalIgnoreCase)
+                && (normalized.EndsWith(".atex", StringComparison.OrdinalIgnoreCase)
+                    || normalized.EndsWith(".tex", StringComparison.OrdinalIgnoreCase)
+                    || normalized.EndsWith(".shpk", StringComparison.OrdinalIgnoreCase)));
+    }
+
+    private static bool IsSummonedObjectVfxAvfxGamePath(string? gamePath)
+    {
+        var normalized = NormalizeTransientGamePathForBuild(gamePath);
+        if (string.IsNullOrWhiteSpace(normalized) || !normalized.EndsWith(".avfx", StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        if (!normalized.Contains("/vfx/", StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        return GetSummonedObjectPathScopes(normalized).Any();
+    }
+
+    private static bool TryGetEmbeddedVfxSupportFileIdentity(string resolvedPath, out long length, out DateTime lastWriteUtc)
+    {
+        length = 0;
+        lastWriteUtc = default;
+
+        if (string.IsNullOrWhiteSpace(resolvedPath) || !resolvedPath.EndsWith(".avfx", StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        try
+        {
+            var fileInfo = new FileInfo(resolvedPath);
+            if (!fileInfo.Exists)
+                return false;
+
+            length = fileInfo.Length;
+            lastWriteUtc = fileInfo.LastWriteTimeUtc;
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static string[] ExtractEmbeddedVfxSupportGamePaths(string resolvedPath)
+    {
+        byte[] bytes;
+        try
+        {
+            bytes = File.ReadAllBytes(resolvedPath);
+        }
+        catch
+        {
+            return [];
+        }
+
+        var result = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var text = Encoding.UTF8.GetString(bytes);
+        foreach (Match match in EmbeddedVfxSupportGamePathRegex.Matches(text))
+        {
+            var normalized = NormalizeTransientGamePathForBuild(match.Groups[1].Value);
+            if (IsEmbeddedVfxSupportGamePath(normalized))
+                result.Add(normalized);
+        }
+
+        return result.OrderBy(static path => path, StringComparer.OrdinalIgnoreCase).ToArray();
+    }
+
+    private static bool IsEmbeddedVfxSupportGamePath(string? gamePath)
+    {
+        var normalized = NormalizeTransientGamePathForBuild(gamePath);
+        if (string.IsNullOrWhiteSpace(normalized))
+            return false;
+
+        if (!normalized.StartsWith("vfx/", StringComparison.OrdinalIgnoreCase)
+            && !normalized.StartsWith("bgcommon/vfx/", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        return normalized.EndsWith(".atex", StringComparison.OrdinalIgnoreCase)
+            || normalized.EndsWith(".avfx", StringComparison.OrdinalIgnoreCase)
+            || normalized.EndsWith(".tex", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private void TrimEmbeddedVfxSupportCacheIfNeeded()
+    {
+        if (_embeddedVfxSupportCacheByResolvedPath.Count <= EmbeddedVfxSupportCacheSoftLimit * 2)
+            return;
+
+        _logger.LogDebug("Clearing embedded VFX support cache after it grew to {count} entries", _embeddedVfxSupportCacheByResolvedPath.Count);
+        _embeddedVfxSupportCacheByResolvedPath.Clear();
+    }
+
+
+    private static bool FragmentContainsPlayerScopedSummonedActorPath(CharacterDataFragment? fragment)
+    {
+        if (fragment?.FileReplacements == null || fragment.FileReplacements.Count == 0)
+            return false;
+
+        return fragment.FileReplacements
+            .SelectMany(static replacement => replacement.GamePaths)
+            .Any(IsPlayerScopedSummonedActorPath);
+    }
+
+    private static bool ContainsPlayerScopedSummonedActorPath(IEnumerable<string>? gamePaths)
+        => gamePaths != null && gamePaths.Any(IsPlayerScopedSummonedActorPath);
+
+    private static bool IsPlayerScopedSummonedActorPath(string? gamePath)
+    {
+        var normalized = NormalizeTransientGamePathForBuild(gamePath);
+        if (string.IsNullOrWhiteSpace(normalized))
+            return false;
+
+        return normalized.StartsWith("chara/monster/", StringComparison.OrdinalIgnoreCase)
+            || normalized.StartsWith("chara/demihuman/", StringComparison.OrdinalIgnoreCase)
+            || normalized.StartsWith("chara/action/mon_sp/", StringComparison.OrdinalIgnoreCase)
+            || normalized.StartsWith("vfx/monster/", StringComparison.OrdinalIgnoreCase)
+            || normalized.StartsWith("vfx/pop/", StringComparison.OrdinalIgnoreCase)
+            || normalized.StartsWith("vfx/action/", StringComparison.OrdinalIgnoreCase)
+            || normalized.StartsWith("sound/vfx/ability/", StringComparison.OrdinalIgnoreCase)
+            || normalized.Contains("/ability/", StringComparison.OrdinalIgnoreCase);
     }
 
     private static bool IsSummonedObjectKind(ObjectKind objectKind)

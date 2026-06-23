@@ -1,4 +1,4 @@
-﻿using FFXIVClientStructs.FFXIV.Client.Game.Character;
+using FFXIVClientStructs.FFXIV.Client.Game.Character;
 using FFXIVClientStructs.FFXIV.Client.Graphics.Scene;
 using RavaSync.Services;
 using RavaSync.Services.Mediator;
@@ -56,14 +56,10 @@ public sealed class GameObjectHandler : DisposableMediatorSubscriberBase, IHighP
                 if (!(_delayedZoningTask?.IsCompleted ?? true)) return;
                 if (msg.Address != Address) return;
 
-                // Player transient resource events are already handled by transient.json / manifest refresh now.
-                // Rebuilding and publishing the whole player payload here was the source of the expensive
-                // "transient-only" builds during animation/VFX playback, and it is not needed for correctness.
                 if (ObjectKind == ObjectKind.Player)
                 {
-                    if (Logger.IsEnabled(LogLevel.Trace))
-                        Logger.LogTrace("[{this}] Ignoring player transient-resource build request; transient manifest state is authoritative", this);
-
+                    Logger.LogDebug("[{this}] Active player transient set primed; sending immediate player state publish", this);
+                    Mediator.Publish(new ImmediatePlayerStatePublishMessage(this, "ClassJobChanged:TransientPrime"));
                     return;
                 }
 
@@ -278,6 +274,13 @@ public sealed class GameObjectHandler : DisposableMediatorSubscriberBase, IHighP
     {
         var owned = _isOwnedObject ? "Self" : "Other";
         return $"{owned}/{ObjectKind}:{Name} ({Address:X},{DrawObjectAddress:X})";
+    }
+
+    private bool ShouldSuppressOwnedPetCacheChurn()
+    {
+        return _isOwnedObject
+            && ObjectKind == ObjectKind.Pet
+            && _dalamudUtil.ShouldRoutePetChurnThroughPlayerScopedSummonsForCurrentJob;
     }
 
     private void PublishImmediatePlayerStateAfterRedraw(string reason, bool includeRequestedRedrawOnly)

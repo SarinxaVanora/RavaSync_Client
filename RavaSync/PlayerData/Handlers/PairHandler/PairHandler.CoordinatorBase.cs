@@ -40,6 +40,9 @@ public sealed partial class PairHandler
 
         protected ILogger Logger => Owner.Logger;
         protected MareMediator Mediator => Owner.Mediator;
+
+        // RAVASYNC_VISIBILITY_DIAGNOSTICS: temporary Info-level tracing for the visible-pair send/apply invariant.
+        protected void LogVisibilityDiagnostic(string message, params object[] args) => Owner.LogVisibilityDiagnostic(message, args);
         protected Pair Pair => Owner.Pair;
         protected bool IsVisible { get => Owner.IsVisible; set => Owner.IsVisible = value; }
         protected string? PlayerName { get => Owner.PlayerName; set => Owner.PlayerName = value; }
@@ -80,6 +83,7 @@ public sealed partial class PairHandler
         protected int _manualRepairRunning { get => Owner._manualRepairRunning; set => Owner._manualRepairRunning = value; }
         protected int? _lastAssignedObjectIndex { get => Owner._lastAssignedObjectIndex; set => Owner._lastAssignedObjectIndex = value; }
         protected nint _lastAssignedPlayerAddress { get => Owner._lastAssignedPlayerAddress; set => Owner._lastAssignedPlayerAddress = value; }
+        protected Dictionary<ObjectKind, (int ObjectIndex, nint Address)> _lastAssignedOwnedObjectIndices => Owner._lastAssignedOwnedObjectIndices;
         protected DateTime _lastAssignedCollectionAssignUtc { get => Owner._lastAssignedCollectionAssignUtc; set => Owner._lastAssignedCollectionAssignUtc = value; }
         protected DateTime _nextTempCollectionRetryNotBeforeUtc { get => Owner._nextTempCollectionRetryNotBeforeUtc; set => Owner._nextTempCollectionRetryNotBeforeUtc = value; }
         protected long _lastApplyCompletedTick { get => Owner._lastApplyCompletedTick; set => Owner._lastApplyCompletedTick = value; }
@@ -170,9 +174,10 @@ public sealed partial class PairHandler
         protected bool HasPendingOwnedObjectCustomizationPayload(CharacterData charaData, ObjectKind objectKind) => Owner.HasPendingOwnedObjectCustomizationPayload(charaData, objectKind);
         protected nint ResolveOwnedObjectAddressForRetry(nint playerAddress, ObjectKind objectKind) => Owner.ResolveOwnedObjectAddressForRetry(playerAddress, objectKind);
         protected void ProcessPendingOwnedObjectCustomizationRetry(long nowTick) => Owner.ProcessPendingOwnedObjectCustomizationRetry(nowTick);
-        protected Task<bool> ApplyCustomizationDataAsync(Guid applicationId, KeyValuePair<ObjectKind, HashSet<PlayerChanges>> changes, CharacterData charaData, bool allowPlayerRedraw, bool forceLightweightMetadataReapply, bool awaitPlayerGlamourerApply, bool waitForPlayerGlamourerDrawSettle, ApplyFlag glamourerApplyFlags, bool deferPlayerGlamourerUntilAfterRedraw, CancellationToken token) => Owner.ApplyCustomizationDataAsync(applicationId, changes, charaData, allowPlayerRedraw, forceLightweightMetadataReapply, awaitPlayerGlamourerApply, waitForPlayerGlamourerDrawSettle, glamourerApplyFlags, deferPlayerGlamourerUntilAfterRedraw, token);
+        protected Task<bool> ApplyCustomizationDataAsync(Guid applicationId, KeyValuePair<ObjectKind, HashSet<PlayerChanges>> changes, CharacterData charaData, bool allowPlayerRedraw, bool forceLightweightMetadataReapply, bool awaitPlayerGlamourerApply, bool waitForPlayerGlamourerDrawSettle, ApplyFlag glamourerApplyFlags, CancellationToken token) => Owner.ApplyCustomizationDataAsync(applicationId, changes, charaData, allowPlayerRedraw, forceLightweightMetadataReapply, awaitPlayerGlamourerApply, waitForPlayerGlamourerDrawSettle, glamourerApplyFlags, token);
         protected Task<bool> OnePassRedrawAsync(Guid applicationId, CancellationToken token, bool criticalRedraw = false) => Owner.OnePassRedrawAsync(applicationId, token, criticalRedraw);
         protected Task<(bool Bound, bool Reassigned)> EnsurePenumbraCollectionBindingAsync(Guid applicationId) => Owner.EnsurePenumbraCollectionBindingAsync(applicationId);
+        protected Task<bool> EnsureOwnedObjectPenumbraCollectionBindingAsync(Guid applicationId, GameObjectHandler handler, ObjectKind objectKind) => Owner.EnsureOwnedObjectPenumbraCollectionBindingAsync(applicationId, handler, objectKind);
         protected Task EnsurePenumbraCollectionAsync() => Owner.EnsurePenumbraCollectionAsync();
         protected Task RemovePenumbraCollectionAsync(Guid applicationId) => Owner.RemovePenumbraCollectionAsync(applicationId);
         protected Task<PairSyncCommitResult> DownloadAndApplyCharacterAsync(Guid applicationBase, CharacterData charaData, Dictionary<ObjectKind, HashSet<PlayerChanges>> updatedData, bool updateModdedPaths, bool updateManip, bool requiresFileReadyGate, PairSyncAssetPlan assetPlan, bool forceApplyModsForThisApply, bool lifecycleApplyRequestedFromPlan, bool lifecycleRedrawRequestedFromPlan, CancellationToken downloadToken) => Owner.DownloadAndApplyCharacterAsync(applicationBase, charaData, updatedData, updateModdedPaths, updateManip, requiresFileReadyGate, assetPlan, forceApplyModsForThisApply, lifecycleApplyRequestedFromPlan, lifecycleRedrawRequestedFromPlan, downloadToken);
@@ -187,6 +192,7 @@ public sealed partial class PairHandler
         protected Task ManualVerifyAndRepairAsync(Guid applicationBase, CharacterData charaData, CancellationToken token, bool verifyFileHashes = true, bool publishEvents = true) => Owner.ManualVerifyAndRepairAsync(applicationBase, charaData, token, verifyFileHashes, publishEvents);
         protected bool TryGetRecentMissingCheck(string dataHash, out bool hadMissing) => Owner.TryGetRecentMissingCheck(dataHash, out hadMissing);
         protected void ScheduleMissingCheck(Guid applicationBase, CharacterData characterData) => Owner.ScheduleMissingCheck(applicationBase, characterData);
+        protected void ScheduleMissingFileSelfHealRetry(CharacterData? characterData, IEnumerable<string?> hashes, bool immediate = false) => Owner.ScheduleMissingFileSelfHealRetry(characterData, hashes, immediate);
         protected void RequestPostApplyRepair(CharacterData appliedData) => Owner.RequestPostApplyRepair(appliedData);
         protected void ReclaimFromOtherSync(bool requestApplyIfPossible, bool treatAsFirstVisible) => Owner.ReclaimFromOtherSync(requestApplyIfPossible, treatAsFirstVisible);
         protected void HandleOtherSyncReleased(bool requestApplyIfPossible) => Owner.HandleOtherSyncReleased(requestApplyIfPossible);

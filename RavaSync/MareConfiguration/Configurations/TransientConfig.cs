@@ -75,62 +75,11 @@ public class TransientConfig : IMareConfiguration
                     }
                 }
 
+                changed |= MoveSummonedActorPetJobCacheToPlayerJobCache();
                 changed |= MoveObjectScopedPathsOutOfPlayerCaches();
                 changed |= MovePlayerActorPathsOutOfObjectScopedCaches();
 
                 var globalSeen = new HashSet<string>(GlobalPersistentCache, StringComparer.OrdinalIgnoreCase);
-                var firstJobByPath = new Dictionary<string, uint>(StringComparer.OrdinalIgnoreCase);
-                var elevatedToGlobal = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
-                foreach (var kvp in JobSpecificCache.OrderBy(k => k.Key).ToList())
-                {
-                    var list = kvp.Value ?? [];
-                    var next = new List<string>(list.Count);
-
-                    foreach (var path in list.ToArray())
-                    {
-                        if (globalSeen.Contains(path))
-                        {
-                            changed = true;
-                            continue;
-                        }
-
-                        if (elevatedToGlobal.Contains(path))
-                        {
-                            changed = true;
-                            continue;
-                        }
-
-                        if (firstJobByPath.TryGetValue(path, out var existingJob) && existingJob != kvp.Key)
-                        {
-                            if (globalSeen.Add(path))
-                                GlobalPersistentCache.Add(path);
-
-                            elevatedToGlobal.Add(path);
-                            changed = true;
-                            continue;
-                        }
-
-                        firstJobByPath[path] = kvp.Key;
-                        next.Add(path);
-                    }
-
-                    if (next.Count != list.Count)
-                    {
-                        list.Clear();
-                        list.AddRange(next);
-                    }
-
-                    if (list.Count == 0)
-                    {
-                        JobSpecificCache.Remove(kvp.Key);
-                        changed = true;
-                    }
-                    else
-                    {
-                        JobSpecificCache[kvp.Key] = list;
-                    }
-                }
 
                 foreach (var kvp in JobSpecificCache.OrderBy(k => k.Key).ToList())
                 {
@@ -142,6 +91,11 @@ public class TransientConfig : IMareConfiguration
                     if (list.Count == 0)
                     {
                         JobSpecificCache.Remove(kvp.Key);
+                        changed = true;
+                    }
+                    else if (!ReferenceEquals(JobSpecificCache[kvp.Key], list))
+                    {
+                        JobSpecificCache[kvp.Key] = list;
                         changed = true;
                     }
                 }
@@ -284,25 +238,21 @@ public class TransientConfig : IMareConfiguration
             lock (this)
             {
                 var normalizedGamePath = NormalizePath(gamePath);
-                if (string.IsNullOrWhiteSpace(normalizedGamePath))
+                if (string.IsNullOrWhiteSpace(normalizedGamePath) || jobId == 0)
                     return;
 
-                if (GlobalPersistentCache.Contains(normalizedGamePath, StringComparer.OrdinalIgnoreCase))
-                    return;
+                GlobalPersistentCache.RemoveAll(path => string.Equals(path, normalizedGamePath, StringComparison.OrdinalIgnoreCase));
+                RemoveFromObjectScopedCaches(normalizedGamePath);
 
-                foreach (var kvp in JobSpecificCache.ToList())
+                if (!JobSpecificCache.TryGetValue(jobId, out var jobCache) || jobCache == null)
                 {
-                    if (kvp.Key == jobId)
-                        continue;
-
-                    if (kvp.Value.Contains(normalizedGamePath, StringComparer.OrdinalIgnoreCase))
-                    {
-                        SetPathScope(null, normalizedGamePath);
-                        return;
-                    }
+                    JobSpecificCache[jobId] = jobCache = [];
                 }
 
-                SetPathScope(jobId, normalizedGamePath);
+                if (!jobCache.Contains(normalizedGamePath, StringComparer.OrdinalIgnoreCase))
+                    jobCache.Add(normalizedGamePath);
+
+                Canonicalize();
             }
         }
 
@@ -350,9 +300,13 @@ public class TransientConfig : IMareConfiguration
                 if (string.IsNullOrWhiteSpace(normalizedGamePath))
                     return;
 
-                foreach (var kvp in JobSpecificPetCache.ToList())
+                if (jobId == 0)
+                    return;
+
+                if (IsLikelyPlayerJobSummonedActorPath(normalizedGamePath))
                 {
-                    kvp.Value?.RemoveAll(path => string.Equals(path, normalizedGamePath, StringComparison.OrdinalIgnoreCase));
+                    AddOrElevate(jobId, normalizedGamePath);
+                    return;
                 }
 
                 if (!JobSpecificPetCache.TryGetValue(jobId, out var jobCache) || jobCache == null)
@@ -406,6 +360,47 @@ public class TransientConfig : IMareConfiguration
                 Canonicalize();
                 return true;
             }
+        }
+
+
+        private bool MoveSummonedActorPetJobCacheToPlayerJobCache()
+        {
+            if (JobSpecificPetCache.Count == 0)
+                return false;
+
+            var changed = false;
+            foreach (var kvp in JobSpecificPetCache.ToList())
+            {
+                var petList = kvp.Value;
+                if (petList == null || petList.Count == 0)
+                    continue;
+
+                foreach (var path in petList.ToArray())
+                {
+                    var normalizedGamePath = NormalizePath(path);
+                    if (string.IsNullOrWhiteSpace(normalizedGamePath) || !IsLikelyPlayerJobSummonedActorPath(normalizedGamePath))
+                        continue;
+
+                    petList.RemoveAll(value => string.Equals(value, normalizedGamePath, StringComparison.OrdinalIgnoreCase));
+                    if (!JobSpecificCache.TryGetValue(kvp.Key, out var jobList) || jobList == null)
+                    {
+                        JobSpecificCache[kvp.Key] = jobList = [];
+                    }
+
+                    if (!jobList.Contains(normalizedGamePath, StringComparer.OrdinalIgnoreCase))
+                        jobList.Add(normalizedGamePath);
+
+                    changed = true;
+                }
+
+                if (petList.Count == 0)
+                {
+                    JobSpecificPetCache.Remove(kvp.Key);
+                    changed = true;
+                }
+            }
+
+            return changed;
         }
 
         private bool MoveObjectScopedPathsOutOfPlayerCaches()
@@ -511,6 +506,23 @@ public class TransientConfig : IMareConfiguration
             var removed = MinionOrMountPersistentCache.RemoveAll(path => string.Equals(path, normalizedGamePath, StringComparison.OrdinalIgnoreCase));
             removed += CompanionPersistentCache.RemoveAll(path => string.Equals(path, normalizedGamePath, StringComparison.OrdinalIgnoreCase));
             return removed;
+        }
+
+
+        private static bool IsLikelyPlayerJobSummonedActorPath(string? path)
+        {
+            var normalized = NormalizePath(path ?? string.Empty);
+            if (string.IsNullOrWhiteSpace(normalized))
+                return false;
+
+            return normalized.StartsWith("chara/monster/", StringComparison.OrdinalIgnoreCase)
+                || normalized.StartsWith("chara/demihuman/", StringComparison.OrdinalIgnoreCase)
+                || normalized.StartsWith("chara/action/mon_sp/", StringComparison.OrdinalIgnoreCase)
+                || normalized.StartsWith("vfx/monster/", StringComparison.OrdinalIgnoreCase)
+                || normalized.StartsWith("vfx/pop/", StringComparison.OrdinalIgnoreCase)
+                || normalized.StartsWith("vfx/action/", StringComparison.OrdinalIgnoreCase)
+                || normalized.StartsWith("sound/vfx/ability/", StringComparison.OrdinalIgnoreCase)
+                || normalized.Contains("/ability/", StringComparison.OrdinalIgnoreCase);
         }
 
         private static bool IsPlayerActorPersistentPath(string? path)

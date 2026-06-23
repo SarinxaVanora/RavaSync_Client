@@ -29,6 +29,8 @@ public sealed partial class PairHandler
     private sealed class VisibilityCoordinator : CoordinatorBase
     {
         private const int VisibleSupportReapplyCooldownMs = 1500;
+        private const string TempFilesModName = "MareChara_Files";
+        private const int TempFilesModPriority = 100;
 
         private readonly int _stableVisibilityJitterMs;
         private bool _remoteFalseProposalBlockActive;
@@ -361,7 +363,10 @@ public sealed partial class PairHandler
                 var addr = ResolveStrictVisiblePlayerAddress();
 
                 if (IsVisible)
+                {
                     TrackVisibleDrawReloadForAssociatedSupportAssets(nowTick);
+                    TrackVisiblePenumbraBindingInvariant(nowTick);
+                }
 
                     if (addr != nint.Zero)
                     {
@@ -443,8 +448,16 @@ public sealed partial class PairHandler
 
                 if (!IsVisible || !_initialApplyPending) return;
 
-                var dataForInitialApply = Pair.LastReceivedCharacterData ?? _cachedData;
-                if (_charaHandler == null || dataForInitialApply == null) return;
+                if (_charaHandler == null) return;
+
+                CharacterData sourceData;
+                if (Pair.LastReceivedCharacterData is CharacterData latestData)
+                    sourceData = latestData;
+                else if (_cachedData is CharacterData cachedDataForInitialApply)
+                    sourceData = cachedDataForInitialApply;
+                else
+                    return;
+
                 if (_charaHandler.CurrentDrawCondition != GameObjectHandler.DrawCondition.None) return;
 
                 var replayAddress = ResolveStrictVisiblePlayerAddress(_charaHandler.Address);
@@ -455,7 +468,6 @@ public sealed partial class PairHandler
                 if (_lastInitialApplyDispatchTick >= 0 && nowTick2 - _lastInitialApplyDispatchTick < VisibleReplayDispatchCooldownMs)
                     return;
 
-                var sourceData = dataForInitialApply;
                 var sourceHash = sourceData.DataHash.Value;
 
                 if (!string.IsNullOrEmpty(sourceHash)
@@ -475,8 +487,8 @@ public sealed partial class PairHandler
                 {
                     try
                     {
-                        var cachedData = Pair.PrepareCharacterDataForLocalApply(sourceData.DeepClone());
-                        if (cachedData == null)
+                        var cachedDataMaybe = Pair.PrepareCharacterDataForLocalApply(sourceData.DeepClone());
+                        if (cachedDataMaybe is not CharacterData cachedData)
                         {
                             MarkInitialApplyRequired();
                             return;
@@ -495,6 +507,87 @@ public sealed partial class PairHandler
                     {
                         MarkInitialApplyRequired();
                         Logger.LogWarning(ex, "[BASE-{appBase}] Deferred initial apply dispatch failed for {player}", appData, PlayerName);
+                    }
+                });
+            }
+
+            private void TrackVisiblePenumbraBindingInvariant(long nowTick)
+            {
+                if (!IsVisible || Pair.IsPaused || Pair.LastReceivedCharacterData is not CharacterData charaData)
+                    return;
+
+                if (!PairHandler.HasPlayerFilePayload(charaData))
+                    return;
+
+                if (_penumbraCollection == Guid.Empty || !_lastAssignedObjectIndex.HasValue || _lastAssignedObjectIndex.Value < 0 || _lastAssignedPlayerAddress == nint.Zero)
+                    return;
+
+                if (nowTick < Owner._nextVisiblePenumbraBindingValidationTick)
+                    return;
+
+                if (Interlocked.CompareExchange(ref Owner._visiblePenumbraBindingValidationInFlight, 1, 0) != 0)
+                    return;
+
+                Owner._nextVisiblePenumbraBindingValidationTick = nowTick + 5000 + _stableVisibilityJitterMs;
+                var applicationId = Guid.NewGuid();
+                var expectedCollection = _penumbraCollection;
+                var expectedIndex = _lastAssignedObjectIndex.Value;
+                var expectedAddress = _lastAssignedPlayerAddress;
+                var expectedName = PlayerName ?? Pair.UserData.AliasOrUID;
+
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        var match = await _ipcManager.Penumbra.TryGetObjectEffectiveCollectionMatchAsync(
+                            Logger,
+                            expectedCollection,
+                            expectedIndex,
+                            Pair.Ident,
+                            expectedAddress,
+                            expectedName).ConfigureAwait(false);
+
+                        if (!IsVisible || Pair.IsPaused)
+                            return;
+
+                        if (match.Checked && match.Matches)
+                        {
+                            var tempModLive = await _ipcManager.Penumbra.HasTemporaryModOnCollectionAsync(Logger, expectedCollection, TempFilesModName, TempFilesModPriority).ConfigureAwait(false);
+                            if (tempModLive)
+                                return;
+
+                            Logger.LogDebug(
+                                "[{applicationId}] Visible Penumbra temp-mod invariant failed for {pair}: collection {collection} is live at idx {idx}, but {tempModName} is missing; forcing authoritative visible reassert",
+                                applicationId,
+                                Pair.UserData.AliasOrUID,
+                                expectedCollection,
+                                expectedIndex,
+                                TempFilesModName);
+                        }
+                        else
+                        {
+                            Logger.LogDebug(
+                                "[{applicationId}] Visible Penumbra binding invariant failed for {pair}: idx={idx}, effective={effective}/{name}, expected={expected}; forcing authoritative visible reassert",
+                                applicationId,
+                                Pair.UserData.AliasOrUID,
+                                expectedIndex,
+                                match.EffectiveCollectionId,
+                                match.EffectiveCollectionName,
+                                expectedCollection);
+                        }
+
+                        _forceApplyMods = true;
+                        _initialApplyPending = true;
+                        _lastAttemptedDataHash = null;
+                        Owner.RequestAuthoritativeVisibleApply(match.Checked && match.Matches ? "visible Penumbra temp-mod invariant failed" : "visible Penumbra binding invariant failed");
+                    }
+                    catch (Exception ex)
+                    {
+                        Logger.LogDebug(ex, "[{applicationId}] Visible Penumbra binding invariant check failed for {pair}; leaving normal visible apply loop to retry", applicationId, Pair.UserData.AliasOrUID);
+                    }
+                    finally
+                    {
+                        Interlocked.Exchange(ref Owner._visiblePenumbraBindingValidationInFlight, 0);
                     }
                 });
             }
@@ -544,7 +637,10 @@ public sealed partial class PairHandler
                 if (nowTick - _lastVisibleSupportReapplyTick < VisibleSupportReapplyCooldownMs)
                     return;
 
-                var sourceData = Pair.LastReceivedCharacterData ?? _cachedData;
+                CharacterData? sourceData = Pair.LastReceivedCharacterData is CharacterData latestData
+                    ? latestData
+                    : (_cachedData is CharacterData cachedData ? cachedData : null);
+
                 if (!HasAssociatedTransientSupportPayload(sourceData))
                     return;
 
@@ -1021,18 +1117,8 @@ public sealed partial class PairHandler
                     SyncStorm.RegisterVisibleNow();
                 }
 
-                if (Pair.LastReceivedCharacterData != null)
-                {
-                    _cachedData = null;
-                    _dataReceivedInDowntime = null;
-                    _lastAttemptedDataHash = null;
-                    _forceApplyMods = true;
-                    _redrawOnNextApplication = true;
-                    _initialApplyPending = true;
-                    ResetVisibleReplayReadiness();
-                    _nextVisibilityWorkTick = 0;
-                    Owner._syncWorker?.Signal(PairSyncReason.BecameVisible);
-                }
+                if (Pair.LastReceivedCharacterData is CharacterData)
+                    Owner.RequestAuthoritativeVisibleApply("initialize resolved visible actor");
         }
 
         public void ResetToUninitializedState(bool revertLiveCustomizationState = true)
@@ -1168,18 +1254,8 @@ public sealed partial class PairHandler
                             applicationId,
                             Pair.UserData.AliasOrUID);
 
-                        if (IsVisible && Pair.LastReceivedCharacterData != null && !Pair.IsPaused)
-                        {
-                            _cachedData = null;
-                            _dataReceivedInDowntime = null;
-                            _lastAttemptedDataHash = null;
-                            _forceApplyMods = true;
-                            _redrawOnNextApplication = true;
-                            _initialApplyPending = true;
-                            ResetVisibleReplayReadiness();
-                            _nextVisibilityWorkTick = 0;
-                            Owner._syncWorker?.Signal(PairSyncReason.BecameVisible);
-                        }
+                        if (IsVisible && Pair.LastReceivedCharacterData is CharacterData && !Pair.IsPaused)
+                            Owner.RequestAuthoritativeVisibleApply("stale visibility teardown completed");
                     }
 
                     Interlocked.Decrement(ref Owner._vanillaTeardownInProgress);

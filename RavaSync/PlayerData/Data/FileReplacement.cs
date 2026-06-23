@@ -8,13 +8,13 @@ public partial class FileReplacement
 {
     public FileReplacement(string[] gamePaths, string filePath)
     {
-        GamePaths = CharacterDataPushSanitizer.GetServerAcceptedGamePaths(gamePaths).ToHashSet(StringComparer.OrdinalIgnoreCase);
         ResolvedPath = filePath.Replace('\\', '/');
+        GamePaths = CharacterDataPushSanitizer.GetServerAcceptedModdedGamePaths(gamePaths, ResolvedPath).ToHashSet(StringComparer.OrdinalIgnoreCase);
     }
 
     public HashSet<string> GamePaths { get; init; }
 
-    public bool HasFileReplacement => GamePaths.Count >= 1 && GamePaths.Any(p => !string.Equals(p, ResolvedPath, StringComparison.Ordinal));
+    public bool HasFileReplacement => GamePaths.Count >= 1 && GamePaths.Any(p => !string.Equals(p, ResolvedPath, StringComparison.OrdinalIgnoreCase));
 
     public string Hash { get; set; } = string.Empty;
     public bool IsFileSwap => !LocalPathRegex().IsMatch(ResolvedPath) && GamePaths.All(p => !LocalPathRegex().IsMatch(p));
@@ -24,7 +24,7 @@ public partial class FileReplacement
     {
         return new FileReplacementData
         {
-            GamePaths = [.. GamePaths],
+            GamePaths = CharacterDataPushSanitizer.GetServerAcceptedModdedGamePaths(GamePaths, IsFileSwap ? ResolvedPath : null),
             Hash = Hash,
             FileSwapPath = IsFileSwap ? ResolvedPath : string.Empty,
         };

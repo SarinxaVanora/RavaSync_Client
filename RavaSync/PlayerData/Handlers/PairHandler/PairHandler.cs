@@ -74,15 +74,34 @@ public sealed partial class PairHandler : DisposableMediatorSubscriberBase
     private bool _redrawOnNextApplication = false;
     private bool _hasRetriedAfterMissingDownload = false;
     private bool _hasRetriedAfterMissingAtApply = false;
+    private int _missingFileSelfHealRunning = 0;
+    private readonly object _missingFileSelfHealGate = new();
+    private CharacterData? _pendingMissingFileSelfHealData;
+    private List<string>? _pendingMissingFileSelfHealHashes;
     private int _manualRepairRunning = 0;
     private int? _lastAssignedObjectIndex = null;
     private nint _lastAssignedPlayerAddress = nint.Zero;
+    private readonly Dictionary<ObjectKind, (int ObjectIndex, nint Address)> _lastAssignedOwnedObjectIndices = [];
+    private readonly ConcurrentDictionary<nint, byte> _summonedActorBindingInFlight = new();
+    private readonly ConcurrentDictionary<nint, long> _nextSummonedActorBindingAttemptTick = new();
+    private readonly ConcurrentDictionary<string, long> _summonedActorRedrawCooldownByKey = new(StringComparer.OrdinalIgnoreCase);
     private DateTime _lastAssignedCollectionAssignUtc = DateTime.MinValue;
     private DateTime _nextTempCollectionRetryNotBeforeUtc = DateTime.MinValue;
     private long _lastApplyCompletedTick;
+    private long _nextVisiblePenumbraBindingValidationTick;
+    private int _visiblePenumbraBindingValidationInFlight;
     private long _nextActiveSyncIndicatorValidationTick;
     private Task? _activeSyncIndicatorValidationTask;
     private static readonly bool IsWineRuntime = SafeIsWine();
+
+    // RAVASYNC_VISIBILITY_DIAGNOSTICS: temporary Info-level tracing for the visible-pair send/apply invariant.
+    // Remove this helper and all '[VIS-DIAG]' log lines once the root cause is confirmed in live logs.
+    private const string VisibilityDiagnosticsPrefix = "[VIS-DIAG]";
+
+    private void LogVisibilityDiagnostic(string message, params object[] args)
+    {
+        Logger.LogInformation(VisibilityDiagnosticsPrefix + " " + message, args);
+    }
 
     private static bool SafeIsWine()
     {
@@ -195,6 +214,9 @@ public sealed partial class PairHandler : DisposableMediatorSubscriberBase
     private static readonly int WineApplyPhaseWarnMs = IsWineRuntime ? 350 : 1200;
     private static readonly int WineApplyTotalWarnMs = IsWineRuntime ? 1200 : 5000;
     private string? _lastAttemptedDataHash;
+    private readonly object _pairSyncAssetPlanCacheGate = new();
+    private PairSyncAssetPlan? _lastResolvedPairSyncAssetPlan;
+    private string? _lastResolvedPairSyncPayloadFingerprint;
     private string? _lastAppliedTempModsFingerprint;
     private Dictionary<string, string>? _lastAppliedTempModsSnapshot;
     private string? _lastAppliedMountMusicTempModsFingerprint;
@@ -219,9 +241,9 @@ public sealed partial class PairHandler : DisposableMediatorSubscriberBase
     private int _visibleReplayStableFrames = 0;
     private long _lastInitialApplyDispatchTick = -1;
     private long _lastVisibleLifecycleReplayTick = -1;
-    private const int VisibleReplayStableFramesRequired = 3;
-    private const int VisibleReplaySettleMs = 175;
-    private const int VisibleReplayDispatchCooldownMs = 500;
+    private const int VisibleReplayStableFramesRequired = 1;
+    private const int VisibleReplaySettleMs = 0;
+    private const int VisibleReplayDispatchCooldownMs = 0;
 
     private readonly object _missingCheckGate = new();
     private string? _lastMissingCheckedHash;
@@ -313,14 +335,7 @@ public sealed partial class PairHandler : DisposableMediatorSubscriberBase
                 _isVisible = value;
 
                 if (value)
-                {
-                    _initialApplyPending = true;
-                    _lastAttemptedDataHash = null;
-                    _redrawOnNextApplication = true;
-                    ResetVisibleReplayReadiness();
-                    _nextVisibilityWorkTick = 0;
-                    _syncWorker?.Signal(PairSyncReason.BecameVisible);
-                }
+                    RequestAuthoritativeVisibleApply("IsVisible=true");
 
                 string text = "User Visibility Changed, now: " + (_isVisible ? "Is Visible" : "Is not Visible");
                 Mediator.Publish(new EventMessage(new Event(PlayerName, Pair.UserData, nameof(PairHandler),EventSeverity.Informational, text)));
@@ -330,6 +345,61 @@ public sealed partial class PairHandler : DisposableMediatorSubscriberBase
     }
 
     public Pair Pair { get; private set; }
+
+    private void RequestAuthoritativeVisibleApply(string reason)
+    {
+        if (!IsVisible)
+            return;
+
+        _cachedData = null;
+        _dataReceivedInDowntime = null;
+        _initialApplyPending = true;
+        _lastAttemptedDataHash = null;
+        _forceApplyMods = true;
+        _redrawOnNextApplication = true;
+        ResetVisibleReplayReadiness();
+        _nextVisibilityWorkTick = 0;
+
+        if (Pair.LastReceivedCharacterData is not CharacterData || Pair.IsPaused)
+        {
+            _syncWorker?.Signal(PairSyncReason.BecameVisible);
+            return;
+        }
+
+        _ = Task.Run(() => TrySubmitLastReceivedVisibleAuthoritativeApply(reason, PairSyncReason.BecameVisible));
+    }
+
+    private bool TrySubmitLastReceivedVisibleAuthoritativeApply(string reason, PairSyncReason syncReason, bool skipIfBusy = true)
+    {
+        try
+        {
+            if (!IsVisible || Pair.IsPaused)
+                return false;
+
+            if (Pair.LastReceivedCharacterData is not CharacterData sourceData)
+                return false;
+
+            var preparedDataMaybe = Pair.PrepareCharacterDataForLocalApply(sourceData.DeepClone());
+            if (preparedDataMaybe is not CharacterData preparedData)
+                return false;
+
+            var payloadFingerprint = PairApplyUtilities.ComputeCharacterDataPayloadFingerprint(preparedData);
+            if (skipIfBusy && IsPairSyncBusyForPayload(payloadFingerprint))
+            {
+                Logger.LogTrace("Skipping immediate visible authoritative apply for {pair}; payload {payload} is already queued/active", Pair.UserData.AliasOrUID, payloadFingerprint);
+                return false;
+            }
+
+            Logger.LogDebug("Submitting immediate visible authoritative apply for {pair}: reason={reason}, payload={payload}", Pair.UserData.AliasOrUID, reason, payloadFingerprint);
+            ApplyCharacterData(Guid.NewGuid(), preparedData, forceApplyCustomization: true, syncReason);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Logger.LogWarning(ex, "Failed to submit immediate visible authoritative apply for {pair}: reason={reason}", Pair.UserData.AliasOrUID, reason);
+            return false;
+        }
+    }
 
     private nint ResolveStablePlayerAddress(nint fallbackAddress = 0)
     {
@@ -577,6 +647,330 @@ public sealed partial class PairHandler : DisposableMediatorSubscriberBase
         });
 
         Mediator.Subscribe<PenumbraResourceLoadMessage>(this, HandlePenumbraResourceLoadForCompactIndicators);
+        Mediator.Subscribe<PenumbraResourceLoadMessage>(this, HandlePenumbraResourceLoadForSummonedActorBinding);
+        Mediator.Subscribe<MissingFileRepairCompletedMessage>(this, HandleMissingFileRepairCompleted);
+    }
+
+    private void HandleMissingFileRepairCompleted(MissingFileRepairCompletedMessage msg)
+    {
+        if (msg == null || !IsVisible || Pair.IsPaused)
+            return;
+
+        if (!string.Equals(msg.SenderUid, Pair.UserData.UID, StringComparison.Ordinal))
+            return;
+
+        var expectedDataHash = Pair.LastReceivedCharacterData?.DataHash.Value ?? _cachedData?.DataHash.Value ?? string.Empty;
+        if (!string.IsNullOrWhiteSpace(msg.DataHash)
+            && !string.IsNullOrWhiteSpace(expectedDataHash)
+            && !string.Equals(msg.DataHash, expectedDataHash, StringComparison.Ordinal))
+        {
+            Logger.LogDebug(
+                "Ignoring stale mesh missing-hash repair completion for {pair}: completionHash={completionHash}, currentHash={currentHash}",
+                Pair.UserData.AliasOrUID,
+                msg.DataHash,
+                expectedDataHash);
+            return;
+        }
+
+        var requestedHashes = (msg.Hashes ?? Array.Empty<string>())
+            .Where(static h => !string.IsNullOrWhiteSpace(h))
+            .Select(static h => h.Trim().ToUpperInvariant())
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        if (requestedHashes.Count == 0)
+            return;
+
+        var failedHashes = (msg.FailedHashes ?? Array.Empty<string>())
+            .Where(static h => !string.IsNullOrWhiteSpace(h))
+            .Select(static h => h.Trim().ToUpperInvariant())
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var stillMissing = requestedHashes
+            .Where(hash => failedHashes.Contains(hash) || !HasUsableCachedFileForHash(hash))
+            .ToList();
+
+        // This is the missing half of the retry loop: the sender has now run its upload/share
+        // path for exactly the hashes we were missing, so allow the receiver-side download/apply
+        // worker to re-check local cache and CDN state instead of waiting for a reconnect.
+        // Also clear the per-hash repair-attempt cap for the still-missing files; otherwise the
+        // retry can wake correctly but never actually ask the sender to upload/share those hashes again.
+        _downloadManager?.ResetCentralFileRepairAttempts(stillMissing);
+        _hasRetriedAfterMissingDownload = false;
+
+        Logger.LogInformation(
+            "Mesh missing-hash repair completed for {pair}: requested={requested}, stillMissingOrFailed={missing}; waking receiver retry",
+            Pair.UserData.AliasOrUID,
+            requestedHashes.Count,
+            stillMissing.Count);
+
+        _syncWorker?.Signal(PairSyncReason.IncomingData);
+        ScheduleMissingFileSelfHealRetry(Pair.LastReceivedCharacterData ?? _cachedData, requestedHashes, immediate: stillMissing.Count == 0);
+    }
+
+    private void ScheduleMissingFileSelfHealRetry(CharacterData? characterData, IEnumerable<string?> hashes, bool immediate = false)
+    {
+        if (characterData == null || !IsVisible || Pair.IsPaused)
+            return;
+
+        var hashList = (hashes ?? Array.Empty<string?>())
+            .Where(static h => !string.IsNullOrWhiteSpace(h))
+            .Select(static h => h!.Trim().ToUpperInvariant())
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        if (hashList.Count == 0)
+            return;
+
+        lock (_missingFileSelfHealGate)
+        {
+            _pendingMissingFileSelfHealData = characterData.DeepClone();
+            _pendingMissingFileSelfHealHashes = hashList;
+        }
+
+        if (Interlocked.CompareExchange(ref _missingFileSelfHealRunning, 1, 0) != 0)
+            return;
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                while (true)
+                {
+                    CharacterData? data;
+                    List<string>? pendingHashes;
+                    lock (_missingFileSelfHealGate)
+                    {
+                        data = _pendingMissingFileSelfHealData;
+                        pendingHashes = _pendingMissingFileSelfHealHashes;
+                        _pendingMissingFileSelfHealData = null;
+                        _pendingMissingFileSelfHealHashes = null;
+                    }
+
+                    if (data == null || pendingHashes == null || pendingHashes.Count == 0)
+                        return;
+
+                    if (!immediate)
+                        await Task.Delay(IsWineRuntime ? 3500 : 1500).ConfigureAwait(false);
+                    immediate = false;
+
+                    if (!IsVisible || Pair.IsPaused)
+                        return;
+
+                    var stillMissing = pendingHashes
+                        .Where(hash => !HasUsableCachedFileForHash(hash))
+                        .ToList();
+
+                    _downloadManager?.ResetCentralFileRepairAttempts(stillMissing.Count > 0 ? stillMissing : pendingHashes);
+                    _hasRetriedAfterMissingDownload = false;
+                    _hasRetriedAfterMissingAtApply = false;
+                    _forceApplyMods = true;
+
+                    Logger.LogInformation(
+                        "Missing-file self-heal retry for {pair}: requested={requested}, stillMissing={missing}; re-submitting authoritative visible apply",
+                        Pair.UserData.AliasOrUID,
+                        pendingHashes.Count,
+                        stillMissing.Count);
+
+                    ApplyCharacterData(Guid.NewGuid(), data.DeepClone(), forceApplyCustomization: true);
+
+                    lock (_missingFileSelfHealGate)
+                    {
+                        if (_pendingMissingFileSelfHealData == null || _pendingMissingFileSelfHealHashes == null || _pendingMissingFileSelfHealHashes.Count == 0)
+                            return;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.LogDebug(ex, "Missing-file self-heal retry failed for {pair}", Pair.UserData.AliasOrUID);
+            }
+            finally
+            {
+                Interlocked.Exchange(ref _missingFileSelfHealRunning, 0);
+
+                CharacterData? queuedData = null;
+                List<string>? queuedHashes = null;
+                lock (_missingFileSelfHealGate)
+                {
+                    if (_pendingMissingFileSelfHealData != null && _pendingMissingFileSelfHealHashes is { Count: > 0 })
+                    {
+                        queuedData = _pendingMissingFileSelfHealData;
+                        queuedHashes = _pendingMissingFileSelfHealHashes;
+                        _pendingMissingFileSelfHealData = null;
+                        _pendingMissingFileSelfHealHashes = null;
+                    }
+                }
+
+                if (queuedData != null && queuedHashes != null)
+                    ScheduleMissingFileSelfHealRetry(queuedData, queuedHashes, immediate: false);
+            }
+        });
+    }
+
+    private bool HasUsableCachedFileForHash(string? hash)
+    {
+        if (string.IsNullOrWhiteSpace(hash))
+            return false;
+
+        try
+        {
+            var entry = _fileDbManager.GetFileCacheByHash(hash.Trim().ToUpperInvariant());
+            if (entry == null || string.IsNullOrWhiteSpace(entry.ResolvedFilepath))
+                return false;
+
+            var fi = new FileInfo(entry.ResolvedFilepath);
+            var usable = fi.Exists && fi.Length > 0;
+            if (usable)
+                FileDownloadManager.RegisterSessionKnownPresentHash(hash);
+
+            return usable;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private void HandlePenumbraResourceLoadForSummonedActorBinding(PenumbraResourceLoadMessage msg)
+    {
+        if (!_dalamudUtil.IsOnFrameworkThread)
+        {
+            _ = _dalamudUtil.RunOnFrameworkThread(() => HandlePenumbraResourceLoadForSummonedActorBinding(msg));
+            return;
+        }
+
+        if (!IsVisible || Pair.IsPaused || _cachedData == null || msg.GameObject == IntPtr.Zero)
+            return;
+
+        var actorAddress = (nint)msg.GameObject;
+        var gamePath = NormalizeLiveIndicatorGamePath(msg.GamePath);
+        if (string.IsNullOrWhiteSpace(gamePath) || !HasSummonedActorPayloadForGamePath(_cachedData, gamePath))
+            return;
+
+        var playerAddress = ResolveStablePlayerAddress();
+        if (playerAddress == nint.Zero || actorAddress == playerAddress)
+            return;
+
+        if (!_dalamudUtil.IsOwnedActorOfPlayer(playerAddress, actorAddress))
+            return;
+
+        var actorRedrawKey = TryBuildSummonedActorRedrawCooldownKey(actorAddress, gamePath);
+        if (string.IsNullOrWhiteSpace(actorRedrawKey))
+            return;
+
+        var nowTick = Environment.TickCount64;
+        if (_nextSummonedActorBindingAttemptTick.TryGetValue(actorAddress, out var nextTick)
+            && unchecked(nowTick - nextTick) < 0)
+        {
+            return;
+        }
+
+        if (!_summonedActorBindingInFlight.TryAdd(actorAddress, 0))
+            return;
+
+        // Keep binding eager. The redraw cooldown is checked only after a successful
+        // bind so actor replacement/redraw storms do not stop us assigning the
+        // collection to the newest owned actor address.
+        _nextSummonedActorBindingAttemptTick[actorAddress] = nowTick + 100;
+
+        var applicationId = Guid.NewGuid();
+        _ = Task.Run(async () =>
+        {
+            var bound = false;
+            try
+            {
+                if (!IsVisible || Pair.IsPaused)
+                    return;
+
+                bound = await EnsureSummonedActorPenumbraCollectionBindingAsync(applicationId, actorAddress, "summoned actor").ConfigureAwait(false);
+                if (!bound)
+                    return;
+
+                var redrawTick = Environment.TickCount64;
+                if (_summonedActorRedrawCooldownByKey.TryGetValue(actorRedrawKey, out var redrawNotBefore)
+                    && unchecked(redrawTick - redrawNotBefore) < 0)
+                {
+                    Logger.LogTrace("[{applicationId}] Bound {pair} summoned actor {addr:X} without redraw because scope {scope} already redrew recently",
+                        applicationId, Pair.UserData.AliasOrUID, actorAddress, actorRedrawKey);
+                    return;
+                }
+
+                // One redraw per summon scope is enough to force the actor onto the
+                // pair temp collection. Further resource-load callbacks may keep
+                // binding newer actor addresses, but they must not keep redrawing and
+                // flashing the actor while the summon settles.
+                _summonedActorRedrawCooldownByKey[actorRedrawKey] = redrawTick + 1000;
+
+                if (IsVisible && !Pair.IsPaused)
+                    Mediator.Publish(new PenumbraRedrawAddressMessage(actorAddress));
+            }
+            catch (Exception ex)
+            {
+                Logger.LogDebug(ex, "[{applicationId}] Failed to bind/redraw summoned actor {addr:X} for {pair}", applicationId, actorAddress, Pair.UserData.AliasOrUID);
+            }
+            finally
+            {
+                _summonedActorBindingInFlight.TryRemove(actorAddress, out _);
+                _nextSummonedActorBindingAttemptTick[actorAddress] = Environment.TickCount64 + (bound ? 250 : 100);
+            }
+        });
+    }
+
+
+    private string TryBuildSummonedActorRedrawCooldownKey(nint actorAddress, string gamePath)
+    {
+        var scope = GetSummonedActorRedrawScope(gamePath);
+        if (!string.IsNullOrWhiteSpace(scope) && !string.Equals(scope, "unknown", StringComparison.OrdinalIgnoreCase))
+            return actorAddress == nint.Zero ? scope : $"{scope}|actor:{actorAddress:X}";
+
+        return actorAddress == nint.Zero ? string.Empty : $"actor:{actorAddress:X}";
+    }
+
+    private static string GetSummonedActorRedrawScope(string gamePath)
+    {
+        var normalized = NormalizeLiveIndicatorGamePath(gamePath);
+        if (string.IsNullOrWhiteSpace(normalized))
+            return "unknown";
+
+        var parts = normalized.Split('/', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        if (parts.Length >= 3
+            && string.Equals(parts[0], "chara", StringComparison.OrdinalIgnoreCase)
+            && (string.Equals(parts[1], "monster", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(parts[1], "demihuman", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(parts[1], "weapon", StringComparison.OrdinalIgnoreCase)))
+        {
+            return string.Join("/", parts.Take(3));
+        }
+
+        if (parts.Length >= 2
+            && (string.Equals(parts[0], "vfx", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(parts[0], "sound", StringComparison.OrdinalIgnoreCase)))
+        {
+            return parts[0];
+        }
+
+        return normalized;
+    }
+
+
+    private static bool HasSummonedActorPayloadForGamePath(CharacterData data, string gamePath)
+    {
+        if (data?.FileReplacements == null || string.IsNullOrWhiteSpace(gamePath))
+            return false;
+
+        foreach (var objectFiles in data.FileReplacements)
+        {
+            foreach (var replacement in objectFiles.Value ?? [])
+            {
+                foreach (var candidate in replacement.GamePaths ?? [])
+                {
+                    if (string.Equals(NormalizeLiveIndicatorGamePath(candidate), gamePath, StringComparison.OrdinalIgnoreCase))
+                        return true;
+                }
+            }
+        }
+
+        return false;
     }
 
     private void HandlePenumbraResourceLoadForCompactIndicators(PenumbraResourceLoadMessage msg)
@@ -761,7 +1155,8 @@ public sealed partial class PairHandler : DisposableMediatorSubscriberBase
 
         return _dalamudUtil.GetCompanionPtr(playerAddress) == address
             || _dalamudUtil.GetPetPtr(playerAddress) == address
-            || _dalamudUtil.GetMinionOrMountPtr(playerAddress) == address;
+            || _dalamudUtil.GetMinionOrMountPtr(playerAddress) == address
+            || _dalamudUtil.IsOwnedActorOfPlayer(playerAddress, address);
     }
 
     private void ValidateActiveSyncIndicators()
@@ -868,6 +1263,12 @@ public sealed partial class PairHandler : DisposableMediatorSubscriberBase
     private Task<(bool Bound, bool Reassigned)> EnsurePenumbraCollectionBindingAsync(Guid applicationId)
         => _penumbraCoordinator.EnsurePenumbraCollectionBindingAsync(applicationId);
 
+    private Task<bool> EnsureOwnedObjectPenumbraCollectionBindingAsync(Guid applicationId, GameObjectHandler handler, ObjectKind objectKind)
+        => _penumbraCoordinator.EnsureOwnedObjectPenumbraCollectionBindingAsync(applicationId, handler, objectKind);
+
+    private Task<bool> EnsureSummonedActorPenumbraCollectionBindingAsync(Guid applicationId, nint actorAddress, string reason)
+        => _penumbraCoordinator.EnsureSummonedActorPenumbraCollectionBindingAsync(applicationId, actorAddress, reason);
+
     private Task EnsurePenumbraCollectionAsync() => _penumbraCoordinator.EnsurePenumbraCollectionAsync();
 
     private Task RemovePenumbraCollectionAsync(Guid applicationId) => _penumbraCoordinator.RemovePenumbraCollectionAsync(applicationId);
@@ -917,8 +1318,8 @@ public sealed partial class PairHandler : DisposableMediatorSubscriberBase
     private void ProcessPendingOwnedObjectCustomizationRetry(long nowTick)
         => _customizationCoordinator.ProcessPendingOwnedObjectCustomizationRetry(nowTick);
 
-    private Task<bool> ApplyCustomizationDataAsync(Guid applicationId, KeyValuePair<ObjectKind, HashSet<PlayerChanges>> changes, CharacterData charaData, bool allowPlayerRedraw, bool forceLightweightMetadataReapply, bool awaitPlayerGlamourerApply, bool waitForPlayerGlamourerDrawSettle, ApplyFlag glamourerApplyFlags, bool deferPlayerGlamourerUntilAfterRedraw, CancellationToken token)
-        => _customizationCoordinator.ApplyCustomizationDataAsync(applicationId, changes, charaData, allowPlayerRedraw, forceLightweightMetadataReapply, awaitPlayerGlamourerApply, waitForPlayerGlamourerDrawSettle, glamourerApplyFlags, deferPlayerGlamourerUntilAfterRedraw, token);
+    private Task<bool> ApplyCustomizationDataAsync(Guid applicationId, KeyValuePair<ObjectKind, HashSet<PlayerChanges>> changes, CharacterData charaData, bool allowPlayerRedraw, bool forceLightweightMetadataReapply, bool awaitPlayerGlamourerApply, bool waitForPlayerGlamourerDrawSettle, ApplyFlag glamourerApplyFlags, CancellationToken token)
+        => _customizationCoordinator.ApplyCustomizationDataAsync(applicationId, changes, charaData, allowPlayerRedraw, forceLightweightMetadataReapply, awaitPlayerGlamourerApply, waitForPlayerGlamourerDrawSettle, glamourerApplyFlags, token);
 
     private Task RevertCustomizationDataAsync(ObjectKind objectKind, string name, Guid applicationId, CancellationToken cancelToken, nint addressOverride = 0, IReadOnlyDictionary<ObjectKind, Guid?>? customizeIdSnapshot = null)
         => _customizationCoordinator.RevertCustomizationDataAsync(objectKind, name, applicationId, cancelToken, addressOverride, customizeIdSnapshot);
@@ -926,7 +1327,11 @@ public sealed partial class PairHandler : DisposableMediatorSubscriberBase
     internal bool IsPairSyncBusyForPayload(string payloadFingerprint) => _syncWorker?.IsBusyForPayload(payloadFingerprint) == true;
 
     private void CancelPairSyncWork(bool clearDesired = false) => _syncWorker?.CancelActiveWork(clearDesired);
-    private void ResetPairSyncPipelineState() => _syncWorker?.ResetPipelineState();
+    private void ResetPairSyncPipelineState()
+    {
+        ClearPairSyncAssetPlanCache();
+        _syncWorker?.ResetPipelineState();
+    }
 
     private Task<PairSyncCommitResult> ApplyCharacterDataAsync(Guid applicationBase, CharacterData charaData, Dictionary<ObjectKind, HashSet<PlayerChanges>> updatedData, bool updateModdedPaths, bool updateManip, bool requiresFileReadyGate, Dictionary<(string GamePath, string? Hash), string> moddedPaths, PairSyncAssetPlan assetPlan, bool downloadedAny, bool forceApplyModsForThisApply, bool lifecycleApplyRequestedFromPlan, bool lifecycleRedrawRequestedFromPlan, CancellationToken token, bool authoritativeCommit = true, bool suppressNonLifecycleRedraw = false)
         => _applyExecutionCoordinator.ApplyCharacterDataAsync(applicationBase, charaData, updatedData, updateModdedPaths, updateManip, requiresFileReadyGate, moddedPaths, assetPlan, downloadedAny, forceApplyModsForThisApply, lifecycleApplyRequestedFromPlan, lifecycleRedrawRequestedFromPlan, token, authoritativeCommit, suppressNonLifecycleRedraw);

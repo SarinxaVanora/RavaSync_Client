@@ -837,13 +837,24 @@ public class CompactUi : WindowMediatorSubscriberBase
             var doneUploads = currentUploads.Count(c => c.IsTransferred);
             var totalUploaded = currentUploads.Sum(c => c.Transferred);
             var totalToUpload = currentUploads.Sum(c => c.Total);
+            var waitingUploadStatus = currentUploads
+                .OfType<UploadFileTransfer>()
+                .Select(u => u.StatusText)
+                .FirstOrDefault(s => !string.IsNullOrWhiteSpace(s));
 
-            ImGui.TextUnformatted($"{doneUploads}/{totalUploads}");
-            var uploadText = $"({UiSharedService.ByteToString(totalUploaded)}/{UiSharedService.ByteToString(totalToUpload)})";
-            var textSize = ImGui.CalcTextSize(uploadText);
-            ImGui.SameLine(_windowContentWidth - textSize.X);
-            ImGui.AlignTextToFramePadding();
-            ImGui.TextUnformatted(uploadText);
+            if (!string.IsNullOrWhiteSpace(waitingUploadStatus))
+            {
+                ImGui.TextUnformatted(waitingUploadStatus);
+            }
+            else
+            {
+                ImGui.TextUnformatted($"{doneUploads}/{totalUploads}");
+                var uploadText = $"({UiSharedService.ByteToString(totalUploaded)}/{UiSharedService.ByteToString(totalToUpload)})";
+                var textSize = ImGui.CalcTextSize(uploadText);
+                ImGui.SameLine(_windowContentWidth - textSize.X);
+                ImGui.AlignTextToFramePadding();
+                ImGui.TextUnformatted(uploadText);
+            }
         }
         else
         {

@@ -938,6 +938,9 @@ public sealed class CacheMonitor : DisposableMediatorSubscriberBase
                 Logger.LogTrace("Scanner added {notScanned} new files to db", newFiles.Length);
             }
 
+            if (newFiles.Length > 0 || _fileDbManager.ConsumeCsvRewriteNeeded())
+                _fileDbManager.WriteOutFullCsv();
+
             Logger.LogDebug("Scan complete");
             TotalFiles = 0;
             _currentFileProgress = 0;

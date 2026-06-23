@@ -1,4 +1,4 @@
-using Dalamud.Bindings.ImGui;
+﻿using Dalamud.Bindings.ImGui;
 using Dalamud.Interface;
 using Dalamud.Interface.Colors;
 using Dalamud.Interface.GameFonts;
@@ -763,7 +763,8 @@ public class SettingsUi : WindowMediatorSubscriberBase
                 ImGui.TableNextColumn();
                 ImGui.TextUnformatted(transfer.Hash);
                 ImGui.TableNextColumn();
-                ImGui.TextUnformatted(UiSharedService.ByteToString(transfer.Transferred));
+                var uploadStatusText = transfer is UploadFileTransfer upload && !string.IsNullOrWhiteSpace(upload.StatusText) ? upload.StatusText : null;
+                ImGui.TextUnformatted(uploadStatusText ?? UiSharedService.ByteToString(transfer.Transferred));
                 ImGui.TableNextColumn();
                 ImGui.TextUnformatted(UiSharedService.ByteToString(transfer.Total));
                 col.Dispose();

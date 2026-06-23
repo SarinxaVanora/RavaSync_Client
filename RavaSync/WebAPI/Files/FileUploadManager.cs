@@ -33,6 +33,7 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
     private readonly ServerConfigurationManager _serverManager;
     private readonly System.Collections.Concurrent.ConcurrentDictionary<string, DateTime> _verifiedUploadedHashes = new(StringComparer.Ordinal);
     private readonly System.Collections.Concurrent.ConcurrentDictionary<string, long> _recentOutboundRecipientUids = new(StringComparer.Ordinal);
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, long> _locallyAbandonedUploadReservationHashes = new(StringComparer.Ordinal);
     private readonly object _outboundRecipientUidsLock = new();
     private HashSet<string> _outboundRecipientUids = new(StringComparer.Ordinal);
     private readonly SemaphoreSlim _centralRepairUploadSemaphore = new(1, 1);
@@ -50,6 +51,11 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
     private const long SmallUploadInMemoryThresholdBytes = 1024L * 1024;
     private const long TinyUploadProgressThresholdBytes = 512L * 1024;
     private const int LocalOutboundUploadStatusEchoSuppressMs = 2500;
+    private const int LocalAbandonedUploadReservationRetryMs = 10 * 60 * 1000;
+    private const int ReservedUploadWaitPollMs = 750;
+    private const int ReservedUploadWaitTimeoutMs = 120_000;
+    private const string WaitingForSharedFilesStatus = "Waiting for shared files to arrive";
+    private const string FinalisingUploadsStatus = "Finalising uploads";
     private static readonly int UploadPayloadPreparationParallelism = GetUploadPayloadPreparationParallelism();
     private static readonly SemaphoreSlim UploadPayloadPreparationSemaphore = new(UploadPayloadPreparationParallelism, UploadPayloadPreparationParallelism);
 
@@ -150,6 +156,57 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
         }
     }
 
+    private void MarkCurrentUploadsAsLocallyAbandonedReservations(string reason)
+    {
+        List<string> hashes;
+        lock (_currentUploadsLock)
+        {
+            hashes = CurrentUploads
+                .OfType<UploadFileTransfer>()
+                .Select(u => u.Hash)
+                .Where(h => !string.IsNullOrWhiteSpace(h))
+                .Select(h => h.Trim().ToUpperInvariant())
+                .Distinct(StringComparer.Ordinal)
+                .ToList();
+        }
+
+        if (hashes.Count == 0)
+            return;
+
+        var expiresTick = unchecked(Environment.TickCount64 + LocalAbandonedUploadReservationRetryMs);
+        foreach (var hash in hashes)
+            _locallyAbandonedUploadReservationHashes[hash] = expiresTick;
+
+        Logger.LogWarning(
+            "Marked {count} upload hash(es) as locally abandoned after {reason}; the next upload may force-refresh their server reservations instead of waiting forever",
+            hashes.Count,
+            reason);
+    }
+
+    private bool IsRecentlyAbandonedLocalUploadReservation(string? hash)
+    {
+        if (string.IsNullOrWhiteSpace(hash))
+            return false;
+
+        var key = hash.Trim().ToUpperInvariant();
+        if (!_locallyAbandonedUploadReservationHashes.TryGetValue(key, out var expiresTick))
+            return false;
+
+        if (unchecked(expiresTick - Environment.TickCount64) > 0)
+            return true;
+
+        _locallyAbandonedUploadReservationHashes.TryRemove(key, out _);
+        return false;
+    }
+
+    private void ClearLocallyAbandonedUploadReservation(string? hash)
+    {
+        if (string.IsNullOrWhiteSpace(hash))
+            return;
+
+        _locallyAbandonedUploadReservationHashes.TryRemove(hash.Trim().ToUpperInvariant(), out _);
+    }
+
     private void CompleteAndClearCurrentUploads(bool publishRefresh = true)
     {
         lock (_currentUploadsLock)
@@ -227,6 +284,7 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
             return false;
 
         Logger.LogDebug("Cancelling current upload");
+        MarkCurrentUploadsAsLocallyAbandonedReservations("local upload cancellation");
         try { ctsToCancel?.Cancel(); } catch { /* best effort */ }
 
         CompleteAndClearCurrentUploads();
@@ -246,6 +304,11 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
         return UploadFilesCore(hashesToUpload, progress, ct ?? CancellationToken.None, AuthMode.NeedAuthorization, Array.Empty<string>());
     }
 
+    public Task<List<string>> UploadFiles(List<string> hashesToUpload, IReadOnlyList<string> recipientUids, IProgress<string> progress, CancellationToken? ct = null, bool forceUploadTickets = false)
+    {
+        return UploadFilesCore(hashesToUpload, progress, ct ?? CancellationToken.None, AuthMode.NeedAuthorization, recipientUids ?? Array.Empty<string>(), forceUploadTickets);
+    }
+
     public async Task<List<string>> ForceUploadMissingHashesAsync(IReadOnlyCollection<string> hashes, string reason, CancellationToken ct = default)
     {
         var toUpload = hashes?
@@ -259,23 +322,23 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
         await _centralRepairUploadSemaphore.WaitAsync(ct).ConfigureAwait(false);
         try
         {
-            Logger.LogDebug("Central B2 force-upload requested for {count} missing hash(es). Reason={reason}. Hashes={hashes}",
+            Logger.LogDebug("Legacy missing-hash upload request for {count} hash(es). Reason={reason}. Hashes={hashes}",
                 toUpload.Count,
                 reason,
                 string.Join(", ", toUpload.Take(20)));
 
             var prog = new Progress<string>(msg => Logger.LogInformation(msg));
-            var failed = await UploadFilesCore(toUpload, prog, ct, AuthMode.PreAuthorized, Array.Empty<string>(), forceUploadTickets: true).ConfigureAwait(false);
+            var failed = await UploadFilesCore(toUpload, prog, ct, AuthMode.PreAuthorized, Array.Empty<string>(), forceUploadTickets: false).ConfigureAwait(false);
 
             if (failed.Count > 0)
             {
-                Logger.LogWarning("Central B2 force-upload incomplete; {count} hash(es) failed: {hashes}",
+                Logger.LogWarning("Legacy missing-hash upload flow incomplete; {count} hash(es) failed: {hashes}",
                     failed.Count,
                     string.Join(", ", failed.Take(20)));
             }
             else
             {
-                Logger.LogDebug("Central B2 force-upload completed for {count} missing hash(es)", toUpload.Count);
+                Logger.LogDebug("Legacy missing-hash upload flow completed for {count} hash(es)", toUpload.Count);
             }
 
             return failed;
@@ -383,7 +446,7 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
         return builder.Uri;
     }
 
-    private async Task UploadFileStreamedFromDisk(string fileHash, string filePath, bool munged, IProgress<UploadProgress>? progress, CancellationToken uploadToken, int streamBufferSize, bool forceUploadTicket = false)
+    private async Task UploadFileStreamedFromDisk(string fileHash, string filePath, bool munged, IProgress<UploadProgress>? progress, CancellationToken uploadToken, int streamBufferSize, bool forceUploadTicket = false, Action? onBytesUploaded = null)
     {
         if (!_orchestrator.IsInitialized) throw new InvalidOperationException("FileTransferManager is not initialized");
         uploadToken.ThrowIfCancellationRequested();
@@ -414,26 +477,10 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
 
         if (!ticket.UploadRequired)
         {
-            if (forceUploadTicket)
-                throw new InvalidOperationException($"[{fileHash}] Forced upload ticket still reported UploadRequired=false; refusing to treat CDN/B2 as repaired without a fresh raw overwrite.");
-
-            if (await VerifyCdnObjectHealthyAsync(fileHash, uploadToken).ConfigureAwait(false))
-                return;
-
-            Logger.LogWarning("[{hash}] Server reported upload not required, but CDN object was missing/empty; retrying with forced upload ticket", fileHash);
-
-            ticketUri = GetUploadTicketUri(fileHash, forceUploadTicket: true);
-            using var forcedTicketResp = await _orchestrator.SendRequestAsync(HttpMethod.Post, ticketUri, ticketReq, uploadToken).ConfigureAwait(false);
-            forcedTicketResp.EnsureSuccessStatusCode();
-
-            var forcedTicketJson = await forcedTicketResp.Content.ReadAsStringAsync(uploadToken).ConfigureAwait(false);
-            ticket = JsonSerializer.Deserialize<UploadTicketResponseDto>(forcedTicketJson, new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
-
-            if (ticket == null || !string.Equals(ticket.Mode, "DirectB2", StringComparison.OrdinalIgnoreCase))
-                throw new InvalidOperationException($"[{fileHash}] Forced upload ticket failed; cannot continue.");
-
-            if (!ticket.UploadRequired)
-                throw new InvalidOperationException($"[{fileHash}] Forced upload ticket did not require upload while CDN/B2 object is missing.");
+            Logger.LogDebug("[{hash}] Upload ticket reports upload not required; trusting server-side object state and skipping local CDN verification", fileHash);
+            _verifiedUploadedHashes[fileHash] = DateTime.UtcNow;
+            progress?.Report(new UploadProgress(fileSize, fileSize));
+            return;
         }
 
         Logger.LogDebug("[{hash}] Direct upload ticket acquired, preparing raw payload", fileHash);
@@ -533,8 +580,10 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
 
                     putResp.EnsureSuccessStatusCode();
 
-                    // The B2 PUT is complete here. The metadata call may still be in flight,
-                    // but upload bytes are finished, so do not fake a 99% stall in the UI.
+                    // The B2 PUT is complete here, but the server-side UploadComplete
+                    // metadata call is still part of the upload barrier. Surface that as
+                    // finalisation instead of making the UI look frozen at 100%.
+                    onBytesUploaded?.Invoke();
                     progress?.Report(new UploadProgress(rawSize, rawSize));
 
                     var etag = putResp.Headers.ETag?.Tag;
@@ -579,16 +628,10 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
 
                         if (!ticket.UploadRequired)
                         {
-                            if (await VerifyCdnObjectHealthyAsync(fileHash, uploadToken).ConfigureAwait(false))
-                            {
-                                Logger.LogDebug("[{hash}] Ticket refresh reports upload not required and CDN object is healthy; treating as success", fileHash);
-                                return;
-                            }
-
-                            if (forceUploadTicket)
-                                throw new InvalidOperationException($"[{fileHash}] Forced refreshed upload ticket still reported UploadRequired=false while CDN/B2 object is missing.");
-
-                            Logger.LogWarning("[{hash}] Ticket refresh reported upload not required, but CDN object was missing/empty; retrying upload", fileHash);
+                            Logger.LogDebug("[{hash}] Ticket refresh reports upload not required; treating server-side object state as authoritative", fileHash);
+                            _verifiedUploadedHashes[fileHash] = DateTime.UtcNow;
+                            progress?.Report(new UploadProgress(fileSize, fileSize));
+                            return;
                         }
                     }
 
@@ -942,10 +985,18 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
             if (missingLocal.Count > 0)
             {
                 Logger.LogWarning(
-                    "Upload aborted: {count} hashes are referenced by character data but missing locally (first 20): {list}",
+                    "Pruning {count} hash(es) referenced by character data but missing locally before upload/share (first 20): {list}",
                     missingLocal.Count, string.Join(", ", missingLocal.Take(20)));
 
-                return (data, false, $"{missingLocal.Count} file(s) missing locally");
+                RemoveHashesFromCharacterData(data, missingLocal);
+
+                allCandidateHashes = GetAllCandidateHashes(data);
+                if (allCandidateHashes.Count == 0)
+                    return (data, true, null);
+
+                presentLocal = allCandidateHashes
+                    .Where(h => _fileDbManager.GetFileCacheByHash(h) != null)
+                    .ToHashSet(StringComparer.Ordinal);
             }
 
             var uids = (visiblePlayers ?? new List<UserData>())
@@ -981,8 +1032,6 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
             var auth = await FilesSend([.. hashesForServerCheck], uids, uploadToken).ConfigureAwait(false);
 
             var now = DateTime.UtcNow;
-            foreach (var h in hashesForServerCheck)
-                _verifiedUploadedHashes[h] = now;
 
             foreach (var f in auth.Where(f => f.IsForbidden))
             {
@@ -1027,6 +1076,10 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
                 }
             }
 
+            var verifiedNow = DateTime.UtcNow;
+            foreach (var hash in hashesForServerCheck)
+                _verifiedUploadedHashes[hash] = verifiedNow;
+
             var prewarmHashes = toPush.Except(failed, StringComparer.Ordinal).Distinct(StringComparer.Ordinal).ToArray();
             QueueCdnPrewarm(prewarmHashes);
 
@@ -1059,7 +1112,7 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
 
     private static HashSet<string> GetAllCandidateHashes(CharacterData data)
     {
-        HashSet<string> hashes = new(StringComparer.Ordinal);
+        HashSet<string> hashes = new(StringComparer.OrdinalIgnoreCase);
 
         foreach (var kvp in data.FileReplacements)
         {
@@ -1075,7 +1128,7 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
                 if (string.IsNullOrEmpty(hash))
                     continue;
 
-                hashes.Add(hash);
+                hashes.Add(hash.Trim().ToUpperInvariant());
             }
         }
 
@@ -1087,6 +1140,32 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
         foreach (var kvp in data.FileReplacements)
         {
             kvp.Value.RemoveAll(fr => string.Equals(fr.Hash, hash, StringComparison.OrdinalIgnoreCase));
+        }
+
+        foreach (var objectKind in data.FileReplacements.Keys.ToArray())
+        {
+            if (data.FileReplacements.TryGetValue(objectKind, out var replacements) && replacements.Count == 0)
+                data.FileReplacements.Remove(objectKind);
+        }
+    }
+
+    private static void RemoveHashesFromCharacterData(CharacterData data, IEnumerable<string> hashes)
+    {
+        var removeSet = hashes?
+            .Where(h => !string.IsNullOrWhiteSpace(h))
+            .Select(h => h.Trim())
+            .ToHashSet(StringComparer.OrdinalIgnoreCase) ?? [];
+
+        if (removeSet.Count == 0)
+            return;
+
+        foreach (var kvp in data.FileReplacements)
+            kvp.Value.RemoveAll(fr => !string.IsNullOrWhiteSpace(fr.Hash) && removeSet.Contains(fr.Hash));
+
+        foreach (var objectKind in data.FileReplacements.Keys.ToArray())
+        {
+            if (data.FileReplacements.TryGetValue(objectKind, out var replacements) && replacements.Count == 0)
+                data.FileReplacements.Remove(objectKind);
         }
     }
 
@@ -1327,6 +1406,7 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
             _uploadCancellationTokenSource = null;
         }
 
+        MarkCurrentUploadsAsLocallyAbandonedReservations("connection reset while uploading");
         try { ctsToCancel?.Cancel(); } catch { /* best effort */ }
 
         CompleteAndClearCurrentUploads();
@@ -1379,17 +1459,10 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
                     continue;
                 if (!ticket.UploadRequired)
                 {
-                    if (await VerifyCdnObjectHealthyAsync(hash, ct).ConfigureAwait(false))
-                    {
-                        _verifiedUploadedHashes[hash] = now;
-                        recovered.Add(hash);
+                    _verifiedUploadedHashes[hash] = now;
+                    recovered.Add(hash);
 
-                        Logger.LogDebug("[{hash}] Recheck recovered upload (server reports UploadRequired=false and CDN object is healthy)", hash);
-                    }
-                    else
-                    {
-                        Logger.LogWarning("[{hash}] Recheck found UploadRequired=false but CDN object was missing/empty; will not treat as recovered", hash);
-                    }
+                    Logger.LogDebug("[{hash}] Recheck recovered upload because the server reports UploadRequired=false", hash);
                 }
             }
             catch (OperationCanceledException)
@@ -1474,7 +1547,8 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
 
             foreach (var hash in present)
             {
-                if (!cacheEntryByHash.TryGetValue(hash, out var cacheEntry) || !TryValidateUploadSource(hash, cacheEntry, requireHashValidation: forceUploadTickets))
+                var requireHashValidation = forceUploadTickets || IsRecentlyAbandonedLocalUploadReservation(hash);
+                if (!cacheEntryByHash.TryGetValue(hash, out var cacheEntry) || !TryValidateUploadSource(hash, cacheEntry, requireHashValidation: requireHashValidation))
                 {
                     invalidLocal.Add(hash);
                 }
@@ -1562,12 +1636,15 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
             }
 
             var succeeded = new System.Collections.Concurrent.ConcurrentDictionary<string, byte>(StringComparer.Ordinal);
+            var reservedUploadHashes = new System.Collections.Concurrent.ConcurrentDictionary<string, byte>(StringComparer.Ordinal);
+            var forceUploadTicketHashes = new System.Collections.Concurrent.ConcurrentDictionary<string, byte>(StringComparer.Ordinal);
             var pendingBatchCompletes = new System.Collections.Concurrent.ConcurrentBag<UploadCompleteBatchFileDto>();
 
             var batchTicketsByHash = await GetUploadTicketsBatchAsync(allowedHashes, sizeByHash, forceUploadTickets, token).ConfigureAwait(false);
             if (batchTicketsByHash.Count > 0)
             {
                 var alreadyCovered = new List<string>();
+                var alreadyReserved = new List<string>();
 
                 foreach (var hash in allowedHashes)
                 {
@@ -1576,42 +1653,81 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
 
                     if (!ticket.Success)
                     {
+                        if (IsUploadAlreadyReserved(ticket.Error))
+                        {
+                            if (IsRecentlyAbandonedLocalUploadReservation(hash))
+                            {
+                                // The last owner of this reservation was our own cancelled/disconnected upload.
+                                // Waiting for "shared files" here deadlocks: nobody else is going to complete it.
+                                // Leave the hash in allowedHashes and force-refresh its ticket on the actual upload attempt.
+                                forceUploadTicketHashes[hash] = 1;
+                                ClearUploadTransferWaitingStatus(hash, uploadEntryByHash);
+                                Logger.LogWarning(
+                                    "[{hash}] Batch upload ticket is still reserved after a locally abandoned upload; forcing a fresh upload ticket instead of waiting for ourselves",
+                                    hash);
+                                continue;
+                            }
+
+                            // The server already has an active reservation for this hash.
+                            // Do not fall back to the per-file ticket endpoint, because that
+                            // only creates a 409 retry storm against the same reservation.
+                            // The owner of the reservation is allowed to finish naturally.
+                            alreadyReserved.Add(hash);
+                            reservedUploadHashes[hash] = 1;
+                            MarkUploadTransferWaitingForSharedFiles(hash, uploadEntryByHash);
+
+                            Logger.LogDebug("[{hash}] Batch upload ticket says this hash is already reserved; waiting for the shared upload to become available before releasing the barrier", hash);
+                            continue;
+                        }
+
                         Logger.LogWarning("[{hash}] Batch upload ticket error, falling back to per-file ticket: {error}", hash, ticket.Error);
                         continue;
                     }
 
                     if (!ticket.UploadRequired)
                     {
-                        if (forceUploadTickets)
-                        {
-                            Logger.LogWarning("[{hash}] Forced batch upload ticket returned UploadRequired=false; falling back to per-file forced upload ticket instead of treating existing CDN/B2 object as repaired", hash);
-                            continue;
-                        }
-
-                        if (!await VerifyCdnObjectHealthyAsync(hash, token).ConfigureAwait(false))
-                        {
-                            Logger.LogWarning("[{hash}] Batch upload ticket reported UploadRequired=false, but the CDN/B2 object was missing or empty; keeping hash queued for per-file forced repair upload", hash);
-                            continue;
-                        }
-
                         alreadyCovered.Add(hash);
                         succeeded[hash] = 1;
                         _verifiedUploadedHashes[hash] = DateTime.UtcNow;
+                        ClearLocallyAbandonedUploadReservation(hash);
 
                         if (uploadEntryByHash.TryGetValue(hash, out var entry))
                             entry.Transferred = entry.Total;
                     }
                 }
 
-                if (alreadyCovered.Count > 0)
+                if (alreadyCovered.Count > 0 || alreadyReserved.Count > 0)
                 {
-                    allowedHashes = allowedHashes.Except(alreadyCovered, StringComparer.Ordinal).ToList();
-                    Logger.LogDebug("Batch upload tickets skipped {count} hash(es) already present on B2", alreadyCovered.Count);
+                    var skipUpload = alreadyCovered
+                        .Concat(alreadyReserved)
+                        .Distinct(StringComparer.Ordinal)
+                        .ToList();
+
+                    allowedHashes = allowedHashes.Except(skipUpload, StringComparer.Ordinal).ToList();
+
+                    if (alreadyCovered.Count > 0)
+                        Logger.LogDebug("Batch upload tickets skipped {count} hash(es) already present on B2", alreadyCovered.Count);
+
+                    if (alreadyReserved.Count > 0)
+                        Logger.LogDebug("Batch upload tickets skipped {count} hash(es) already reserved by another active upload", alreadyReserved.Count);
                 }
             }
 
             if (allowedHashes.Count == 0)
-                return forbidden;
+            {
+                var arrivedReservedOnly = await WaitForReservedUploadHashesToArriveAsync(reservedUploadHashes.Keys.ToList(), sizeByHash, uploadEntryByHash, progress, token).ConfigureAwait(false);
+                foreach (var hash in arrivedReservedOnly)
+                {
+                    succeeded[hash] = 1;
+                    reservedUploadHashes.TryRemove(hash, out _);
+                    ClearLocallyAbandonedUploadReservation(hash);
+                }
+
+                return forbidden
+                    .Concat(reservedUploadHashes.Keys)
+                    .Distinct(StringComparer.Ordinal)
+                    .ToList();
+            }
 
             const int MaxUploadAttempts = 3;
 
@@ -1753,6 +1869,15 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
 
             Logger.LogDebug("Completing {count} direct B2 uploads via {mode} batch metadata call", pendingCompletes.Count, final ? "final" : "rolling");
 
+            if (final)
+            {
+                foreach (var complete in pendingCompletes)
+                    MarkUploadTransferFinalising(complete.Hash, uploadEntryByHash);
+
+                progress?.Report(FinalisingUploadsStatus);
+                try { Mediator.Publish(new RefreshUiMessage()); } catch { }
+            }
+
             var batchCompleted = await UploadCompletesBatchAsync(pendingCompletes, token).ConfigureAwait(false);
             if (!final && batchCompleted.Count == 0)
                 rollingUploadCompletesDisabled = true;
@@ -1786,6 +1911,8 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
                 {
                     _verifiedUploadedHashes[complete.Hash] = DateTime.UtcNow;
                     succeeded[complete.Hash] = 1;
+                    ClearLocallyAbandonedUploadReservation(complete.Hash);
+                    ClearUploadTransferFinalisingStatus(complete.Hash, uploadEntryByHash);
                     if (uploadEntryByHash.TryGetValue(complete.Hash, out var finalEntry))
                         finalEntry.Transferred = finalEntry.Total;
                 }
@@ -1983,7 +2110,13 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
                     }
                     else
                     {
-                        await UploadFileStreamedFromDisk(hash, filePath, _mareConfigService.Current.UseAlternativeFileUpload, throttledProg, tokenInner, buf, forceUploadTickets).ConfigureAwait(false);
+                        var useForceUploadTicket = forceUploadTickets || forceUploadTicketHashes.ContainsKey(hash);
+                        await UploadFileStreamedFromDisk(hash, filePath, _mareConfigService.Current.UseAlternativeFileUpload, throttledProg, tokenInner, buf, useForceUploadTicket,
+                            onBytesUploaded: () =>
+                            {
+                                MarkUploadTransferFinalising(hash, uploadEntryByHash);
+                                try { Mediator.Publish(new RefreshUiMessage()); } catch { }
+                            }).ConfigureAwait(false);
                     }
 
                     if (!useLiveProgress)
@@ -1993,6 +2126,9 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
                     {
                         _verifiedUploadedHashes[hash] = DateTime.UtcNow;
                         succeeded[hash] = 1;
+                        ClearLocallyAbandonedUploadReservation(hash);
+                        forceUploadTicketHashes.TryRemove(hash, out _);
+                        ClearUploadTransferFinalisingStatus(hash, uploadEntryByHash);
 
                         if (uploadEntryByHash.TryGetValue(hash, out var finalEntry))
                             finalEntry.Transferred = finalEntry.Total;
@@ -2011,6 +2147,28 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
                 {
                     Logger.LogDebug("[{hash}] Upload cancelled on attempt {attempt}/{max}", hash, attempt, MaxUploadAttempts);
                     throw;
+                }
+                catch (Exception ex) when (IsUploadReservationConflict(ex))
+                {
+                    if (!forceUploadTickets && !forceUploadTicketHashes.ContainsKey(hash) && IsRecentlyAbandonedLocalUploadReservation(hash))
+                    {
+                        forceUploadTicketHashes[hash] = 1;
+                        ClearUploadTransferWaitingStatus(hash, uploadEntryByHash);
+                        Logger.LogWarning(
+                            "[{hash}] Upload ticket conflicted with a locally abandoned reservation; retrying with a forced fresh ticket",
+                            hash);
+                        continue;
+                    }
+
+                    // Another active upload already owns this hash reservation. Re-requesting
+                    // the ticket just hammers the server with 409s, but a reservation is not a
+                    // completed upload. Keep this hash failed for the barrier unless the later
+                    // server recheck proves it became present.
+                    Logger.LogDebug("[{hash}] Upload skipped because the server already has an active reservation for this hash; waiting for the shared upload to become available before releasing the barrier", hash);
+                    reservedUploadHashes[hash] = 1;
+                    MarkUploadTransferWaitingForSharedFiles(hash, uploadEntryByHash);
+
+                    return;
                 }
                 catch (Exception ex)
                 {
@@ -2039,9 +2197,18 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
 
             await FlushPendingUploadCompletesAsync(final: true).ConfigureAwait(false);
 
+            var arrivedReserved = await WaitForReservedUploadHashesToArriveAsync(reservedUploadHashes.Keys.ToList(), sizeByHash, uploadEntryByHash, progress, token).ConfigureAwait(false);
+            foreach (var hash in arrivedReserved)
+            {
+                succeeded[hash] = 1;
+                reservedUploadHashes.TryRemove(hash, out _);
+                ClearLocallyAbandonedUploadReservation(hash);
+            }
+
             // ---- Result classification ----
             var failed = allowedHashes
                 .Where(h => !succeeded.ContainsKey(h))
+                .Concat(reservedUploadHashes.Keys)
                 .Concat(forbidden)
                 .Distinct(StringComparer.Ordinal)
                 .ToList();
@@ -2054,6 +2221,165 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
             CompleteAndClearCurrentUploads();
             progress?.Report("No uploads in progress");
         }
+    }
+
+    private void MarkUploadTransferFinalising(string hash, System.Collections.Concurrent.ConcurrentDictionary<string, UploadFileTransfer> uploadEntryByHash)
+    {
+        if (uploadEntryByHash.TryGetValue(hash, out var entry) && !string.Equals(entry.StatusText, WaitingForSharedFilesStatus, StringComparison.Ordinal))
+            entry.StatusText = FinalisingUploadsStatus;
+    }
+
+    private void ClearUploadTransferFinalisingStatus(string hash, System.Collections.Concurrent.ConcurrentDictionary<string, UploadFileTransfer> uploadEntryByHash)
+    {
+        if (uploadEntryByHash.TryGetValue(hash, out var entry) && string.Equals(entry.StatusText, FinalisingUploadsStatus, StringComparison.Ordinal))
+            entry.StatusText = null;
+    }
+
+    private void MarkUploadTransferWaitingForSharedFiles(string hash, System.Collections.Concurrent.ConcurrentDictionary<string, UploadFileTransfer> uploadEntryByHash)
+    {
+        if (uploadEntryByHash.TryGetValue(hash, out var entry))
+            entry.StatusText = WaitingForSharedFilesStatus;
+    }
+
+    private void ClearUploadTransferWaitingStatus(string hash, System.Collections.Concurrent.ConcurrentDictionary<string, UploadFileTransfer> uploadEntryByHash)
+    {
+        if (uploadEntryByHash.TryGetValue(hash, out var entry) && string.Equals(entry.StatusText, WaitingForSharedFilesStatus, StringComparison.Ordinal))
+            entry.StatusText = null;
+    }
+
+    private async Task<HashSet<string>> WaitForReservedUploadHashesToArriveAsync(IReadOnlyCollection<string> reservedHashes, IReadOnlyDictionary<string, long> sizeByHash, System.Collections.Concurrent.ConcurrentDictionary<string, UploadFileTransfer> uploadEntryByHash, IProgress<string>? progress, CancellationToken token)
+    {
+        var pending = reservedHashes?
+            .Where(h => !string.IsNullOrWhiteSpace(h))
+            .Distinct(StringComparer.Ordinal)
+            .ToHashSet(StringComparer.Ordinal) ?? [];
+
+        var arrived = new HashSet<string>(StringComparer.Ordinal);
+        if (pending.Count == 0)
+            return arrived;
+
+        foreach (var hash in pending)
+            MarkUploadTransferWaitingForSharedFiles(hash, uploadEntryByHash);
+
+        progress?.Report(WaitingForSharedFilesStatus);
+        Logger.LogInformation("Waiting for {count} shared/reserved upload hash(es) to arrive before releasing upload barrier", pending.Count);
+
+        try
+        {
+            Mediator.Publish(new RefreshUiMessage());
+        }
+        catch
+        {
+            // best effort
+        }
+
+        var deadlineTick = unchecked(Environment.TickCount64 + ReservedUploadWaitTimeoutMs);
+        var lastProgressTick = 0L;
+
+        while (pending.Count > 0)
+        {
+            token.ThrowIfCancellationRequested();
+
+            var ticketHashes = pending
+                .Where(h => sizeByHash.TryGetValue(h, out var size) && size > 0)
+                .ToList();
+
+            if (ticketHashes.Count == 0)
+                break;
+
+            var tickets = await GetUploadTicketsBatchAsync(ticketHashes, sizeByHash, forceUploadTicket: false, token).ConfigureAwait(false);
+            var becameAvailable = new List<string>();
+            var noLongerReservedButMissing = new List<string>();
+
+            foreach (var hash in ticketHashes)
+            {
+                if (!tickets.TryGetValue(hash, out var ticket))
+                    continue;
+
+                if (ticket.Success && !ticket.UploadRequired)
+                {
+                    becameAvailable.Add(hash);
+                    continue;
+                }
+
+                if (ticket.Success && ticket.UploadRequired && !string.IsNullOrWhiteSpace(ticket.UploadUrl))
+                {
+                    noLongerReservedButMissing.Add(hash);
+                    continue;
+                }
+
+                if (!ticket.Success && !IsUploadAlreadyReserved(ticket.Error))
+                    Logger.LogDebug("[{hash}] Reserved upload wait still cannot verify file presence; ticket error={error}", hash, ticket.Error);
+            }
+
+            foreach (var hash in becameAvailable)
+            {
+                pending.Remove(hash);
+                arrived.Add(hash);
+                _verifiedUploadedHashes[hash] = DateTime.UtcNow;
+                ClearLocallyAbandonedUploadReservation(hash);
+                ClearUploadTransferWaitingStatus(hash, uploadEntryByHash);
+                if (uploadEntryByHash.TryGetValue(hash, out var entry))
+                    entry.Transferred = entry.Total;
+            }
+
+            if (becameAvailable.Count > 0)
+            {
+                Logger.LogInformation("Shared upload wait recovered {count} hash(es); {remaining} still waiting", becameAvailable.Count, pending.Count);
+                try { Mediator.Publish(new RefreshUiMessage()); } catch { }
+            }
+
+            foreach (var hash in noLongerReservedButMissing)
+            {
+                Logger.LogWarning("[{hash}] Shared upload reservation cleared but server still reports the object missing; leaving it failed for this barrier", hash);
+                pending.Remove(hash);
+                ClearUploadTransferWaitingStatus(hash, uploadEntryByHash);
+            }
+
+            if (pending.Count == 0)
+                break;
+
+            var nowTick = Environment.TickCount64;
+            if (unchecked(deadlineTick - nowTick) <= 0)
+            {
+                Logger.LogWarning("Timed out waiting for {count} shared/reserved upload hash(es) to arrive", pending.Count);
+                break;
+            }
+
+            if (lastProgressTick == 0 || unchecked(nowTick - lastProgressTick) >= 2500)
+            {
+                lastProgressTick = nowTick;
+                progress?.Report(WaitingForSharedFilesStatus);
+                try { Mediator.Publish(new RefreshUiMessage()); } catch { }
+            }
+
+            await Task.Delay(ReservedUploadWaitPollMs, token).ConfigureAwait(false);
+        }
+
+        return arrived;
+    }
+
+    private static bool IsUploadAlreadyReserved(string? message)
+    {
+        return !string.IsNullOrWhiteSpace(message)
+               && message.Contains("Upload already reserved", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsUploadReservationConflict(Exception ex)
+    {
+        if (ex is HttpRequestException { StatusCode: HttpStatusCode.Conflict })
+            return true;
+
+        var current = ex;
+        while (current != null)
+        {
+            if (IsUploadAlreadyReserved(current.Message))
+                return true;
+
+            current = current.InnerException;
+        }
+
+        return false;
     }
 
     private static bool IsLikelyTransientTlsReset(Exception ex)

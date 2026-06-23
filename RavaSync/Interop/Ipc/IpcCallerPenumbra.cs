@@ -235,6 +235,21 @@ public sealed class IpcCallerPenumbra : DisposableMediatorSubscriberBase, IIpcCa
         return result;
     }
 
+    public async Task<bool> HasTemporaryModOnCollectionAsync(ILogger logger, Guid collectionId, string tempModName, int priority = 0)
+    {
+        if (!APIAvailable || collectionId == Guid.Empty || string.IsNullOrWhiteSpace(tempModName))
+            return false;
+
+        var settings = await GetCollectionModSettingsAsync(logger, collectionId, string.Empty).ConfigureAwait(false);
+        if (settings?.Mods == null)
+            return false;
+
+        if (!settings.Mods.TryGetValue(tempModName, out var state))
+            return false;
+
+        return state.Enabled && state.Temporary && state.Priority == priority;
+    }
+
     public async Task<PenumbraCollectionModSettings?> GetDefaultCollectionModSettingsAsync(ILogger logger)
     {
         var defaultCollection = await GetCollectionAsync(logger, ApiCollectionType.Default).ConfigureAwait(false);
@@ -242,6 +257,34 @@ public sealed class IpcCallerPenumbra : DisposableMediatorSubscriberBase, IIpcCa
             return null;
 
         return await GetCollectionModSettingsAsync(logger, defaultCollection.Value.Id, defaultCollection.Value.Name ?? string.Empty).ConfigureAwait(false);
+    }
+
+
+    public async Task<(bool Checked, bool Matches, Guid EffectiveCollectionId, string EffectiveCollectionName)> TryGetObjectEffectiveCollectionMatchAsync(ILogger logger, Guid expectedCollectionId, int idx, string? expectedIdent, nint expectedAddress, string? expectedDisplayName = null)
+    {
+        if (!APIAvailable || expectedCollectionId == Guid.Empty || idx < 0)
+            return (false, false, Guid.Empty, string.Empty);
+
+        (bool Checked, bool Matches, Guid EffectiveCollectionId, string EffectiveCollectionName) result = (false, false, Guid.Empty, string.Empty);
+
+        await SafeIpc.TryRun(Logger, "Penumbra.GetCollectionForObject.Match", TimeSpan.FromSeconds(2), async ct =>
+        {
+            result = await RunPacedPenumbraFrameworkIpcAsync(logger, "Penumbra.GetCollectionForObject(match)", () =>
+            {
+                if (!ValidateTemporaryCollectionAssignmentTargetOnFramework(logger, expectedCollectionId, idx, expectedIdent, expectedAddress, expectedDisplayName))
+                    return (false, false, Guid.Empty, string.Empty);
+
+                var collectionInfo = _penumbraGetCollectionForObject.Invoke(idx);
+                if (!collectionInfo.ObjectValid)
+                    return (true, false, Guid.Empty, string.Empty);
+
+                var effectiveId = collectionInfo.EffectiveCollection.Id;
+                var effectiveName = collectionInfo.EffectiveCollection.Name ?? string.Empty;
+                return (true, effectiveId == expectedCollectionId, effectiveId, effectiveName);
+            }, ct).ConfigureAwait(false);
+        }).ConfigureAwait(false);
+
+        return result;
     }
 
     public async Task<PenumbraCollectionModSettings?> GetLocalPlayerCollectionModSettingsAsync(ILogger logger, int gameObjectIndex)
@@ -676,12 +719,12 @@ public sealed class IpcCallerPenumbra : DisposableMediatorSubscriberBase, IIpcCa
             }
 
             var localPlayerAddress = _dalamudUtil.GetPlayerPtr();
-            var target = _dalamudUtil.GetCharacterFromObjectTableByIndex(idx);
-            var targetAddress = target?.Address ?? nint.Zero;
+            var targetObject = _dalamudUtil.GetObjectFromObjectTableByIndex(idx);
+            var targetAddress = targetObject?.Address ?? nint.Zero;
 
-            if (targetAddress == nint.Zero)
+            if (targetAddress == nint.Zero || targetObject is not ICharacter)
             {
-                logger.LogDebug("Blocked RavaSync receiver temporary collection assignment for {name}/{ident}: idx {idx} no longer points at a valid player", expectedDisplayName ?? string.Empty, expectedIdent ?? string.Empty, idx);
+                logger.LogDebug("Blocked RavaSync receiver temporary collection assignment for {name}/{ident}: idx {idx} no longer points at a valid character actor", expectedDisplayName ?? string.Empty, expectedIdent ?? string.Empty, idx);
                 return false;
             }
 
@@ -699,6 +742,12 @@ public sealed class IpcCallerPenumbra : DisposableMediatorSubscriberBase, IIpcCa
 
             if (expectedAddress != nint.Zero && targetAddress != expectedAddress)
             {
+                if (string.IsNullOrWhiteSpace(expectedIdent))
+                {
+                    logger.LogDebug("Blocked RavaSync receiver temporary collection {collection} assignment to idx {idx}: target addr {addr:X} no longer matches expected actor addr {expectedAddr:X} for {name}", collId, idx, targetAddress, expectedAddress, expectedDisplayName ?? string.Empty);
+                    return false;
+                }
+
                 logger.LogTrace("RavaSync receiver temporary collection assignment target for {name}/{ident} moved from {oldAddr:X} to {newAddr:X}; accepting because ident still matches", expectedDisplayName ?? string.Empty, expectedIdent ?? string.Empty, expectedAddress, targetAddress);
             }
 
